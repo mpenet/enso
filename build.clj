@@ -33,7 +33,7 @@
                 :version version
                 :basis @basis
                 :src-dirs ["src/clj"]
-                :pom-data [[:description "Zero-dependency Ring-compliant HTTP/1.1 server for Clojure on JDK 25 virtual threads."]
+                :pom-data [[:description "Zero-dep , near 0-alloc, High Performance Ring adapter for Clojure"]
                            [:url "https://github.com/mpenet/enso"]
                            [:licenses
                             [:license
