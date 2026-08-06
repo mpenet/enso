@@ -18,7 +18,7 @@
   (b/delete {:path "target"}))
 
 (defn javac [_]
-  (b/javac {:src-dirs ["java"]
+  (b/javac {:src-dirs ["src/java"]
             :class-dir class-dir
             :basis @basis
             :javac-opts ["--release" "25"]}))
@@ -32,8 +32,8 @@
                 :lib lib
                 :version version
                 :basis @basis
-                :src-dirs ["src"]
-                :pom-data [[:description "Fast JSON parser/writer for Clojure."]
+                :src-dirs ["src/clj"]
+                :pom-data [[:description "Zero-dependency Ring-compliant HTTP/1.1 server for Clojure on JDK 25 virtual threads."]
                            [:url "https://github.com/mpenet/enso"]
                            [:licenses
                             [:license
@@ -43,7 +43,7 @@
                             [:url "https://github.com/mpenet/enso"]
                             [:connection "scm:git:git://github.com/mpenet/enso.git"]
                             [:developerConnection "scm:git:ssh://git@github.com/mpenet/enso.git"]]]})
-  (b/copy-dir {:src-dirs ["src"]
+  (b/copy-dir {:src-dirs ["src/clj"]
                :target-dir jar-class-dir})
   (b/jar {:class-dir jar-class-dir
           :jar-file jar-file}))
