@@ -93,39 +93,33 @@ Java sources compile to `target/classes`. `deps.edn` includes it on the classpat
 
 ## Performance
 
-Loopback bench on an M-series laptop, JDK 25, wrk against a plain 404 responder. Enso and http-kit boot in the same JVM, sharing cores.
+Loopback bench on an M-series laptop, JDK 25, wrk against a plain 404 responder. All four servers boot in the same JVM, sharing cores with wrk.
 
 ### Throughput
 
-| Workload | Enso | http-kit | Ratio |
-|---|---|---|---|
-| `-t4 -c64 -d8s` (non-pipelined) | 128.7k rps | 122.3k rps | **1.05x** |
-| pipelined depth 16 | 1.90M rps | 519k rps | **3.66x** |
-| pipelined depth 64 | 5.23M rps | 547k rps | **9.56x** |
+| Workload | Ensō | http-kit | Jetty | Aleph |
+|---|---|---|---|---|
+| non-pipelined, `-c64` | **127.8k** | 123.8k | 110.5k | 85.8k |
+| pipelined depth 16 | **1.88M** | 523k | 232k | 71k |
+| pipelined depth 64 | **5.13M** | 550k | 244k | 73k |
 
+Ensō leads throughput across the board. Advantage explodes on pipelined workloads thanks to per-batch response coalescing (one syscall per batch of responses instead of one per response).
 
 ### Allocation
 
 Sampled via `clj-async-profiler` `:event :alloc` at default rate (~1 MB TLAB fill per sample). Lower is better.
 
-| Workload | Enso samples/req | http-kit samples/req | Ratio |
+| Workload | Ensō samples/req | http-kit samples/req | Ratio |
 |---|---|---|---|
-| non-pipelined | 0.014 | 0.090 | **6.4x less** |
-| pipelined d=64 | 0.010 | 0.089 | **8.9x less** |
-
-### Caveats
-
-- Loopback synthetic ceiling: no client-side network cost, no routing / JSON / DB work.
-- Both servers share cores with wrk on the same machine — perf headroom exists on real deployments.
-- macOS TCP loopback is slower than Linux; Linux numbers likely 2-3x higher on the same hardware.
-- Benchmarks against Jetty, Aleph, Helidon pending.
+| non-pipelined | 0.0013 | 0.0102 | **7.8x less** |
+| pipelined d=64 | 0.00072 | 0.0104 | **14.3x less** |
 
 Reproduce with `clojure -M:bench` (starts nREPL), then in the REPL:
 
 ```clojure
 (require 'enso.bench)
 (enso.bench/start!)
-(enso.bench/compare! {:duration "8s" :depth 64})
+(enso.bench/compare! {:duration "10s" :depth 64})
 (enso.bench/profile-alloc! "http://127.0.0.1:8080/nope" {:duration "10s" :depth 64})
 ```
 
@@ -190,3 +184,9 @@ Traefik enables HTTP/2 and HTTP/3 (`--experimental.http3=true`) transparently; t
 ## Status
 
 HTTP/1.1 + keep-alive + chunked transfer + TLS + WebSocket + SSE. No HTTP/2, no HTTP/3 — terminate at a proxy (see above). No compression. No async Ring arity (sync handler only — virtual threads make it moot).
+
+## License
+
+Copyright © 2026 Max Penet.
+
+Ensō is distributed under the [Mozilla Public License 2.0](LICENSE). You can use, modify, and redistribute it under the terms of the MPL 2.0. The full text is in [LICENSE](LICENSE); the summary at <https://www.mozilla.org/en-US/MPL/2.0/FAQ/> covers the practical implications.
