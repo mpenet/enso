@@ -1,0 +1,39 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Clojure
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: 1.12.5.1654
+
+      - name: Cache Maven / Gitlibs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.deps.clj
+          key: ${{ runner.os }}-clj-${{ hashFiles('deps.edn') }}
+          restore-keys: ${{ runner.os }}-clj-
+
+      - name: Compile Java sources
+        run: clojure -T:build javac
+
+      - name: Run tests
+        run: clojure -X:test

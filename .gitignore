@@ -1,0 +1,6 @@
+target/
+.cpcache/
+.clj-kondo/.cache/
+.lsp/.cache/
+.nrepl-port
+.agent-shell/
