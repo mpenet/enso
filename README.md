@@ -1,7 +1,8 @@
 # Ensō
 
-Zero-dependency, Ring-compliant HTTP/1.1 + HTTP/2 server for Clojure leveraging
-modern jvm features.
+Fast, low-allocation, zero-dependency HTTP/1.1 + HTTP/2 Ring server adapter for
+Clojure. Java core optimized for Ring, not a wrapper. 
+Built on/for virtual threads. Plain sync handler.
 
 - **Zero third-party dependencies.** Java core + thin Clojure adapter. Clojure runtime is the only requirement.
 - **Virtual threads, sync API.** One virtual thread per connection, blocking I/O. Handler is a plain Ring function — no async arity, no callbacks.
