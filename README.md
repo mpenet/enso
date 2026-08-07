@@ -1,5 +1,7 @@
 # Ensō
 
+/!\ WIP
+
 Zero-dependency, Ring-compliant HTTP/1.1 server for Clojure leveraging modern
 jvm features.
 
