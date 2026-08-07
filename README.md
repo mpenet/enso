@@ -159,8 +159,8 @@ Reproduce with `clojure -M:bench` (starts nREPL), then in the REPL:
 ## Status
 
 * HTTP/1.1 + HTTP/2 + keep-alive + chunked transfer + TLS + WebSocket + SSE.
-* No HTTP/3 (it's on our todo)
-* No compression. No async Ring arity (sync handler only — virtual threads make it moot). 
+* HTTP/3 — GET + POST round-trips proven end-to-end via cloudflare-quiche + Java FFM. Requires libquiche installed (`brew install cloudflare-quiche` on macOS; build from source on Linux) and JDK 22+. Alt-Svc advertised from h1/h2 responses when h3 enabled. Streaming response bodies + full perf benchmarks pending.
+* No compression. No async Ring arity (sync handler only — virtual threads make it moot).
 * No h2c (cleartext HTTP/2), no Server Push, no PRIORITY (all deprecated or receive-side only per RFC 9113).
 
 ## Build

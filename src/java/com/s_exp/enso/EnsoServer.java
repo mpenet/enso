@@ -30,6 +30,11 @@ public final class EnsoServer implements AutoCloseable {
     private final Thread acceptor;
     private final Config config;
     private final Set<HttpConnection> connections = ConcurrentHashMap.newKeySet();
+    // HTTP/3 listener kept as Object to avoid a static reference from
+    // EnsoServer to the quiche FFM classes; loaded reflectively when the
+    // http3 flag is set. Users with http3 disabled never trigger the FFM
+    // classloader.
+    private final AutoCloseable http3Listener;
     private volatile boolean running = true;
 
     public EnsoServer(RingHandler handler, Config config) throws IOException {
@@ -51,6 +56,34 @@ public final class EnsoServer implements AutoCloseable {
             .name("enso-acceptor")
             .daemon(true)
             .unstarted(this::acceptLoop);
+        this.http3Listener = createHttp3Listener();
+    }
+
+    /**
+     * Reflective probe for the optional HTTP/3 listener. Keeping the
+     * dependency behind {@link Class#forName} means users with
+     * {@code :http3 false} never trigger classloading of the quiche FFM
+     * bindings and never touch libquiche.
+     */
+    private AutoCloseable createHttp3Listener() throws IOException {
+        if (!config.http3) return null;
+        try {
+            Class<?> cls = Class.forName("com.s_exp.enso.quiche.Http3Listener");
+            AutoCloseable l = (AutoCloseable) cls
+                .getConstructor(Config.class, RingHandler.class, Object.class)
+                .newInstance(config, handler, this);
+            cls.getMethod("start").invoke(l);
+            return l;
+        } catch (ClassNotFoundException | NoClassDefFoundError e) {
+            throw new IllegalStateException(
+                "HTTP/3 support requires the com.s_exp.enso.quiche package "
+                + "(shipped with the main jar) plus libquiche installed. "
+                + "See README.", e);
+        } catch (Throwable t) {
+            Throwable root = t.getCause() != null ? t.getCause() : t;
+            throw new IllegalStateException(
+                "HTTP/3 listener failed to start: " + root.getMessage(), root);
+        }
     }
 
     public void start() {
@@ -159,6 +192,13 @@ public final class EnsoServer implements AutoCloseable {
             executor.shutdownNow();
         }
         connections.clear();
+        if (http3Listener != null) {
+            try {
+                http3Listener.close();
+            } catch (Exception e) {
+                LOG.log(Level.WARNING, "http3 listener close failed", e);
+            }
+        }
     }
 
     private void closeIdleConnections() {

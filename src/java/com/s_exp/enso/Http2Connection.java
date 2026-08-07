@@ -973,6 +973,7 @@ final class Http2Connection implements Runnable {
         List<Hpack.HeaderField> fields = new ArrayList<>(
             (respHeaders == null ? 0 : respHeaders.size()) + 1);
         fields.add(new Hpack.HeaderField(":status", Integer.toString(status)));
+        boolean hasAltSvc = false;
         if (respHeaders != null) {
             for (Map.Entry<?, ?> e : respHeaders.entrySet()) {
                 String name = String.valueOf(e.getKey()).toLowerCase();
@@ -982,9 +983,14 @@ final class Http2Connection implements Runnable {
                     // Forbidden in HTTP/2 responses per §8.1.2.2.
                     continue;
                 }
+                if (name.equals("alt-svc")) hasAltSvc = true;
                 Object v = e.getValue();
                 fields.add(new Hpack.HeaderField(name, v == null ? "" : v.toString()));
             }
+        }
+        // Advertise h3 endpoint (RFC 7838). Handler-supplied Alt-Svc wins.
+        if (!hasAltSvc && config.altSvcValue != null) {
+            fields.add(new Hpack.HeaderField("alt-svc", config.altSvcValue));
         }
         boolean hasBody = body != null && !(body instanceof byte[] b && b.length == 0)
                                        && !(body instanceof String s && s.isEmpty());

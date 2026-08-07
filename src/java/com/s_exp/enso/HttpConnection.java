@@ -523,6 +523,7 @@ final class HttpConnection implements Runnable {
         long declaredLength = -1;
         boolean hasDate = false;
         boolean hasTransferEncoding = false;
+        boolean hasAltSvc = false;
         String connectionHeader = null;
         if (response.headers != null) {
             for (Map.Entry<?, ?> e : response.headers.entrySet()) {
@@ -542,6 +543,7 @@ final class HttpConnection implements Runnable {
                             connectionHeader = String.valueOf(value);
                         }
                     }
+                    case 7 -> hasAltSvc = hasAltSvc || name.equalsIgnoreCase("alt-svc");
                     case 17 -> hasTransferEncoding = hasTransferEncoding || name.equalsIgnoreCase("transfer-encoding");
                     default -> {
                     }
@@ -560,6 +562,11 @@ final class HttpConnection implements Runnable {
         }
         if (!hasDate) {
             hAppend(HttpDates.dateLine());
+        }
+        // Advertise the h3 endpoint via Alt-Svc so ALPN-aware clients can
+        // upgrade on their next request. Handler-supplied Alt-Svc wins.
+        if (!hasAltSvc && config.altSvcValue != null) {
+            hHeader("alt-svc", config.altSvcValue);
         }
 
         boolean useChunked = false;

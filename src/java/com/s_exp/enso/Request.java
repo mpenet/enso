@@ -62,7 +62,7 @@ public final class Request implements IPersistentMap, Map<Object, Object> {
     private Keyword methodKw;
     private String serverName;
 
-    Request(String method, String uri, String queryString, String protocol,
+    public Request(String method, String uri, String queryString, String protocol,
             IPersistentMap headers, InputStream body, InetAddress remoteAddress, int serverPort) {
         this.method = method;
         this.uri = uri;

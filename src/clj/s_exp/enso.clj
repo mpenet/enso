@@ -134,6 +134,16 @@
     (when-let [v (:http2-initial-window-size opts)] (.http2InitialWindowSize b (int v)))
     (when-let [v (:http2-max-frame-size opts)] (.http2MaxFrameSize b (int v)))
     (when-let [v (:http2-max-header-list-size opts)] (.http2MaxHeaderListSize b (int v)))
+    (when (:http3 opts) (.http3 b true))
+    (when-let [v (:http3-port opts)] (.http3Port b (int v)))
+    (when-let [v (:http3-max-idle-timeout opts)] (.http3MaxIdleTimeoutMs b (int v)))
+    (when-let [v (:http3-initial-max-data opts)] (.http3InitialMaxData b (long v)))
+    (when-let [v (:http3-initial-max-streams-bidi opts)] (.http3InitialMaxStreamsBidi b (int v)))
+    (when-let [v (:http3-max-udp-payload-size opts)] (.http3MaxUdpPayloadSize b (int v)))
+    (when-let [v (:http3-cert-path opts)] (.http3CertPath b ^String v))
+    (when-let [v (:http3-key-path opts)] (.http3KeyPath b ^String v))
+    (when (contains? opts :advertise-alt-svc) (.advertiseAltSvc b (boolean (:advertise-alt-svc opts))))
+    (when-let [v (:alt-svc-max-age opts)] (.altSvcMaxAge b (int v)))
     (.build b)))
 
 (defn run-server
