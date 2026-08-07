@@ -4,7 +4,6 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
@@ -16,6 +15,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLServerSocketFactory;
 
@@ -41,7 +41,11 @@ public final class EnsoServer implements AutoCloseable {
         this.handler = handler;
         this.errorHandler = errorHandler;
         this.config = config;
-        this.listener = config.sslContext != null ? new SslListener(config) : new PlainListener(config);
+        this.listener = config.sslContext != null
+            ? (config.http2
+                ? new TlsChannelListener(config)
+                : new SslListener(config))
+            : new PlainListener(config);
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
         this.acceptor = Thread.ofPlatform()
             .name("enso-acceptor")
@@ -85,13 +89,44 @@ public final class EnsoServer implements AutoCloseable {
                 if (config.idleTimeoutMillis > 0) {
                     socket.setSoTimeout(config.idleTimeoutMillis);
                 }
-                executor.execute(new HttpConnection(socket, handler, this));
+                executor.execute(() -> dispatch(socket));
             } catch (IOException e) {
                 if (running) {
                     LOG.log(Level.WARNING, "accept failed", e);
                 }
             }
         }
+    }
+
+    /**
+     * Routes the accepted socket to the right protocol driver. Runs on the
+     * virtual thread that will own the connection so the TLS handshake and
+     * ALPN inspection happen off the acceptor. When the listener produced a
+     * {@link TlsSocket.AdapterSocket}, drives the handshake and dispatches
+     * to {@link Http2Connection} for "h2" or falls through to
+     * {@link HttpConnection} for "http/1.1" (or when the peer sent no ALPN).
+     */
+    private void dispatch(Socket socket) {
+        if (socket instanceof TlsSocket.AdapterSocket adapter) {
+            try {
+                TlsSocket tls = adapter.tls();
+                tls.handshake();
+                String proto = tls.getApplicationProtocol();
+                if ("h2".equals(proto)) {
+                    new Http2Connection(socket, handler, this).run();
+                    return;
+                }
+                // ALPN negotiated http/1.1 or the peer sent no ALPN — fall
+                // through to HttpConnection.
+            } catch (java.io.IOException e) {
+                try {
+                    socket.close();
+                } catch (java.io.IOException ignored) {
+                }
+                return;
+            }
+        }
+        new HttpConnection(socket, handler, this).run();
     }
 
     /**
@@ -143,7 +178,8 @@ public final class EnsoServer implements AutoCloseable {
         }
     }
 
-    private sealed interface Listener extends Closeable permits PlainListener, SslListener {
+    private sealed interface Listener extends Closeable
+            permits PlainListener, SslListener, TlsChannelListener {
         Socket accept() throws IOException;
         int port();
     }
@@ -195,6 +231,13 @@ public final class EnsoServer implements AutoCloseable {
             } else if (config.sslWantClientAuth) {
                 this.serverSocket.setWantClientAuth(true);
             }
+            if (config.http2) {
+                // Advertise both application protocols; "h2" first so ALPN-aware
+                // clients prefer HTTP/2 while HTTP/1.1-only clients still work.
+                javax.net.ssl.SSLParameters params = serverSocket.getSSLParameters();
+                params.setApplicationProtocols(new String[] {"h2", "http/1.1"});
+                serverSocket.setSSLParameters(params);
+            }
         }
 
         @Override
@@ -210,6 +253,56 @@ public final class EnsoServer implements AutoCloseable {
         @Override
         public void close() throws IOException {
             serverSocket.close();
+        }
+    }
+
+    /**
+     * TLS listener over {@link ServerSocketChannel} + {@link SSLEngine}.
+     * Each accepted connection is wrapped in a {@link TlsSocket}; the
+     * handshake and ALPN inspection happen in the connection's virtual
+     * thread (see {@link EnsoServer#dispatch}). Enables gathering writes,
+     * clean {@code close_notify} shutdown, and a {@link SocketChannel} for
+     * zero-copy file transfer.
+     */
+    private static final class TlsChannelListener implements Listener {
+
+        private final ServerSocketChannel channel;
+        private final javax.net.ssl.SSLContext sslContext;
+        private final Config config;
+
+        TlsChannelListener(Config config) throws IOException {
+            this.config = config;
+            this.sslContext = config.sslContext;
+            this.channel = ServerSocketChannel.open();
+            this.channel.bind(new InetSocketAddress(config.host, config.port), config.backlog);
+        }
+
+        @Override
+        public Socket accept() throws IOException {
+            SocketChannel sc = channel.accept();
+            sc.socket().setTcpNoDelay(true);
+            SSLEngine engine = sslContext.createSSLEngine();
+            engine.setUseClientMode(false);
+            if (config.sslNeedClientAuth) engine.setNeedClientAuth(true);
+            else if (config.sslWantClientAuth) engine.setWantClientAuth(true);
+            javax.net.ssl.SSLParameters params = engine.getSSLParameters();
+            params.setApplicationProtocols(new String[] {"h2", "http/1.1"});
+            engine.setSSLParameters(params);
+            return new TlsSocket(sc, engine).asSocket();
+        }
+
+        @Override
+        public int port() {
+            try {
+                return ((InetSocketAddress) channel.getLocalAddress()).getPort();
+            } catch (IOException e) {
+                return -1;
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            channel.close();
         }
     }
 }

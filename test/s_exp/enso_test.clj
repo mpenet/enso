@@ -189,6 +189,57 @@
         (is (str/includes? raw "HTTP/1.1 200 OK"))
         (is (str/ends-with? raw "hello"))))))
 
+;; ---- HPACK (RFC 7541 Appendix C) ---------------------------------------
+
+(defn- hex->bytes ^"[B" [s]
+  (let [s (str/replace s #"\s" "")
+        n (/ (count s) 2)
+        out (byte-array n)]
+    (dotimes [i n]
+      (aset-byte out i (byte (- (Integer/parseInt (subs s (* i 2) (+ (* i 2) 2)) 16)
+                                (if (>= (Integer/parseInt (subs s (* i 2) (+ (* i 2) 2)) 16) 128) 256 0)))))
+    out))
+
+(deftest hpack-decode-c-3-1
+  ;; RFC 7541 C.3.1 — first request in the sequence, no Huffman.
+  (let [^com.s_exp.enso.Hpack$Decoder dec (com.s_exp.enso.Hpack$Decoder. 4096)
+        ^bytes block (hex->bytes "8286 8441 0f77 7777 2e65 7861 6d70 6c65 2e63 6f6d")
+        ^java.util.List fields (.decode dec block (int 0) (int (alength block)))]
+    (is (= 4 (.size fields)))
+    (let [entries (map (fn [i]
+                         (let [^com.s_exp.enso.Hpack$HeaderField hf (.get fields (int i))]
+                           [(.name hf) (.value hf)]))
+                       (range (.size fields)))]
+      (is (= [[":method" "GET"]
+              [":scheme" "http"]
+              [":path" "/"]
+              [":authority" "www.example.com"]]
+             entries)))))
+
+(deftest hpack-huffman-decode-c-4-1
+  ;; RFC 7541 C.4.1 — Huffman-encoded "www.example.com" (from the same request).
+  (let [^bytes encoded (hex->bytes "f1e3 c2e5 f23a 6ba0 ab90 f4ff")
+        ^bytes decoded (com.s_exp.enso.HpackHuffman/decode encoded (int 0) (int (alength encoded)))]
+    (is (= "www.example.com" (String. decoded StandardCharsets/UTF_8)))))
+
+(deftest hpack-integer-round-trip
+  ;; RFC 7541 §5.1: single-byte and multi-byte integer encodings.
+  (doseq [[v prefix expected-hex]
+          [[10 5 "0a"]
+           [1337 5 "1f9a0a"]
+           [42 8 "2a"]]]
+    (let [buf (byte-array 8)
+          n (com.s_exp.enso.Hpack/encodeInteger buf 0 prefix 0 v)
+          hex (apply str (map #(format "%02x" (bit-and % 0xff))
+                              (java.util.Arrays/copyOf buf n)))]
+      (is (= expected-hex hex) (str "encode value=" v " prefix=" prefix)))
+    ;; And round-trip through decode.
+    (let [buf (byte-array 8)
+          n (com.s_exp.enso.Hpack/encodeInteger buf 0 prefix 0 v)
+          cursor (com.s_exp.enso.Hpack$Cursor. buf 0 n)
+          out (com.s_exp.enso.Hpack/decodeInteger cursor prefix)]
+      (is (= v out) (str "roundtrip value=" v " prefix=" prefix)))))
+
 (deftest response-header-crlf-rejected
   ;; Handler returning a header with embedded CRLF must not split the response.
   (with-server

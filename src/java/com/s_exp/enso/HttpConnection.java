@@ -702,7 +702,9 @@ final class HttpConnection implements Runnable {
     /**
      * Zero-copy file transfer via {@link FileChannel#transferTo} when the socket
      * exposes a {@link SocketChannel} (plain HTTP path). Falls back to a
-     * user-space copy for socket types without a channel (TLS via SSLSocket).
+     * user-space copy for socket types without a channel — TLS via
+     * {@link com.s_exp.enso.TlsSocket.AdapterSocket} takes this path because
+     * the ciphertext has to pass through {@link javax.net.ssl.SSLEngine} first.
      */
     private void sendFile(File file) throws IOException {
         SocketChannel sc = socket.getChannel();

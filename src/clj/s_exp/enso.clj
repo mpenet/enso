@@ -91,9 +91,7 @@
          (.write w ^bytes b)
          (.write w (byte-array [(byte b)]))))
       ([b off len]
-       (let [copy (byte-array len)]
-         (System/arraycopy b off copy 0 len)
-         (.write w copy))))
+       (.write w ^bytes b (int off) (int len))))
     (flush [] (.flush w))
     (close [])))
 
@@ -131,6 +129,11 @@
     (when-let [v (:ssl-context opts)] (.sslContext b ^javax.net.ssl.SSLContext v))
     (when (:ssl-need-client-auth opts) (.sslNeedClientAuth b true))
     (when (:ssl-want-client-auth opts) (.sslWantClientAuth b true))
+    (when (:http2 opts) (.http2 b true))
+    (when-let [v (:http2-max-concurrent-streams opts)] (.http2MaxConcurrentStreams b (int v)))
+    (when-let [v (:http2-initial-window-size opts)] (.http2InitialWindowSize b (int v)))
+    (when-let [v (:http2-max-frame-size opts)] (.http2MaxFrameSize b (int v)))
+    (when-let [v (:http2-max-header-list-size opts)] (.http2MaxHeaderListSize b (int v)))
     (.build b)))
 
 (defn run-server
