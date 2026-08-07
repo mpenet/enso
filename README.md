@@ -1,12 +1,22 @@
 # Ensō
 
-Zero-dependency, Ring-compliant HTTP/1.1 server for Clojure. Blocking I/O on virtual threads. Java core, Clojure adapter.
+Zero-dependency, Ring-compliant HTTP/1.1 server for Clojure leveraging modern
+jvm features.
 
-Licensed under [MPL 2.0](LICENSE).
+- **Zero third-party dependencies.** Java core + thin Clojure adapter. Clojure runtime is the only requirement.
+- **Virtual threads, sync API.** One virtual thread per connection, blocking I/O. Handler is a plain Ring function — no async arity, no callbacks.
+- **HTTP/1.1 complete.** Keep-alive, pipelining, chunked transfer (request + response), 100-Continue, `Expect`, TLS via `SSLContext`.
+- **WebSocket.** Ring 1.5+ listener shape. Text + binary, ping/pong, close handshake.
+- **SSE / long-poll.** Response body can be a function receiving a `ChunkedWriter` — push events over time with `flush!`.
+- **`StreamableResponseBody`.** Optional support for `ring.core.protocols` — user-extensible response body types.
+- **Fast.** ~5M rps pipelined depth 64 on a laptop, ~128k rps non-pipelined.
+- **Low allocation.** ~0.001 sample/req at 1 MB TLAB interval — near-zero GC pressure on hot paths.
+- **Sendfile.** `File` response bodies dispatch via `FileChannel.transferTo(SocketChannel)` — zero-copy on plain HTTP.
+- **Correct.** Rejects request smuggling variants (duplicate `Content-Length`, `TE + CL`, obs-fold), header injection in responses, slowloris (per-request deadline), and enforces body-size caps.
 
 ## Requirements
 
-- JDK 25+ (virtual threads, `SocketChannel` sendfile)
+- JDK 21+ 
 - Clojure 1.12+
 
 ## Quick start
@@ -82,15 +92,6 @@ Limits (tune only if you know why):
 
 `socket` is a `com.s_exp.enso.WebSocketSocket`. Text and binary messages, ping/pong (auto-pong on ping unless `:on-ping` is provided), close handshake.
 
-## Build
-
-```
-clojure -T:build javac
-clojure -X:test
-```
-
-Java sources compile to `target/classes`. `deps.edn` includes it on the classpath.
-
 ## Performance
 
 Loopback bench on an M-series laptop, JDK 25, wrk against a plain 404 responder. All four servers boot in the same JVM, sharing cores with wrk.
@@ -103,7 +104,7 @@ Loopback bench on an M-series laptop, JDK 25, wrk against a plain 404 responder.
 | pipelined depth 16 | **1.88M** | 523k | 232k | 71k |
 | pipelined depth 64 | **5.13M** | 550k | 244k | 73k |
 
-Ensō leads throughput across the board. Advantage explodes on pipelined workloads thanks to per-batch response coalescing (one syscall per batch of responses instead of one per response).
+Ensō leads throughput across the board, especially on pipelined workloads.
 
 ### Allocation
 
@@ -123,67 +124,20 @@ Reproduce with `clojure -M:bench` (starts nREPL), then in the REPL:
 (enso.bench/profile-alloc! "http://127.0.0.1:8080/nope" {:duration "10s" :depth 64})
 ```
 
-## HTTP/2 + HTTP/3
-
-Enso speaks HTTP/1.1 only, by design. For HTTP/2 or HTTP/3, terminate at a reverse proxy and forward to Enso over HTTP/1.1. The proxy handles ALPN, HPACK/QPACK, streams, flow control, and QUIC — Enso stays a tight sync-Ring core.
-
-### Caddy
-
-```caddy
-example.com {
-    reverse_proxy 127.0.0.1:8080
-}
-```
-
-Auto-provisions certs, enables HTTP/2 and HTTP/3 out of the box, keep-alive to the origin.
-
-### nginx
-
-```nginx
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    listen 443 quic reuseport;   # HTTP/3
-    listen [::]:443 quic reuseport;
-
-    server_name example.com;
-    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
-    add_header Alt-Svc 'h3=":443"; ma=86400';
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-### Traefik
-
-```yaml
-http:
-  routers:
-    enso:
-      rule: "Host(`example.com`)"
-      service: enso
-      tls:
-        certResolver: letsencrypt
-  services:
-    enso:
-      loadBalancer:
-        servers:
-          - url: "http://127.0.0.1:8080"
-```
-
-Traefik enables HTTP/2 and HTTP/3 (`--experimental.http3=true`) transparently; the origin still sees HTTP/1.1.
-
 ## Status
 
-HTTP/1.1 + keep-alive + chunked transfer + TLS + WebSocket + SSE. No HTTP/2, no HTTP/3 — terminate at a proxy (see above). No compression. No async Ring arity (sync handler only — virtual threads make it moot).
+HTTP/1.1 + keep-alive + chunked transfer + TLS + WebSocket + SSE. No HTTP/2, no
+HTTP/3 (for now) — terminate at a proxy (see above). No compression. No async
+Ring arity (sync handler only — virtual threads make it moot).
+
+## Build
+
+```
+clojure -T:build javac
+clojure -X:test
+```
+
+Java sources compile to `target/classes`. `deps.edn` includes it on the classpath.
 
 ## License
 

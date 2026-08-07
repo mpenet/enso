@@ -21,7 +21,7 @@
   (b/javac {:src-dirs ["src/java"]
             :class-dir class-dir
             :basis @basis
-            :javac-opts ["--release" "25"]}))
+            :javac-opts ["--release" "21"]}))
 
 (defn jar [_]
   (javac nil)
