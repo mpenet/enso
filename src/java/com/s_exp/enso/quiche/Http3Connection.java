@@ -71,7 +71,12 @@ final class Http3Connection implements AutoCloseable {
     private final InetSocketAddress peer;
     private final RingHandler handler;
     private final BlockingQueue<byte[]> ingress = new LinkedBlockingQueue<>(INGRESS_CAPACITY);
-    private final BlockingQueue<ResponseTask> outbound = new LinkedBlockingQueue<>();
+    // Bounded outbound queue — a handler burst that outpaces the send path
+    // applies backpressure to workers via LinkedBlockingQueue.put's block
+    // rather than growing heap. Sized generously; capped mostly against
+    // pathological handler code.
+    private static final int OUTBOUND_CAPACITY = 1024;
+    private final BlockingQueue<ResponseTask> outbound = new LinkedBlockingQueue<>(OUTBOUND_CAPACITY);
     // Owner-thread work is submitted to a shared cached platform-thread
     // pool owned by Http3Listener rather than each connection spawning its
     // own thread — accept flood then never churns thread creation. Track
@@ -91,6 +96,17 @@ final class Http3Connection implements AutoCloseable {
     // Live request bodies keyed by stream_id. Owner-thread only, no
     // concurrent mutation — the map is unlocked.
     private final HashMap<Long, H3BodyPipe> bodyPipes = new HashMap<>();
+    // Ctor-time reusable FFM scratch, all backed by the connection-lifetime
+    // arena. Copies Jetty's pattern for the pieces where sharing across
+    // iterations is safe (fixed-size buffers, single-thread reader).
+    // sockaddrs stay per-call — pre-baking recvInfo caused subtle
+    // second-connection handshake stalls; the confined-arena rebuild is
+    // still cheap versus the datagram-copy cost.
+    private MemorySegment inBuf;          // inbound datagram scratch
+    private MemorySegment outBuf;         // outbound datagram scratch
+    private MemorySegment sendInfo;       // quiche_send_info out param
+    private MemorySegment evPtr;          // out-param for quiche_h3_conn_poll
+    private MemorySegment bodyBuf;        // recv_body scratch (4 KiB)
 
     private final long maxRequestBodyBytes;
 
@@ -123,6 +139,14 @@ final class Http3Connection implements AutoCloseable {
                 });
                 return 0;
             }, arena);
+        // Pre-allocate fixed-size FFM scratch on the connection arena.
+        // Reused across every iteration of the recv/poll/send loop —
+        // saves an Arena.allocate per iteration for these slots.
+        this.inBuf = arena.allocate(2 * MAX_DATAGRAM_SIZE);
+        this.outBuf = arena.allocate(MAX_DATAGRAM_SIZE);
+        this.sendInfo = arena.allocate(64);
+        this.evPtr = arena.allocate(ValueLayout.ADDRESS);
+        this.bodyBuf = arena.allocate(4096);
         // Owner runs on a shared platform-thread pool (see Http3Listener).
         // FutureTask lets close() join it — cached pool + reuse means we
         // don't spin up a thread per connection.
@@ -145,15 +169,16 @@ final class Http3Connection implements AutoCloseable {
     }
 
     private void run() {
+        // Per-iteration variable-length scratch (header emission arrays,
+        // occasional small allocations). Fixed-size FFM slots come from
+        // the connection-lifetime `arena`.
         try (Arena scratch = Arena.ofConfined()) {
-            MemorySegment outBuf = scratch.allocate(MAX_DATAGRAM_SIZE);
-            MemorySegment sendInfo = scratch.allocate(64);
             while (running) {
-                drainIngress(scratch);
+                drainIngress();
                 maybeCreateH3();
                 pollH3Events(scratch);
                 drainOutbound(scratch);
-                processSend(scratch, outBuf, sendInfo);
+                processSend();
                 if (quiche_h.quiche_conn_is_closed(conn)) return;
                 if (!loggedEstablished && quiche_h.quiche_conn_is_established(conn)) {
                     loggedEstablished = true;
@@ -190,10 +215,10 @@ final class Http3Connection implements AutoCloseable {
         }
     }
 
-    private void drainIngress(Arena scratch) throws IOException {
+    private void drainIngress() throws IOException {
         byte[] datagram;
         while ((datagram = ingress.poll()) != null) {
-            processRecv(scratch, datagram);
+            processRecv(datagram);
         }
     }
 
@@ -221,7 +246,6 @@ final class Http3Connection implements AutoCloseable {
     private void pollH3Events(Arena scratch) {
         if (h3conn == null) return;
         while (true) {
-            MemorySegment evPtr = scratch.allocate(ValueLayout.ADDRESS);
             long streamId = quiche_h.quiche_h3_conn_poll(h3conn, conn, evPtr);
             if (streamId < 0) return; // QUICHE_H3_ERR_DONE or fatal
             MemorySegment ev = evPtr.get(ValueLayout.ADDRESS, 0);
@@ -230,7 +254,7 @@ final class Http3Connection implements AutoCloseable {
                 if (type == quiche_h.QUICHE_H3_EVENT_HEADERS()) {
                     handleHeaders(scratch, streamId, ev);
                 } else if (type == quiche_h.QUICHE_H3_EVENT_DATA()) {
-                    pumpRequestBody(scratch, streamId);
+                    pumpRequestBody(streamId);
                 } else if (type == quiche_h.QUICHE_H3_EVENT_FINISHED()) {
                     H3BodyPipe pipe = bodyPipes.remove(streamId);
                     if (pipe != null) pipe.signalEnd();
@@ -251,20 +275,27 @@ final class Http3Connection implements AutoCloseable {
         }
     }
 
-    private void pumpRequestBody(Arena scratch, long streamId) {
+    // Adversarial peer can spam small DATA frames on one stream. Bound the
+    // in-loop iterations so pollH3Events() gets to service other streams'
+    // events + fire timeouts. quiche re-fires the DATA event next poll if
+    // there's more.
+    private static final int PUMP_MAX_ITERS = 32;
+
+    private void pumpRequestBody(long streamId) {
         H3BodyPipe pipe = bodyPipes.get(streamId);
         if (pipe == null) return;
-        int cap = 4096;
-        MemorySegment buf = scratch.allocate(cap);
-        while (true) {
-            long r = quiche_h.quiche_h3_recv_body(h3conn, conn, streamId, buf, cap);
-            if (r <= 0) return;
+        for (int iter = 0; iter < PUMP_MAX_ITERS; iter++) {
+            long r = quiche_h.quiche_h3_recv_body(h3conn, conn, streamId,
+                                                   bodyBuf, bodyBuf.byteSize());
+            if (r == quiche_h.QUICHE_ERR_DONE()) return;
+            if (r < 0) {
+                LOG.info("h3 recv_body rc=" + r + " stream=" + streamId);
+                return;
+            }
+            if (r == 0) return;
             byte[] chunk = new byte[(int) r];
-            MemorySegment.copy(buf, ValueLayout.JAVA_BYTE, 0, chunk, 0, (int) r);
+            MemorySegment.copy(bodyBuf, ValueLayout.JAVA_BYTE, 0, chunk, 0, (int) r);
             if (!pipe.enqueueChecked(chunk)) {
-                // Body exceeded config.maxRequestBodyBytes. Reset the stream
-                // + unblock the worker via EOF. Peer sees the reset and stops
-                // sending further body bytes.
                 LOG.info("h3 body size cap exceeded, resetting stream " + streamId);
                 bodyPipes.remove(streamId);
                 pipe.signalEnd();
@@ -378,14 +409,20 @@ final class Http3Connection implements AutoCloseable {
     private void runHandler(long streamId, Request request) {
         try {
             Response response = handler.handle(request);
-            if (response == null) {
-                outbound.offer(fallback500(streamId));
-                return;
-            }
-            outbound.offer(ResponseTask.of(streamId, response));
+            ResponseTask task = response == null
+                ? fallback500(streamId)
+                : ResponseTask.of(streamId, response);
+            // Backpressure: block until the send path has room. Worker
+            // vthread parks harmlessly; unbounded queue would let handler
+            // bursts inflate the heap.
+            outbound.put(task);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "h3 handler threw for stream " + streamId, t);
-            outbound.offer(fallback500(streamId));
+            try { outbound.put(fallback500(streamId)); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -454,26 +491,30 @@ final class Http3Connection implements AutoCloseable {
         array.set(ValueLayout.JAVA_LONG, base + 24, vb.length);
     }
 
-    private void processRecv(Arena scratch, byte[] datagram) throws IOException {
-        MemorySegment in = scratch.allocate(datagram.length);
-        MemorySegment.copy(datagram, 0, in, ValueLayout.JAVA_BYTE, 0, datagram.length);
-        Sockaddr.Encoded fromEnc = Sockaddr.encode(scratch, peer);
-        Sockaddr.Encoded toEnc = Sockaddr.encode(scratch, local);
-        MemorySegment info = scratch.allocate(48);
-        long p = 0;
-        info.set(ValueLayout.ADDRESS, p, fromEnc.segment()); p += 8;
-        info.set(ValueLayout.JAVA_INT, p, fromEnc.length()); p += 4;
-        p += 4;
-        info.set(ValueLayout.ADDRESS, p, toEnc.segment()); p += 8;
-        info.set(ValueLayout.JAVA_INT, p, toEnc.length());
-        long rc = quiche_h.quiche_conn_recv(conn, in, datagram.length, info);
-        if (rc < 0 && rc != quiche_h.QUICHE_ERR_DONE()) {
-            LOG.info("h3 quiche_conn_recv returned " + rc);
+    private void processRecv(byte[] datagram) throws IOException {
+        // Reuse ctor-allocated inBuf (2 * MAX_DATAGRAM_SIZE). sockaddrs
+        // and recvInfo are rebuilt per call — cheap on a confined-scoped
+        // arena and sidesteps subtle SharedArena visibility questions
+        // observed when we pre-baked recvInfo in the ctor.
+        try (Arena s = Arena.ofConfined()) {
+            MemorySegment.copy(datagram, 0, inBuf, ValueLayout.JAVA_BYTE, 0, datagram.length);
+            Sockaddr.Encoded fromEnc = Sockaddr.encode(s, peer);
+            Sockaddr.Encoded toEnc = Sockaddr.encode(s, local);
+            MemorySegment info = s.allocate(48);
+            long p = 0;
+            info.set(ValueLayout.ADDRESS, p, fromEnc.segment()); p += 8;
+            info.set(ValueLayout.JAVA_INT, p, fromEnc.length()); p += 4;
+            p += 4;
+            info.set(ValueLayout.ADDRESS, p, toEnc.segment()); p += 8;
+            info.set(ValueLayout.JAVA_INT, p, toEnc.length());
+            long rc = quiche_h.quiche_conn_recv(conn, inBuf, datagram.length, info);
+            if (rc < 0 && rc != quiche_h.QUICHE_ERR_DONE()) {
+                LOG.info("h3 quiche_conn_recv returned " + rc);
+            }
         }
     }
 
-    private void processSend(Arena scratch, MemorySegment outBuf, MemorySegment sendInfo)
-            throws IOException {
+    private void processSend() throws IOException {
         while (true) {
             long rc = quiche_h.quiche_conn_send(conn, outBuf, MAX_DATAGRAM_SIZE, sendInfo);
             if (rc == quiche_h.QUICHE_ERR_DONE()) return;

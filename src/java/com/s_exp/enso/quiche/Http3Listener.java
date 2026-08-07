@@ -63,6 +63,7 @@ public final class Http3Listener implements AutoCloseable {
     private InetSocketAddress localAddr;
     private final SecureRandom rng = new SecureRandom();
     private final ConcurrentHashMap<CidKey, Http3Connection> conns = new ConcurrentHashMap<>();
+    private RetryToken retryToken;
     // Named platform-thread pool for per-connection drivers. Cached so
     // threads are reused as connections come and go (h3 handshake floods
     // are common). Combined with MAX_CONNECTIONS the pool size is bounded.
@@ -112,6 +113,10 @@ public final class Http3Listener implements AutoCloseable {
         // the cached pool so accept floods don't churn thread creation.
         connExecutor = Executors.newCachedThreadPool(
             Thread.ofPlatform().name("enso-h3-conn-", 0).factory());
+
+        if (config.http3StatelessRetry) {
+            retryToken = new RetryToken();
+        }
 
         demux = Thread.ofVirtual()
             .name("enso-h3-demux")
@@ -183,14 +188,74 @@ public final class Http3Listener implements AutoCloseable {
             }
             long sLen = hScidLen.get(ValueLayout.JAVA_LONG, 0);
             byte[] scidBytes = hScid.reinterpret(sLen).toArray(ValueLayout.JAVA_BYTE);
-            // Materialise the datagram bytes for the connection driver's
-            // ingress queue (only when we're actually going to accept).
+            // Stateless retry (RFC 9000 §8.1.2). Force the client to prove
+            // it can receive at its claimed source address before we
+            // allocate connection state. Peers that don't echo a valid
+            // token get bounced with a retry challenge; peers that do get
+            // their odcid restored so the handshake proceeds normally.
+            //
+            // Without retry:  localCid = fresh random, odcid = client's DCID.
+            // With retry:     localCid = the DCID the client is now using
+            //                 (which is the scid we sent in the retry),
+            //                 odcid = the client's ORIGINAL DCID (from token).
+            byte[] localCid;
+            byte[] odcid;
+            if (retryToken != null) {
+                long tLen = hTokenLen.get(ValueLayout.JAVA_LONG, 0);
+                if (tLen == 0) {
+                    byte[] token = retryToken.mint(from, dcidBytes);
+                    byte[] newScid = new byte[LOCAL_CID_LEN];
+                    rng.nextBytes(newScid);
+                    sendRetry(scidBytes, dcidBytes, newScid, token, wireVersion, from);
+                    return;
+                }
+                byte[] token = hToken.reinterpret(tLen).toArray(ValueLayout.JAVA_BYTE);
+                byte[] verifiedOdcid = retryToken.verify(token, from);
+                if (verifiedOdcid == null) {
+                    return;
+                }
+                localCid = dcidBytes;
+                odcid = verifiedOdcid;
+            } else {
+                localCid = new byte[LOCAL_CID_LEN];
+                rng.nextBytes(localCid);
+                odcid = dcidBytes;
+            }
             datagram.rewind();
             byte[] pkt = new byte[length];
             datagram.get(pkt);
-            acceptNew(pkt, from, scidBytes, dcidBytes);
+            acceptNew(pkt, from, localCid, odcid);
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "h3 onDatagram failed", t);
+        }
+    }
+
+    private void sendRetry(byte[] scid, byte[] dcid, byte[] newScid,
+                           byte[] token, int version,
+                           InetSocketAddress peer) throws IOException {
+        try (Arena scratch = Arena.ofConfined()) {
+            MemorySegment sScid = scratch.allocate(scid.length);
+            MemorySegment.copy(scid, 0, sScid, ValueLayout.JAVA_BYTE, 0, scid.length);
+            MemorySegment sDcid = scratch.allocate(dcid.length);
+            MemorySegment.copy(dcid, 0, sDcid, ValueLayout.JAVA_BYTE, 0, dcid.length);
+            MemorySegment sNew = scratch.allocate(newScid.length);
+            MemorySegment.copy(newScid, 0, sNew, ValueLayout.JAVA_BYTE, 0, newScid.length);
+            MemorySegment sTok = scratch.allocate(token.length);
+            MemorySegment.copy(token, 0, sTok, ValueLayout.JAVA_BYTE, 0, token.length);
+            MemorySegment out = scratch.allocate(MAX_DATAGRAM_SIZE);
+            long len = quiche_h.quiche_retry(
+                sScid, scid.length,
+                sDcid, dcid.length,
+                sNew, newScid.length,
+                sTok, token.length,
+                version, out, MAX_DATAGRAM_SIZE);
+            if (len < 0) {
+                LOG.info("h3 quiche_retry rc=" + len);
+                return;
+            }
+            byte[] pkt = new byte[(int) len];
+            MemorySegment.copy(out, ValueLayout.JAVA_BYTE, 0, pkt, 0, (int) len);
+            channel.send(ByteBuffer.wrap(pkt), peer);
         }
     }
 
@@ -212,29 +277,26 @@ public final class Http3Listener implements AutoCloseable {
     }
 
     private void acceptNew(byte[] datagram, InetSocketAddress from,
-                           byte[] clientScid, byte[] clientDcid) throws IOException {
-        // Cheap DoS gate. Once the map is at cap, drop new-CID datagrams
-        // rather than allocate more arenas + threads. Legit peers get a
-        // retryable connection error; abusers get bounced.
+                           byte[] localCid, byte[] odcid) throws IOException {
+        // First-line DoS gate — cheap and racy but avoids the expensive
+        // quiche_accept path once we're near cap. Real bound is enforced
+        // below via a putIfAbsent on the reserve slot (see below).
         if (conns.size() >= MAX_CONNECTIONS) {
             return;
         }
-        // Server-generated destination CID for this connection — that's the
-        // stable routing key for subsequent datagrams from the same peer.
-        byte[] localCid = new byte[LOCAL_CID_LEN];
-        rng.nextBytes(localCid);
         Arena connArena = Arena.ofShared();
         try {
             MemorySegment scidSeg = connArena.allocate(localCid.length);
             MemorySegment.copy(localCid, 0, scidSeg, ValueLayout.JAVA_BYTE, 0, localCid.length);
             Sockaddr.Encoded local = Sockaddr.encode(connArena, localAddr);
             Sockaddr.Encoded peer = Sockaddr.encode(connArena, from);
-            // odcid = original destination CID sent by the client on this Initial.
-            MemorySegment odcidSeg = connArena.allocate(clientDcid.length);
-            MemorySegment.copy(clientDcid, 0, odcidSeg, ValueLayout.JAVA_BYTE, 0, clientDcid.length);
+            // odcid = ORIGINAL destination CID (from client's first Initial,
+            // pre-retry). Same as the DCID when retry isn't in play.
+            MemorySegment odcidSeg = connArena.allocate(odcid.length);
+            MemorySegment.copy(odcid, 0, odcidSeg, ValueLayout.JAVA_BYTE, 0, odcid.length);
             MemorySegment conn = quiche_h.quiche_accept(
                 scidSeg, localCid.length,
-                odcidSeg, clientDcid.length,
+                odcidSeg, odcid.length,
                 local.segment(), local.length(),
                 peer.segment(), peer.length(),
                 quicheConfig.segment());

@@ -142,6 +142,7 @@
     (when-let [v (:http3-max-udp-payload-size opts)] (.http3MaxUdpPayloadSize b (int v)))
     (when-let [v (:http3-cert-path opts)] (.http3CertPath b ^String v))
     (when-let [v (:http3-key-path opts)] (.http3KeyPath b ^String v))
+    (when (contains? opts :http3-stateless-retry) (.http3StatelessRetry b (boolean (:http3-stateless-retry opts))))
     (when (contains? opts :advertise-alt-svc) (.advertiseAltSvc b (boolean (:advertise-alt-svc opts))))
     (when-let [v (:alt-svc-max-age opts)] (.altSvcMaxAge b (int v)))
     (.build b)))

@@ -37,6 +37,7 @@ public final class Config {
     public final int http3MaxUdpPayloadSize;
     public final String http3CertPath;
     public final String http3KeyPath;
+    public final boolean http3StatelessRetry;
     public final boolean advertiseAltSvc;
     public final int altSvcMaxAge;
 
@@ -70,6 +71,7 @@ public final class Config {
         this.http3MaxUdpPayloadSize = b.http3MaxUdpPayloadSize;
         this.http3CertPath = b.http3CertPath;
         this.http3KeyPath = b.http3KeyPath;
+        this.http3StatelessRetry = b.http3StatelessRetry;
         // Auto-enable Alt-Svc when http3 is on so h1.1/h2 clients can
         // discover the h3 endpoint on the next request. Users can override.
         this.advertiseAltSvc = b.advertiseAltSvcExplicit != null
@@ -124,6 +126,7 @@ public final class Config {
         private int http3MaxUdpPayloadSize = 1350;
         private String http3CertPath;
         private String http3KeyPath;
+        private boolean http3StatelessRetry = false;
         // null → auto (true iff http3 enabled). Explicit true/false overrides.
         private Boolean advertiseAltSvcExplicit;
         private int altSvcMaxAge = 86_400;    // 24h — RFC 7838 typical
@@ -157,6 +160,7 @@ public final class Config {
         public Builder http3MaxUdpPayloadSize(int v) { this.http3MaxUdpPayloadSize = v; return this; }
         public Builder http3CertPath(String v) { this.http3CertPath = v; return this; }
         public Builder http3KeyPath(String v) { this.http3KeyPath = v; return this; }
+        public Builder http3StatelessRetry(boolean v) { this.http3StatelessRetry = v; return this; }
         public Builder advertiseAltSvc(boolean v) { this.advertiseAltSvcExplicit = v; return this; }
         public Builder altSvcMaxAge(int v) { this.altSvcMaxAge = v; return this; }
 

@@ -12,7 +12,7 @@ import java.util.concurrent.LinkedBlockingQueue;
  * <p>Mirrors {@code Http2Stream}'s pattern: an END_MARKER sentinel signals
  * EOF, so the reader never has to special-case the terminal chunk.
  */
-final class H3BodyPipe {
+public final class H3BodyPipe {
 
     private static final byte[] END_MARKER = new byte[0];
 
@@ -21,7 +21,7 @@ final class H3BodyPipe {
     private final long maxBytes;
     private long received = 0;
 
-    H3BodyPipe() {
+    public H3BodyPipe() {
         this(0);
     }
 
@@ -30,11 +30,11 @@ final class H3BodyPipe {
      *   exceeded, {@link #enqueueChecked} returns false so the caller can
      *   reset the stream instead of pushing more chunks.
      */
-    H3BodyPipe(long maxBytes) {
+    public H3BodyPipe(long maxBytes) {
         this.maxBytes = maxBytes;
     }
 
-    void enqueue(byte[] chunk) {
+    public void enqueue(byte[] chunk) {
         queue.add(chunk);
     }
 
@@ -43,7 +43,7 @@ final class H3BodyPipe {
      *   {@link #maxBytes}. On overflow, callers should reset the stream +
      *   {@link #signalEnd()} to unblock the reader.
      */
-    boolean enqueueChecked(byte[] chunk) {
+    public boolean enqueueChecked(byte[] chunk) {
         if (maxBytes > 0) {
             received += chunk.length;
             if (received > maxBytes) return false;
@@ -52,11 +52,11 @@ final class H3BodyPipe {
         return true;
     }
 
-    void signalEnd() {
+    public void signalEnd() {
         queue.add(END_MARKER);
     }
 
-    InputStream inputStream() {
+    public InputStream inputStream() {
         return input;
     }
 
