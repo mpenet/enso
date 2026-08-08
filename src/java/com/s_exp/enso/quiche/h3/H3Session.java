@@ -125,12 +125,24 @@ public final class H3Session {
      */
     public void onStreamData(long streamId, byte[] data, boolean fin,
                               RequestSink sink) {
+        onStreamData(streamId, data, 0, data.length, fin, sink);
+    }
+
+    /**
+     * byte[]+off+len variant: lets the driver pass its owner-thread
+     * recvBuf directly without a fresh per-chunk allocation (task
+     * #147-adjacent). H3FrameReader.feed copies into its rolling buf
+     * immediately, so the caller's byte[] is free to be overwritten
+     * after this call returns.
+     */
+    public void onStreamData(long streamId, byte[] data, int off, int len,
+                              boolean fin, RequestSink sink) {
         try {
             long dir = streamId & 0x3;
             if (dir == DIR_CLIENT_BIDI) {
-                handleRequestStream(streamId, data, fin, sink);
+                handleRequestStream(streamId, data, off, len, fin, sink);
             } else if (dir == DIR_CLIENT_UNI) {
-                handlePeerUniStream(streamId, data, fin);
+                handlePeerUniStream(streamId, data, off, len, fin);
             }
             // Server-uni: ignored (that's our own outbound). Server-bidi:
             // unused in H3.
@@ -197,15 +209,15 @@ public final class H3Session {
 
     // -----------------------------------------------------------------
 
-    private void handleRequestStream(long streamId, byte[] data, boolean fin,
-                                      RequestSink sink) {
+    private void handleRequestStream(long streamId, byte[] data, int off, int len,
+                                      boolean fin, RequestSink sink) {
         RequestStream rs = requestStreams.get(streamId);
         if (rs == null) {
             rs = new RequestStream(acquireReader());
             requestStreams.put(streamId, rs);
         }
         try {
-            rs.reader.feed(data, 0, data.length);
+            rs.reader.feed(data, off, len);
         } catch (IllegalStateException e) {
             releaseReader(requestStreams.remove(streamId));
             throw new H3ConnectionException(
@@ -279,24 +291,25 @@ public final class H3Session {
         } catch (Throwable ignored) {}
     }
 
-    private void handlePeerUniStream(long streamId, byte[] data, boolean fin) {
+    private void handlePeerUniStream(long streamId, byte[] data, int off, int len,
+                                      boolean fin) {
         Long knownType = peerUniTypes.get(streamId);
         ByteBuffer buf;
         if (knownType == null) {
             // Type varint not fully known yet — accumulate.
             ByteBuffer accum = peerUniHeaderBuf.get(streamId);
             if (accum == null) {
-                accum = ByteBuffer.allocate(Math.max(8, data.length));
+                accum = ByteBuffer.allocate(Math.max(8, len));
                 peerUniHeaderBuf.put(streamId, accum);
             }
-            if (accum.remaining() < data.length) {
-                ByteBuffer bigger = ByteBuffer.allocate(accum.position() + data.length);
+            if (accum.remaining() < len) {
+                ByteBuffer bigger = ByteBuffer.allocate(accum.position() + len);
                 accum.flip();
                 bigger.put(accum);
                 accum = bigger;
                 peerUniHeaderBuf.put(streamId, accum);
             }
-            accum.put(data);
+            accum.put(data, off, len);
             ByteBuffer readView = accum.duplicate();
             readView.flip();
             int peekLen = Varint.peekLength(readView);
@@ -359,13 +372,13 @@ public final class H3Session {
             }
             peerUniTypes.put(streamId, type);
             // Any leftover bytes after the type varint fall through to
-            // the type-specific handler.
-            byte[] leftover = new byte[readView.remaining()];
-            readView.get(leftover);
-            buf = ByteBuffer.wrap(leftover);
+            // the type-specific handler. readView still holds a slice
+            // over `accum` — safe to pass on directly since we're done
+            // with the type varint.
+            buf = readView;
             knownType = type;
         } else {
-            buf = ByteBuffer.wrap(data);
+            buf = ByteBuffer.wrap(data, off, len);
         }
         // Peer control stream: parse SETTINGS / GOAWAY / MAX_PUSH_ID.
         // Any protocol-level violation raises H3ConnectionException which

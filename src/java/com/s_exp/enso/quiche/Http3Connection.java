@@ -288,9 +288,11 @@ final class Http3Connection implements AutoCloseable {
                 return;
             }
             boolean fin = finOut[0];
-            byte[] chunk = new byte[(int) rc];
-            System.arraycopy(recvBuf, 0, chunk, 0, (int) rc);
-            session.onStreamData(streamId, chunk, fin, sink);
+            // Pass owner-thread recvBuf directly — H3Session.onStreamData
+            // copies into rolling reader buf immediately (or slices for
+            // uni-stream type varint accum), so the buf is free to be
+            // overwritten by the next stream_recv.
+            session.onStreamData(streamId, recvBuf, 0, (int) rc, fin, sink);
             if (fin) return;
             if (rc < STREAM_RECV_BUF) return;
         }
