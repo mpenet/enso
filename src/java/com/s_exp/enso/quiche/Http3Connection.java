@@ -234,10 +234,17 @@ final class Http3Connection implements AutoCloseable {
         }
     }
 
+    // Owner-thread reusable scratch for stream_recv. finOut/errOut are
+    // small out-arrays JNI writes into; recvBuf receives up to
+    // STREAM_RECV_BUF bytes per call. Chunks that need to outlive the
+    // call (body payload → H3BodyPipe → worker vthread) still get copied
+    // to a fresh byte[], but header parsing feeds a rolling reader that
+    // copies internally — no per-call allocation for those either.
+    private final byte[] recvBuf = new byte[STREAM_RECV_BUF];
+    private final boolean[] finOut = new boolean[1];
+    private final long[] errOut = new long[1];
+
     private void readAllStream(long streamId, H3Session.RequestSink sink) {
-        byte[] recvBuf = new byte[STREAM_RECV_BUF];
-        boolean[] finOut = new boolean[1];
-        long[] errOut = new long[1];
         while (true) {
             finOut[0] = false;
             long rc = Quiche.connStreamRecv(conn, streamId,

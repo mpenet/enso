@@ -78,28 +78,49 @@ public final class H3Session {
      * our initial SETTINGS. Idempotent — safe to call every time the
      * transport becomes writable in case earlier stream opens deferred.
      */
+    /**
+     * Open our three server-uni streams + emit SETTINGS. Idempotent and
+     * retry-safe: if any sub-step short-writes (peer hasn't extended
+     * enough uni-stream credit yet), the completion flags stay unset and
+     * the next call resumes from the first still-pending step. Task #114.
+     */
     public void ensureInitialised() {
         if (initialised) return;
-        // Open the three server-uni streams by sending their type varint
-        // as the first byte(s). quiche assigns a fresh ID on first
-        // stream_send if we pick unused ones.
-        ctrlStreamId = nextServerUniId; nextServerUniId += 4;
-        qpackEncStreamId = nextServerUniId; nextServerUniId += 4;
-        qpackDecStreamId = nextServerUniId; nextServerUniId += 4;
-
-        writeStreamTypePrefix(ctrlStreamId, H3StreamType.CONTROL);
-        // Emit our SETTINGS immediately after the type prefix so peers
-        // that gate other traffic on our SETTINGS make progress.
-        ByteBuffer settings = H3FrameWriter.settings(new long[]{
-            H3SettingId.QPACK_MAX_TABLE_CAPACITY, 0,
-            H3SettingId.QPACK_BLOCKED_STREAMS, 0,
-        });
-        writeAll(ctrlStreamId, settings, false);
-
-        writeStreamTypePrefix(qpackEncStreamId, H3StreamType.QPACK_ENCODER);
-        writeStreamTypePrefix(qpackDecStreamId, H3StreamType.QPACK_DECODER);
+        // Assign stream IDs on first entry so retries reuse them. Server
+        // uni IDs advance by 4 (RFC 9000 §2.1).
+        if (ctrlStreamId < 0) {
+            ctrlStreamId = nextServerUniId; nextServerUniId += 4;
+            qpackEncStreamId = nextServerUniId; nextServerUniId += 4;
+            qpackDecStreamId = nextServerUniId; nextServerUniId += 4;
+        }
+        if (!ctrlTypeSent) {
+            if (!writeStreamTypePrefix(ctrlStreamId, H3StreamType.CONTROL)) return;
+            ctrlTypeSent = true;
+        }
+        if (!settingsSent) {
+            ByteBuffer settings = H3FrameWriter.settings(new long[]{
+                H3SettingId.QPACK_MAX_TABLE_CAPACITY, 0,
+                H3SettingId.QPACK_BLOCKED_STREAMS, 0,
+            });
+            if (!writeAll(ctrlStreamId, settings, false)) return;
+            settingsSent = true;
+        }
+        if (!qpackEncTypeSent) {
+            if (!writeStreamTypePrefix(qpackEncStreamId, H3StreamType.QPACK_ENCODER)) return;
+            qpackEncTypeSent = true;
+        }
+        if (!qpackDecTypeSent) {
+            if (!writeStreamTypePrefix(qpackDecStreamId, H3StreamType.QPACK_DECODER)) return;
+            qpackDecTypeSent = true;
+        }
         initialised = true;
     }
+
+    // Init sub-step completion flags — sticky once true.
+    private boolean ctrlTypeSent;
+    private boolean settingsSent;
+    private boolean qpackEncTypeSent;
+    private boolean qpackDecTypeSent;
 
     /**
      * Feed inbound stream data. Router dispatches by stream type — bidi
@@ -126,22 +147,47 @@ public final class H3Session {
      */
     public void writeResponse(long streamId, List<String[]> headers,
                                byte[] body) {
-        byte[] hdrs = QpackFieldSection.encode(headers);
-        ByteBuffer headersFrame = H3FrameWriter.headers(hdrs);
+        byte[] hdrs = QpackFieldSection.encode(headers, qpackScratch);
         boolean hasBody = body != null && body.length > 0;
-        writeAll(streamId, headersFrame, !hasBody);
+        // Reuse a single per-session scratch ByteBuffer for the frame
+        // envelope. Grow if a response's headers or body exceed current
+        // capacity. Owner-thread only; no sync.
+        int needHdrs = 16 + hdrs.length; // frame overhead + payload
+        frameBuf = ensureFrameCap(frameBuf, needHdrs);
+        writeAll(streamId,
+            H3FrameWriter.writeHeaders(frameBuf, hdrs), !hasBody);
         if (hasBody) {
-            writeAll(streamId, H3FrameWriter.data(body), true);
+            int needBody = 16 + body.length;
+            frameBuf = ensureFrameCap(frameBuf, needBody);
+            writeAll(streamId,
+                H3FrameWriter.writeData(frameBuf, body), true);
         }
-        requestStreams.remove(streamId);
+        releaseReader(requestStreams.remove(streamId));
+    }
+
+    // Response frame scratch — grows to largest response seen on this
+    // conn. Bounded implicitly by the connection's overall payload sizes.
+    private ByteBuffer frameBuf = ByteBuffer.allocate(4096);
+    // QPACK encoder scratch. QpackFieldSection.encode(headers, scratch)
+    // writes here then returns a freshly-allocated byte[] copy for the
+    // frame body; scratch itself is reused across responses.
+    private final ByteBuffer qpackScratch = ByteBuffer.allocate(1024);
+
+    private static ByteBuffer ensureFrameCap(ByteBuffer buf, int need) {
+        if (buf.capacity() >= need) return buf;
+        int newCap = Math.max(buf.capacity() * 2, need);
+        return ByteBuffer.allocate(newCap);
     }
 
     // -----------------------------------------------------------------
 
     private void handleRequestStream(long streamId, byte[] data, boolean fin,
                                       RequestSink sink) {
-        RequestStream rs = requestStreams.computeIfAbsent(streamId,
-            k -> new RequestStream());
+        RequestStream rs = requestStreams.get(streamId);
+        if (rs == null) {
+            rs = new RequestStream(acquireReader());
+            requestStreams.put(streamId, rs);
+        }
         rs.reader.feed(ByteBuffer.wrap(data));
         while (true) {
             H3FrameReader.Frame f = rs.reader.poll();
@@ -158,7 +204,7 @@ public final class H3Session {
                 LOG.warning("h3 unexpected frame type=0x" + Long.toHexString(f.type)
                     + " on request stream=" + streamId);
                 resetStream(streamId, 0x105); // H3_FRAME_UNEXPECTED
-                requestStreams.remove(streamId);
+                releaseReader(requestStreams.remove(streamId));
                 return;
             }
             if (f.type == H3FrameType.HEADERS) {
@@ -175,7 +221,7 @@ public final class H3Session {
                         + " code=0x" + Long.toHexString(qe.errorCode())
                         + " msg=" + qe.getMessage());
                     resetStream(streamId, qe.errorCode());
-                    requestStreams.remove(streamId);
+                    releaseReader(requestStreams.remove(streamId));
                     return;
                 }
                 sink.onHeaders(streamId, headers);
@@ -187,7 +233,7 @@ public final class H3Session {
         }
         if (fin) {
             sink.onFin(streamId);
-            requestStreams.remove(streamId);
+            releaseReader(requestStreams.remove(streamId));
         }
     }
 
@@ -310,12 +356,12 @@ public final class H3Session {
         return ((t - 0x21L) % 0x1fL) == 0L;
     }
 
-    private void writeStreamTypePrefix(long streamId, long type) {
+    private boolean writeStreamTypePrefix(long streamId, long type) {
         int sz = Varint.size(type);
         ByteBuffer bb = ByteBuffer.allocate(sz);
         Varint.encode(bb, type);
         bb.flip();
-        writeAll(streamId, bb, false);
+        return writeAll(streamId, bb, false);
     }
 
     /**
@@ -325,7 +371,13 @@ public final class H3Session {
      * once. Larger streaming payloads (big response bodies) get chunked at
      * the caller.
      */
-    private void writeAll(long streamId, ByteBuffer buf, boolean fin) {
+    /**
+     * @return true iff quiche accepted all {@code remaining} bytes.
+     *         Short writes leave the ByteBuffer's position advanced past
+     *         the unwritten bytes (the caller does not retry — see
+     *         task #104 for the fin-split fix).
+     */
+    private boolean writeAll(long streamId, ByteBuffer buf, boolean fin) {
         int remaining = buf.remaining();
         byte[] bytes;
         int off;
@@ -344,17 +396,14 @@ public final class H3Session {
         long rc = Quiche.connStreamSend(conn, streamId, bytes, off, remaining, fin);
         if (rc < 0) {
             LOG.info("h3 stream_send stream=" + streamId + " rc=" + rc);
-            return;
+            return false;
         }
-        // Short-write handling is unreliable while we're still passing
-        // fin on the sole call — retrying with fin=false would strand
-        // the FIN. Frames are small (~100 bytes) so single-call success
-        // is the practical norm; task #104's proper fin-split logic
-        // remains open.
         if (rc < remaining) {
             LOG.info("h3 short stream_send stream=" + streamId
                 + " wrote=" + rc + " of=" + remaining);
+            return false;
         }
+        return true;
     }
 
     /**
@@ -362,7 +411,30 @@ public final class H3Session {
      * owner-only access.
      */
     private static final class RequestStream {
-        final H3FrameReader reader = new H3FrameReader();
+        final H3FrameReader reader;
+        RequestStream(H3FrameReader reader) { this.reader = reader; }
+    }
+
+    // Reader pool — task #93. Under load a single connection may see
+    // many transient request streams; keeping a small deque of reset
+    // readers amortises the ~4 KB rolling buffer allocation across
+    // successive streams. Cap keeps the pool from growing unboundedly
+    // under bursty concurrency.
+    private static final int READER_POOL_CAP = 32;
+    private final java.util.ArrayDeque<H3FrameReader> readerPool =
+        new java.util.ArrayDeque<>();
+
+    private H3FrameReader acquireReader() {
+        H3FrameReader r = readerPool.pollFirst();
+        return r != null ? r : new H3FrameReader();
+    }
+
+    private void releaseReader(RequestStream rs) {
+        if (rs == null) return;
+        if (readerPool.size() < READER_POOL_CAP) {
+            rs.reader.reset();
+            readerPool.offerFirst(rs.reader);
+        }
     }
 
     /**

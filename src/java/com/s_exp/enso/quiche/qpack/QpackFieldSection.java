@@ -148,13 +148,24 @@ public final class QpackFieldSection {
     }
 
     /**
-     * Encode a list of {@code {name, value}} pairs into a byte[] field
-     * section. Always emits a zero-prefix (RIC=0, Base=0) since we don't
-     * insert into any dynamic table.
+     * Encode into a fresh byte[]. Convenience for cold-path callers +
+     * tests; prefer {@link #encode(Iterable, ByteBuffer)} on the hot
+     * response path to reuse a caller-owned scratch buffer.
      */
     public static byte[] encode(Iterable<String[]> headers) {
-        // Estimate 128 bytes/header is generous; will grow if needed.
-        ByteBuffer out = ByteBuffer.allocate(512);
+        return encode(headers, ByteBuffer.allocate(512));
+    }
+
+    /**
+     * Encode a list of {@code {name, value}} pairs into a QPACK field
+     * section using {@code scratch} as the working buffer. Always emits a
+     * zero-prefix (RIC=0, Base=0) since we don't insert into any dynamic
+     * table. Scratch may be grown internally; the returned byte[] is a
+     * freshly-allocated copy the caller may retain.
+     */
+    public static byte[] encode(Iterable<String[]> headers, ByteBuffer scratch) {
+        ByteBuffer out = scratch;
+        out.clear();
         // Prefix: RIC = 0, S = 0, Delta Base = 0 → two 0x00 bytes.
         out.put((byte) 0x00);
         out.put((byte) 0x00);

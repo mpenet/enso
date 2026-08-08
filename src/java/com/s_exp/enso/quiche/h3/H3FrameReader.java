@@ -92,13 +92,40 @@ public final class H3FrameReader {
     /** Poll the next complete frame or DATA chunk, or {@code null}. */
     public Frame poll() { return ready.pollFirst(); }
 
+    /**
+     * Clear all reader state so the instance can be reused for a fresh
+     * stream. Keeps the rolling {@link #buf} allocation to amortise it
+     * across pooled reuse; the buffer's position is reset. Pooled by
+     * {@link H3Session} to avoid per-stream reader allocations.
+     */
+    public void reset() {
+        buf.clear();
+        pendingType = -1;
+        pendingLength = -1;
+        pendingConsumed = 0;
+        ready.clear();
+    }
+
     // --------------------------------------------------------------
 
     private void appendTo(ByteBuffer more) {
         int need = more.remaining();
         if (buf.remaining() < need) {
-            int newCap = Math.max(buf.capacity() * 2, buf.position() + need);
-            ByteBuffer bigger = ByteBuffer.allocate(newCap);
+            // Grow-by-doubling but cap at maxAccum + a small varint prefix
+            // budget. Anything larger would already have thrown at the
+            // frame-length check; refusing to grow past the cap gives an
+            // early, clean IllegalStateException instead of a native OOM.
+            long target = Math.max((long) buf.capacity() * 2L,
+                (long) buf.position() + (long) need);
+            long ceiling = (long) maxAccum + 16L;
+            if (target > ceiling) {
+                if ((long) buf.position() + (long) need > ceiling) {
+                    throw new IllegalStateException(
+                        "H3FrameReader input would exceed maxAccum=" + maxAccum);
+                }
+                target = ceiling;
+            }
+            ByteBuffer bigger = ByteBuffer.allocate((int) target);
             buf.flip();
             bigger.put(buf);
             buf = bigger;
