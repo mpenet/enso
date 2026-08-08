@@ -1,6 +1,5 @@
 {:paths ["src/clj" "target/classes"]
- :deps {org.clojure/clojure {:mvn/version "1.12.3"}
-        net.java.dev.jna/jna {:mvn/version "5.14.0"}}
+ :deps {org.clojure/clojure {:mvn/version "1.12.3"}}
  :aliases
  {:build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}
                  io.github.slipset/deps-deploy {:git/sha "07022b92d768590ab25b9ceb619ef17d2922da9a"}}

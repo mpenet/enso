@@ -7,8 +7,6 @@ import com.s_exp.enso.Response;
 import com.s_exp.enso.RingHandler;
 import com.s_exp.enso.quiche.ffm.quiche_h;
 import com.s_exp.enso.quiche.ffm.quiche_h3_event_for_each_header$cb;
-import com.s_exp.enso.quiche.jna.QuicheJna;
-import com.sun.jna.Pointer;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -203,7 +201,6 @@ final class Http3Connection implements AutoCloseable {
         // Publish this connection's collector so the shared upcall stub can
         // reach it. Owner thread is dedicated to this loop for its lifetime,
         // so a plain ThreadLocal.set here + remove in finally is enough.
-        // BIG-HAMMER BISECT: full loop.
         CURRENT_COLLECTOR.set(collector);
         try (Arena scratch = Arena.ofConfined()) {
             while (running) {
@@ -213,6 +210,11 @@ final class Http3Connection implements AutoCloseable {
                 drainOutbound(scratch);
                 processSend();
                 if (quiche_h.quiche_conn_is_closed(conn)) return;
+                if (!loggedEstablished && quiche_h.quiche_conn_is_established(conn)) {
+                    loggedEstablished = true;
+                    LOG.info("h3 handshake established with " + peer
+                        + " cid=" + HexFormat.of().formatHex(cid));
+                }
                 waitForWork();
             }
         } catch (Throwable t) {
@@ -254,11 +256,9 @@ final class Http3Connection implements AutoCloseable {
     private void maybeCreateH3() {
         if (h3conn != null) return;
         if (!quiche_h.quiche_conn_is_established(conn)) return;
-        // Shared listener-lifetime h3 config. Per-conn h3_config_new + free
-        // was the root cause of libmalloc freelist corruption crashes seen
-        // in task #79: quiche_h3_config_free churn on 0.29.3 poisons the
-        // allocator. Matches quiche's own example server (one config for
-        // the whole server).
+        // Shared listener-lifetime h3 config — reused, not per-conn. Per-conn
+        // quiche_h3_config_new/free churn on 0.29.3 triggers libmalloc
+        // freelist corruption (task #79).
         MemorySegment cfg = h3Config;
         try {
             h3conn = quiche_h.quiche_h3_conn_new_with_transport(conn, cfg);
@@ -271,7 +271,6 @@ final class Http3Connection implements AutoCloseable {
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "quiche_h3_conn_new_with_transport threw", t);
         }
-        // Do NOT free h3Config — shared, listener owns it.
     }
 
     private void pollH3Events(Arena scratch) {
@@ -290,16 +289,11 @@ final class Http3Connection implements AutoCloseable {
                     H3BodyPipe pipe = bodyPipes.remove(streamId);
                     if (pipe != null) pipe.signalEnd();
                 } else if (type == quiche_h.QUICHE_H3_EVENT_RESET()) {
-                    // Peer aborted the stream — unblock the worker so it
-                    // sees EOF and exits cleanly.
                     H3BodyPipe pipe = bodyPipes.remove(streamId);
                     if (pipe != null) pipe.signalEnd();
                 } else if (type == quiche_h.QUICHE_H3_EVENT_GOAWAY()) {
-                    // Peer is going away. Log; existing streams continue,
-                    // but we could stop accepting new ones. Phase 5+.
                     LOG.info("h3 GOAWAY received on cid=" + HexFormat.of().formatHex(cid));
                 }
-                // PRIORITY_UPDATE ignored (RFC 9218; deprecated in practice).
             } finally {
                 quiche_h.quiche_h3_event_free(ev);
             }
@@ -497,13 +491,10 @@ final class Http3Connection implements AutoCloseable {
             return;
         }
         if (hasBody) {
-            // JNA send_body — swap-in for FFM path that trips libmalloc
-            // freelist corruption on JDK 25 + macOS ARM64 (task #79).
-            // Same libquiche.dylib, different JVM→C marshalling layer.
-            Pointer h3p = new Pointer(h3conn.address());
-            Pointer cp = new Pointer(conn.address());
-            long sent = QuicheJna.INSTANCE.quiche_h3_send_body(
-                h3p, cp, task.streamId, task.body, task.body.length, true);
+            MemorySegment body = scratch.allocate(task.body.length);
+            MemorySegment.copy(task.body, 0, body, ValueLayout.JAVA_BYTE, 0, task.body.length);
+            long sent = quiche_h.quiche_h3_send_body(h3conn, conn, task.streamId,
+                body, task.body.length, true);
             if (sent < 0) {
                 LOG.info("h3 send_body rc=" + sent + " stream=" + task.streamId);
             }
@@ -526,8 +517,6 @@ final class Http3Connection implements AutoCloseable {
     }
 
     private void processRecv(byte[] datagram) throws IOException {
-        // All FFM buffers live on the connection arena — no per-call
-        // Arena.ofConfined() churn.
         MemorySegment.copy(datagram, 0, inBuf, ValueLayout.JAVA_BYTE, 0, datagram.length);
         long rc = quiche_h.quiche_conn_recv(conn, inBuf, datagram.length, recvInfo);
         if (rc < 0 && rc != quiche_h.QUICHE_ERR_DONE()) {
