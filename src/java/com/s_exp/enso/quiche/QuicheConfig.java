@@ -1,33 +1,24 @@
 package com.s_exp.enso.quiche;
 
 import com.s_exp.enso.Config;
-import com.s_exp.enso.quiche.ffm.quiche_h;
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 
 /**
  * Thin Java wrapper over a heap-allocated {@code quiche_config} pointer.
- * Owns an {@link Arena} that keeps the config alive for the listener's
- * lifetime; {@link #close} frees both the arena and the quiche config via
- * {@code quiche_config_free}.
- *
- * <p>Populated from Enso's {@link Config} at listener startup — cert/key
+ * Populated from Enso's {@link Config} at listener startup — cert/key
  * PEM paths, ALPN protos, idle timeout, initial flow control windows.
+ * {@link #close} frees the underlying quiche config.
  */
 public final class QuicheConfig implements AutoCloseable {
 
-    private final Arena arena;
-    private final MemorySegment ptr;
+    private final long ptr;
 
     public QuicheConfig(Config cfg) throws IOException {
-        this.arena = Arena.ofShared();
         // Version 1 = the current wire version. quiche_config_new(0xbabababa)
         // is for version negotiation testing; we always advertise v1.
-        this.ptr = quiche_h.quiche_config_new(quiche_h.QUICHE_PROTOCOL_VERSION());
-        if (ptr.address() == 0) {
+        this.ptr = Quiche.configNew(Quiche.QUICHE_PROTOCOL_VERSION);
+        if (ptr == 0) {
             throw new IOException("quiche_config_new returned null");
         }
         loadCertKey(cfg);
@@ -35,19 +26,18 @@ public final class QuicheConfig implements AutoCloseable {
         setKnobs(cfg);
     }
 
-    public MemorySegment segment() {
+    /** Raw {@code quiche_config *} handle for {@code quiche_accept}. */
+    public long handle() {
         return ptr;
     }
 
     private void loadCertKey(Config cfg) throws IOException {
-        MemorySegment certPath = arena.allocateFrom(cfg.http3CertPath, StandardCharsets.UTF_8);
-        int rc = quiche_h.quiche_config_load_cert_chain_from_pem_file(ptr, certPath);
+        int rc = Quiche.configLoadCertChainFromPemFile(ptr, cfg.http3CertPath);
         if (rc < 0) {
             throw new IOException("quiche_config_load_cert_chain_from_pem_file failed rc=" + rc
                 + " for " + cfg.http3CertPath);
         }
-        MemorySegment keyPath = arena.allocateFrom(cfg.http3KeyPath, StandardCharsets.UTF_8);
-        rc = quiche_h.quiche_config_load_priv_key_from_pem_file(ptr, keyPath);
+        rc = Quiche.configLoadPrivKeyFromPemFile(ptr, cfg.http3KeyPath);
         if (rc < 0) {
             throw new IOException("quiche_config_load_priv_key_from_pem_file failed rc=" + rc
                 + " for " + cfg.http3KeyPath);
@@ -61,37 +51,33 @@ public final class QuicheConfig implements AutoCloseable {
      */
     private void setApplicationProtos() throws IOException {
         byte[] h3 = "h3".getBytes(StandardCharsets.US_ASCII);
-        MemorySegment protos = arena.allocate(1 + h3.length);
-        protos.set(ValueLayout.JAVA_BYTE, 0, (byte) h3.length);
-        MemorySegment.copy(h3, 0, protos, ValueLayout.JAVA_BYTE, 1, h3.length);
-        int rc = quiche_h.quiche_config_set_application_protos(ptr, protos, protos.byteSize());
+        byte[] protos = new byte[1 + h3.length];
+        protos[0] = (byte) h3.length;
+        System.arraycopy(h3, 0, protos, 1, h3.length);
+        int rc = Quiche.configSetApplicationProtos(ptr, protos);
         if (rc < 0) {
             throw new IOException("quiche_config_set_application_protos failed rc=" + rc);
         }
     }
 
     private void setKnobs(Config cfg) {
-        quiche_h.quiche_config_set_max_idle_timeout(ptr, cfg.http3MaxIdleTimeoutMs);
-        quiche_h.quiche_config_set_max_recv_udp_payload_size(ptr, cfg.http3MaxUdpPayloadSize);
-        quiche_h.quiche_config_set_max_send_udp_payload_size(ptr, cfg.http3MaxUdpPayloadSize);
-        quiche_h.quiche_config_set_initial_max_data(ptr, cfg.http3InitialMaxData);
+        Quiche.configSetMaxIdleTimeout(ptr, cfg.http3MaxIdleTimeoutMs);
+        Quiche.configSetMaxRecvUdpPayloadSize(ptr, cfg.http3MaxUdpPayloadSize);
+        Quiche.configSetMaxSendUdpPayloadSize(ptr, cfg.http3MaxUdpPayloadSize);
+        Quiche.configSetInitialMaxData(ptr, cfg.http3InitialMaxData);
         // Per-stream windows sized to match the connection window / streams.
         long perStream = Math.max(1L << 20,
             cfg.http3InitialMaxData / Math.max(1, cfg.http3InitialMaxStreamsBidi));
-        quiche_h.quiche_config_set_initial_max_stream_data_bidi_local(ptr, perStream);
-        quiche_h.quiche_config_set_initial_max_stream_data_bidi_remote(ptr, perStream);
-        quiche_h.quiche_config_set_initial_max_stream_data_uni(ptr, perStream);
-        quiche_h.quiche_config_set_initial_max_streams_bidi(ptr, cfg.http3InitialMaxStreamsBidi);
-        quiche_h.quiche_config_set_initial_max_streams_uni(ptr, cfg.http3InitialMaxStreamsBidi);
-        quiche_h.quiche_config_set_disable_active_migration(ptr, true);
+        Quiche.configSetInitialMaxStreamDataBidiLocal(ptr, perStream);
+        Quiche.configSetInitialMaxStreamDataBidiRemote(ptr, perStream);
+        Quiche.configSetInitialMaxStreamDataUni(ptr, perStream);
+        Quiche.configSetInitialMaxStreamsBidi(ptr, cfg.http3InitialMaxStreamsBidi);
+        Quiche.configSetInitialMaxStreamsUni(ptr, cfg.http3InitialMaxStreamsBidi);
+        Quiche.configSetDisableActiveMigration(ptr, true);
     }
 
     @Override
     public void close() {
-        try {
-            quiche_h.quiche_config_free(ptr);
-        } finally {
-            arena.close();
-        }
+        Quiche.configFree(ptr);
     }
 }

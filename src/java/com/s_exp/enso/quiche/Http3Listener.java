@@ -2,13 +2,7 @@ package com.s_exp.enso.quiche;
 
 import com.s_exp.enso.Config;
 import com.s_exp.enso.RingHandler;
-import com.s_exp.enso.quiche.ffm.quiche_h;
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
-import java.nio.charset.StandardCharsets;
-import java.util.List;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
@@ -37,10 +31,7 @@ import java.util.logging.Logger;
  * </ul>
  *
  * <p>Instantiated reflectively from {@link com.s_exp.enso.EnsoServer} so
- * that non-http3 users never trigger classloading of the FFM bindings.
- *
- * <p>Phase 1/2 scope: real handshake completes end-to-end with quiche-client.
- * Streams / Ring handler dispatch lands in Phase 3.
+ * that non-http3 users never trigger classloading of the JNI shim.
  */
 public final class Http3Listener implements AutoCloseable {
 
@@ -48,10 +39,10 @@ public final class Http3Listener implements AutoCloseable {
 
     private static final int MAX_DATAGRAM_SIZE = 1350;
     private static final int LOCAL_CID_LEN = 16;
+    private static final int MAX_TOKEN_LEN = 2048;
     // Hard cap on concurrent QUIC connections per listener. Above this,
     // new Initials are dropped so a flood of unique-DCID packets can't
-    // exhaust memory / thread count. Rough sizing: 10K conns × ~8 KB
-    // arena footprint ≈ 80 MB.
+    // exhaust memory / thread count.
     private static final int MAX_CONNECTIONS = 10_000;
 
     private final Config config;
@@ -66,20 +57,7 @@ public final class Http3Listener implements AutoCloseable {
     private final SecureRandom rng = new SecureRandom();
     private final ConcurrentHashMap<CidKey, Http3Connection> conns = new ConcurrentHashMap<>();
     private RetryToken retryToken;
-    // Named platform-thread pool for per-connection drivers. Cached so
-    // threads are reused as connections come and go (h3 handshake floods
-    // are common). Combined with MAX_CONNECTIONS the pool size is bounded.
     private ExecutorService connExecutor;
-    // Listener-lifetime arena backing the demux thread's persistent
-    // quiche_header_info scratch slots. Allocated once at start(); freed
-    // on close(). Avoids Arena.ofConfined() + several allocate() calls
-    // per received datagram.
-    private Arena demuxArena;
-    private MemorySegment hVersion;
-    private MemorySegment hType;
-    private MemorySegment hScid, hScidLen;
-    private MemorySegment hDcid, hDcidLen;
-    private MemorySegment hToken, hTokenLen;
 
     public Http3Listener(Config config, RingHandler handler, Object server) {
         this.config = config;
@@ -95,21 +73,6 @@ public final class Http3Listener implements AutoCloseable {
         channel = DatagramChannel.open();
         channel.socket().bind(new InetSocketAddress(config.host, port));
         localAddr = (InetSocketAddress) channel.getLocalAddress();
-
-        // Persistent header-info slots. quiche_header_info writes into
-        // these each call; we reset the length outputs before every
-        // dispatch. Keeps demux hot path allocation-free (aside from the
-        // byte[] we enqueue).
-        demuxArena = Arena.ofShared();
-        int maxCid = (int) quiche_h.QUICHE_MAX_CONN_ID_LEN();
-        hVersion = demuxArena.allocate(ValueLayout.JAVA_INT);
-        hType = demuxArena.allocate(ValueLayout.JAVA_BYTE);
-        hScid = demuxArena.allocate(maxCid);
-        hScidLen = demuxArena.allocate(ValueLayout.JAVA_LONG);
-        hDcid = demuxArena.allocate(maxCid);
-        hDcidLen = demuxArena.allocate(ValueLayout.JAVA_LONG);
-        hToken = demuxArena.allocate(2048);
-        hTokenLen = demuxArena.allocate(ValueLayout.JAVA_LONG);
 
         // Named platform threads for per-connection drivers; reused via
         // the cached pool so accept floods don't churn thread creation.
@@ -151,64 +114,61 @@ public final class Http3Listener implements AutoCloseable {
 
     private void onDatagram(ByteBuffer datagram, InetSocketAddress from) {
         int length = datagram.remaining();
-        // Peek the header on the direct ByteBuffer directly via
-        // MemorySegment.ofBuffer — no heap byte[] allocation until we
-        // actually route the datagram to a connection.
-        MemorySegment in = MemorySegment.ofBuffer(datagram);
-        int maxCid = (int) quiche_h.QUICHE_MAX_CONN_ID_LEN();
+        byte[] pkt = new byte[length];
+        datagram.get(pkt);
         try {
-            hScidLen.set(ValueLayout.JAVA_LONG, 0, maxCid);
-            hDcidLen.set(ValueLayout.JAVA_LONG, 0, maxCid);
-            hTokenLen.set(ValueLayout.JAVA_LONG, 0, 2048);
-            int rc = quiche_h.quiche_header_info(
-                in, length, LOCAL_CID_LEN,
-                hVersion, hType, hScid, hScidLen, hDcid, hDcidLen, hToken, hTokenLen);
+            // Per-datagram scratch. JNI shim writes back scid/dcid/token
+            // lengths in the *Len arrays; pre-set them to buffer sizes.
+            int[] versionOut = new int[1];
+            byte[] typeOut = new byte[1];
+            byte[] scidBuf = new byte[Quiche.QUICHE_MAX_CONN_ID_LEN];
+            long[] scidLenA = new long[]{Quiche.QUICHE_MAX_CONN_ID_LEN};
+            byte[] dcidBuf = new byte[Quiche.QUICHE_MAX_CONN_ID_LEN];
+            long[] dcidLenA = new long[]{Quiche.QUICHE_MAX_CONN_ID_LEN};
+            byte[] tokenBuf = new byte[MAX_TOKEN_LEN];
+            long[] tokenLenA = new long[]{MAX_TOKEN_LEN};
+
+            int rc = Quiche.headerInfo(pkt, length, LOCAL_CID_LEN,
+                versionOut, typeOut,
+                scidBuf, scidLenA,
+                dcidBuf, dcidLenA,
+                tokenBuf, tokenLenA);
             if (rc < 0) {
                 // Non-QUIC or malformed. Drop.
                 return;
             }
-            long dLen = hDcidLen.get(ValueLayout.JAVA_LONG, 0);
-            byte[] dcidBytes = hDcid.reinterpret(dLen).toArray(ValueLayout.JAVA_BYTE);
+            int scidLen = (int) scidLenA[0];
+            int dcidLen = (int) dcidLenA[0];
+            int tokenLen = (int) tokenLenA[0];
+            byte[] scidBytes = Arrays.copyOf(scidBuf, scidLen);
+            byte[] dcidBytes = Arrays.copyOf(dcidBuf, dcidLen);
             CidKey key = new CidKey(dcidBytes);
             Http3Connection existing = conns.get(key);
             if (existing != null) {
-                datagram.rewind();
-                byte[] pkt = new byte[length];
-                datagram.get(pkt);
                 existing.enqueue(pkt);
                 return;
             }
-            // New DCID — accept a new connection.
-            int wireVersion = hVersion.get(ValueLayout.JAVA_INT, 0);
-            if (!quiche_h.quiche_version_is_supported(wireVersion)) {
-                sendVersionNegotiation(hScid, hScidLen.get(ValueLayout.JAVA_LONG, 0),
-                                       hDcid, dLen, from);
+            int wireVersion = versionOut[0];
+            if (!Quiche.versionIsSupported(wireVersion)) {
+                sendVersionNegotiation(scidBytes, dcidBytes, from);
                 return;
             }
-            long sLen = hScidLen.get(ValueLayout.JAVA_LONG, 0);
-            byte[] scidBytes = hScid.reinterpret(sLen).toArray(ValueLayout.JAVA_BYTE);
             // Stateless retry (RFC 9000 §8.1.2). Force the client to prove
             // it can receive at its claimed source address before we
             // allocate connection state. Peers that don't echo a valid
             // token get bounced with a retry challenge; peers that do get
             // their odcid restored so the handshake proceeds normally.
-            //
-            // Without retry:  localCid = fresh random, odcid = client's DCID.
-            // With retry:     localCid = the DCID the client is now using
-            //                 (which is the scid we sent in the retry),
-            //                 odcid = the client's ORIGINAL DCID (from token).
             byte[] localCid;
             byte[] odcid;
             if (retryToken != null) {
-                long tLen = hTokenLen.get(ValueLayout.JAVA_LONG, 0);
-                if (tLen == 0) {
+                if (tokenLen == 0) {
                     byte[] token = retryToken.mint(from, dcidBytes);
                     byte[] newScid = new byte[LOCAL_CID_LEN];
                     rng.nextBytes(newScid);
                     sendRetry(scidBytes, dcidBytes, newScid, token, wireVersion, from);
                     return;
                 }
-                byte[] token = hToken.reinterpret(tLen).toArray(ValueLayout.JAVA_BYTE);
+                byte[] token = Arrays.copyOf(tokenBuf, tokenLen);
                 byte[] verifiedOdcid = retryToken.verify(token, from);
                 if (verifiedOdcid == null) {
                     return;
@@ -220,9 +180,6 @@ public final class Http3Listener implements AutoCloseable {
                 rng.nextBytes(localCid);
                 odcid = dcidBytes;
             }
-            datagram.rewind();
-            byte[] pkt = new byte[length];
-            datagram.get(pkt);
             acceptNew(pkt, from, localCid, odcid);
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "h3 onDatagram failed", t);
@@ -232,100 +189,62 @@ public final class Http3Listener implements AutoCloseable {
     private void sendRetry(byte[] scid, byte[] dcid, byte[] newScid,
                            byte[] token, int version,
                            InetSocketAddress peer) throws IOException {
-        try (Arena scratch = Arena.ofConfined()) {
-            MemorySegment sScid = scratch.allocate(scid.length);
-            MemorySegment.copy(scid, 0, sScid, ValueLayout.JAVA_BYTE, 0, scid.length);
-            MemorySegment sDcid = scratch.allocate(dcid.length);
-            MemorySegment.copy(dcid, 0, sDcid, ValueLayout.JAVA_BYTE, 0, dcid.length);
-            MemorySegment sNew = scratch.allocate(newScid.length);
-            MemorySegment.copy(newScid, 0, sNew, ValueLayout.JAVA_BYTE, 0, newScid.length);
-            MemorySegment sTok = scratch.allocate(token.length);
-            MemorySegment.copy(token, 0, sTok, ValueLayout.JAVA_BYTE, 0, token.length);
-            MemorySegment out = scratch.allocate(MAX_DATAGRAM_SIZE);
-            long len = quiche_h.quiche_retry(
-                sScid, scid.length,
-                sDcid, dcid.length,
-                sNew, newScid.length,
-                sTok, token.length,
-                version, out, MAX_DATAGRAM_SIZE);
-            if (len < 0) {
-                LOG.info("h3 quiche_retry rc=" + len);
-                return;
-            }
-            byte[] pkt = new byte[(int) len];
-            MemorySegment.copy(out, ValueLayout.JAVA_BYTE, 0, pkt, 0, (int) len);
-            channel.send(ByteBuffer.wrap(pkt), peer);
+        byte[] out = new byte[MAX_DATAGRAM_SIZE];
+        long len = Quiche.retry(scid, dcid, newScid, token, version, out);
+        if (len < 0) {
+            LOG.info("h3 quiche_retry rc=" + len);
+            return;
         }
+        channel.send(ByteBuffer.wrap(out, 0, (int) len), peer);
     }
 
-    private void sendVersionNegotiation(MemorySegment scid, long scidLen,
-                                        MemorySegment dcid, long dcidLen,
+    private void sendVersionNegotiation(byte[] scid, byte[] dcid,
                                         InetSocketAddress peer) throws IOException {
-        try (Arena scratch = Arena.ofConfined()) {
-            MemorySegment out = scratch.allocate(MAX_DATAGRAM_SIZE);
-            long len = quiche_h.quiche_negotiate_version(
-                scid, scidLen, dcid, dcidLen, out, MAX_DATAGRAM_SIZE);
-            if (len < 0) {
-                LOG.info("h3 quiche_negotiate_version rc=" + len);
-                return;
-            }
-            byte[] pkt = new byte[(int) len];
-            MemorySegment.copy(out, ValueLayout.JAVA_BYTE, 0, pkt, 0, (int) len);
-            channel.send(ByteBuffer.wrap(pkt), peer);
+        byte[] out = new byte[MAX_DATAGRAM_SIZE];
+        long len = Quiche.negotiateVersion(scid, dcid, out);
+        if (len < 0) {
+            LOG.info("h3 quiche_negotiate_version rc=" + len);
+            return;
         }
+        channel.send(ByteBuffer.wrap(out, 0, (int) len), peer);
     }
 
     private void acceptNew(byte[] datagram, InetSocketAddress from,
-                           byte[] localCid, byte[] odcid) throws IOException {
-        // First-line DoS gate — cheap and racy but avoids the expensive
-        // quiche_accept path once we're near cap. Real bound is enforced
-        // below via a putIfAbsent on the reserve slot (see below).
+                           byte[] localCid, byte[] odcid) {
+        // First-line DoS gate — cheap and racy, real bound enforced below
+        // via putIfAbsent semantics on the connection map.
         if (conns.size() >= MAX_CONNECTIONS) {
             return;
         }
-        Arena connArena = Arena.ofShared();
-        try {
-            MemorySegment scidSeg = connArena.allocate(localCid.length);
-            MemorySegment.copy(localCid, 0, scidSeg, ValueLayout.JAVA_BYTE, 0, localCid.length);
-            Sockaddr.Encoded local = Sockaddr.encode(connArena, localAddr);
-            Sockaddr.Encoded peer = Sockaddr.encode(connArena, from);
-            // odcid = ORIGINAL destination CID (from client's first Initial,
-            // pre-retry). Same as the DCID when retry isn't in play.
-            MemorySegment odcidSeg = connArena.allocate(odcid.length);
-            MemorySegment.copy(odcid, 0, odcidSeg, ValueLayout.JAVA_BYTE, 0, odcid.length);
-            MemorySegment conn = quiche_h.quiche_accept(
-                scidSeg, localCid.length,
-                odcidSeg, odcid.length,
-                local.segment(), local.length(),
-                peer.segment(), peer.length(),
-                quicheConfig.segment());
-            if (conn.address() == 0) {
-                LOG.warning("h3 quiche_accept returned null");
-                connArena.close();
-                return;
-            }
-            CidKey key = new CidKey(localCid);
-            Http3Connection h3conn = new Http3Connection(
-                localCid, conn, connArena, channel, localAddr, from,
-                handler,
-                config.maxRequestBodyBytes,
-                connExecutor,
-                () -> conns.remove(key));
-            Http3Connection prev = conns.putIfAbsent(key, h3conn);
-            if (prev != null) {
-                // Extremely unlikely collision on 128-bit random CID; keep
-                // existing and abandon this one.
-                h3conn.close();
-                prev.enqueue(datagram);
-                return;
-            }
-            LOG.info("h3 accepted new connection cid="
-                + HexFormat.of().formatHex(localCid) + " from " + from);
-            h3conn.enqueue(datagram);
-        } catch (Throwable t) {
-            connArena.close();
-            throw t;
+        byte[] localIp = localAddr.getAddress().getAddress();
+        byte[] peerIp = from.getAddress().getAddress();
+        long conn = Quiche.accept(
+            localCid, odcid,
+            localIp, localAddr.getPort(),
+            peerIp, from.getPort(),
+            quicheConfig.handle());
+        if (conn == 0) {
+            LOG.warning("h3 quiche_accept returned null");
+            return;
         }
+        CidKey key = new CidKey(localCid);
+        Http3Connection h3conn = new Http3Connection(
+            localCid, conn, channel, localAddr, from,
+            handler,
+            config.maxRequestBodyBytes,
+            connExecutor,
+            () -> conns.remove(key));
+        Http3Connection prev = conns.putIfAbsent(key, h3conn);
+        if (prev != null) {
+            // Extremely unlikely collision on 128-bit random CID; keep
+            // existing and abandon this one.
+            h3conn.close();
+            prev.enqueue(datagram);
+            return;
+        }
+        LOG.info("h3 accepted new connection cid="
+            + HexFormat.of().formatHex(localCid) + " from " + from);
+        h3conn.enqueue(datagram);
     }
 
     @Override
@@ -340,9 +259,6 @@ public final class Http3Listener implements AutoCloseable {
         conns.clear();
         if (quicheConfig != null) {
             try { quicheConfig.close(); } catch (Throwable ignored) {}
-        }
-        if (demuxArena != null) {
-            try { demuxArena.close(); } catch (Throwable ignored) {}
         }
         if (connExecutor != null) {
             connExecutor.shutdown();

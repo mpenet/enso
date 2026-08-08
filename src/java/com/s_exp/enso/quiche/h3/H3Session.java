@@ -1,11 +1,8 @@
 package com.s_exp.enso.quiche.h3;
 
-import com.s_exp.enso.quiche.QuicheStreams;
+import com.s_exp.enso.quiche.Quiche;
 import com.s_exp.enso.quiche.qpack.QpackException;
 import com.s_exp.enso.quiche.qpack.QpackFieldSection;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.List;
@@ -49,8 +46,7 @@ public final class H3Session {
     static final long DIR_CLIENT_UNI = 0x2;
     static final long DIR_SERVER_UNI = 0x3;
 
-    private final MemorySegment conn;
-    private final Arena arena;
+    private final long conn;
     // Our outbound uni stream IDs — assigned in order.
     private long ctrlStreamId = -1;
     private long qpackEncStreamId = -1;
@@ -72,9 +68,8 @@ public final class H3Session {
     private final Map<Long, ByteBuffer> peerUniHeaderBuf = new HashMap<>();
     private boolean initialised = false;
 
-    public H3Session(MemorySegment conn, Arena arena) {
+    public H3Session(long conn) {
         this.conn = conn;
-        this.arena = arena;
     }
 
     /**
@@ -197,13 +192,14 @@ public final class H3Session {
 
     private void resetStream(long streamId, long errorCode) {
         // Shutdown both directions so peer stops sending and we don't try
-        // to respond. Direction: 0=read (send STOP_SENDING), 1=write
-        // (send RESET_STREAM).
+        // to respond.
         try {
-            QuicheStreams.streamShutdown(conn, streamId, 0, errorCode);
+            Quiche.connStreamShutdown(conn, streamId,
+                Quiche.QUICHE_SHUTDOWN_READ, errorCode);
         } catch (Throwable ignored) {}
         try {
-            QuicheStreams.streamShutdown(conn, streamId, 1, errorCode);
+            Quiche.connStreamShutdown(conn, streamId,
+                Quiche.QUICHE_SHUTDOWN_WRITE, errorCode);
         } catch (Throwable ignored) {}
     }
 
@@ -299,14 +295,7 @@ public final class H3Session {
         int remaining = buf.remaining();
         byte[] bytes = new byte[remaining];
         buf.get(bytes);
-        // Arena.allocate per call — leaks into the connection arena over
-        // the conn lifetime. Task #87 tracks a proper reusable-scratch
-        // fix; the rewrite attempt regressed stability, so we leave the
-        // simple leak-ish shape in place for now.
-        MemorySegment src = arena.allocate(remaining);
-        MemorySegment.copy(bytes, 0, src, ValueLayout.JAVA_BYTE, 0, remaining);
-        long rc = QuicheStreams.streamSend(
-            conn, streamId, src, remaining, fin, MemorySegment.NULL);
+        long rc = Quiche.connStreamSend(conn, streamId, bytes, 0, remaining, fin);
         if (rc < 0) {
             LOG.info("h3 stream_send stream=" + streamId + " rc=" + rc);
             return;
@@ -314,8 +303,8 @@ public final class H3Session {
         // Short-write handling is unreliable while we're still passing
         // fin on the sole call — retrying with fin=false would strand
         // the FIN. Frames are small (~100 bytes) so single-call success
-        // is the practical norm; task #104's proper fin-split logic will
-        // land alongside #87.
+        // is the practical norm; task #104's proper fin-split logic
+        // remains open.
         if (rc < remaining) {
             LOG.info("h3 short stream_send stream=" + streamId
                 + " wrote=" + rc + " of=" + remaining);

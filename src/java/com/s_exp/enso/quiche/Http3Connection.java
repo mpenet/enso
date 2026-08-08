@@ -5,12 +5,8 @@ import clojure.lang.PersistentArrayMap;
 import com.s_exp.enso.Request;
 import com.s_exp.enso.Response;
 import com.s_exp.enso.RingHandler;
-import com.s_exp.enso.quiche.ffm.quiche_h;
 import com.s_exp.enso.quiche.h3.H3Session;
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
@@ -36,11 +32,8 @@ import java.util.logging.Logger;
  * owner platform thread drives everything — quiche's connection objects
  * aren't thread-safe.
  *
- * <p>The h3 layer used to be quiche's own {@code quiche_h3_conn} FFM
- * module, but that path corrupts libmalloc's freelist on macOS ARM64 +
- * JDK 25 under connection churn (task #79). We now implement H3 in Java
- * on top of quiche's transport-only stream primitives, matching what
- * Netty + Jetty do.
+ * <p>Now backed by a JNI shim ({@link Quiche}), not FFM — see task #86
+ * for the libmalloc corruption that pushed us off the FFM path.
  *
  * <p>Loop shape per iteration:
  * <ol>
@@ -70,11 +63,14 @@ final class Http3Connection implements AutoCloseable {
     private static final byte[] WAKE_SENTINEL = new byte[0];
 
     private final byte[] cid;
-    private final Arena arena;
-    private final MemorySegment conn;
+    private final long conn;
     private final DatagramChannel out;
     private final InetSocketAddress local;
     private final InetSocketAddress peer;
+    private final byte[] localIp;
+    private final int localPort;
+    private final byte[] peerIp;
+    private final int peerPort;
     private final RingHandler handler;
     private final long maxRequestBodyBytes;
     private final Runnable onClose;
@@ -94,21 +90,7 @@ final class Http3Connection implements AutoCloseable {
     // mutation).
     private final HashMap<Long, H3BodyPipe> bodyPipes = new HashMap<>();
 
-    // Ctor-time reusable FFM scratch (owned by connection arena).
-    private final MemorySegment inBuf;
-    private final MemorySegment outBuf;
-    private final MemorySegment sendInfo;
-    private final MemorySegment recvInfo;
-    private final MemorySegment streamRecvBuf;
-    private final MemorySegment finOut;
-    private final MemorySegment errOut;
-    private final MemorySegment streamIdOut;
-    private final MemorySegment peerSockaddr;
-    private final int peerSockaddrLen;
-    private final MemorySegment localSockaddr;
-    private final int localSockaddrLen;
-
-    Http3Connection(byte[] cid, MemorySegment conn, Arena arena,
+    Http3Connection(byte[] cid, long conn,
                     DatagramChannel out,
                     InetSocketAddress local, InetSocketAddress peer,
                     RingHandler handler,
@@ -117,35 +99,16 @@ final class Http3Connection implements AutoCloseable {
                     Runnable onClose) {
         this.cid = cid;
         this.conn = conn;
-        this.arena = arena;
         this.out = out;
         this.local = local;
         this.peer = peer;
+        this.localIp = local.getAddress().getAddress();
+        this.localPort = local.getPort();
+        this.peerIp = peer.getAddress().getAddress();
+        this.peerPort = peer.getPort();
         this.handler = handler;
         this.maxRequestBodyBytes = maxRequestBodyBytes;
         this.onClose = onClose;
-
-        this.inBuf = arena.allocate(2 * MAX_DATAGRAM_SIZE);
-        this.outBuf = arena.allocate(MAX_DATAGRAM_SIZE);
-        this.sendInfo = arena.allocate(64);
-        this.streamRecvBuf = arena.allocate(STREAM_RECV_BUF);
-        this.finOut = arena.allocate(ValueLayout.JAVA_BOOLEAN);
-        this.errOut = arena.allocate(ValueLayout.JAVA_LONG);
-        this.streamIdOut = arena.allocate(ValueLayout.JAVA_LONG);
-
-        Sockaddr.Encoded peerEnc = Sockaddr.encode(arena, peer);
-        this.peerSockaddr = peerEnc.segment();
-        this.peerSockaddrLen = peerEnc.length();
-        Sockaddr.Encoded localEnc = Sockaddr.encode(arena, local);
-        this.localSockaddr = localEnc.segment();
-        this.localSockaddrLen = localEnc.length();
-        this.recvInfo = arena.allocate(48);
-        long rip = 0;
-        recvInfo.set(ValueLayout.ADDRESS, rip, peerSockaddr); rip += 8;
-        recvInfo.set(ValueLayout.JAVA_INT, rip, peerSockaddrLen); rip += 4;
-        rip += 4;
-        recvInfo.set(ValueLayout.ADDRESS, rip, localSockaddr); rip += 8;
-        recvInfo.set(ValueLayout.JAVA_INT, rip, localSockaddrLen);
 
         FutureTask<?> task = new FutureTask<>(this::run, null);
         this.ownerFuture = task;
@@ -176,8 +139,8 @@ final class Http3Connection implements AutoCloseable {
                     drainOutbound();
                 }
                 processSend();
-                if (quiche_h.quiche_conn_is_closed(conn)) return;
-                if (!loggedEstablished && quiche_h.quiche_conn_is_established(conn)) {
+                if (Quiche.connIsClosed(conn)) return;
+                if (!loggedEstablished && Quiche.connIsEstablished(conn)) {
                     loggedEstablished = true;
                     LOG.info("h3 handshake established with " + peer
                         + " cid=" + HexFormat.of().formatHex(cid));
@@ -188,22 +151,17 @@ final class Http3Connection implements AutoCloseable {
             LOG.log(Level.WARNING, "h3 conn driver crash", t);
         } finally {
             // Owner-thread cleanup. This is the ONLY site that frees the
-            // quiche conn + the shared arena. External close() only
-            // signals via `running=false` + WAKE_SENTINEL. Doing native
-            // cleanup here guarantees no FFM call is mid-flight when we
-            // free — earlier libmalloc freelist corruption crashes (task
-            // #79/#86) came from a foreign thread freeing conn/arena while
-            // the owner was still inside quiche_conn_send / stream_send.
+            // quiche conn. External close() only signals via
+            // `running=false` + WAKE_SENTINEL. Guarantees no JNI call is
+            // in-flight when we free.
             closed.set(true);
             for (H3BodyPipe pipe : bodyPipes.values()) {
                 try { pipe.signalEnd(); } catch (Throwable ignored) {}
             }
             bodyPipes.clear();
             try {
-                quiche_h.quiche_conn_free(conn);
-            } catch (Throwable ignored) {
+                Quiche.connFree(conn);
             } finally {
-                try { arena.close(); } catch (Throwable ignored) {}
                 if (onClose != null) {
                     try { onClose.run(); } catch (Throwable ignored) {}
                 }
@@ -213,17 +171,17 @@ final class Http3Connection implements AutoCloseable {
 
     private void waitForWork() throws InterruptedException {
         if (!ingress.isEmpty() || !outbound.isEmpty()) return;
-        long timeoutNanos = quiche_h.quiche_conn_timeout_as_nanos(conn);
+        long timeoutNanos = Quiche.connTimeoutAsNanos(conn);
         long parkNanos = timeoutNanos == -1L ? 500_000_000L
             : Math.min(timeoutNanos, 500_000_000L);
         if (parkNanos <= 0) {
-            quiche_h.quiche_conn_on_timeout(conn);
+            Quiche.connOnTimeout(conn);
             return;
         }
         byte[] first = ingress.poll(parkNanos, TimeUnit.NANOSECONDS);
         if (first != null) ingress.offer(first);
         else if (timeoutNanos != -1L && timeoutNanos <= 500_000_000L) {
-            quiche_h.quiche_conn_on_timeout(conn);
+            Quiche.connOnTimeout(conn);
         }
     }
 
@@ -237,8 +195,8 @@ final class Http3Connection implements AutoCloseable {
 
     private void maybeInitH3() {
         if (session != null) return;
-        if (!quiche_h.quiche_conn_is_established(conn)) return;
-        session = new H3Session(conn, arena);
+        if (!Quiche.connIsEstablished(conn)) return;
+        session = new H3Session(conn);
         session.ensureInitialised();
     }
 
@@ -248,31 +206,34 @@ final class Http3Connection implements AutoCloseable {
      * returns an iterator that we must free.
      */
     private void drainReadableStreams(H3Session.RequestSink sink) {
-        MemorySegment iter = QuicheStreams.readableIter(conn);
-        if (iter == null || iter.address() == 0) return;
+        long iter = Quiche.connReadable(conn);
+        if (iter == 0) return;
         try {
-            while (QuicheStreams.iterNext(iter, streamIdOut)) {
-                long streamId = streamIdOut.get(ValueLayout.JAVA_LONG, 0);
-                readAllStream(streamId, sink);
+            long[] sidOut = new long[1];
+            while (Quiche.streamIterNext(iter, sidOut)) {
+                readAllStream(sidOut[0], sink);
             }
         } finally {
-            QuicheStreams.iterFree(iter);
+            Quiche.streamIterFree(iter);
         }
     }
 
     private void readAllStream(long streamId, H3Session.RequestSink sink) {
+        byte[] recvBuf = new byte[STREAM_RECV_BUF];
+        boolean[] finOut = new boolean[1];
+        long[] errOut = new long[1];
         while (true) {
-            finOut.set(ValueLayout.JAVA_BOOLEAN, 0, false);
-            long rc = QuicheStreams.streamRecv(conn, streamId,
-                streamRecvBuf, STREAM_RECV_BUF, finOut, errOut);
-            if (rc == quiche_h.QUICHE_ERR_DONE()) return;
+            finOut[0] = false;
+            long rc = Quiche.connStreamRecv(conn, streamId,
+                recvBuf, STREAM_RECV_BUF, finOut, errOut);
+            if (rc == Quiche.QUICHE_ERR_DONE) return;
             if (rc < 0) {
                 LOG.info("h3 stream_recv stream=" + streamId + " rc=" + rc);
                 return;
             }
-            boolean fin = finOut.get(ValueLayout.JAVA_BOOLEAN, 0);
+            boolean fin = finOut[0];
             byte[] chunk = new byte[(int) rc];
-            MemorySegment.copy(streamRecvBuf, ValueLayout.JAVA_BYTE, 0, chunk, 0, (int) rc);
+            System.arraycopy(recvBuf, 0, chunk, 0, (int) rc);
             session.onStreamData(streamId, chunk, fin, sink);
             if (fin) return;
             if (rc < STREAM_RECV_BUF) return;
@@ -301,37 +262,34 @@ final class Http3Connection implements AutoCloseable {
     }
 
     private void processRecv(byte[] datagram) throws IOException {
-        MemorySegment.copy(datagram, 0, inBuf, ValueLayout.JAVA_BYTE, 0, datagram.length);
-        long rc = quiche_h.quiche_conn_recv(conn, inBuf, datagram.length, recvInfo);
-        if (rc < 0 && rc != quiche_h.QUICHE_ERR_DONE()) {
+        long rc = Quiche.connRecv(conn, datagram, datagram.length,
+            peerIp, peerPort, localIp, localPort);
+        if (rc < 0 && rc != Quiche.QUICHE_ERR_DONE) {
             LOG.info("h3 quiche_conn_recv returned " + rc);
         }
     }
 
     private void processSend() throws IOException {
+        byte[] outBuf = new byte[MAX_DATAGRAM_SIZE];
         while (true) {
-            long rc = quiche_h.quiche_conn_send(conn, outBuf, MAX_DATAGRAM_SIZE, sendInfo);
-            if (rc == quiche_h.QUICHE_ERR_DONE()) return;
+            long rc = Quiche.connSend(conn, outBuf, MAX_DATAGRAM_SIZE);
+            if (rc == Quiche.QUICHE_ERR_DONE) return;
             if (rc < 0) {
                 LOG.info("h3 quiche_conn_send returned " + rc);
                 return;
             }
-            byte[] pkt = new byte[(int) rc];
-            MemorySegment.copy(outBuf, ValueLayout.JAVA_BYTE, 0, pkt, 0, (int) rc);
-            out.send(ByteBuffer.wrap(pkt), peer);
+            out.send(ByteBuffer.wrap(outBuf, 0, (int) rc), peer);
         }
     }
 
     @Override
     public void close() {
-        // Signal-only. Native cleanup (quiche_conn_free + arena.close) is
-        // done exclusively by the owner thread in run()'s finally block,
-        // so foreign-thread close() never races with an in-flight FFM
-        // call — the source of the earlier libmalloc freelist corruption.
+        // Signal-only. Native cleanup (quiche_conn_free) done exclusively
+        // by the owner thread in run()'s finally block.
         if (!closed.compareAndSet(false, true)) return;
         running = false;
-        ingress.offer(WAKE_SENTINEL); // unpark owner if in ingress.poll
-        if (Thread.currentThread() == ownerThread) return; // owner self-close
+        ingress.offer(WAKE_SENTINEL);
+        if (Thread.currentThread() == ownerThread) return;
         try {
             ownerFuture.get(3, TimeUnit.SECONDS);
         } catch (TimeoutException te) {

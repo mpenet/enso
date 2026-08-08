@@ -23,11 +23,22 @@
             :basis @basis
             :javac-opts ["--release" "22"]}))
 
+(defn shim
+  "Build the enso_quiche JNI shim into target/native/<os>-<arch>/. Callers
+  that don't need HTTP/3 can skip this."
+  [_]
+  (sh "make -C native/enso_quiche"))
+
 (defn jar [_]
   (javac nil)
   (b/delete {:path jar-class-dir})
   (b/copy-dir {:src-dirs [class-dir]
                :target-dir jar-class-dir})
+  ;; Bundle the JNI shim per platform under META-INF/native/<os>-<arch>/.
+  ;; Quiche.java's loader extracts + System.load at runtime.
+  (when (.exists (java.io.File. "target/native"))
+    (b/copy-dir {:src-dirs ["target/native"]
+                 :target-dir (str jar-class-dir "/META-INF/native")}))
   (b/write-pom {:class-dir jar-class-dir
                 :lib lib
                 :version version

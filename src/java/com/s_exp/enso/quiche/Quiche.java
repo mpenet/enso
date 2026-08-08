@@ -1,43 +1,42 @@
 package com.s_exp.enso.quiche;
 
-import com.s_exp.enso.quiche.ffm.quiche_h;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 
 /**
- * Entry point for the libquiche FFM bindings. Loading this class triggers
- * a search for {@code libquiche} in common install locations, then falls
- * back to {@code System.loadLibrary("quiche")} so users can override with
- * {@code -Djava.library.path=…}. Any environment problem surfaces at
- * class-init time with a clear diagnostic.
+ * JNI shim over libquiche. Loads {@code libenso_quiche.<so|dylib>}
+ * bundled in the jar (extracted to a temp dir on first use), which in
+ * turn dlopens the system {@code libquiche}. All methods are 1:1 with
+ * the C entry points in {@code native/enso_quiche/enso_quiche.c}.
  *
- * <p>The rest of Enso must never reach this class directly. HTTP/3 support
- * is behind a {@code Class.forName("com.s_exp.enso.quiche.Http3Listener")}
- * probe in {@link com.s_exp.enso.EnsoServer}, so users with {@code :http3
- * false} pay no classloading, memory, or startup cost for the FFM bindings.
+ * <p>We use JNI instead of FFM because JDK 25 + macOS ARM64 FFM downcall
+ * paths corrupt libmalloc's freelist under connection churn (task
+ * #86/#79; see also JDK-8357145 / JDK-8357268 which Netty's own
+ * CleanerJava25.java steers around by gating MemorySegment usage on
+ * JDK ≥ 25).
  *
- * <p>Trimmed jextract output lives under {@code com.s_exp.enso.quiche.ffm}
- * with only the symbols Enso actually calls.
+ * <p>Pointer discipline: every quiche resource crosses the boundary as
+ * an opaque {@code long} address. Java code treats them as tokens — do
+ * not dereference. Use the {@code *Free} methods to release.
+ *
+ * <p>Sockaddr passing: instead of shipping {@code sockaddr_storage}
+ * bytes (whose layout differs by OS), the shim takes {@code (byte[] ip,
+ * int port)}. IPv4 addresses are 4-byte arrays; IPv6 addresses are
+ * 16-byte arrays. The C side builds the real struct on the JNI stack.
  */
 public final class Quiche {
 
-    // Common install prefixes. Homebrew on Apple Silicon puts things under
-    // /opt/homebrew; Intel Homebrew and manual builds prefer /usr/local;
-    // Linux distro packages land in /usr/lib*. Kept small on purpose — if
-    // the user's setup is more exotic they can point at it via
-    // -Djava.library.path or -Denso.quiche.path=/abs/path/libquiche.dylib.
-    private static final String[] SEARCH_PREFIXES = {
-        System.getProperty("enso.quiche.path"),
-        "/opt/homebrew/opt/cloudflare-quiche/lib",
-        "/opt/homebrew/lib",
-        "/usr/local/opt/cloudflare-quiche/lib",
-        "/usr/local/lib",
-        "/usr/lib",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-    };
+    public static final int QUICHE_MAX_CONN_ID_LEN = 20;
+    public static final int QUICHE_PROTOCOL_VERSION = 0x00000001;
+    public static final long QUICHE_ERR_DONE = -1L;
 
-    private static final String LIB_FILE = System.mapLibraryName("quiche");
+    // enum quiche_shutdown
+    public static final int QUICHE_SHUTDOWN_READ = 0;
+    public static final int QUICHE_SHUTDOWN_WRITE = 1;
 
     static {
         loadLibrary();
@@ -46,45 +45,149 @@ public final class Quiche {
     private Quiche() {}
 
     private static void loadLibrary() {
-        // Explicit override wins.
-        String override = System.getProperty("enso.quiche.path");
+        // Explicit override wins: user pointed us at a specific dylib
+        // (typically for a locally-built shim during development).
+        String override = System.getProperty("enso.quiche.shim");
         if (override != null && !override.isBlank()) {
-            Path p = Path.of(override);
-            if (Files.exists(p)) {
-                System.load(p.toAbsolutePath().toString());
-                return;
-            }
+            System.load(Path.of(override).toAbsolutePath().toString());
+            return;
         }
-        // Try each common prefix; System.load takes an absolute path.
-        for (String prefix : SEARCH_PREFIXES) {
-            if (prefix == null) continue;
-            Path candidate = Path.of(prefix, LIB_FILE);
-            if (Files.exists(candidate)) {
-                System.load(candidate.toAbsolutePath().toString());
-                return;
-            }
-        }
-        // Fall back to the standard loader — respects -Djava.library.path
-        // and the LD_LIBRARY_PATH / DYLD_LIBRARY_PATH environment.
+        // Try loading from classpath resource first — the released jar
+        // ships per-platform shim libs under META-INF/native/<os>-<arch>/.
+        String os = detectOs();
+        String arch = detectArch();
+        String libName = System.mapLibraryName("enso_quiche");
+        String resPath = "/META-INF/native/" + os + "-" + arch + "/" + libName;
         try {
-            System.loadLibrary("quiche");
+            java.net.URL u = Quiche.class.getResource(resPath);
+            if (u != null) {
+                Path tmp = extractResource(resPath, libName);
+                System.load(tmp.toAbsolutePath().toString());
+                return;
+            }
+        } catch (IOException e) {
+            // fall through to filesystem probes
+        }
+        // Development / repl: probe local build output.
+        Path devPath = Path.of("target/native/" + os + "-" + arch + "/" + libName);
+        if (Files.exists(devPath)) {
+            System.load(devPath.toAbsolutePath().toString());
+            return;
+        }
+        // Last resort: standard library-path lookup.
+        try {
+            System.loadLibrary("enso_quiche");
         } catch (UnsatisfiedLinkError e) {
             throw new UnsatisfiedLinkError(
-                "libquiche not found. Install cloudflare-quiche (macOS: "
-                + "`brew install cloudflare-quiche`; Linux: build from "
-                + "https://github.com/cloudflare/quiche with --features ffi) "
-                + "and either place " + LIB_FILE + " on the system library "
-                + "path or set -Denso.quiche.path=/abs/path/to/" + LIB_FILE
+                "libenso_quiche not found. Build with `make -C native/enso_quiche`"
+                + " or set -Denso.quiche.shim=/abs/path/to/" + libName
                 + ". Underlying error: " + e.getMessage());
         }
     }
 
-    /**
-     * Returns the wire version string reported by {@code quiche_version}.
-     * Also acts as a probe that libquiche loaded correctly.
-     */
-    public static String version() {
-        var seg = quiche_h.quiche_version();
-        return seg.reinterpret(64).getString(0);
+    private static String detectOs() {
+        String n = System.getProperty("os.name").toLowerCase();
+        if (n.contains("mac") || n.contains("darwin")) return "darwin";
+        if (n.contains("linux")) return "linux";
+        return n.replace(' ', '_');
     }
+
+    private static String detectArch() {
+        String a = System.getProperty("os.arch").toLowerCase();
+        if (a.equals("x86_64") || a.equals("amd64")) return "amd64";
+        if (a.equals("aarch64") || a.equals("arm64")) return "arm64";
+        return a;
+    }
+
+    private static Path extractResource(String resPath, String libName) throws IOException {
+        Path tmp = Files.createTempFile("enso-quiche-", "-" + libName);
+        tmp.toFile().deleteOnExit();
+        try (InputStream in = Quiche.class.getResourceAsStream(resPath);
+             OutputStream out = Files.newOutputStream(tmp,
+                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                 StandardOpenOption.WRITE)) {
+            in.transferTo(out);
+        }
+        return tmp;
+    }
+
+    // -----------------------------------------------------------------
+    // Version
+    // -----------------------------------------------------------------
+    public static native String version();
+
+    // -----------------------------------------------------------------
+    // Config
+    // -----------------------------------------------------------------
+    public static native long configNew(int version);
+    public static native void configFree(long config);
+    public static native int configLoadCertChainFromPemFile(long config, String path);
+    public static native int configLoadPrivKeyFromPemFile(long config, String path);
+    public static native int configSetApplicationProtos(long config, byte[] protos);
+    public static native void configSetMaxIdleTimeout(long config, long v);
+    public static native void configSetMaxRecvUdpPayloadSize(long config, long v);
+    public static native void configSetMaxSendUdpPayloadSize(long config, long v);
+    public static native void configSetInitialMaxData(long config, long v);
+    public static native void configSetInitialMaxStreamDataBidiLocal(long config, long v);
+    public static native void configSetInitialMaxStreamDataBidiRemote(long config, long v);
+    public static native void configSetInitialMaxStreamDataUni(long config, long v);
+    public static native void configSetInitialMaxStreamsBidi(long config, long v);
+    public static native void configSetInitialMaxStreamsUni(long config, long v);
+    public static native void configSetDisableActiveMigration(long config, boolean v);
+
+    // -----------------------------------------------------------------
+    // Accept / retry / negotiate / header info
+    // -----------------------------------------------------------------
+    public static native long accept(byte[] scid, byte[] odcid,
+                                     byte[] localIp, int localPort,
+                                     byte[] peerIp, int peerPort,
+                                     long config);
+    /** Returns bytes written (>=0), QUICHE_ERR_DONE (-1), or < 0 on error. */
+    public static native long retry(byte[] scid, byte[] dcid,
+                                    byte[] newScid, byte[] token,
+                                    int version, byte[] out);
+    /** Returns bytes written, or < 0 on error. */
+    public static native long negotiateVersion(byte[] scid, byte[] dcid, byte[] out);
+
+    /**
+     * Parses a QUIC packet header. Pre-fill scidLen[0]/dcidLen[0]/tokenLen[0]
+     * with the maximum buffer size; C writes back the actual lengths on
+     * success. Returns 0 on success or < 0 on error.
+     */
+    public static native int headerInfo(byte[] buf, int bufLen, int dcil,
+                                        int[] versionOut, byte[] typeOut,
+                                        byte[] scid, long[] scidLen,
+                                        byte[] dcid, long[] dcidLen,
+                                        byte[] token, long[] tokenLen);
+    public static native boolean versionIsSupported(int version);
+
+    // -----------------------------------------------------------------
+    // Conn lifecycle + state
+    // -----------------------------------------------------------------
+    public static native void connFree(long conn);
+    public static native boolean connIsClosed(long conn);
+    public static native boolean connIsEstablished(long conn);
+    /** Nanoseconds until next timeout, or -1 if no timeout is scheduled. */
+    public static native long connTimeoutAsNanos(long conn);
+    public static native void connOnTimeout(long conn);
+
+    public static native long connRecv(long conn, byte[] buf, int bufLen,
+                                       byte[] fromIp, int fromPort,
+                                       byte[] toIp, int toPort);
+    public static native long connSend(long conn, byte[] out, int outLen);
+
+    // -----------------------------------------------------------------
+    // Streams
+    // -----------------------------------------------------------------
+    public static native long connStreamRecv(long conn, long streamId,
+                                             byte[] out, int outLen,
+                                             boolean[] finOut, long[] errOut);
+    public static native long connStreamSend(long conn, long streamId,
+                                             byte[] buf, int off, int len,
+                                             boolean fin);
+    public static native int connStreamShutdown(long conn, long streamId,
+                                                int direction, long err);
+    public static native long connReadable(long conn);
+    public static native boolean streamIterNext(long iter, long[] streamIdOut);
+    public static native void streamIterFree(long iter);
 }
