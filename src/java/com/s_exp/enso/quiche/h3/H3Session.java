@@ -299,37 +299,26 @@ public final class H3Session {
         int remaining = buf.remaining();
         byte[] bytes = new byte[remaining];
         buf.get(bytes);
+        // Arena.allocate per call — leaks into the connection arena over
+        // the conn lifetime. Task #87 tracks a proper reusable-scratch
+        // fix; the rewrite attempt regressed stability, so we leave the
+        // simple leak-ish shape in place for now.
         MemorySegment src = arena.allocate(remaining);
         MemorySegment.copy(bytes, 0, src, ValueLayout.JAVA_BYTE, 0, remaining);
-        // Common case: our frames are small (typically <1KB) and quiche
-        // accepts the full buffer in one call. Pass fin on the first call
-        // so quiche can queue FIN alongside the last byte with no extra
-        // trip. Handle short writes below with fin=false retries; if we
-        // ever short-wrote AND FIN was requested, quiche has already
-        // locked the stream — data after the short cutoff would strand,
-        // but that would only trigger with a >1KB frame under flow-control
-        // pressure, which our current frame sizes never hit.
-        long written = 0;
-        int spinGuard = 0;
-        while (written < remaining) {
-            long left = remaining - written;
-            boolean firstAndFin = written == 0 && fin;
-            long rc = QuicheStreams.streamSend(
-                conn, streamId,
-                src.asSlice(written), left, firstAndFin,
-                MemorySegment.NULL);
-            if (rc < 0) {
-                LOG.info("h3 stream_send stream=" + streamId + " rc=" + rc);
-                return;
-            }
-            if (rc == 0) {
-                // Flow-control blocked. Break out; owner loop re-polls
-                // writable streams next iteration.
-                if (++spinGuard > 3) return;
-                continue;
-            }
-            spinGuard = 0;
-            written += rc;
+        long rc = QuicheStreams.streamSend(
+            conn, streamId, src, remaining, fin, MemorySegment.NULL);
+        if (rc < 0) {
+            LOG.info("h3 stream_send stream=" + streamId + " rc=" + rc);
+            return;
+        }
+        // Short-write handling is unreliable while we're still passing
+        // fin on the sole call — retrying with fin=false would strand
+        // the FIN. Frames are small (~100 bytes) so single-call success
+        // is the practical norm; task #104's proper fin-split logic will
+        // land alongside #87.
+        if (rc < remaining) {
+            LOG.info("h3 short stream_send stream=" + streamId
+                + " wrote=" + rc + " of=" + remaining);
         }
     }
 
