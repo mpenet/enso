@@ -261,6 +261,56 @@
        :samples-per-req (when (and total (:total-req result) (pos? (:total-req result)))
                           (double (/ total (:total-req result))))})))
 
+(defn profile-alloc-h3-jfr!
+  "JFR-based allocation profiler for h3. Uses the JVM's built-in
+  jdk.ObjectAllocationSample event stream (JEP 331, always enabled at low
+  overhead on JDK 16+). Sidesteps async-profiler's SIGABRT-in-GC-thread
+  crashes we hit at task #76 on JDK 25 + FFM.
+
+  Returns {jfr-path, top-classes, load} — a small aggregated report over
+  the recording plus the raw .jfr for deeper drill-down via `jfr print`."
+  [{:keys [clients per-client]
+    :or {clients 4 per-client 200}}]
+  (let [{:keys [h3-port]} @h3-state
+        _ (when-not h3-port (throw (ex-info "h3-start! first" {})))
+        url (str "https://127.0.0.1:" h3-port "/nope")
+        jfr-path (java.nio.file.Paths/get
+                  "/tmp/enso-h3-alloc.jfr" (make-array String 0))
+        recording (jdk.jfr.Recording.)]
+    ;; Warmup.
+    (drive-h3! url {:clients 2 :per-client 50})
+    ;; Enable the two allocation events. jdk.ObjectAllocationSample is
+    ;; the low-overhead sampling event (default rate ≈ 100 Hz per class);
+    ;; jdk.ObjectAllocationInNewTLAB fires on every TLAB refill and gives
+    ;; higher-resolution data at higher cost.
+    (doto recording
+      (.enable "jdk.ObjectAllocationSample")
+      (.enable "jdk.ObjectAllocationInNewTLAB")
+      (.setToDisk true)
+      (.setDestination jfr-path)
+      (.start))
+    (let [result (drive-h3! url {:clients clients :per-client per-client})]
+      (.stop recording)
+      (.close recording)
+      (let [top (with-open [it (jdk.jfr.consumer.RecordingFile. jfr-path)]
+                  (loop [counts (transient {})]
+                    (if (.hasMoreEvents it)
+                      (let [ev (.readEvent it)
+                            klass-field (.getValue ev "objectClass")
+                            klass-name (some-> klass-field .getName)]
+                        (recur (if klass-name
+                                 (assoc! counts klass-name
+                                         (inc (or (get counts klass-name) 0)))
+                                 counts)))
+                      (persistent! counts))))
+            ranked (->> top
+                        (sort-by (comp - val))
+                        (take 15))]
+        {:jfr (.toString jfr-path)
+         :load result
+         :top-classes ranked
+         :total-events (reduce + (vals top))}))))
+
 (defn profile-cpu-h3!
   [{:keys [clients per-client]
     :or {clients 8 per-client 500}}]

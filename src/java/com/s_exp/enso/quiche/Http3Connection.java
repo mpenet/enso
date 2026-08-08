@@ -26,6 +26,7 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -64,6 +65,10 @@ final class Http3Connection implements AutoCloseable {
     private static final int OUTBOUND_CAPACITY = 1024;
     private static final int STREAM_RECV_BUF = 16 * 1024;
 
+    // Zero-length datagram used by close() to wake the owner if it's parked
+    // in ingress.poll(). drainIngress skips zero-length entries.
+    private static final byte[] WAKE_SENTINEL = new byte[0];
+
     private final byte[] cid;
     private final Arena arena;
     private final MemorySegment conn;
@@ -80,7 +85,7 @@ final class Http3Connection implements AutoCloseable {
     private final Future<?> ownerFuture;
     private volatile Thread ownerThread;
     private volatile boolean running = true;
-    private volatile boolean closed = false;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
     private boolean loggedEstablished;
 
     // H3-layer state, created once transport handshake completes.
@@ -182,7 +187,27 @@ final class Http3Connection implements AutoCloseable {
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "h3 conn driver crash", t);
         } finally {
-            close();
+            // Owner-thread cleanup. This is the ONLY site that frees the
+            // quiche conn + the shared arena. External close() only
+            // signals via `running=false` + WAKE_SENTINEL. Doing native
+            // cleanup here guarantees no FFM call is mid-flight when we
+            // free — earlier libmalloc freelist corruption crashes (task
+            // #79/#86) came from a foreign thread freeing conn/arena while
+            // the owner was still inside quiche_conn_send / stream_send.
+            closed.set(true);
+            for (H3BodyPipe pipe : bodyPipes.values()) {
+                try { pipe.signalEnd(); } catch (Throwable ignored) {}
+            }
+            bodyPipes.clear();
+            try {
+                quiche_h.quiche_conn_free(conn);
+            } catch (Throwable ignored) {
+            } finally {
+                try { arena.close(); } catch (Throwable ignored) {}
+                if (onClose != null) {
+                    try { onClose.run(); } catch (Throwable ignored) {}
+                }
+            }
         }
     }
 
@@ -205,6 +230,7 @@ final class Http3Connection implements AutoCloseable {
     private void drainIngress() throws IOException {
         byte[] datagram;
         while ((datagram = ingress.poll()) != null) {
+            if (datagram.length == 0) continue; // wake sentinel
             processRecv(datagram);
         }
     }
@@ -298,35 +324,24 @@ final class Http3Connection implements AutoCloseable {
 
     @Override
     public void close() {
-        synchronized (this) {
-            if (closed) return;
-            closed = true;
-        }
+        // Signal-only. Native cleanup (quiche_conn_free + arena.close) is
+        // done exclusively by the owner thread in run()'s finally block,
+        // so foreign-thread close() never races with an in-flight FFM
+        // call — the source of the earlier libmalloc freelist corruption.
+        if (!closed.compareAndSet(false, true)) return;
         running = false;
-        for (H3BodyPipe pipe : bodyPipes.values()) {
-            try { pipe.signalEnd(); } catch (Throwable ignored) {}
-        }
-        bodyPipes.clear();
-        Thread owner = ownerThread;
-        if (owner != null && Thread.currentThread() != owner) {
-            try {
-                ownerFuture.get(1, TimeUnit.SECONDS);
-            } catch (java.util.concurrent.CancellationException
-                     | InterruptedException
-                     | java.util.concurrent.ExecutionException
-                     | TimeoutException ignored) {
-                if (ignored instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-        }
+        ingress.offer(WAKE_SENTINEL); // unpark owner if in ingress.poll
+        if (Thread.currentThread() == ownerThread) return; // owner self-close
         try {
-            quiche_h.quiche_conn_free(conn);
-        } catch (Throwable ignored) {
-        } finally {
-            try { arena.close(); } catch (Throwable ignored) {}
-            if (onClose != null) onClose.run();
-        }
+            ownerFuture.get(3, TimeUnit.SECONDS);
+        } catch (TimeoutException te) {
+            Thread owner = ownerThread;
+            if (owner != null) owner.interrupt();
+            try { ownerFuture.get(1, TimeUnit.SECONDS); }
+            catch (Throwable ignored) {}
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } catch (Throwable ignored) {}
     }
 
     byte[] cid() { return cid; }
