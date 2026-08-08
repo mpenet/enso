@@ -21,6 +21,7 @@ public final class H3ConnectionException extends RuntimeException {
 
     public static final long H3_NO_ERROR = 0x100L;
     public static final long H3_GENERAL_PROTOCOL_ERROR = 0x101L;
+    public static final long H3_STREAM_CREATION_ERROR = 0x103L;
     public static final long H3_FRAME_UNEXPECTED = 0x105L;
     public static final long H3_FRAME_ERROR = 0x106L;
     public static final long H3_ID_ERROR = 0x108L;

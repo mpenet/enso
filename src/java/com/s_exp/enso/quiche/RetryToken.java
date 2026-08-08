@@ -68,32 +68,45 @@ public final class RetryToken {
      */
     public byte[] verify(byte[] token, InetSocketAddress peer) {
         if (token == null || token.length < HMAC_LEN + MAGIC.length + 1) return null;
-        byte[] body = new byte[token.length - HMAC_LEN];
-        System.arraycopy(token, HMAC_LEN, body, 0, body.length);
+        // Slice-based verify — no intermediate body[] / copyOfRange
+        // (task #145). HMAC over the tail via mac.update(off,len).
         byte[] tag;
         synchronized (mac) {
             mac.reset();
-            tag = mac.doFinal(body);
+            mac.update(token, HMAC_LEN, token.length - HMAC_LEN);
+            tag = mac.doFinal();
         }
-        // Constant-time compare — matters when a peer can control the
-        // token body via replay/probe attempts.
-        if (!MessageDigest.isEqual(java.util.Arrays.copyOfRange(token, 0, HMAC_LEN), tag)) {
-            return null;
-        }
-        int p = 0;
+        // Constant-time compare over the tag prefix without slicing.
+        if (!constantTimeEquals(token, 0, tag, 0, HMAC_LEN)) return null;
+        // Body starts at token[HMAC_LEN].
+        int p = HMAC_LEN;
+        int end = token.length;
         for (int i = 0; i < MAGIC.length; i++) {
-            if (body[p++] != MAGIC[i]) return null;
+            if (p >= end || token[p++] != MAGIC[i]) return null;
         }
-        byte[] addr = addressBytes(peer);
-        for (int i = 0; i < addr.length; i++) {
-            if (p >= body.length || body[p++] != addr[i]) return null;
+        // Peer IP: 4 bytes v4 or 16 bytes v6.
+        byte[] ip = peer.getAddress().getAddress();
+        for (int i = 0; i < ip.length; i++) {
+            if (p >= end || token[p++] != ip[i]) return null;
         }
-        if (p >= body.length) return null;
-        int odcidLen = body[p++] & 0xFF;
-        if (odcidLen > 20 || p + odcidLen != body.length) return null;
+        // Peer port: big-endian short.
+        if (p + 2 > end) return null;
+        int port = ((token[p] & 0xFF) << 8) | (token[p + 1] & 0xFF);
+        if (port != (peer.getPort() & 0xFFFF)) return null;
+        p += 2;
+        if (p >= end) return null;
+        int odcidLen = token[p++] & 0xFF;
+        if (odcidLen > 20 || p + odcidLen != end) return null;
         byte[] odcid = new byte[odcidLen];
-        System.arraycopy(body, p, odcid, 0, odcidLen);
+        System.arraycopy(token, p, odcid, 0, odcidLen);
         return odcid;
+    }
+
+    private static boolean constantTimeEquals(byte[] a, int aOff,
+                                              byte[] b, int bOff, int len) {
+        int diff = 0;
+        for (int i = 0; i < len; i++) diff |= (a[aOff + i] ^ b[bOff + i]);
+        return diff == 0;
     }
 
     private static byte[] addressBytes(InetSocketAddress addr) {

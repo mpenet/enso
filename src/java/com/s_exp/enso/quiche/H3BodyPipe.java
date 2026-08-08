@@ -64,15 +64,26 @@ public final class H3BodyPipe {
     }
 
     /**
-     * Blocking put that preserves interrupt state. Owner thread would
-     * only block if the ring is full — reader vthread is presumed to be
-     * consuming.
+     * Blocking put that must not drop the chunk on interrupt. Retries in
+     * a loop while restoring the interrupted status at the end — matches
+     * Guava's {@code Uninterruptibles.putUninterruptibly} pattern. Task
+     * #135 fixed the prior version that swallowed the chunk on the
+     * first InterruptedException, which stranded END_MARKER and hung
+     * worker vthreads reading the pipe.
      */
     private void putUninterruptibly(byte[] chunk) {
+        boolean interrupted = false;
         try {
-            queue.put(chunk);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            while (true) {
+                try {
+                    queue.put(chunk);
+                    return;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
         }
     }
 

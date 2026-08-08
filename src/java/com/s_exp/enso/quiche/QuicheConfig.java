@@ -72,10 +72,11 @@ public final class QuicheConfig implements AutoCloseable {
         Quiche.configSetInitialMaxStreamDataBidiRemote(ptr, perStream);
         Quiche.configSetInitialMaxStreamDataUni(ptr, perStream);
         Quiche.configSetInitialMaxStreamsBidi(ptr, cfg.http3InitialMaxStreamsBidi);
-        // Uni streams are only used for the peer's control + QPACK enc/dec
-        // (3 total). Advertise a small fixed cap; using the bidi knob here
-        // was a copy-paste bug (task #117).
-        Quiche.configSetInitialMaxStreamsUni(ptr, 3);
+        // Peer needs 3 uni streams (control + QPACK enc/dec) plus any
+        // grease uni streams they may open (RFC 9114 §7.2.8 clients MAY
+        // open one). Bumped from 3 to 8 to leave headroom without
+        // needing on-demand MAX_STREAMS_UNI updates (task #142).
+        Quiche.configSetInitialMaxStreamsUni(ptr, 8);
         Quiche.configSetDisableActiveMigration(ptr, true);
     }
 

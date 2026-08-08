@@ -73,15 +73,11 @@ public final class H3Session {
     }
 
     /**
-     * Open control + QPACK encoder + QPACK decoder uni streams and send
-     * our initial SETTINGS. Idempotent — safe to call every time the
-     * transport becomes writable in case earlier stream opens deferred.
-     */
-    /**
-     * Open our three server-uni streams + emit SETTINGS. Idempotent and
-     * retry-safe: if any sub-step short-writes (peer hasn't extended
-     * enough uni-stream credit yet), the completion flags stay unset and
-     * the next call resumes from the first still-pending step. Task #114.
+     * Open our three server-uni streams (control + QPACK enc/dec) and
+     * emit our initial SETTINGS. Idempotent and retry-safe: if any
+     * sub-step short-writes (peer hasn't extended enough uni-stream
+     * credit yet), the completion flags stay unset and the next call
+     * resumes from the first still-pending step. Task #114.
      */
     public void ensureInitialised() {
         if (initialised) return;
@@ -162,12 +158,10 @@ public final class H3Session {
     public void writeResponse(long streamId, List<String[]> headers,
                                byte[] body) {
         boolean hasBody = body != null && body.length > 0;
-        // Encode QPACK directly into the frame scratch — one alloc +
-        // memcpy dropped vs the old encode→byte[]→writeHeaders shape
-        // (task #123). Estimate size with a generous per-header budget;
-        // grows the scratch buf if the encoded fields overflow.
-        // Indexed loop over headers List — avoids the iterator alloc
-        // that `for (String[] hf : headers)` would trigger (task #129).
+        // Encode HEADERS + DATA into a single frame buffer + single
+        // writeAll. Fixes ordering hazard where a deferred HEADERS could
+        // reach quiche AFTER a fin=true DATA frame (task #131), and
+        // halves JNI hops per response (task #143).
         int hdrsBudget = 32;
         int hn = headers.size();
         for (int i = 0; i < hn; i++) {
@@ -175,15 +169,17 @@ public final class H3Session {
             hdrsBudget += 24 + (hf[0] == null ? 0 : hf[0].length())
                              + (hf[1] == null ? 0 : hf[1].length());
         }
-        frameBuf = ensureFrameCap(frameBuf, hdrsBudget);
-        writeAll(streamId,
-            H3FrameWriter.writeHeadersFrom(frameBuf, headers), !hasBody);
+        int total = hdrsBudget + (hasBody ? (16 + body.length) : 0);
+        frameBuf = ensureFrameCap(frameBuf, total);
+        frameBuf.clear();
+        H3FrameWriter.appendHeadersFrom(frameBuf, headers);
         if (hasBody) {
-            int needBody = 16 + body.length;
-            frameBuf = ensureFrameCap(frameBuf, needBody);
-            writeAll(streamId,
-                H3FrameWriter.writeData(frameBuf, body), true);
+            H3FrameWriter.appendData(frameBuf, body);
         }
+        frameBuf.flip();
+        // Single stream_send with fin=true — HEADERS + DATA travel
+        // together, FIN can't outrun HEADERS.
+        writeAll(streamId, frameBuf, true);
         releaseReader(requestStreams.remove(streamId));
     }
 
@@ -208,9 +204,24 @@ public final class H3Session {
             rs = new RequestStream(acquireReader());
             requestStreams.put(streamId, rs);
         }
-        rs.reader.feed(data, 0, data.length);
+        try {
+            rs.reader.feed(data, 0, data.length);
+        } catch (IllegalStateException e) {
+            releaseReader(requestStreams.remove(streamId));
+            throw new H3ConnectionException(
+                H3ConnectionException.H3_FRAME_ERROR,
+                "request-stream reader: " + e.getMessage());
+        }
         while (true) {
-            H3FrameReader.Frame f = rs.reader.poll();
+            H3FrameReader.Frame f;
+            try {
+                f = rs.reader.poll();
+            } catch (IllegalStateException e) {
+                releaseReader(requestStreams.remove(streamId));
+                throw new H3ConnectionException(
+                    H3ConnectionException.H3_FRAME_ERROR,
+                    "request-stream reader: " + e.getMessage());
+            }
             if (f == null) break;
             // RFC 9114 §7.2: control-only frames on a request stream MUST
             // be treated as H3_FRAME_UNEXPECTED at the connection level.
@@ -325,7 +336,7 @@ public final class H3Session {
                 // RFC 9114 §6.2.2: server-initiated push MUST NOT arrive on
                 // a client uni stream. Treat as H3_STREAM_CREATION_ERROR.
                 LOG.warning("h3 client-initiated PUSH stream id=" + streamId);
-                resetStream(streamId, 0x103); // H3_STREAM_CREATION_ERROR
+                resetStream(streamId, H3ConnectionException.H3_STREAM_CREATION_ERROR);
                 return;
             } else if (isGreaseType(type)) {
                 // RFC 9114 §7.2.8: grease types (0x1f * N + 0x21) MUST be
@@ -339,10 +350,10 @@ public final class H3Session {
                 LOG.info("h3 unknown peer uni stream type=0x"
                     + Long.toHexString(type) + " id=" + streamId);
                 try {
-                    com.s_exp.enso.quiche.Quiche.connStreamShutdown(
+                    Quiche.connStreamShutdown(
                         conn, streamId,
-                        com.s_exp.enso.quiche.Quiche.QUICHE_SHUTDOWN_READ,
-                        0x103);
+                        Quiche.QUICHE_SHUTDOWN_READ,
+                        H3ConnectionException.H3_STREAM_CREATION_ERROR);
                 } catch (Throwable ignored) {}
                 return;
             }
@@ -373,7 +384,13 @@ public final class H3Session {
      */
     private void handlePeerControlBytes(ByteBuffer buf) {
         if (peerControlReader == null) peerControlReader = new H3FrameReader();
-        peerControlReader.feed(buf);
+        try {
+            peerControlReader.feed(buf);
+        } catch (IllegalStateException e) {
+            throw new H3ConnectionException(
+                H3ConnectionException.H3_FRAME_ERROR,
+                "peer control-stream feed: " + e.getMessage());
+        }
         while (true) {
             H3FrameReader.Frame f;
             try {
@@ -411,10 +428,25 @@ public final class H3Session {
                     "frame type 0x" + Long.toHexString(f.type)
                         + " forbidden on control stream");
             } else if (f.type == H3FrameType.GOAWAY) {
-                // Peer signals graceful close. Track lowest ID + ignore
-                // any decoded value regression (RFC 9114 §5.2). We don't
-                // originate streams so no further action needed here.
+                // RFC 9114 §5.2: peer's GOAWAY IDs must be non-increasing
+                // across repeated frames. Increasing = H3_ID_ERROR at
+                // connection level (task #138).
+                long goawayId;
+                try {
+                    goawayId = Varint.decode(java.nio.ByteBuffer.wrap(f.payload));
+                } catch (Throwable ex) {
+                    throw new H3ConnectionException(
+                        H3ConnectionException.H3_FRAME_ERROR,
+                        "malformed GOAWAY payload: " + ex.getMessage());
+                }
+                if (sawPeerGoaway && goawayId > lastPeerGoawayId) {
+                    throw new H3ConnectionException(
+                        H3ConnectionException.H3_ID_ERROR,
+                        "GOAWAY ID increased: prev=" + lastPeerGoawayId
+                            + " new=" + goawayId);
+                }
                 sawPeerGoaway = true;
+                lastPeerGoawayId = goawayId;
             } else if (f.type == H3FrameType.MAX_PUSH_ID
                     || f.type == H3FrameType.CANCEL_PUSH) {
                 // We never enable push (SETTINGS_ENABLE_CONNECT_PROTOCOL
@@ -427,6 +459,7 @@ public final class H3Session {
     private H3FrameReader peerControlReader;
     private boolean sawPeerSettings;
     private boolean sawPeerGoaway;
+    private long lastPeerGoawayId;
 
     /**
      * RFC 9114 §7.2.8 grease-type check. Reserved unassigned stream types
@@ -512,8 +545,15 @@ public final class H3Session {
     }
 
     private void enqueuePending(long streamId, byte[] bytes, boolean fin) {
-        pendingByStream.computeIfAbsent(streamId, k -> new java.util.ArrayDeque<>())
-            .addLast(new Pending(bytes, fin));
+        // Init cap 2 — most streams only defer 1-2 items when flow
+        // control blocks. ArrayDeque default is 16 which allocates a
+        // ~128-byte Object[] per new stream (task #144).
+        java.util.Deque<Pending> q = pendingByStream.get(streamId);
+        if (q == null) {
+            q = new java.util.ArrayDeque<>(2);
+            pendingByStream.put(streamId, q);
+        }
+        q.addLast(new Pending(bytes, fin));
     }
 
     /**
@@ -579,6 +619,19 @@ public final class H3Session {
     /** Exposed so the driver loop can skip parking when writes await capacity. */
     public boolean hasPendingWrites() {
         return !pendingByStream.isEmpty();
+    }
+
+    /**
+     * Drop all session-level state for a stream. Called by the transport
+     * driver when quiche_conn_stream_recv reports a terminal error
+     * (STOP_SENDING / RESET_STREAM); without this, per-stream maps
+     * accumulate under peer reset-flood (task #140).
+     */
+    public void forgetStream(long streamId) {
+        releaseReader(requestStreams.remove(streamId));
+        pendingByStream.remove(streamId);
+        peerUniTypes.remove(streamId);
+        peerUniHeaderBuf.remove(streamId);
     }
 
     /**

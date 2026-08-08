@@ -51,8 +51,12 @@ public final class NBitString {
     public static String decode(ByteBuffer buf, int n, int firstByte) {
         boolean huffman = (firstByte & (1 << n)) != 0;
         long len = NBitInteger.decode(buf, n, firstByte);
-        if (len > Integer.MAX_VALUE) {
-            throw new IllegalStateException("string too long: " + len);
+        // Belt-and-suspenders: N-bit decode now guards against overflow
+        // (task #137), but if a future refactor loses that guard a
+        // negative len would silently produce NegativeArraySizeException
+        // that escapes the QPACK error path.
+        if (len < 0 || len > Integer.MAX_VALUE) {
+            throw new IllegalStateException("string length out of range: " + len);
         }
         int l = (int) len;
         // Non-huffman path: pull directly from the ByteBuffer's backing

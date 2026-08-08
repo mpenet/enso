@@ -67,7 +67,6 @@ final class Http3Connection implements AutoCloseable {
     private final String cidHex; // computed once; used only in log messages
     private final long conn;
     private final DatagramChannel out;
-    private final InetSocketAddress local;
     private final InetSocketAddress peer;
     private final byte[] localIp;
     private final int localPort;
@@ -108,7 +107,6 @@ final class Http3Connection implements AutoCloseable {
         this.cidHex = HexFormat.of().formatHex(cid);
         this.conn = conn;
         this.out = out;
-        this.local = local;
         this.peer = peer;
         this.localIp = local.getAddress().getAddress();
         this.localPort = local.getPort();
@@ -277,7 +275,16 @@ final class Http3Connection implements AutoCloseable {
                 recvBuf, STREAM_RECV_BUF, finOut, errOut);
             if (rc == Quiche.QUICHE_ERR_DONE) return;
             if (rc < 0) {
-                LOG.info("h3 stream_recv stream=" + streamId + " rc=" + rc);
+                LOG.info("h3 stream_recv stream=" + streamId
+                    + " rc=" + rc + " err=" + errOut[0]);
+                // Peer STOP_SENDING / RESET_STREAM / other terminal
+                // error. Clean the stream out of all owner-thread maps
+                // so entries don't accumulate under reset-flood (task
+                // #140). Owner-side pipe/reader release; H3Session
+                // scrubs its own maps.
+                H3BodyPipe pipe = bodyPipes.remove(streamId);
+                if (pipe != null) pipe.signalEnd();
+                session.forgetStream(streamId);
                 return;
             }
             boolean fin = finOut[0];
@@ -308,9 +315,27 @@ final class Http3Connection implements AutoCloseable {
                 || hn.equals("transfer-encoding") || hn.equals("upgrade")
                 || hn.equals("proxy-connection")) continue;
             Object v = e.getValue();
-            headersList.add(new String[]{hn, v == null ? "" : v.toString()});
+            String vs = v == null ? "" : v.toString();
+            // RFC 9114 §4.2: header names/values MUST NOT contain CR,
+            // LF, or NUL. A Ring app emitting these would allow a
+            // response-splitting-style abuse over h3. Drop the header +
+            // log (task #139).
+            if (containsCtl(hn) || containsCtl(vs)) {
+                LOG.warning("h3 dropping response header with CTL char: '"
+                    + hn + "' streamId=" + task.streamId);
+                continue;
+            }
+            headersList.add(new String[]{hn, vs});
         }
         session.writeResponse(task.streamId, headersList, task.body);
+    }
+
+    private static boolean containsCtl(String s) {
+        for (int i = 0, n = s.length(); i < n; i++) {
+            char c = s.charAt(i);
+            if (c == '\r' || c == '\n' || c == '\0') return true;
+        }
+        return false;
     }
 
     // Init cap sized for typical Ring app headers (:status + a handful of
@@ -332,16 +357,18 @@ final class Http3Connection implements AutoCloseable {
         return cached;
     }
 
+    // Codes 100..599 pre-formatted. Index 0 = "100", index 499 = "599".
+    // Anything outside falls back to Integer.toString (rare).
+    private static final int STATUS_MIN = 100;
     private static final String[] STATUS_STRINGS = buildStatusStrings();
     private static String[] buildStatusStrings() {
-        String[] s = new String[600];
-        for (int i = 100; i < s.length; i++) s[i] = Integer.toString(i);
+        String[] s = new String[500];
+        for (int i = 0; i < s.length; i++) s[i] = Integer.toString(STATUS_MIN + i);
         return s;
     }
     private static String statusString(int code) {
-        if (code >= 0 && code < STATUS_STRINGS.length && STATUS_STRINGS[code] != null) {
-            return STATUS_STRINGS[code];
-        }
+        int idx = code - STATUS_MIN;
+        if (idx >= 0 && idx < STATUS_STRINGS.length) return STATUS_STRINGS[idx];
         return Integer.toString(code);
     }
 
@@ -399,13 +426,30 @@ final class Http3Connection implements AutoCloseable {
     private final class SinkImpl implements H3Session.RequestSink {
         @Override
         public void onHeaders(long streamId, List<String[]> headers) {
+            // RFC 9114 §4.1: HEADERS may appear at most twice per stream
+            // — request headers first, optional trailers after body. Ring
+            // 1.x has no trailer surface, so we treat any second HEADERS
+            // as a protocol error and close the connection (task #134).
+            if (bodyPipes.containsKey(streamId)) {
+                throw new com.s_exp.enso.quiche.h3.H3ConnectionException(
+                    com.s_exp.enso.quiche.h3.H3ConnectionException.H3_FRAME_UNEXPECTED,
+                    "unexpected second HEADERS on request stream " + streamId);
+            }
             dispatchRequest(streamId, headers);
         }
 
         @Override
         public void onData(long streamId, byte[] chunk, boolean finalChunk) {
             H3BodyPipe pipe = bodyPipes.get(streamId);
-            if (pipe == null) return;
+            if (pipe == null) {
+                // RFC 9114 §4.1: first frame on a request stream MUST
+                // be HEADERS. DATA before dispatchRequest sets up the
+                // pipe = malformed sequence → connection error (task
+                // #136).
+                throw new com.s_exp.enso.quiche.h3.H3ConnectionException(
+                    com.s_exp.enso.quiche.h3.H3ConnectionException.H3_FRAME_UNEXPECTED,
+                    "DATA frame before HEADERS on request stream " + streamId);
+            }
             if (chunk.length > 0) {
                 if (!pipe.enqueueChecked(chunk)) {
                     LOG.info("h3 body size cap exceeded, stream=" + streamId);
@@ -433,7 +477,9 @@ final class Http3Connection implements AutoCloseable {
         for (String[] hf : headers) {
             if (!hf[0].isEmpty() && hf[0].charAt(0) != ':') regularCount++;
         }
-        Object[] regular = new Object[regularCount * 2];
+        // +1 slot for "host" — folded in directly so we can skip the
+        // extra .assoc call + its Object[] alloc (task #148).
+        Object[] regular = new Object[(regularCount + 1) * 2];
         int rp = 0;
         boolean seenRegular = false;
         for (String[] hf : headers) {
@@ -537,13 +583,11 @@ final class Http3Connection implements AutoCloseable {
         if (q < 0) { uri = path; query = null; }
         else { uri = path.substring(0, q); query = path.substring(q + 1); }
 
-        IPersistentMap hmap;
-        if (rp == 0) {
-            hmap = PersistentArrayMap.EMPTY;
-        } else {
-            hmap = (IPersistentMap) PersistentArrayMap.createAsIfByAssoc(regular);
-        }
-        hmap = hmap.assoc("host", authority == null ? "" : authority);
+        // Fold "host" pair directly into the pre-sized regular[] so we
+        // build the Ring header map in a single createAsIfByAssoc call.
+        regular[rp++] = "host";
+        regular[rp++] = authority == null ? "" : authority;
+        IPersistentMap hmap = (IPersistentMap) PersistentArrayMap.createAsIfByAssoc(regular);
 
         H3BodyPipe pipe = new H3BodyPipe(maxRequestBodyBytes);
         bodyPipes.put(streamId, pipe);
@@ -552,7 +596,7 @@ final class Http3Connection implements AutoCloseable {
             method, uri, query, "HTTP/3.0",
             hmap,
             pipe.inputStream(),
-            peer.getAddress(), local.getPort());
+            peer.getAddress(), localPort);
 
         Thread.ofVirtual()
             .name("enso-h3-worker-" + streamId)

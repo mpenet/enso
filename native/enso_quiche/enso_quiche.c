@@ -11,9 +11,11 @@
  *   - All pointers cross the boundary as jlong (raw address). Java side
  *     treats them opaquely.
  *   - Byte arrays use GetByteArrayElements. HotSpot avoids the copy when
- *     the JVM can pin the underlying heap array; if profiling later shows
- *     copies dominate, switch the hot paths to GetPrimitiveArrayCritical
- *     (constraint: no JNI calls inside the critical section).
+ *     the JVM can pin the underlying heap array. GetPrimitiveArrayCritical
+ *     is NOT viable here because every downcall wraps a real quiche
+ *     function call, which may itself invoke stdlib routines — the
+ *     critical section rule (no JNI, no blocking, no lock-taking) is
+ *     hard to guarantee across those.
  *   - Buffers we only read → JNI_ABORT on release (skip copy-back).
  *     Buffers we write into for the caller → commit (0).
  *   - Sockaddrs are passed as (byte[] ip, int port). C builds the real
@@ -359,7 +361,7 @@ Java_com_s_1exp_enso_quiche_Quiche_connRecv(
     struct sockaddr_storage from, to;
     socklen_t fromLen = build_sockaddr(env, fromIp, fromPort, &from);
     socklen_t toLen = build_sockaddr(env, toIp, toPort, &to);
-    if (fromLen == 0 || toLen == 0) return -1; /* QUICHE_ERR_INVALID_STATE */
+    if (fromLen == 0 || toLen == 0) return -6; /* QUICHE_ERR_INVALID_STATE (-1 = DONE would silent-drop) */
     quiche_recv_info info = {
         .from = (struct sockaddr *)&from, .from_len = fromLen,
         .to = (struct sockaddr *)&to, .to_len = toLen,

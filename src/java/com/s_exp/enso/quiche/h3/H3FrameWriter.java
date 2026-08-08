@@ -33,28 +33,50 @@ public final class H3FrameWriter {
      * actual QPACK payload length after encoding. Wire overhead ≤ 7
      * bytes per HEADERS frame — trivial vs eliminating one allocation +
      * memcpy per response (task #123).
+     *
+     * <p>Note: clears {@code out} before writing and flips at the end.
+     * Callers that want to concatenate a DATA frame after should use
+     * {@link #appendHeadersFrom(ByteBuffer, Iterable)} +
+     * {@link #appendData(ByteBuffer, byte[])} instead.
      */
     public static ByteBuffer writeHeadersFrom(
             ByteBuffer out, Iterable<String[]> headers) {
         out.clear();
-        int prefixStart = out.position();
-        // HEADERS type = 0x01 → single-byte varint.
+        appendHeadersFrom(out, headers);
+        out.flip();
+        return out;
+    }
+
+    /**
+     * Append a HEADERS frame at {@code out}'s current position. Does NOT
+     * clear or flip — used to concatenate HEADERS + DATA into a single
+     * buffer for one stream_send (task #143). Same fixed-8-byte length
+     * back-patch as {@link #writeHeadersFrom}.
+     */
+    public static void appendHeadersFrom(
+            ByteBuffer out, Iterable<String[]> headers) {
         out.put((byte) H3FrameType.HEADERS);
         int lengthPos = out.position();
-        // Reserve 8 bytes for the length varint (fixed 8-byte form).
         out.position(lengthPos + 8);
         int bodyStart = out.position();
         com.s_exp.enso.quiche.qpack.QpackFieldSection.encodeInto(out, headers);
         int bodyLen = out.position() - bodyStart;
         Varint.encodeFixed8(out, lengthPos, bodyLen);
-        out.flip();
-        out.position(prefixStart);
-        return out;
     }
 
     /** Write a DATA frame into {@code out}. Returns flipped buffer. */
     public static ByteBuffer writeData(ByteBuffer out, byte[] data) {
         return writeFrame(out, H3FrameType.DATA, data, 0, data.length);
+    }
+
+    /**
+     * Append a DATA frame at {@code out}'s current position. Does NOT
+     * clear or flip. Companion to {@link #appendHeadersFrom}.
+     */
+    public static void appendData(ByteBuffer out, byte[] data) {
+        Varint.encode(out, H3FrameType.DATA);
+        Varint.encode(out, data.length);
+        out.put(data);
     }
 
     private static ByteBuffer writeFrame(ByteBuffer out, long type,

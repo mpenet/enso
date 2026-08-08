@@ -68,14 +68,23 @@ public final class NBitInteger {
         long mask = (1L << n) - 1;
         long value = firstByte & mask;
         if (value < mask) return value;
-        // Continuation. Guard BEFORE the shift so a 7-bit chunk left-shifted
-        // by 63 can never truncate its high bits into the sign position.
+        // Continuation loop. Guard BEFORE the shift so a 7-bit chunk
+        // left-shifted by 63 can never truncate its high bits into the
+        // sign position. At m=63 only the lowest bit of the chunk can
+        // fit — any wider chunk is overflow. Task #137.
         long m = 0;
         int b;
         do {
             if (m >= 64) throw new IllegalStateException("N-bit int overflow");
             b = buf.get() & 0xFF;
-            value += ((long) (b & 0x7F)) << m;
+            int chunk = b & 0x7F;
+            if (m == 63 && chunk > 1) {
+                throw new IllegalStateException("N-bit int overflow");
+            }
+            value += ((long) chunk) << m;
+            if (value < 0) {
+                throw new IllegalStateException("N-bit int overflow");
+            }
             m += 7;
         } while ((b & 0x80) != 0);
         return value;

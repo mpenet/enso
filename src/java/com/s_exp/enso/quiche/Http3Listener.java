@@ -265,10 +265,13 @@ public final class Http3Listener implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
+        // Signal demux to stop accepting, but leave the channel OPEN so
+        // per-connection driver threads can flush their graceful
+        // CONNECTION_CLOSE datagrams to peers on the way down (RFC 9114
+        // §5.1). If we close the channel here, out.send in the driver
+        // finally throws AsynchronousCloseException and peers never see
+        // H3_NO_ERROR — task #133.
         running = false;
-        if (channel != null) {
-            try { channel.close(); } catch (IOException ignored) {}
-        }
         for (Http3Connection c : conns.values()) {
             try { c.close(); } catch (Throwable ignored) {}
         }
@@ -285,6 +288,12 @@ public final class Http3Listener implements AutoCloseable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+        // Now safe to close the channel — all conn drivers have flushed
+        // their final datagrams. Closing here also unblocks the demux
+        // vthread (channel.receive throws AsynchronousCloseException).
+        if (channel != null) {
+            try { channel.close(); } catch (IOException ignored) {}
         }
         if (quicheConfig != null) {
             try { quicheConfig.close(); } catch (Throwable ignored) {}
