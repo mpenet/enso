@@ -3,10 +3,9 @@ package com.s_exp.enso.quiche.h3;
 import com.s_exp.enso.quiche.Quiche;
 import com.s_exp.enso.quiche.qpack.QpackException;
 import com.s_exp.enso.quiche.qpack.QpackFieldSection;
+import com.s_exp.enso.util.Long2ObjectHashMap;
 import java.nio.ByteBuffer;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.logging.Logger;
 
 /**
@@ -54,7 +53,7 @@ public final class H3Session {
     private long qpackDecStreamId = -1;
     private long nextServerUniId = 0x03; // server uni starts at 3.
     // Per-request state; keyed by client-bidi stream id.
-    private final Map<Long, RequestStream> requestStreams = new HashMap<>();
+    private final Long2ObjectHashMap<RequestStream> requestStreams = new Long2ObjectHashMap<>();
     // First-seen peer stream IDs for the three singleton uni-stream types.
     // RFC 9114 §6.2.1: duplicates MUST close the connection with
     // H3_STREAM_CREATION_ERROR (task #100 wires the connection close;
@@ -64,9 +63,9 @@ public final class H3Session {
     private long peerQpackDecStreamId = -1;
     // Peer uni streams that we've identified. Value = stream type varint.
     // Streams whose type hasn't arrived yet aren't in this map.
-    private final Map<Long, Long> peerUniTypes = new HashMap<>();
+    private final Long2ObjectHashMap<Long> peerUniTypes = new Long2ObjectHashMap<>();
     // Peer uni streams whose type varint is only partially known.
-    private final Map<Long, ByteBuffer> peerUniHeaderBuf = new HashMap<>();
+    private final Long2ObjectHashMap<ByteBuffer> peerUniHeaderBuf = new Long2ObjectHashMap<>();
     private boolean initialised = false;
 
     public H3Session(long conn) {
@@ -162,15 +161,19 @@ public final class H3Session {
      */
     public void writeResponse(long streamId, List<String[]> headers,
                                byte[] body) {
-        byte[] hdrs = QpackFieldSection.encode(headers, qpackScratch);
         boolean hasBody = body != null && body.length > 0;
-        // Reuse a single per-session scratch ByteBuffer for the frame
-        // envelope. Grow if a response's headers or body exceed current
-        // capacity. Owner-thread only; no sync.
-        int needHdrs = 16 + hdrs.length; // frame overhead + payload
-        frameBuf = ensureFrameCap(frameBuf, needHdrs);
+        // Encode QPACK directly into the frame scratch — one alloc +
+        // memcpy dropped vs the old encode→byte[]→writeHeaders shape
+        // (task #123). Estimate size with a generous per-header budget;
+        // grows the scratch buf if the encoded fields overflow.
+        int hdrsBudget = 32;
+        for (String[] hf : headers) {
+            hdrsBudget += 24 + (hf[0] == null ? 0 : hf[0].length())
+                             + (hf[1] == null ? 0 : hf[1].length());
+        }
+        frameBuf = ensureFrameCap(frameBuf, hdrsBudget);
         writeAll(streamId,
-            H3FrameWriter.writeHeaders(frameBuf, hdrs), !hasBody);
+            H3FrameWriter.writeHeadersFrom(frameBuf, headers), !hasBody);
         if (hasBody) {
             int needBody = 16 + body.length;
             frameBuf = ensureFrameCap(frameBuf, needBody);
@@ -182,11 +185,9 @@ public final class H3Session {
 
     // Response frame scratch — grows to largest response seen on this
     // conn. Bounded implicitly by the connection's overall payload sizes.
+    // QPACK now encodes directly into this buffer (task #123), so a
+    // separate qpackScratch is no longer needed.
     private ByteBuffer frameBuf = ByteBuffer.allocate(4096);
-    // QPACK encoder scratch. QpackFieldSection.encode(headers, scratch)
-    // writes here then returns a freshly-allocated byte[] copy for the
-    // frame body; scratch itself is reused across responses.
-    private final ByteBuffer qpackScratch = ByteBuffer.allocate(1024);
 
     private static ByteBuffer ensureFrameCap(ByteBuffer buf, int need) {
         if (buf.capacity() >= need) return buf;
@@ -203,7 +204,7 @@ public final class H3Session {
             rs = new RequestStream(acquireReader());
             requestStreams.put(streamId, rs);
         }
-        rs.reader.feed(ByteBuffer.wrap(data));
+        rs.reader.feed(data, 0, data.length);
         while (true) {
             H3FrameReader.Frame f = rs.reader.poll();
             if (f == null) break;
@@ -518,11 +519,11 @@ public final class H3Session {
      */
     public void drainPendingWrites() {
         if (pendingByStream.isEmpty()) return;
-        var it = pendingByStream.entrySet().iterator();
-        while (it.hasNext()) {
-            var e = it.next();
-            long streamId = e.getKey();
-            var q = e.getValue();
+        // Two-pass: forEach mutates queue values in place, then we walk
+        // pendingRemovals to drop empty entries. Long2ObjectHashMap
+        // doesn't support removal during iteration.
+        pendingRemovalsSize = 0;
+        pendingByStream.forEach((streamId, q) -> {
             while (!q.isEmpty()) {
                 Pending p = q.peekFirst();
                 long cap = Quiche.connStreamCapacity(conn, streamId);
@@ -538,9 +539,21 @@ public final class H3Session {
                 p.len -= (int) rc;
                 if (p.len == 0) q.pollFirst();
             }
-            if (q.isEmpty()) it.remove();
+            if (q.isEmpty()) {
+                if (pendingRemovalsSize == pendingRemovals.length) {
+                    pendingRemovals = java.util.Arrays.copyOf(
+                        pendingRemovals, pendingRemovals.length * 2);
+                }
+                pendingRemovals[pendingRemovalsSize++] = streamId;
+            }
+        });
+        for (int i = 0; i < pendingRemovalsSize; i++) {
+            pendingByStream.remove(pendingRemovals[i]);
         }
     }
+
+    private long[] pendingRemovals = new long[8];
+    private int pendingRemovalsSize;
 
     /** Per-stream deferred write: what quiche's flow control blocked. */
     private static final class Pending {
@@ -556,8 +569,8 @@ public final class H3Session {
         }
     }
 
-    private final java.util.Map<Long, java.util.Deque<Pending>> pendingByStream =
-        new java.util.HashMap<>();
+    private final Long2ObjectHashMap<java.util.Deque<Pending>> pendingByStream =
+        new Long2ObjectHashMap<>();
 
     /** Exposed so the driver loop can skip parking when writes await capacity. */
     public boolean hasPendingWrites() {

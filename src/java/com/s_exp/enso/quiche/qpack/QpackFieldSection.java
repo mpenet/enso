@@ -157,6 +157,38 @@ public final class QpackFieldSection {
     }
 
     /**
+     * Encode QPACK bytes directly into {@code out} at its current position
+     * without allocating an intermediate byte[]. Returns the number of
+     * bytes written. Used by {@link com.s_exp.enso.quiche.h3.H3FrameWriter}
+     * to fold header encoding into the outbound frame envelope (task
+     * #123).
+     */
+    public static int encodeInto(ByteBuffer out, Iterable<String[]> headers) {
+        int start = out.position();
+        // Prefix: RIC = 0, S = 0, Delta Base = 0 → two 0x00 bytes.
+        out.put((byte) 0x00);
+        out.put((byte) 0x00);
+        for (String[] hf : headers) {
+            String name = hf[0].toLowerCase();
+            String value = hf[1] == null ? "" : hf[1];
+            int exact = QpackStaticTable.findExact(name, value);
+            if (exact >= 0) {
+                NBitInteger.encode(out, 6, 0xC0, exact);
+                continue;
+            }
+            int nameIdx = QpackStaticTable.findName(name);
+            if (nameIdx >= 0) {
+                NBitInteger.encode(out, 4, 0x50, nameIdx);
+                NBitString.encode(out, 7, 0, value, shouldHuffman(value));
+                continue;
+            }
+            NBitString.encode(out, 3, 0x20, name, shouldHuffman(name));
+            NBitString.encode(out, 7, 0, value, shouldHuffman(value));
+        }
+        return out.position() - start;
+    }
+
+    /**
      * Encode a list of {@code {name, value}} pairs into a QPACK field
      * section using {@code scratch} as the working buffer. Always emits a
      * zero-prefix (RIC=0, Base=0) since we don't insert into any dynamic

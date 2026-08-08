@@ -26,6 +26,19 @@ public final class Varint {
         throw new IllegalArgumentException("varint too big: " + v);
     }
 
+    /**
+     * Force-encode {@code v} in exactly 8 bytes at absolute position
+     * {@code pos}. Used by writers that need a fixed-size length prefix
+     * they can back-patch after producing the payload — RFC 9000 §16
+     * permits non-minimal encodings on the write side. Costs at most
+     * 7 extra wire bytes vs the minimal form.
+     */
+    public static void encodeFixed8(ByteBuffer buf, int pos, long v) {
+        if (v > MAX_VALUE) throw new IllegalArgumentException("varint too big: " + v);
+        if (v < 0) throw new IllegalArgumentException("negative varint: " + v);
+        buf.putLong(pos, v | 0xC000000000000000L);
+    }
+
     /** Encode {@code v} into {@code buf} at the current position. */
     public static void encode(ByteBuffer buf, long v) {
         int n = size(v);

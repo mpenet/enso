@@ -25,6 +25,33 @@ public final class H3FrameWriter {
         return writeFrame(out, H3FrameType.HEADERS, encoded, 0, encoded.length);
     }
 
+    /**
+     * Encode QPACK headers directly into {@code out} as a HEADERS frame,
+     * avoiding the intermediate byte[] that {@link #writeHeaders(ByteBuffer, byte[])}
+     * would need. Uses a fixed 9-byte prefix (1-byte HEADERS type varint
+     * + 8-byte fixed length varint) that gets back-patched with the
+     * actual QPACK payload length after encoding. Wire overhead ≤ 7
+     * bytes per HEADERS frame — trivial vs eliminating one allocation +
+     * memcpy per response (task #123).
+     */
+    public static ByteBuffer writeHeadersFrom(
+            ByteBuffer out, Iterable<String[]> headers) {
+        out.clear();
+        int prefixStart = out.position();
+        // HEADERS type = 0x01 → single-byte varint.
+        out.put((byte) H3FrameType.HEADERS);
+        int lengthPos = out.position();
+        // Reserve 8 bytes for the length varint (fixed 8-byte form).
+        out.position(lengthPos + 8);
+        int bodyStart = out.position();
+        com.s_exp.enso.quiche.qpack.QpackFieldSection.encodeInto(out, headers);
+        int bodyLen = out.position() - bodyStart;
+        Varint.encodeFixed8(out, lengthPos, bodyLen);
+        out.flip();
+        out.position(prefixStart);
+        return out;
+    }
+
     /** Write a DATA frame into {@code out}. Returns flipped buffer. */
     public static ByteBuffer writeData(ByteBuffer out, byte[] data) {
         return writeFrame(out, H3FrameType.DATA, data, 0, data.length);

@@ -89,6 +89,17 @@ public final class H3FrameReader {
         drain();
     }
 
+    /**
+     * byte[]-input overload that avoids the {@link ByteBuffer#wrap} the
+     * {@link ByteBuffer} variant would need — task #125 alloc profile
+     * showed HeapByteBuffer wrappers accumulating on the hot per-recv
+     * path.
+     */
+    public void feed(byte[] data, int off, int len) {
+        appendTo(data, off, len);
+        drain();
+    }
+
     /** Poll the next complete frame or DATA chunk, or {@code null}. */
     public Frame poll() { return ready.pollFirst(); }
 
@@ -110,11 +121,17 @@ public final class H3FrameReader {
 
     private void appendTo(ByteBuffer more) {
         int need = more.remaining();
+        ensureCapacity(need);
+        buf.put(more);
+    }
+
+    private void appendTo(byte[] data, int off, int len) {
+        ensureCapacity(len);
+        buf.put(data, off, len);
+    }
+
+    private void ensureCapacity(int need) {
         if (buf.remaining() < need) {
-            // Grow-by-doubling but cap at maxAccum + a small varint prefix
-            // budget. Anything larger would already have thrown at the
-            // frame-length check; refusing to grow past the cap gives an
-            // early, clean IllegalStateException instead of a native OOM.
             long target = Math.max((long) buf.capacity() * 2L,
                 (long) buf.position() + (long) need);
             long ceiling = (long) maxAccum + 16L;
@@ -130,7 +147,6 @@ public final class H3FrameReader {
             bigger.put(buf);
             buf = bigger;
         }
-        buf.put(more);
     }
 
     private void drain() {

@@ -6,20 +6,20 @@ import com.s_exp.enso.Request;
 import com.s_exp.enso.Response;
 import com.s_exp.enso.RingHandler;
 import com.s_exp.enso.quiche.h3.H3Session;
+import com.s_exp.enso.util.Long2ObjectHashMap;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -76,8 +76,11 @@ final class Http3Connection implements AutoCloseable {
     private final long maxRequestBodyBytes;
     private final Runnable onClose;
 
-    private final BlockingQueue<byte[]> ingress = new LinkedBlockingQueue<>(INGRESS_CAPACITY);
-    private final BlockingQueue<ResponseTask> outbound = new LinkedBlockingQueue<>(OUTBOUND_CAPACITY);
+    // ArrayBlockingQueue uses a single backing ring + one condition var
+    // rather than allocating a Node per put — task #124 alloc profile
+    // showed LinkedBlockingQueue$Node in the top 15.
+    private final BlockingQueue<byte[]> ingress = new ArrayBlockingQueue<>(INGRESS_CAPACITY);
+    private final BlockingQueue<ResponseTask> outbound = new ArrayBlockingQueue<>(OUTBOUND_CAPACITY);
 
     private final Future<?> ownerFuture;
     private volatile Thread ownerThread;
@@ -88,8 +91,10 @@ final class Http3Connection implements AutoCloseable {
     // H3-layer state, created once transport handshake completes.
     private H3Session session;
     // Per-stream request body pipes (owner-thread only, no concurrent
-    // mutation).
-    private final HashMap<Long, H3BodyPipe> bodyPipes = new HashMap<>();
+    // mutation). Primitive-long-keyed to avoid Long autoboxing on
+    // put/get/remove — task #122 alloc profile identified this as a
+    // top boxed-primitive source.
+    private final Long2ObjectHashMap<H3BodyPipe> bodyPipes = new Long2ObjectHashMap<>();
 
     Http3Connection(byte[] cid, long conn,
                     DatagramChannel out,
@@ -176,9 +181,9 @@ final class Http3Connection implements AutoCloseable {
             // `running=false` + WAKE_SENTINEL. Guarantees no JNI call is
             // in-flight when we free.
             closed.set(true);
-            for (H3BodyPipe pipe : bodyPipes.values()) {
+            bodyPipes.forEach((k, pipe) -> {
                 try { pipe.signalEnd(); } catch (Throwable ignored) {}
-            }
+            });
             bodyPipes.clear();
             // RFC 9114 §5.1 graceful close: if we haven't already been
             // closed (peer close, protocol error, timeout), emit a
@@ -290,17 +295,50 @@ final class Http3Connection implements AutoCloseable {
     }
 
     private void sendResponse(ResponseTask task) {
-        java.util.ArrayList<String[]> headers = new java.util.ArrayList<>();
-        headers.add(new String[]{":status", Integer.toString(task.status)});
+        // Reusable owner-only headers list; cleared each call → no
+        // ArrayList alloc per response (task #126).
+        headersList.clear();
+        String statusStr = statusString(task.status);
+        headersList.add(statusPair(statusStr));
         for (Map.Entry<?, ?> e : task.headers.entrySet()) {
             String hn = String.valueOf(e.getKey()).toLowerCase();
             if (hn.equals("connection") || hn.equals("keep-alive")
                 || hn.equals("transfer-encoding") || hn.equals("upgrade")
                 || hn.equals("proxy-connection")) continue;
             Object v = e.getValue();
-            headers.add(new String[]{hn, v == null ? "" : v.toString()});
+            headersList.add(new String[]{hn, v == null ? "" : v.toString()});
         }
-        session.writeResponse(task.streamId, headers, task.body);
+        session.writeResponse(task.streamId, headersList, task.body);
+    }
+
+    private final java.util.ArrayList<String[]> headersList =
+        new java.util.ArrayList<>(16);
+
+    // Cached ":status <N>" pair for common status codes. First-request
+    // path pays a lookup miss + one alloc; every subsequent response w/
+    // the same status reuses the cached String[] instance.
+    private final java.util.HashMap<String, String[]> statusPairCache =
+        new java.util.HashMap<>();
+
+    private String[] statusPair(String statusStr) {
+        String[] cached = statusPairCache.get(statusStr);
+        if (cached != null) return cached;
+        cached = new String[]{":status", statusStr};
+        statusPairCache.put(statusStr, cached);
+        return cached;
+    }
+
+    private static final String[] STATUS_STRINGS = buildStatusStrings();
+    private static String[] buildStatusStrings() {
+        String[] s = new String[600];
+        for (int i = 100; i < s.length; i++) s[i] = Integer.toString(i);
+        return s;
+    }
+    private static String statusString(int code) {
+        if (code >= 0 && code < STATUS_STRINGS.length && STATUS_STRINGS[code] != null) {
+            return STATUS_STRINGS[code];
+        }
+        return Integer.toString(code);
     }
 
     private void processRecv(byte[] datagram) throws IOException {
