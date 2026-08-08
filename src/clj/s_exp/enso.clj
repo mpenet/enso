@@ -1,9 +1,10 @@
 (ns s-exp.enso
   "Ring adapter backed by a zero-dependency Java core: blocking I/O on virtual
   threads, one virtual thread per connection."
-  (:import (com.s_exp.enso ChunkedWriter Config EnsoServer Response
-                           RingErrorHandler RingHandler StreamingBody
-                           WebSocketListener WebSocketSocket)))
+  (:import (com.s_exp.enso EnsoServer)
+           (com.s_exp.enso.api ChunkedWriter Config Response
+                               RingErrorHandler RingHandler StreamingBody)
+           (com.s_exp.enso.websocket WebSocketListener WebSocketSocket)))
 
 (set! *warn-on-reflection* true)
 
@@ -211,7 +212,7 @@
     `min(idle, remaining-request-budget)`. Set both to sensible values.
 
   Errors are routed through `java.util.logging` under the loggers
-  `com.s_exp.enso.HttpConnection` and `com.s_exp.enso.EnsoServer`. Wire a
+  `com.s_exp.enso.http1.HttpConnection` and `com.s_exp.enso.EnsoServer`. Wire a
   handler / SLF4J bridge in your application to redirect them."
   (^EnsoServer [handler]
    (run-server handler nil))

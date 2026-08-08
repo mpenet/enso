@@ -111,7 +111,7 @@ Limits (tune only if you know why):
     :on-close   (fn [socket code reason] ...)}})
 ```
 
-`socket` is a `com.s_exp.enso.WebSocketSocket`. Text and binary messages, ping/pong (auto-pong on ping unless `:on-ping` is provided), close handshake.
+`socket` is a `com.s_exp.enso.websocket.WebSocketSocket`. Text and binary messages, ping/pong (auto-pong on ping unless `:on-ping` is provided), close handshake.
 
 ## Performance
 

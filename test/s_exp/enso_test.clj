@@ -3,7 +3,7 @@
             [clojure.string :as str]
             [ring.core.protocols]
             [s-exp.enso :as enso])
-  (:import (com.s_exp.enso WebSocketSocket)
+  (:import (com.s_exp.enso.websocket WebSocketSocket)
            (java.io ByteArrayInputStream IOException)
            (java.net Socket SocketException URI)
            (java.net.http HttpClient WebSocket WebSocket$Builder WebSocket$Listener)
@@ -202,12 +202,12 @@
 
 (deftest hpack-decode-c-3-1
   ;; RFC 7541 C.3.1 — first request in the sequence, no Huffman.
-  (let [^com.s_exp.enso.Hpack$Decoder dec (com.s_exp.enso.Hpack$Decoder. 4096)
+  (let [^com.s_exp.enso.http2.Hpack$Decoder dec (com.s_exp.enso.http2.Hpack$Decoder. 4096)
         ^bytes block (hex->bytes "8286 8441 0f77 7777 2e65 7861 6d70 6c65 2e63 6f6d")
         ^java.util.List fields (.decode dec block (int 0) (int (alength block)))]
     (is (= 4 (.size fields)))
     (let [entries (map (fn [i]
-                         (let [^com.s_exp.enso.Hpack$HeaderField hf (.get fields (int i))]
+                         (let [^com.s_exp.enso.http2.Hpack$HeaderField hf (.get fields (int i))]
                            [(.name hf) (.value hf)]))
                        (range (.size fields)))]
       (is (= [[":method" "GET"]
@@ -219,7 +219,7 @@
 (deftest hpack-huffman-decode-c-4-1
   ;; RFC 7541 C.4.1 — Huffman-encoded "www.example.com" (from the same request).
   (let [^bytes encoded (hex->bytes "f1e3 c2e5 f23a 6ba0 ab90 f4ff")
-        ^bytes decoded (com.s_exp.enso.HpackHuffman/decode encoded (int 0) (int (alength encoded)))]
+        ^bytes decoded (com.s_exp.enso.http2.HpackHuffman/decode encoded (int 0) (int (alength encoded)))]
     (is (= "www.example.com" (String. decoded StandardCharsets/UTF_8)))))
 
 (deftest hpack-integer-round-trip
@@ -229,15 +229,15 @@
            [1337 5 "1f9a0a"]
            [42 8 "2a"]]]
     (let [buf (byte-array 8)
-          n (com.s_exp.enso.Hpack/encodeInteger buf 0 prefix 0 v)
+          n (com.s_exp.enso.http2.Hpack/encodeInteger buf 0 prefix 0 v)
           hex (apply str (map #(format "%02x" (bit-and % 0xff))
                               (java.util.Arrays/copyOf buf n)))]
       (is (= expected-hex hex) (str "encode value=" v " prefix=" prefix)))
     ;; And round-trip through decode.
     (let [buf (byte-array 8)
-          n (com.s_exp.enso.Hpack/encodeInteger buf 0 prefix 0 v)
-          cursor (com.s_exp.enso.Hpack$Cursor. buf 0 n)
-          out (com.s_exp.enso.Hpack/decodeInteger cursor prefix)]
+          n (com.s_exp.enso.http2.Hpack/encodeInteger buf 0 prefix 0 v)
+          cursor (com.s_exp.enso.http2.Hpack$Cursor. buf 0 n)
+          out (com.s_exp.enso.http2.Hpack/decodeInteger cursor prefix)]
       (is (= v out) (str "roundtrip value=" v " prefix=" prefix)))))
 
 (deftest response-header-crlf-rejected
@@ -1150,14 +1150,14 @@
     (is (nil? (.verify t2 m1 peer)) "cross-instance verify must fail")))
 
 (deftest h3-body-pipe-basic
-  (let [pipe (com.s_exp.enso.quiche.H3BodyPipe.)
+  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe.)
         in (.inputStream pipe)]
     (.enqueue pipe (.getBytes "hello" StandardCharsets/UTF_8))
     (.signalEnd pipe)
     (is (= "hello" (slurp in)))))
 
 (deftest h3-body-pipe-multi-chunk
-  (let [pipe (com.s_exp.enso.quiche.H3BodyPipe.)
+  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe.)
         in (.inputStream pipe)]
     (.enqueue pipe (.getBytes "aaa" StandardCharsets/UTF_8))
     (.enqueue pipe (.getBytes "bbb" StandardCharsets/UTF_8))
@@ -1166,28 +1166,28 @@
     (is (= "aaabbbccc" (slurp in)))))
 
 (deftest h3-body-pipe-eof-only
-  (let [pipe (com.s_exp.enso.quiche.H3BodyPipe.)
+  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe.)
         in (.inputStream pipe)]
     (.signalEnd pipe)
     (is (= "" (slurp in)) "empty body streams to empty string")))
 
 (deftest h3-body-pipe-cap-accepts-below-limit
-  (let [pipe (com.s_exp.enso.quiche.H3BodyPipe. 100)]
+  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe. 100)]
     (is (.enqueueChecked pipe (byte-array 40)))
     (is (.enqueueChecked pipe (byte-array 40)))
     (is (.enqueueChecked pipe (byte-array 20)))))
 
 (deftest h3-body-pipe-cap-rejects-above-limit
-  (let [pipe (com.s_exp.enso.quiche.H3BodyPipe. 100)]
+  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe. 100)]
     (is (.enqueueChecked pipe (byte-array 90)))
     (is (not (.enqueueChecked pipe (byte-array 20))) "20-byte push over 100 cap rejected")))
 
 (deftest h3-body-pipe-cap-disabled-with-zero
-  (let [pipe (com.s_exp.enso.quiche.H3BodyPipe. 0)]
+  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe. 0)]
     (is (.enqueueChecked pipe (byte-array 1000000)) "cap=0 disables enforcement")))
 
 (deftest h3-body-pipe-read-single-byte
-  (let [pipe (com.s_exp.enso.quiche.H3BodyPipe.)
+  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe.)
         in (.inputStream pipe)]
     (.enqueue pipe (byte-array [(byte 65) (byte 66)]))
     (.signalEnd pipe)
@@ -1208,32 +1208,32 @@
   ;; Config.build() throws directly — no server startup involved so no
   ;; risk of a shutdown hang.
   (is (thrown-with-msg? IllegalArgumentException #"http3CertPath"
-                        (-> (com.s_exp.enso.Config/builder)
+                        (-> (com.s_exp.enso.api.Config/builder)
                             (.http3 true)
                             (.build)))
       "http3 without cert path throws"))
 
 (deftest h3-config-validates-udp-payload-size
   (is (thrown-with-msg? IllegalArgumentException #"http3MaxUdpPayloadSize"
-                        (-> (com.s_exp.enso.Config/builder)
+                        (-> (com.s_exp.enso.api.Config/builder)
                             (.http3MaxUdpPayloadSize 500)
                             (.build)))
       "below 1200 rejected")
   (is (thrown-with-msg? IllegalArgumentException #"http3MaxUdpPayloadSize"
-                        (-> (com.s_exp.enso.Config/builder)
+                        (-> (com.s_exp.enso.api.Config/builder)
                             (.http3MaxUdpPayloadSize 70000)
                             (.build)))
       "above 65527 rejected"))
 
 (deftest h3-config-alt-svc-max-age-negative-rejected
   (is (thrown-with-msg? IllegalArgumentException #"altSvcMaxAge"
-                        (-> (com.s_exp.enso.Config/builder)
+                        (-> (com.s_exp.enso.api.Config/builder)
                             (.altSvcMaxAge -1)
                             (.build)))))
 
 (deftest h3-config-initial-max-streams-bidi-positive
   (is (thrown-with-msg? IllegalArgumentException #"http3InitialMaxStreamsBidi"
-                        (-> (com.s_exp.enso.Config/builder)
+                        (-> (com.s_exp.enso.api.Config/builder)
                             (.http3InitialMaxStreamsBidi 0)
                             (.build)))))
 
@@ -1244,7 +1244,7 @@
 ;; ============================================================================
 
 (deftest alt-svc-computed-when-explicitly-enabled
-  (let [cfg (-> (com.s_exp.enso.Config/builder)
+  (let [cfg (-> (com.s_exp.enso.api.Config/builder)
                 (.advertiseAltSvc true)
                 (.port 9999)
                 (.build))]
@@ -1252,7 +1252,7 @@
     (is (= "h3=\":9999\"; ma=86400" (.-altSvcValue cfg)))))
 
 (deftest alt-svc-not-computed-by-default
-  (let [cfg (-> (com.s_exp.enso.Config/builder) (.build))]
+  (let [cfg (-> (com.s_exp.enso.api.Config/builder) (.build))]
     (is (false? (.-advertiseAltSvc cfg)))
     (is (nil? (.-altSvcValue cfg))
         "no Alt-Svc header value when disabled")))
@@ -1261,14 +1261,14 @@
   ;; When http3 is on, Alt-Svc defaults to true; explicit false disables.
   ;; Skip the real http3 flag here (needs cert paths for validation), just
   ;; exercise the advertiseAltSvcExplicit override branch.
-  (let [cfg (-> (com.s_exp.enso.Config/builder)
+  (let [cfg (-> (com.s_exp.enso.api.Config/builder)
                 (.advertiseAltSvc false)
                 (.build))]
     (is (false? (.-advertiseAltSvc cfg)))
     (is (nil? (.-altSvcValue cfg)))))
 
 (deftest alt-svc-custom-max-age
-  (let [cfg (-> (com.s_exp.enso.Config/builder)
+  (let [cfg (-> (com.s_exp.enso.api.Config/builder)
                 (.advertiseAltSvc true)
                 (.altSvcMaxAge 300)
                 (.port 8443)
@@ -1276,7 +1276,7 @@
     (is (= "h3=\":8443\"; ma=300" (.-altSvcValue cfg)))))
 
 (deftest alt-svc-uses-http3-port-when-set
-  (let [cfg (-> (com.s_exp.enso.Config/builder)
+  (let [cfg (-> (com.s_exp.enso.api.Config/builder)
                 (.advertiseAltSvc true)
                 (.port 8080)
                 (.http3Port 4433)

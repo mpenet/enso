@@ -1,6 +1,6 @@
 package com.s_exp.enso.quiche;
 
-import com.s_exp.enso.Config;
+import com.s_exp.enso.api.Config;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 

@@ -1,5 +1,11 @@
 package com.s_exp.enso;
 
+import com.s_exp.enso.api.Config;
+import com.s_exp.enso.api.RingErrorHandler;
+import com.s_exp.enso.api.RingHandler;
+import com.s_exp.enso.core.TlsSocket;
+import com.s_exp.enso.http1.HttpConnection;
+import com.s_exp.enso.http2.Http2Connection;
 import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -68,7 +74,7 @@ public final class EnsoServer implements AutoCloseable {
     private AutoCloseable createHttp3Listener() throws IOException {
         if (!config.http3) return null;
         try {
-            Class<?> cls = Class.forName("com.s_exp.enso.quiche.Http3Listener");
+            Class<?> cls = Class.forName("com.s_exp.enso.http3.Http3Listener");
             AutoCloseable l = (AutoCloseable) cls
                 .getConstructor(Config.class, RingHandler.class, Object.class)
                 .newInstance(config, handler, this);
@@ -94,23 +100,23 @@ public final class EnsoServer implements AutoCloseable {
         return listener.port();
     }
 
-    Config config() {
+    public Config config() {
         return config;
     }
 
-    RingErrorHandler errorHandler() {
+    public RingErrorHandler errorHandler() {
         return errorHandler;
     }
 
-    boolean isRunning() {
+    public boolean isRunning() {
         return running;
     }
 
-    void register(HttpConnection conn) {
+    public void register(HttpConnection conn) {
         connections.add(conn);
     }
 
-    void unregister(HttpConnection conn) {
+    public void unregister(HttpConnection conn) {
         connections.remove(conn);
     }
 
