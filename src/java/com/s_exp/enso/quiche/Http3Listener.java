@@ -92,15 +92,34 @@ public final class Http3Listener implements AutoCloseable {
         return localAddr != null ? localAddr.getPort() : -1;
     }
 
+    /**
+     * Owner-only scratch for {@link #onDatagram}. Kept on the demux
+     * vthread so we never allocate on the hot per-datagram path — task
+     * #118 restored what task #72 had removed but the JNI rewrite
+     * dropped. Reset each call: the two *Len arrays get re-primed with
+     * the buffer capacities that quiche is allowed to write.
+     */
+    private static final class DemuxScratch {
+        final int[] versionOut = new int[1];
+        final byte[] typeOut = new byte[1];
+        final byte[] scidBuf = new byte[Quiche.QUICHE_MAX_CONN_ID_LEN];
+        final long[] scidLenA = new long[1];
+        final byte[] dcidBuf = new byte[Quiche.QUICHE_MAX_CONN_ID_LEN];
+        final long[] dcidLenA = new long[1];
+        final byte[] tokenBuf = new byte[MAX_TOKEN_LEN];
+        final long[] tokenLenA = new long[1];
+    }
+
     private void demuxLoop() {
         ByteBuffer buf = ByteBuffer.allocateDirect(2 * MAX_DATAGRAM_SIZE);
+        DemuxScratch scratch = new DemuxScratch();
         while (running) {
             try {
                 buf.clear();
                 SocketAddress from = channel.receive(buf);
                 if (from == null) continue;
                 buf.flip();
-                onDatagram(buf, (InetSocketAddress) from);
+                onDatagram(buf, (InetSocketAddress) from, scratch);
             } catch (java.nio.channels.AsynchronousCloseException e) {
                 return;
             } catch (IOException e) {
@@ -112,43 +131,40 @@ public final class Http3Listener implements AutoCloseable {
         }
     }
 
-    private void onDatagram(ByteBuffer datagram, InetSocketAddress from) {
+    private void onDatagram(ByteBuffer datagram, InetSocketAddress from,
+                             DemuxScratch s) {
         int length = datagram.remaining();
         byte[] pkt = new byte[length];
         datagram.get(pkt);
         try {
-            // Per-datagram scratch. JNI shim writes back scid/dcid/token
-            // lengths in the *Len arrays; pre-set them to buffer sizes.
-            int[] versionOut = new int[1];
-            byte[] typeOut = new byte[1];
-            byte[] scidBuf = new byte[Quiche.QUICHE_MAX_CONN_ID_LEN];
-            long[] scidLenA = new long[]{Quiche.QUICHE_MAX_CONN_ID_LEN};
-            byte[] dcidBuf = new byte[Quiche.QUICHE_MAX_CONN_ID_LEN];
-            long[] dcidLenA = new long[]{Quiche.QUICHE_MAX_CONN_ID_LEN};
-            byte[] tokenBuf = new byte[MAX_TOKEN_LEN];
-            long[] tokenLenA = new long[]{MAX_TOKEN_LEN};
-
+            s.scidLenA[0] = Quiche.QUICHE_MAX_CONN_ID_LEN;
+            s.dcidLenA[0] = Quiche.QUICHE_MAX_CONN_ID_LEN;
+            s.tokenLenA[0] = MAX_TOKEN_LEN;
             int rc = Quiche.headerInfo(pkt, length, LOCAL_CID_LEN,
-                versionOut, typeOut,
-                scidBuf, scidLenA,
-                dcidBuf, dcidLenA,
-                tokenBuf, tokenLenA);
+                s.versionOut, s.typeOut,
+                s.scidBuf, s.scidLenA,
+                s.dcidBuf, s.dcidLenA,
+                s.tokenBuf, s.tokenLenA);
             if (rc < 0) {
                 // Non-QUIC or malformed. Drop.
                 return;
             }
-            int scidLen = (int) scidLenA[0];
-            int dcidLen = (int) dcidLenA[0];
-            int tokenLen = (int) tokenLenA[0];
-            byte[] scidBytes = Arrays.copyOf(scidBuf, scidLen);
-            byte[] dcidBytes = Arrays.copyOf(dcidBuf, dcidLen);
-            CidKey key = new CidKey(dcidBytes);
-            Http3Connection existing = conns.get(key);
+            int scidLen = (int) s.scidLenA[0];
+            int dcidLen = (int) s.dcidLenA[0];
+            int tokenLen = (int) s.tokenLenA[0];
+            // Look up existing connection via a view-based key first so
+            // the common case (packet for an established conn) skips the
+            // dcidBytes copy entirely.
+            Http3Connection existing = conns.get(CidKey.view(s.dcidBuf, dcidLen));
             if (existing != null) {
                 existing.enqueue(pkt);
                 return;
             }
-            int wireVersion = versionOut[0];
+            // Miss → materialise the cid bytes for the accept path (we
+            // hand them off to Http3Connection ctor + retryToken).
+            byte[] scidBytes = Arrays.copyOf(s.scidBuf, scidLen);
+            byte[] dcidBytes = Arrays.copyOf(s.dcidBuf, dcidLen);
+            int wireVersion = s.versionOut[0];
             if (!Quiche.versionIsSupported(wireVersion)) {
                 sendVersionNegotiation(scidBytes, dcidBytes, from);
                 return;
@@ -168,7 +184,7 @@ public final class Http3Listener implements AutoCloseable {
                     sendRetry(scidBytes, dcidBytes, newScid, token, wireVersion, from);
                     return;
                 }
-                byte[] token = Arrays.copyOf(tokenBuf, tokenLen);
+                byte[] token = Arrays.copyOf(s.tokenBuf, tokenLen);
                 byte[] verifiedOdcid = retryToken.verify(token, from);
                 if (verifiedOdcid == null) {
                     return;
@@ -257,9 +273,11 @@ public final class Http3Listener implements AutoCloseable {
             try { c.close(); } catch (Throwable ignored) {}
         }
         conns.clear();
-        if (quicheConfig != null) {
-            try { quicheConfig.close(); } catch (Throwable ignored) {}
-        }
+        // Drain per-connection driver threads BEFORE freeing the shared
+        // quiche_config — quiche's conn objects keep no strong ref to the
+        // config after quiche_accept returns, but freeing config while a
+        // still-running driver might touch anything config-adjacent is a
+        // pointless risk. Ordering matters (task #113).
         if (connExecutor != null) {
             connExecutor.shutdown();
             try {
@@ -267,6 +285,9 @@ public final class Http3Listener implements AutoCloseable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+        if (quicheConfig != null) {
+            try { quicheConfig.close(); } catch (Throwable ignored) {}
         }
     }
 
@@ -277,16 +298,48 @@ public final class Http3Listener implements AutoCloseable {
      */
     private static final class CidKey {
         private final byte[] bytes;
+        private final int off;
+        private final int len;
         private final int hash;
 
+        /** Owned-copy variant — used as the persisted map key. */
         CidKey(byte[] bytes) {
             this.bytes = bytes;
-            this.hash = Arrays.hashCode(bytes);
+            this.off = 0;
+            this.len = bytes.length;
+            this.hash = hashBytes(bytes, 0, bytes.length);
+        }
+
+        private CidKey(byte[] bytes, int off, int len, int hash) {
+            this.bytes = bytes;
+            this.off = off;
+            this.len = len;
+            this.hash = hash;
+        }
+
+        /**
+         * Lookup-only view over a scratch buffer prefix. Do NOT store this
+         * in the map — the backing array is reused across datagrams.
+         * Safe for {@code get}/{@code containsKey} which only invoke
+         * hashCode/equals synchronously.
+         */
+        static CidKey view(byte[] scratch, int len) {
+            return new CidKey(scratch, 0, len, hashBytes(scratch, 0, len));
+        }
+
+        private static int hashBytes(byte[] a, int off, int len) {
+            int h = 1;
+            for (int i = 0; i < len; i++) h = 31 * h + a[off + i];
+            return h;
         }
 
         @Override public int hashCode() { return hash; }
         @Override public boolean equals(Object o) {
-            return o instanceof CidKey k && Arrays.equals(bytes, k.bytes);
+            if (!(o instanceof CidKey k) || k.len != this.len) return false;
+            for (int i = 0; i < len; i++) {
+                if (bytes[off + i] != k.bytes[k.off + i]) return false;
+            }
+            return true;
         }
     }
 }

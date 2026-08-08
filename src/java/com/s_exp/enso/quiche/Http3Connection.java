@@ -125,8 +125,24 @@ final class Http3Connection implements AutoCloseable {
     }
 
     void enqueue(byte[] datagram) {
-        ingress.offer(datagram);
+        // Short-circuit once the owner has begun shutdown: nothing will
+        // drain the queue and holding refs delays GC.
+        if (closed.get()) return;
+        if (!ingress.offer(datagram)) {
+            // Full queue → dropped. Would-be quiche packets are lost;
+            // congestion control will eventually surface as retx storms.
+            // Cap log rate (once per ~1024 drops) so we don't spam under
+            // sustained overrun.
+            long n = drops.incrementAndGet();
+            if ((n & 0x3ffL) == 1L) {
+                LOG.warning("h3 ingress queue full, dropped " + n
+                    + " datagrams for cid=" + HexFormat.of().formatHex(cid));
+            }
+        }
     }
+
+    private final java.util.concurrent.atomic.AtomicLong drops =
+        new java.util.concurrent.atomic.AtomicLong();
 
     private void run() {
         H3Session.RequestSink sink = new SinkImpl();
@@ -269,16 +285,22 @@ final class Http3Connection implements AutoCloseable {
         }
     }
 
+    // Owner-thread scratch. quiche fills sendBuf; sendView wraps it for
+    // DatagramChannel.send. Both live for connection lifetime — no
+    // per-call allocation.
+    private final byte[] sendBuf = new byte[MAX_DATAGRAM_SIZE];
+    private final ByteBuffer sendView = ByteBuffer.wrap(sendBuf);
+
     private void processSend() throws IOException {
-        byte[] outBuf = new byte[MAX_DATAGRAM_SIZE];
         while (true) {
-            long rc = Quiche.connSend(conn, outBuf, MAX_DATAGRAM_SIZE);
+            long rc = Quiche.connSend(conn, sendBuf, MAX_DATAGRAM_SIZE);
             if (rc == Quiche.QUICHE_ERR_DONE) return;
             if (rc < 0) {
                 LOG.info("h3 quiche_conn_send returned " + rc);
                 return;
             }
-            out.send(ByteBuffer.wrap(outBuf, 0, (int) rc), peer);
+            sendView.clear().limit((int) rc);
+            out.send(sendView, peer);
         }
     }
 
@@ -389,10 +411,24 @@ final class Http3Connection implements AutoCloseable {
                 }
             } else {
                 seenRegular = true;
+                // RFC 9114 §4.2: header field names MUST be lowercase.
+                // Any uppercase char makes the request malformed.
+                if (hasUppercase(n)) {
+                    LOG.warning("h3 uppercase header name '" + n
+                        + "' streamId=" + streamId);
+                    return;
+                }
+                // §4.2 forbidden hop-by-hop headers. TE is allowed only if
+                // its value is exactly "trailers".
                 if (n.equals("connection") || n.equals("keep-alive")
                     || n.equals("proxy-connection") || n.equals("transfer-encoding")
                     || n.equals("upgrade")) {
                     LOG.warning("h3 forbidden header '" + n + "' streamId=" + streamId);
+                    return;
+                }
+                if (n.equals("te") && !"trailers".equals(v)) {
+                    LOG.warning("h3 TE header with non-trailers value, streamId="
+                        + streamId);
                     return;
                 }
                 regular[rp++] = n;
@@ -453,6 +489,14 @@ final class Http3Connection implements AutoCloseable {
         Thread.ofVirtual()
             .name("enso-h3-worker-" + streamId)
             .start(() -> runHandler(streamId, request));
+    }
+
+    private static boolean hasUppercase(String s) {
+        for (int i = 0, n = s.length(); i < n; i++) {
+            char c = s.charAt(i);
+            if (c >= 'A' && c <= 'Z') return true;
+        }
+        return false;
     }
 
     private void runHandler(long streamId, Request request) {

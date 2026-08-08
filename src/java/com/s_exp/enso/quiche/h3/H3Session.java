@@ -11,9 +11,10 @@ import java.util.logging.Logger;
 
 /**
  * Pure-Java HTTP/3 session state on top of the QUIC transport primitives
- * exposed by {@link QuicheStreams}. Replaces the {@code quiche_h3_*} FFM
- * calls that triggered the libmalloc freelist corruption crashes on
- * macOS ARM64 + JDK 25 (see task #79).
+ * exposed by the {@link Quiche} JNI shim. Replaces the {@code quiche_h3_*}
+ * FFM calls that triggered libmalloc freelist corruption crashes on
+ * macOS ARM64 + JDK 25 (see task #79/#86; the JNI migration in #111 also
+ * moved us off FFM entirely).
  *
  * <p>Scope is v1-server:
  * <ul>
@@ -256,6 +257,30 @@ public final class H3Session {
                     return;
                 }
                 peerQpackDecStreamId = streamId;
+            } else if (type == 0x01L /* PUSH */) {
+                // RFC 9114 §6.2.2: server-initiated push MUST NOT arrive on
+                // a client uni stream. Treat as H3_STREAM_CREATION_ERROR.
+                LOG.warning("h3 client-initiated PUSH stream id=" + streamId);
+                resetStream(streamId, 0x103); // H3_STREAM_CREATION_ERROR
+                return;
+            } else if (isGreaseType(type)) {
+                // RFC 9114 §7.2.8: grease types (0x1f * N + 0x21) MUST be
+                // ignored — read + discard silently.
+                peerUniTypes.put(streamId, type);
+                return;
+            } else {
+                // RFC 9114 §6.2.3: any other type = MUST STOP_SENDING with
+                // H3_STREAM_CREATION_ERROR. We only shut the read side so
+                // peer stops sending; write side is theirs to close.
+                LOG.info("h3 unknown peer uni stream type=0x"
+                    + Long.toHexString(type) + " id=" + streamId);
+                try {
+                    com.s_exp.enso.quiche.Quiche.connStreamShutdown(
+                        conn, streamId,
+                        com.s_exp.enso.quiche.Quiche.QUICHE_SHUTDOWN_READ,
+                        0x103);
+                } catch (Throwable ignored) {}
+                return;
             }
             peerUniTypes.put(streamId, type);
             // Any leftover bytes after the type varint fall through to
@@ -276,6 +301,15 @@ public final class H3Session {
         }
     }
 
+    /**
+     * RFC 9114 §7.2.8 grease-type check. Reserved unassigned stream types
+     * follow the pattern {@code 0x1f * N + 0x21} for non-negative N.
+     */
+    private static boolean isGreaseType(long t) {
+        if (t < 0x21L) return false;
+        return ((t - 0x21L) % 0x1fL) == 0L;
+    }
+
     private void writeStreamTypePrefix(long streamId, long type) {
         int sz = Varint.size(type);
         ByteBuffer bb = ByteBuffer.allocate(sz);
@@ -293,9 +327,21 @@ public final class H3Session {
      */
     private void writeAll(long streamId, ByteBuffer buf, boolean fin) {
         int remaining = buf.remaining();
-        byte[] bytes = new byte[remaining];
-        buf.get(bytes);
-        long rc = Quiche.connStreamSend(conn, streamId, bytes, 0, remaining, fin);
+        byte[] bytes;
+        int off;
+        if (buf.hasArray()) {
+            // Zero-copy: hand quiche the backing array directly with the
+            // ByteBuffer's current view offsets. H3FrameWriter always
+            // returns heap-backed buffers so we hit this path in practice.
+            bytes = buf.array();
+            off = buf.arrayOffset() + buf.position();
+            buf.position(buf.limit());
+        } else {
+            bytes = new byte[remaining];
+            buf.get(bytes);
+            off = 0;
+        }
+        long rc = Quiche.connStreamSend(conn, streamId, bytes, off, remaining, fin);
         if (rc < 0) {
             LOG.info("h3 stream_send stream=" + streamId + " rc=" + rc);
             return;

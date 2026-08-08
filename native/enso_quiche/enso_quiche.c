@@ -10,9 +10,12 @@
  * Conventions:
  *   - All pointers cross the boundary as jlong (raw address). Java side
  *     treats them opaquely.
- *   - Byte arrays use GetPrimitiveArrayCritical for zero-copy on the
- *     hot recv/send/stream paths; the critical region is kept as short
- *     as possible (no callbacks / no long allocations inside).
+ *   - Byte arrays use GetByteArrayElements. HotSpot avoids the copy when
+ *     the JVM can pin the underlying heap array; if profiling later shows
+ *     copies dominate, switch the hot paths to GetPrimitiveArrayCritical
+ *     (constraint: no JNI calls inside the critical section).
+ *   - Buffers we only read → JNI_ABORT on release (skip copy-back).
+ *     Buffers we write into for the caller → commit (0).
  *   - Sockaddrs are passed as (byte[] ip, int port). C builds the real
  *     struct sockaddr_in / _in6 on the JNI stack per call. Avoids
  *     shipping sockaddr_storage layout across the boundary (differs by
@@ -167,6 +170,11 @@ Java_com_s_1exp_enso_quiche_Quiche_accept(
     struct sockaddr_storage local, peer;
     socklen_t localLen = build_sockaddr(env, localIp, localPort, &local);
     socklen_t peerLen = build_sockaddr(env, peerIp, peerPort, &peer);
+    if (localLen == 0 || peerLen == 0) {
+        (*env)->ReleaseByteArrayElements(env, scidArr, scid, JNI_ABORT);
+        (*env)->ReleaseByteArrayElements(env, odcidArr, odcid, JNI_ABORT);
+        return 0; /* Java treats 0 handle as null → accept failure. */
+    }
 
     quiche_conn *conn = quiche_accept(
         (const uint8_t *)scid, (size_t)scidLen,
@@ -275,10 +283,14 @@ Java_com_s_1exp_enso_quiche_Quiche_headerInfo(
         (uint8_t *)dcid, &dcidLen,
         (uint8_t *)token, &tokenLen);
 
+    /* On error paths quiche may have partially clobbered scid/dcid/token —
+     * caller ignores them anyway, so skip the copy-back to avoid a real
+     * memcpy in the pinned-array fallback. */
+    jint releaseMode = (rc == 0) ? 0 : JNI_ABORT;
     (*env)->ReleaseByteArrayElements(env, bufArr, buf, JNI_ABORT);
-    (*env)->ReleaseByteArrayElements(env, scidArr, scid, 0);
-    (*env)->ReleaseByteArrayElements(env, dcidArr, dcid, 0);
-    (*env)->ReleaseByteArrayElements(env, tokenArr, token, 0);
+    (*env)->ReleaseByteArrayElements(env, scidArr, scid, releaseMode);
+    (*env)->ReleaseByteArrayElements(env, dcidArr, dcid, releaseMode);
+    (*env)->ReleaseByteArrayElements(env, tokenArr, token, releaseMode);
 
     if (rc == 0) {
         jint vJ = (jint)version;
@@ -347,6 +359,7 @@ Java_com_s_1exp_enso_quiche_Quiche_connRecv(
     struct sockaddr_storage from, to;
     socklen_t fromLen = build_sockaddr(env, fromIp, fromPort, &from);
     socklen_t toLen = build_sockaddr(env, toIp, toPort, &to);
+    if (fromLen == 0 || toLen == 0) return -1; /* QUICHE_ERR_INVALID_STATE */
     quiche_recv_info info = {
         .from = (struct sockaddr *)&from, .from_len = fromLen,
         .to = (struct sockaddr *)&to, .to_len = toLen,

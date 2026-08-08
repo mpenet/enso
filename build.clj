@@ -14,6 +14,11 @@
 (def basis (delay (b/create-basis {:project "deps.edn"})))
 (def target-dir "target")
 
+(defn- sh
+  [& cmds]
+  (doseq [cmd cmds]
+    (p/process {:command-args ["sh" "-c" cmd]})))
+
 (defn clean [_]
   (b/delete {:path "target"}))
 
@@ -76,11 +81,6 @@
               :installer :remote
               :sign-releases? false})
   opts)
-
-(defn- sh
-  [& cmds]
-  (doseq [cmd cmds]
-    (p/process {:command-args ["sh" "-c" cmd]})))
 
 (defn tag
   [opts]
