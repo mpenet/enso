@@ -3,9 +3,8 @@
   Boots all servers in one JVM, drives wrk against each, aggregates throughput
   + latency percentiles, and profiles allocation via clj-async-profiler.
 
-  Aleph/netty are excluded from the bench alias — netty's Unsafe/DirectBuffer
-  initialisation corrupts FFM upcall behaviour in the same JVM, crashing the
-  h3 profile path. Bench h1/h2 numbers were similar to Jetty anyway."
+  Aleph/netty are excluded from the bench alias because they were of limited
+  additional value versus the Jetty comparison and inflated the classpath."
   (:require [clj-async-profiler.core :as prof]
             [clojure.java.io :as io]
             [clojure.java.shell :as sh]

@@ -1,7 +1,5 @@
 package com.s_exp.enso.quiche.qpack;
 
-import java.nio.BufferOverflowException;
-import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 
 /**
@@ -70,14 +68,15 @@ public final class NBitInteger {
         long mask = (1L << n) - 1;
         long value = firstByte & mask;
         if (value < mask) return value;
-        // Continuation.
+        // Continuation. Guard BEFORE the shift so a 7-bit chunk left-shifted
+        // by 63 can never truncate its high bits into the sign position.
         long m = 0;
         int b;
         do {
+            if (m >= 64) throw new IllegalStateException("N-bit int overflow");
             b = buf.get() & 0xFF;
             value += ((long) (b & 0x7F)) << m;
             m += 7;
-            if (m > 63) throw new IllegalStateException("N-bit int overflow");
         } while ((b & 0x80) != 0);
         return value;
     }

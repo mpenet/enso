@@ -381,12 +381,38 @@ final class Http3Connection implements AutoCloseable {
                     LOG.warning("h3 pseudo-header after regular, streamId=" + streamId);
                     return;
                 }
+                // RFC 9114 §4.3.1: pseudo-headers MUST NOT appear more
+                // than once. Duplicate → malformed request; drop.
                 switch (n) {
-                    case ":method"    -> method    = v;
-                    case ":path"      -> path      = v;
-                    case ":scheme"    -> scheme    = v;
-                    case ":authority" -> authority = v;
-                    default           -> { /* ignore unknown pseudo */ }
+                    case ":method" -> {
+                        if (method != null) {
+                            LOG.warning("h3 duplicate :method, streamId=" + streamId);
+                            return;
+                        }
+                        method = v;
+                    }
+                    case ":path" -> {
+                        if (path != null) {
+                            LOG.warning("h3 duplicate :path, streamId=" + streamId);
+                            return;
+                        }
+                        path = v;
+                    }
+                    case ":scheme" -> {
+                        if (scheme != null) {
+                            LOG.warning("h3 duplicate :scheme, streamId=" + streamId);
+                            return;
+                        }
+                        scheme = v;
+                    }
+                    case ":authority" -> {
+                        if (authority != null) {
+                            LOG.warning("h3 duplicate :authority, streamId=" + streamId);
+                            return;
+                        }
+                        authority = v;
+                    }
+                    default -> { /* ignore unknown pseudo */ }
                 }
             } else {
                 seenRegular = true;
@@ -400,13 +426,33 @@ final class Http3Connection implements AutoCloseable {
                 regular[rp++] = v;
             }
         }
-        if (method == null || path == null || scheme == null) {
-            LOG.warning("h3 request missing pseudo-headers, streamId=" + streamId);
+        // RFC 9114 §4.3.1 request pseudo-header requirements:
+        //   - non-CONNECT: :method, :scheme, :path, :authority all REQUIRED
+        //   - CONNECT: :method + :authority REQUIRED, :scheme + :path MUST
+        //     be omitted.
+        boolean isConnect = "CONNECT".equals(method);
+        if (method == null) {
+            LOG.warning("h3 request missing :method, streamId=" + streamId);
             return;
         }
-        if (path.isEmpty() && (scheme.equals("http") || scheme.equals("https"))) {
-            LOG.warning("h3 empty :path for http(s), streamId=" + streamId);
-            return;
+        if (isConnect) {
+            if (authority == null || scheme != null || path != null) {
+                LOG.warning("h3 malformed CONNECT pseudo-headers, streamId=" + streamId);
+                return;
+            }
+            // Fill in placeholder scheme/path so downstream Ring code
+            // doesn't NPE on the tunnel-style request.
+            scheme = "https";
+            path = "";
+        } else {
+            if (path == null || scheme == null) {
+                LOG.warning("h3 request missing pseudo-headers, streamId=" + streamId);
+                return;
+            }
+            if (path.isEmpty() && (scheme.equals("http") || scheme.equals("https"))) {
+                LOG.warning("h3 empty :path for http(s), streamId=" + streamId);
+                return;
+            }
         }
         String uri;
         String query;

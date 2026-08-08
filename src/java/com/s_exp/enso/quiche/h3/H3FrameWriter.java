@@ -20,7 +20,7 @@ public final class H3FrameWriter {
         return frame(H3FrameType.HEADERS, encodedFieldSection);
     }
 
-    /** Encode a DATA frame. Zero-copy over {@code data}. */
+    /** Encode a DATA frame. Copies {@code data} into the output buffer. */
     public static ByteBuffer data(byte[] data) {
         return frame(H3FrameType.DATA, data);
     }

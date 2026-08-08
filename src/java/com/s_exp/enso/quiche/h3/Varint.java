@@ -1,6 +1,5 @@
 package com.s_exp.enso.quiche.h3;
 
-import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 
 /**

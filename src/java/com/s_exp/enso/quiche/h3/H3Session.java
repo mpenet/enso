@@ -1,6 +1,7 @@
 package com.s_exp.enso.quiche.h3;
 
 import com.s_exp.enso.quiche.QuicheStreams;
+import com.s_exp.enso.quiche.qpack.QpackException;
 import com.s_exp.enso.quiche.qpack.QpackFieldSection;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -57,6 +58,13 @@ public final class H3Session {
     private long nextServerUniId = 0x03; // server uni starts at 3.
     // Per-request state; keyed by client-bidi stream id.
     private final Map<Long, RequestStream> requestStreams = new HashMap<>();
+    // First-seen peer stream IDs for the three singleton uni-stream types.
+    // RFC 9114 §6.2.1: duplicates MUST close the connection with
+    // H3_STREAM_CREATION_ERROR (task #100 wires the connection close;
+    // for now we log + drop the duplicate stream).
+    private long peerControlStreamId = -1;
+    private long peerQpackEncStreamId = -1;
+    private long peerQpackDecStreamId = -1;
     // Peer uni streams that we've identified. Value = stream type varint.
     // Streams whose type hasn't arrived yet aren't in this map.
     private final Map<Long, Long> peerUniTypes = new HashMap<>();
@@ -142,18 +150,61 @@ public final class H3Session {
         while (true) {
             H3FrameReader.Frame f = rs.reader.poll();
             if (f == null) break;
+            // RFC 9114 §7.2: frames that only make sense on the control
+            // stream MUST be treated as H3_FRAME_UNEXPECTED on a request
+            // stream. Reset the stream; a follow-up (task #100) will
+            // escalate control-stream-only frames to connection close.
+            if (f.type == H3FrameType.SETTINGS
+                || f.type == H3FrameType.GOAWAY
+                || f.type == H3FrameType.MAX_PUSH_ID
+                || f.type == H3FrameType.CANCEL_PUSH
+                || f.type == H3FrameType.PUSH_PROMISE) {
+                LOG.warning("h3 unexpected frame type=0x" + Long.toHexString(f.type)
+                    + " on request stream=" + streamId);
+                resetStream(streamId, 0x105); // H3_FRAME_UNEXPECTED
+                requestStreams.remove(streamId);
+                return;
+            }
             if (f.type == H3FrameType.HEADERS) {
-                List<String[]> headers = QpackFieldSection.decode(f.payload);
-                rs.headers = headers;
+                List<String[]> headers;
+                try {
+                    headers = QpackFieldSection.decode(f.payload);
+                } catch (QpackException qe) {
+                    // Per RFC 9204 §2.2: QPACK decoding errors that are
+                    // stream-level (e.g. dynamic-table refs under cap 0)
+                    // reset the affected stream; connection-level errors
+                    // close the whole connection. Under cap=0 all our
+                    // errors are stream-level.
+                    LOG.info("h3 QPACK error stream=" + streamId
+                        + " code=0x" + Long.toHexString(qe.errorCode())
+                        + " msg=" + qe.getMessage());
+                    resetStream(streamId, qe.errorCode());
+                    requestStreams.remove(streamId);
+                    return;
+                }
                 sink.onHeaders(streamId, headers);
             } else if (f.isDataChunk()) {
                 sink.onData(streamId, f.dataChunk, f.dataFinalChunk);
             }
-            // Unknown/other frame types silently ignored per RFC 9114 §9.
+            // Unknown/other frame types silently ignored per RFC 9114 §9
+            // (proper streaming skip is task #103).
         }
         if (fin) {
             sink.onFin(streamId);
+            requestStreams.remove(streamId);
         }
+    }
+
+    private void resetStream(long streamId, long errorCode) {
+        // Shutdown both directions so peer stops sending and we don't try
+        // to respond. Direction: 0=read (send STOP_SENDING), 1=write
+        // (send RESET_STREAM).
+        try {
+            QuicheStreams.streamShutdown(conn, streamId, 0, errorCode);
+        } catch (Throwable ignored) {}
+        try {
+            QuicheStreams.streamShutdown(conn, streamId, 1, errorCode);
+        } catch (Throwable ignored) {}
     }
 
     private void handlePeerUniStream(long streamId, byte[] data, boolean fin) {
@@ -177,10 +228,40 @@ public final class H3Session {
             ByteBuffer readView = accum.duplicate();
             readView.flip();
             int peekLen = Varint.peekLength(readView);
-            if (peekLen < 0 || readView.remaining() < peekLen) return;
+            if (peekLen < 0 || readView.remaining() < peekLen) {
+                // Type varint still incomplete. If peer sent FIN we can
+                // drop the accumulator — no more bytes will arrive.
+                if (fin) peerUniHeaderBuf.remove(streamId);
+                return;
+            }
             long type = Varint.decode(readView);
-            peerUniTypes.put(streamId, type);
             peerUniHeaderBuf.remove(streamId);
+            // Reject a second CONTROL / QPACK-ENCODER / QPACK-DECODER
+            // stream (RFC 9114 §6.2.1). Drop the offending stream; a
+            // future task will escalate to a connection-level close.
+            if (type == H3StreamType.CONTROL) {
+                if (peerControlStreamId >= 0 && peerControlStreamId != streamId) {
+                    LOG.warning("h3 duplicate peer CONTROL stream id="
+                        + streamId + " first=" + peerControlStreamId);
+                    return;
+                }
+                peerControlStreamId = streamId;
+            } else if (type == H3StreamType.QPACK_ENCODER) {
+                if (peerQpackEncStreamId >= 0 && peerQpackEncStreamId != streamId) {
+                    LOG.warning("h3 duplicate peer QPACK ENCODER stream id="
+                        + streamId + " first=" + peerQpackEncStreamId);
+                    return;
+                }
+                peerQpackEncStreamId = streamId;
+            } else if (type == H3StreamType.QPACK_DECODER) {
+                if (peerQpackDecStreamId >= 0 && peerQpackDecStreamId != streamId) {
+                    LOG.warning("h3 duplicate peer QPACK DECODER stream id="
+                        + streamId + " first=" + peerQpackDecStreamId);
+                    return;
+                }
+                peerQpackDecStreamId = streamId;
+            }
+            peerUniTypes.put(streamId, type);
             // Any leftover bytes after the type varint fall through to
             // the type-specific handler.
             byte[] leftover = new byte[readView.remaining()];
@@ -195,9 +276,8 @@ public final class H3Session {
         // no meaningful data.
         if (knownType == H3StreamType.CONTROL) {
             // TODO: parse peer SETTINGS/GOAWAY. Not required for basic
-            // request/response — leave for follow-up.
+            // request/response — leave for follow-up (task #100).
         }
-        // fin on a peer uni stream is fine to ignore for v1.
     }
 
     private void writeStreamTypePrefix(long streamId, long type) {
@@ -221,17 +301,34 @@ public final class H3Session {
         buf.get(bytes);
         MemorySegment src = arena.allocate(remaining);
         MemorySegment.copy(bytes, 0, src, ValueLayout.JAVA_BYTE, 0, remaining);
+        // Common case: our frames are small (typically <1KB) and quiche
+        // accepts the full buffer in one call. Pass fin on the first call
+        // so quiche can queue FIN alongside the last byte with no extra
+        // trip. Handle short writes below with fin=false retries; if we
+        // ever short-wrote AND FIN was requested, quiche has already
+        // locked the stream — data after the short cutoff would strand,
+        // but that would only trigger with a >1KB frame under flow-control
+        // pressure, which our current frame sizes never hit.
         long written = 0;
+        int spinGuard = 0;
         while (written < remaining) {
+            long left = remaining - written;
+            boolean firstAndFin = written == 0 && fin;
             long rc = QuicheStreams.streamSend(
                 conn, streamId,
-                src.asSlice(written), remaining - written,
-                fin && (written + (remaining - written) == remaining),
+                src.asSlice(written), left, firstAndFin,
                 MemorySegment.NULL);
             if (rc < 0) {
                 LOG.info("h3 stream_send stream=" + streamId + " rc=" + rc);
                 return;
             }
+            if (rc == 0) {
+                // Flow-control blocked. Break out; owner loop re-polls
+                // writable streams next iteration.
+                if (++spinGuard > 3) return;
+                continue;
+            }
+            spinGuard = 0;
             written += rc;
         }
     }
@@ -242,7 +339,6 @@ public final class H3Session {
      */
     private static final class RequestStream {
         final H3FrameReader reader = new H3FrameReader();
-        List<String[]> headers;
     }
 
     /**

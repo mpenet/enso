@@ -1,6 +1,5 @@
 package com.s_exp.enso.quiche.h3;
 
-import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -148,7 +147,15 @@ public final class H3FrameReader {
         if (pendingType == H3FrameType.DATA) {
             return drainData();
         }
-        // Accumulate — but only if the length is within cap.
+        // Unknown types (and other reserved types) MUST be discarded per
+        // RFC 9114 §7.2.8. Peer could set arbitrary lengths — stream-skip
+        // rather than accumulate, so we never OOM on adversarial input.
+        if (!isKnownAccumulatedType(pendingType)) {
+            return skipPayload();
+        }
+        // Known bounded types — cap enforced. HEADERS/SETTINGS/GOAWAY
+        // sizes are all small in practice; exceeding the cap is a
+        // malformed-frame condition to raise at the connection layer.
         if (pendingLength > maxAccum) {
             throw new IllegalStateException(
                 "frame type=" + pendingType + " length=" + pendingLength
@@ -162,6 +169,36 @@ public final class H3FrameReader {
         pendingType = -1;
         pendingLength = -1;
         pendingConsumed = 0;
+        return true;
+    }
+
+    private static boolean isKnownAccumulatedType(long t) {
+        return t == H3FrameType.HEADERS
+            || t == H3FrameType.SETTINGS
+            || t == H3FrameType.GOAWAY
+            || t == H3FrameType.MAX_PUSH_ID
+            || t == H3FrameType.CANCEL_PUSH
+            || t == H3FrameType.PUSH_PROMISE;
+    }
+
+    /** Streaming-skip unknown-type payloads. No allocation, no emission. */
+    private boolean skipPayload() {
+        long remaining = pendingLength - pendingConsumed;
+        if (remaining <= 0) {
+            pendingType = -1;
+            pendingLength = -1;
+            pendingConsumed = 0;
+            return true;
+        }
+        int take = (int) Math.min(remaining, buf.remaining());
+        if (take == 0) return false;
+        buf.position(buf.position() + take);
+        pendingConsumed += take;
+        if (pendingConsumed == pendingLength) {
+            pendingType = -1;
+            pendingLength = -1;
+            pendingConsumed = 0;
+        }
         return true;
     }
 
