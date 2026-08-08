@@ -52,44 +52,83 @@ public final class Quiche {
             System.load(Path.of(override).toAbsolutePath().toString());
             return;
         }
-        // Try loading from classpath resource first — the released jar
-        // ships per-platform shim libs under META-INF/native/<os>-<arch>/.
-        String os = detectOs();
         String arch = detectArch();
         String libName = System.mapLibraryName("enso_quiche");
-        String resPath = "/META-INF/native/" + os + "-" + arch + "/" + libName;
-        try {
-            java.net.URL u = Quiche.class.getResource(resPath);
-            if (u != null) {
-                Path tmp = extractResource(resPath, libName);
-                System.load(tmp.toAbsolutePath().toString());
+        // Ordered list of classifier prefixes to try. On Linux+musl we
+        // prefer the musl-built shim; if that isn't shipped, fall back
+        // to the glibc build — libquiche links against libc which may
+        // fail at runtime, but we bubble up a clear error rather than
+        // silently misload.
+        String[] osClassifiers = detectOsClassifiers();
+        // 1) Try each candidate classpath resource in order.
+        for (String os : osClassifiers) {
+            String resPath = "/META-INF/native/" + os + "-" + arch + "/" + libName;
+            try {
+                if (Quiche.class.getResource(resPath) != null) {
+                    Path extracted = extractResource(resPath, libName);
+                    System.load(extracted.toAbsolutePath().toString());
+                    return;
+                }
+            } catch (IOException e) {
+                // fall through to the next candidate / filesystem probe
+            }
+        }
+        // 2) Development / repl: probe local build output (same
+        //    classifier list, first match wins).
+        for (String os : osClassifiers) {
+            Path devPath = Path.of("target/native/" + os + "-" + arch + "/" + libName);
+            if (Files.exists(devPath)) {
+                System.load(devPath.toAbsolutePath().toString());
                 return;
             }
-        } catch (IOException e) {
-            // fall through to filesystem probes
         }
-        // Development / repl: probe local build output.
-        Path devPath = Path.of("target/native/" + os + "-" + arch + "/" + libName);
-        if (Files.exists(devPath)) {
-            System.load(devPath.toAbsolutePath().toString());
-            return;
-        }
-        // Last resort: standard library-path lookup.
+        // 3) Standard library-path lookup (respects LD_LIBRARY_PATH,
+        //    java.library.path, DYLD_LIBRARY_PATH).
         try {
             System.loadLibrary("enso_quiche");
         } catch (UnsatisfiedLinkError e) {
             throw new UnsatisfiedLinkError(
-                "libenso_quiche not found. Build with `make -C native/enso_quiche`"
-                + " or set -Denso.quiche.shim=/abs/path/to/" + libName
+                "libenso_quiche not found for classifier(s) "
+                + java.util.Arrays.toString(osClassifiers) + "-" + arch
+                + ". Build with `make -C native/enso_quiche` or set"
+                + " -Denso.quiche.shim=/abs/path/to/" + libName
                 + ". Underlying error: " + e.getMessage());
         }
     }
 
-    private static String detectOs() {
+    /**
+     * OS classifiers in load-preference order. Standard `darwin` /
+     * `linux` first; Alpine / musl systems get `linux-musl` prepended
+     * so we prefer the musl-built shim over the glibc one. Detection
+     * looks for {@code /lib/ld-musl-*.so.1} which is present on every
+     * musl libc install (Alpine, Wolfi, Chimera).
+     */
+    private static String[] detectOsClassifiers() {
         String n = System.getProperty("os.name").toLowerCase();
-        if (n.contains("mac") || n.contains("darwin")) return "darwin";
-        if (n.contains("linux")) return "linux";
-        return n.replace(' ', '_');
+        if (n.contains("mac") || n.contains("darwin")) {
+            return new String[]{"darwin"};
+        }
+        if (n.contains("linux")) {
+            if (isMusl()) {
+                return new String[]{"linux-musl", "linux"};
+            }
+            return new String[]{"linux"};
+        }
+        return new String[]{n.replace(' ', '_')};
+    }
+
+    /**
+     * Detect musl libc. Fast + cheap: check for the dynamic linker path
+     * that musl always installs. Avoids exec of ldd + parse.
+     */
+    private static boolean isMusl() {
+        Path lib = Path.of("/lib");
+        if (!Files.isDirectory(lib)) return false;
+        try (java.util.stream.Stream<Path> s = Files.list(lib)) {
+            return s.anyMatch(p -> p.getFileName().toString().startsWith("ld-musl-"));
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private static String detectArch() {
@@ -99,16 +138,38 @@ public final class Quiche {
         return a;
     }
 
+    /**
+     * Extract the classpath resource into a per-JVM tempdir with a
+     * random name, then return the path to the shim inside. Mirrors
+     * Netty's netty_jni_util pattern (each JVM instance gets its own
+     * filename so concurrent JVMs on the same host don't share a
+     * dlopen'd file — some libc / kernel combinations refuse to
+     * overwrite an in-use shared object). A shutdown hook removes the
+     * dir + file on clean exit; {@link File#deleteOnExit} covers the
+     * shutdown-hook-skipped paths (SIGKILL still leaks the tempdir,
+     * which is expected).
+     */
     private static Path extractResource(String resPath, String libName) throws IOException {
-        Path tmp = Files.createTempFile("enso-quiche-", "-" + libName);
-        tmp.toFile().deleteOnExit();
+        Path dir = Files.createTempDirectory("enso-quiche-");
+        Path lib = dir.resolve(libName);
         try (InputStream in = Quiche.class.getResourceAsStream(resPath);
-             OutputStream out = Files.newOutputStream(tmp,
-                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+             OutputStream out = Files.newOutputStream(lib,
+                 StandardOpenOption.CREATE_NEW,
                  StandardOpenOption.WRITE)) {
+            if (in == null) {
+                throw new IOException("resource missing: " + resPath);
+            }
             in.transferTo(out);
         }
-        return tmp;
+        // Best-effort cleanup on normal shutdown. deleteOnExit + shutdown
+        // hook are redundant to survive early-shutdown-hook-skip paths.
+        lib.toFile().deleteOnExit();
+        dir.toFile().deleteOnExit();
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try { Files.deleteIfExists(lib); } catch (IOException ignored) {}
+            try { Files.deleteIfExists(dir); } catch (IOException ignored) {}
+        }, "enso-quiche-shim-cleanup"));
+        return lib;
     }
 
     // -----------------------------------------------------------------
