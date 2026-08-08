@@ -149,10 +149,10 @@ Same JVM, same host, all three h3 servers boot in-process for apples-to-apples:
 | Server | rps | wall (ms) |
 |---|---:|---:|
 | **Ensō** | **54,157** | 5909 |
-| Netty h3 (incubator 0.0.28, native quic 0.0.66, BoringSSL, quiche master) | 51,387 | 6227 |
+| Netty h3 (incubator 0.0.28, native quic 0.0.66, BoringSSL, vendored quiche master snapshot) | 51,387 | 6227 |
 | Jetty h3 (12.0.14, JNA quiche) | 10,132 | 31,582 |
 
-Ensō ~5% ahead of Netty (both use libquiche + JNI, Netty vendors newer quiche + BoringSSL), ~5.3× Jetty (JNA path). 0 failures across all runs.
+Ensō ~5% ahead of Netty (both use libquiche + JNI), ~5.3× Jetty (JNA path). 0 failures across all runs.
 
 ### Allocation
 
