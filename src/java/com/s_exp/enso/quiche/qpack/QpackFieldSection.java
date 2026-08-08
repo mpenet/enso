@@ -55,7 +55,10 @@ public final class QpackFieldSection {
                     + ") but advertised capacity is 0");
         }
 
-        List<String[]> out = new ArrayList<>();
+        // Init cap sized generously for typical request headers (5-6
+        // pseudo + regular). Skips the first ArrayList grow visible in
+        // alloc profile.
+        List<String[]> out = new ArrayList<>(24);
         while (buf.hasRemaining()) {
             int b = buf.get() & 0xFF;
             if ((b & 0x80) != 0) {
@@ -168,24 +171,35 @@ public final class QpackFieldSection {
         // Prefix: RIC = 0, S = 0, Delta Base = 0 → two 0x00 bytes.
         out.put((byte) 0x00);
         out.put((byte) 0x00);
-        for (String[] hf : headers) {
-            String name = hf[0].toLowerCase();
-            String value = hf[1] == null ? "" : hf[1];
-            int exact = QpackStaticTable.findExact(name, value);
-            if (exact >= 0) {
-                NBitInteger.encode(out, 6, 0xC0, exact);
-                continue;
-            }
-            int nameIdx = QpackStaticTable.findName(name);
-            if (nameIdx >= 0) {
-                NBitInteger.encode(out, 4, 0x50, nameIdx);
-                NBitString.encode(out, 7, 0, value, shouldHuffman(value));
-                continue;
-            }
-            NBitString.encode(out, 3, 0x20, name, shouldHuffman(name));
-            NBitString.encode(out, 7, 0, value, shouldHuffman(value));
+        // Take the indexed fast path when caller supplies a List (avoids
+        // Iterator alloc — task #129).
+        if (headers instanceof java.util.List<?>) {
+            @SuppressWarnings("unchecked")
+            java.util.List<String[]> list = (java.util.List<String[]>) headers;
+            int n = list.size();
+            for (int i = 0; i < n; i++) encodeOne(out, list.get(i));
+        } else {
+            for (String[] hf : headers) encodeOne(out, hf);
         }
         return out.position() - start;
+    }
+
+    private static void encodeOne(ByteBuffer out, String[] hf) {
+        String name = hf[0].toLowerCase();
+        String value = hf[1] == null ? "" : hf[1];
+        int exact = QpackStaticTable.findExact(name, value);
+        if (exact >= 0) {
+            NBitInteger.encode(out, 6, 0xC0, exact);
+            return;
+        }
+        int nameIdx = QpackStaticTable.findName(name);
+        if (nameIdx >= 0) {
+            NBitInteger.encode(out, 4, 0x50, nameIdx);
+            NBitString.encode(out, 7, 0, value, shouldHuffman(value));
+            return;
+        }
+        NBitString.encode(out, 3, 0x20, name, shouldHuffman(name));
+        NBitString.encode(out, 7, 0, value, shouldHuffman(value));
     }
 
     /**

@@ -2,7 +2,8 @@ package com.s_exp.enso.quiche;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 
 /**
  * Per-stream request-body pipe. The owner thread pushes decrypted body
@@ -16,7 +17,13 @@ public final class H3BodyPipe {
 
     private static final byte[] END_MARKER = new byte[0];
 
-    private final LinkedBlockingQueue<byte[]> queue = new LinkedBlockingQueue<>();
+    // Small ring — typical Ring bodies are 0..2 chunks. Under a body
+    // burst larger than cap, enqueue briefly blocks the owner thread
+    // until the reader vthread drains. Cap kept small because the
+    // backing Object[] alloc scales linearly with capacity and dominates
+    // per-pipe cost per alloc profile.
+    private static final int QUEUE_CAP = 8;
+    private final BlockingQueue<byte[]> queue = new ArrayBlockingQueue<>(QUEUE_CAP);
     private final InputStream input = new PipeInputStream();
     private final long maxBytes;
     private long received = 0;
@@ -35,7 +42,7 @@ public final class H3BodyPipe {
     }
 
     public void enqueue(byte[] chunk) {
-        queue.add(chunk);
+        putUninterruptibly(chunk);
     }
 
     /**
@@ -48,12 +55,25 @@ public final class H3BodyPipe {
             received += chunk.length;
             if (received > maxBytes) return false;
         }
-        queue.add(chunk);
+        putUninterruptibly(chunk);
         return true;
     }
 
     public void signalEnd() {
-        queue.add(END_MARKER);
+        putUninterruptibly(END_MARKER);
+    }
+
+    /**
+     * Blocking put that preserves interrupt state. Owner thread would
+     * only block if the ring is full — reader vthread is presumed to be
+     * consuming.
+     */
+    private void putUninterruptibly(byte[] chunk) {
+        try {
+            queue.put(chunk);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     public InputStream inputStream() {

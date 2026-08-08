@@ -27,4 +27,23 @@ public final class QpackHuffman {
     public static byte[] decode(byte[] src, int off, int len) throws IOException {
         return HpackHuffman.decode(src, off, len);
     }
+
+    /**
+     * Upper bound on the decoded byte count. Uses the HPACK formula
+     * {@code (len * 8) / 5 + 1} which is the theoretical worst case for
+     * the 5-bit shortest Huffman code.
+     */
+    public static int decodedLength(byte[] src, int off, int len) {
+        return Math.max(16, (len * 8) / 5 + 1);
+    }
+
+    /**
+     * Decode into caller-supplied {@code dst}, returning bytes written.
+     * {@code dst} must be at least {@link #decodedLength(byte[], int, int)}
+     * bytes. Zero-allocation path for hot QPACK decoders (task #128).
+     */
+    public static int decodeInto(byte[] src, int off, int len, byte[] dst)
+            throws IOException {
+        return HpackHuffman.decodeInto(src, off, len, dst);
+    }
 }

@@ -64,6 +64,7 @@ final class Http3Connection implements AutoCloseable {
     private static final byte[] EMPTY_REASON = new byte[0];
 
     private final byte[] cid;
+    private final String cidHex; // computed once; used only in log messages
     private final long conn;
     private final DatagramChannel out;
     private final InetSocketAddress local;
@@ -104,6 +105,7 @@ final class Http3Connection implements AutoCloseable {
                     Executor executor,
                     Runnable onClose) {
         this.cid = cid;
+        this.cidHex = HexFormat.of().formatHex(cid);
         this.conn = conn;
         this.out = out;
         this.local = local;
@@ -122,7 +124,7 @@ final class Http3Connection implements AutoCloseable {
             ownerThread = Thread.currentThread();
             String prev = ownerThread.getName();
             try {
-                ownerThread.setName("enso-h3-conn-" + HexFormat.of().formatHex(cid));
+                ownerThread.setName("enso-h3-conn-" + cidHex);
                 task.run();
             } finally {
                 ownerThread.setName(prev);
@@ -142,7 +144,7 @@ final class Http3Connection implements AutoCloseable {
             long n = drops.incrementAndGet();
             if ((n & 0x3ffL) == 1L) {
                 LOG.warning("h3 ingress queue full, dropped " + n
-                    + " datagrams for cid=" + HexFormat.of().formatHex(cid));
+                    + " datagrams for cid=" + cidHex);
             }
         }
     }
@@ -169,7 +171,7 @@ final class Http3Connection implements AutoCloseable {
                 if (!loggedEstablished && Quiche.connIsEstablished(conn)) {
                     loggedEstablished = true;
                     LOG.info("h3 handshake established with " + peer
-                        + " cid=" + HexFormat.of().formatHex(cid));
+                        + " cid=" + cidHex);
                 }
                 waitForWork();
             }
@@ -311,8 +313,10 @@ final class Http3Connection implements AutoCloseable {
         session.writeResponse(task.streamId, headersList, task.body);
     }
 
+    // Init cap sized for typical Ring app headers (:status + a handful of
+    // regular). Larger than default to skip the first grow (task #129).
     private final java.util.ArrayList<String[]> headersList =
-        new java.util.ArrayList<>(16);
+        new java.util.ArrayList<>(64);
 
     // Cached ":status <N>" pair for common status codes. First-request
     // path pays a lookup miss + one alloc; every subsequent response w/

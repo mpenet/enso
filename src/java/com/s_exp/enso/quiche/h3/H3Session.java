@@ -166,8 +166,12 @@ public final class H3Session {
         // memcpy dropped vs the old encode→byte[]→writeHeaders shape
         // (task #123). Estimate size with a generous per-header budget;
         // grows the scratch buf if the encoded fields overflow.
+        // Indexed loop over headers List — avoids the iterator alloc
+        // that `for (String[] hf : headers)` would trigger (task #129).
         int hdrsBudget = 32;
-        for (String[] hf : headers) {
+        int hn = headers.size();
+        for (int i = 0; i < hn; i++) {
+            String[] hf = headers.get(i);
             hdrsBudget += 24 + (hf[0] == null ? 0 : hf[0].length())
                              + (hf[1] == null ? 0 : hf[1].length());
         }

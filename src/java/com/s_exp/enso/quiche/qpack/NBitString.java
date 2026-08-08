@@ -55,18 +55,50 @@ public final class NBitString {
             throw new IllegalStateException("string too long: " + len);
         }
         int l = (int) len;
-        byte[] raw = new byte[l];
-        buf.get(raw);
-        byte[] bytes;
-        if (huffman) {
-            try {
-                bytes = QpackHuffman.decode(raw, 0, l);
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
+        // Non-huffman path: pull directly from the ByteBuffer's backing
+        // array into the String constructor — no intermediate byte[].
+        if (!huffman) {
+            String s;
+            if (buf.hasArray()) {
+                s = new String(buf.array(),
+                    buf.arrayOffset() + buf.position(), l, StandardCharsets.UTF_8);
+                buf.position(buf.position() + l);
+            } else {
+                byte[] raw = new byte[l];
+                buf.get(raw);
+                s = new String(raw, StandardCharsets.UTF_8);
             }
-        } else {
-            bytes = raw;
+            return s;
         }
-        return new String(bytes, StandardCharsets.UTF_8);
+        // Huffman path: read into a per-thread scratch, then decode into
+        // a second per-thread scratch. Both grow monotonically to fit
+        // the largest header seen on this thread — task #128. String
+        // ctor still copies out of scratch, so callers get their own
+        // immutable String.
+        byte[] rawScratch = ensureCap(RAW_TL.get(), l);
+        if (rawScratch != RAW_TL.get()) RAW_TL.set(rawScratch);
+        buf.get(rawScratch, 0, l);
+        try {
+            int decodedLen = QpackHuffman.decodedLength(rawScratch, 0, l);
+            byte[] outScratch = ensureCap(OUT_TL.get(), decodedLen);
+            if (outScratch != OUT_TL.get()) OUT_TL.set(outScratch);
+            int actual = QpackHuffman.decodeInto(rawScratch, 0, l, outScratch);
+            return new String(outScratch, 0, actual, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
+
+    private static byte[] ensureCap(byte[] buf, int need) {
+        if (buf == null || buf.length < need) {
+            return new byte[Math.max(64, Integer.highestOneBit(need - 1) << 1)];
+        }
+        return buf;
+    }
+
+    // Per-thread scratch used by the huffman decode path. Owner threads
+    // (one per h3 conn) hit this repeatedly; each keeps its own scratch
+    // sized to the largest header on that thread.
+    private static final ThreadLocal<byte[]> RAW_TL = ThreadLocal.withInitial(() -> new byte[64]);
+    private static final ThreadLocal<byte[]> OUT_TL = ThreadLocal.withInitial(() -> new byte[128]);
 }
