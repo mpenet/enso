@@ -130,14 +130,29 @@ public final class H3Session {
      */
     public void onStreamData(long streamId, byte[] data, boolean fin,
                               RequestSink sink) {
-        long dir = streamId & 0x3;
-        if (dir == DIR_CLIENT_BIDI) {
-            handleRequestStream(streamId, data, fin, sink);
-        } else if (dir == DIR_CLIENT_UNI) {
-            handlePeerUniStream(streamId, data, fin);
+        try {
+            long dir = streamId & 0x3;
+            if (dir == DIR_CLIENT_BIDI) {
+                handleRequestStream(streamId, data, fin, sink);
+            } else if (dir == DIR_CLIENT_UNI) {
+                handlePeerUniStream(streamId, data, fin);
+            }
+            // Server-uni: ignored (that's our own outbound). Server-bidi:
+            // unused in H3.
+        } catch (H3ConnectionException hce) {
+            // Protocol-level violation → close the whole connection with
+            // the H3 error code. Owner-thread driver observes
+            // connIsClosed on next iteration and exits cleanly.
+            LOG.info("h3 closing connection code=0x"
+                + Long.toHexString(hce.errorCode()) + " reason="
+                + hce.getMessage());
+            byte[] reason = hce.getMessage() == null
+                ? new byte[0]
+                : hce.getMessage().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            try {
+                Quiche.connClose(conn, true, hce.errorCode(), reason);
+            } catch (Throwable ignored) {}
         }
-        // Server-uni: ignored (that's our own outbound). Server-bidi:
-        // unused in H3.
     }
 
     /**
@@ -192,20 +207,18 @@ public final class H3Session {
         while (true) {
             H3FrameReader.Frame f = rs.reader.poll();
             if (f == null) break;
-            // RFC 9114 §7.2: frames that only make sense on the control
-            // stream MUST be treated as H3_FRAME_UNEXPECTED on a request
-            // stream. Reset the stream; a follow-up (task #100) will
-            // escalate control-stream-only frames to connection close.
+            // RFC 9114 §7.2: control-only frames on a request stream MUST
+            // be treated as H3_FRAME_UNEXPECTED at the connection level.
             if (f.type == H3FrameType.SETTINGS
                 || f.type == H3FrameType.GOAWAY
                 || f.type == H3FrameType.MAX_PUSH_ID
                 || f.type == H3FrameType.CANCEL_PUSH
                 || f.type == H3FrameType.PUSH_PROMISE) {
-                LOG.warning("h3 unexpected frame type=0x" + Long.toHexString(f.type)
-                    + " on request stream=" + streamId);
-                resetStream(streamId, 0x105); // H3_FRAME_UNEXPECTED
                 releaseReader(requestStreams.remove(streamId));
-                return;
+                throw new H3ConnectionException(
+                    H3ConnectionException.H3_FRAME_UNEXPECTED,
+                    "frame type 0x" + Long.toHexString(f.type)
+                        + " forbidden on request stream " + streamId);
             }
             if (f.type == H3FrameType.HEADERS) {
                 List<String[]> headers;
@@ -338,14 +351,77 @@ public final class H3Session {
         } else {
             buf = ByteBuffer.wrap(data);
         }
-        // For v1 we only need to parse the peer control stream (SETTINGS,
-        // GOAWAY). QPACK enc/dec streams under our cap=0 contract carry
-        // no meaningful data.
+        // Peer control stream: parse SETTINGS / GOAWAY / MAX_PUSH_ID.
+        // Any protocol-level violation raises H3ConnectionException which
+        // onStreamData catches + translates into a quiche_conn_close.
         if (knownType == H3StreamType.CONTROL) {
-            // TODO: parse peer SETTINGS/GOAWAY. Not required for basic
-            // request/response — leave for follow-up (task #100).
+            handlePeerControlBytes(buf);
+        }
+        // QPACK enc/dec streams under our cap=0 contract carry no
+        // meaningful data — drop.
+    }
+
+    /**
+     * Feed the peer's control-stream bytes to a per-connection reader
+     * and enforce RFC 9114 §7.2 ordering rules. Protocol violations here
+     * MUST close the whole connection, not just the stream.
+     */
+    private void handlePeerControlBytes(ByteBuffer buf) {
+        if (peerControlReader == null) peerControlReader = new H3FrameReader();
+        peerControlReader.feed(buf);
+        while (true) {
+            H3FrameReader.Frame f;
+            try {
+                f = peerControlReader.poll();
+            } catch (IllegalStateException e) {
+                // Reader detected an over-sized frame → treat as
+                // H3_EXCESSIVE_LOAD / FRAME_ERROR at the connection layer.
+                throw new H3ConnectionException(
+                    H3ConnectionException.H3_FRAME_ERROR,
+                    "peer control-stream frame reader: " + e.getMessage());
+            }
+            if (f == null) break;
+            // RFC 9114 §7.2.4: SETTINGS MUST be the first frame.
+            if (!sawPeerSettings && f.type != H3FrameType.SETTINGS) {
+                throw new H3ConnectionException(
+                    H3ConnectionException.H3_MISSING_SETTINGS,
+                    "first frame on peer control stream must be SETTINGS, got 0x"
+                        + Long.toHexString(f.type));
+            }
+            if (f.type == H3FrameType.SETTINGS) {
+                if (sawPeerSettings) {
+                    throw new H3ConnectionException(
+                        H3ConnectionException.H3_FRAME_UNEXPECTED,
+                        "duplicate SETTINGS on peer control stream");
+                }
+                sawPeerSettings = true;
+                // We accept + ignore peer settings values. Under our
+                // advertised MAX_TABLE_CAPACITY=0 nothing they choose
+                // affects our encoding.
+            } else if (f.type == H3FrameType.HEADERS
+                    || f.type == H3FrameType.DATA
+                    || f.type == H3FrameType.PUSH_PROMISE) {
+                throw new H3ConnectionException(
+                    H3ConnectionException.H3_FRAME_UNEXPECTED,
+                    "frame type 0x" + Long.toHexString(f.type)
+                        + " forbidden on control stream");
+            } else if (f.type == H3FrameType.GOAWAY) {
+                // Peer signals graceful close. Track lowest ID + ignore
+                // any decoded value regression (RFC 9114 §5.2). We don't
+                // originate streams so no further action needed here.
+                sawPeerGoaway = true;
+            } else if (f.type == H3FrameType.MAX_PUSH_ID
+                    || f.type == H3FrameType.CANCEL_PUSH) {
+                // We never enable push (SETTINGS_ENABLE_CONNECT_PROTOCOL
+                // == 0, MAX_PUSH_ID unset). Accept + ignore.
+            }
+            // Unknown / reserved frame types: reader stream-skipped them.
         }
     }
+
+    private H3FrameReader peerControlReader;
+    private boolean sawPeerSettings;
+    private boolean sawPeerGoaway;
 
     /**
      * RFC 9114 §7.2.8 grease-type check. Reserved unassigned stream types
@@ -372,19 +448,23 @@ public final class H3Session {
      * the caller.
      */
     /**
-     * @return true iff quiche accepted all {@code remaining} bytes.
-     *         Short writes leave the ByteBuffer's position advanced past
-     *         the unwritten bytes (the caller does not retry — see
-     *         task #104 for the fin-split fix).
+     * Try to send the buffer's bytes on {@code streamId}. Checks stream
+     * capacity first to avoid the busy-spin path when peer flow control
+     * is closed. On partial or capacity=0, copies the un-sent remainder
+     * into an owned byte[] and enqueues it in {@link #pendingByStream}
+     * for later resumption by {@link #drainPendingWrites}. FIN is only
+     * applied on the terminal call that consumes the last byte — matches
+     * RFC 9000 §4.5 semantics; earlier partials must use fin=false so a
+     * short-write doesn't strand the FIN signal.
+     *
+     * @return true iff every byte was sent in this call (FIN, if
+     *   requested, was applied).
      */
     private boolean writeAll(long streamId, ByteBuffer buf, boolean fin) {
         int remaining = buf.remaining();
         byte[] bytes;
         int off;
         if (buf.hasArray()) {
-            // Zero-copy: hand quiche the backing array directly with the
-            // ByteBuffer's current view offsets. H3FrameWriter always
-            // returns heap-backed buffers so we hit this path in practice.
             bytes = buf.array();
             off = buf.arrayOffset() + buf.position();
             buf.position(buf.limit());
@@ -393,17 +473,95 @@ public final class H3Session {
             buf.get(bytes);
             off = 0;
         }
-        long rc = Quiche.connStreamSend(conn, streamId, bytes, off, remaining, fin);
+        long cap = Quiche.connStreamCapacity(conn, streamId);
+        if (cap < 0) {
+            LOG.info("h3 stream_capacity stream=" + streamId + " rc=" + cap);
+            return false;
+        }
+        if (cap == 0) {
+            // No credit right now — copy the payload out of caller's
+            // reused scratch and defer.
+            enqueuePending(streamId, copyOwned(bytes, off, remaining), fin);
+            return false;
+        }
+        int chunk = (int) Math.min((long) remaining, cap);
+        boolean applyFin = fin && (chunk == remaining);
+        long rc = Quiche.connStreamSend(conn, streamId, bytes, off, chunk, applyFin);
         if (rc < 0) {
             LOG.info("h3 stream_send stream=" + streamId + " rc=" + rc);
             return false;
         }
-        if (rc < remaining) {
-            LOG.info("h3 short stream_send stream=" + streamId
-                + " wrote=" + rc + " of=" + remaining);
-            return false;
+        if (rc == remaining) return true;
+        // Partial: enqueue what wasn't sent (may be entire chunk on rc==0,
+        // or leftover past what capacity accepted).
+        int written = (int) rc;
+        enqueuePending(streamId,
+            copyOwned(bytes, off + written, remaining - written), fin);
+        return false;
+    }
+
+    private static byte[] copyOwned(byte[] src, int off, int len) {
+        byte[] out = new byte[len];
+        System.arraycopy(src, off, out, 0, len);
+        return out;
+    }
+
+    private void enqueuePending(long streamId, byte[] bytes, boolean fin) {
+        pendingByStream.computeIfAbsent(streamId, k -> new java.util.ArrayDeque<>())
+            .addLast(new Pending(bytes, fin));
+    }
+
+    /**
+     * Retry any deferred stream writes. Called by the owner-thread driver
+     * loop after regular drainOutbound so newly-opened flow-control
+     * windows get picked up promptly.
+     */
+    public void drainPendingWrites() {
+        if (pendingByStream.isEmpty()) return;
+        var it = pendingByStream.entrySet().iterator();
+        while (it.hasNext()) {
+            var e = it.next();
+            long streamId = e.getKey();
+            var q = e.getValue();
+            while (!q.isEmpty()) {
+                Pending p = q.peekFirst();
+                long cap = Quiche.connStreamCapacity(conn, streamId);
+                if (cap < 0) { q.clear(); break; }
+                if (cap == 0) break;
+                int chunk = (int) Math.min((long) p.len, cap);
+                boolean applyFin = p.fin && (chunk == p.len);
+                long rc = Quiche.connStreamSend(
+                    conn, streamId, p.buf, p.off, chunk, applyFin);
+                if (rc < 0) { q.clear(); break; }
+                if (rc == 0) break;
+                p.off += (int) rc;
+                p.len -= (int) rc;
+                if (p.len == 0) q.pollFirst();
+            }
+            if (q.isEmpty()) it.remove();
         }
-        return true;
+    }
+
+    /** Per-stream deferred write: what quiche's flow control blocked. */
+    private static final class Pending {
+        byte[] buf;
+        int off;
+        int len;
+        final boolean fin;
+        Pending(byte[] buf, boolean fin) {
+            this.buf = buf;
+            this.off = 0;
+            this.len = buf.length;
+            this.fin = fin;
+        }
+    }
+
+    private final java.util.Map<Long, java.util.Deque<Pending>> pendingByStream =
+        new java.util.HashMap<>();
+
+    /** Exposed so the driver loop can skip parking when writes await capacity. */
+    public boolean hasPendingWrites() {
+        return !pendingByStream.isEmpty();
     }
 
     /**

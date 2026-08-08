@@ -175,10 +175,24 @@ public final class Quiche {
                                        byte[] fromIp, int fromPort,
                                        byte[] toIp, int toPort);
     public static native long connSend(long conn, byte[] out, int outLen);
+    /**
+     * Initiate graceful/error connection close. {@code app=true} sends an
+     * application-level close (H3 error codes); {@code app=false} sends a
+     * transport-level QUIC close. {@code reason} may be null / empty.
+     * Returns 0 on success or a quiche error code.
+     */
+    public static native int connClose(long conn, boolean app, long err,
+                                       byte[] reason);
 
     // -----------------------------------------------------------------
     // Streams
     // -----------------------------------------------------------------
+    /**
+     * Bytes the stream can currently accept from stream_send (peer flow
+     * control window minus in-flight). Negative on error. Zero means we
+     * must defer sending and retry once the peer's window opens.
+     */
+    public static native long connStreamCapacity(long conn, long streamId);
     public static native long connStreamRecv(long conn, long streamId,
                                              byte[] out, int outLen,
                                              boolean[] finOut, long[] errOut);

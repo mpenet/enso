@@ -386,9 +386,35 @@ Java_com_s_1exp_enso_quiche_Quiche_connSend(
     return (jlong)rc;
 }
 
+JNIEXPORT jint JNICALL
+Java_com_s_1exp_enso_quiche_Quiche_connClose(
+        JNIEnv *env, jclass cls, jlong conn,
+        jboolean app, jlong err, jbyteArray reasonArr) {
+    UNUSED(cls);
+    jsize len = (reasonArr != NULL) ? (*env)->GetArrayLength(env, reasonArr) : 0;
+    jbyte *reason = (len > 0)
+        ? (*env)->GetByteArrayElements(env, reasonArr, NULL) : NULL;
+    int rc = quiche_conn_close(
+        (quiche_conn *)(intptr_t)conn,
+        app == JNI_TRUE, (uint64_t)err,
+        (const uint8_t *)reason, (size_t)len);
+    if (reason != NULL) {
+        (*env)->ReleaseByteArrayElements(env, reasonArr, reason, JNI_ABORT);
+    }
+    return (jint)rc;
+}
+
 /* --------------------------------------------------------------------- */
 /* Streams                                                                */
 /* --------------------------------------------------------------------- */
+
+JNIEXPORT jlong JNICALL
+Java_com_s_1exp_enso_quiche_Quiche_connStreamCapacity(
+        JNIEnv *env, jclass cls, jlong conn, jlong streamId) {
+    UNUSED(env); UNUSED(cls);
+    return (jlong)quiche_conn_stream_capacity(
+        (quiche_conn *)(intptr_t)conn, (uint64_t)streamId);
+}
 
 JNIEXPORT jlong JNICALL
 Java_com_s_1exp_enso_quiche_Quiche_connStreamRecv(

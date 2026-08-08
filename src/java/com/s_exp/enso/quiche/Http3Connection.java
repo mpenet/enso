@@ -61,6 +61,7 @@ final class Http3Connection implements AutoCloseable {
     // Zero-length datagram used by close() to wake the owner if it's parked
     // in ingress.poll(). drainIngress skips zero-length entries.
     private static final byte[] WAKE_SENTINEL = new byte[0];
+    private static final byte[] EMPTY_REASON = new byte[0];
 
     private final byte[] cid;
     private final long conn;
@@ -153,6 +154,10 @@ final class Http3Connection implements AutoCloseable {
                 if (session != null) {
                     drainReadableStreams(sink);
                     drainOutbound();
+                    // Retry deferred stream writes (task #104) — quiche
+                    // may have accepted new flow-control credit from the
+                    // peer since our last attempt.
+                    session.drainPendingWrites();
                 }
                 processSend();
                 if (Quiche.connIsClosed(conn)) return;
@@ -175,6 +180,17 @@ final class Http3Connection implements AutoCloseable {
                 try { pipe.signalEnd(); } catch (Throwable ignored) {}
             }
             bodyPipes.clear();
+            // RFC 9114 §5.1 graceful close: if we haven't already been
+            // closed (peer close, protocol error, timeout), emit a
+            // H3_NO_ERROR CONNECTION_CLOSE and flush the resulting
+            // datagram before freeing. Task #110.
+            try {
+                if (!Quiche.connIsClosed(conn)) {
+                    Quiche.connClose(conn, true,
+                        0x100L /* H3_NO_ERROR */, EMPTY_REASON);
+                    try { processSend(); } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {}
             try {
                 Quiche.connFree(conn);
             } finally {
@@ -187,6 +203,9 @@ final class Http3Connection implements AutoCloseable {
 
     private void waitForWork() throws InterruptedException {
         if (!ingress.isEmpty() || !outbound.isEmpty()) return;
+        // Deferred writes drain on next ingress-triggered iteration —
+        // peer flow-control credit only grows when we receive their
+        // ACK / MAX_STREAM_DATA frames, so no point busy-spinning here.
         long timeoutNanos = Quiche.connTimeoutAsNanos(conn);
         long parkNanos = timeoutNanos == -1L ? 500_000_000L
             : Math.min(timeoutNanos, 500_000_000L);
