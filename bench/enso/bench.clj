@@ -231,6 +231,91 @@
      :wall-ms wall-ms
      :rps-est (double (/ (* clients per-client) (/ wall-ms 1000.0)))}))
 
+;; --- Cross-server h3 bench (task #95) --------------------------------------
+
+(defn- gen-p12!
+  "Wraps a PEM cert + key into a PKCS12 keystore for Jetty. Returns
+  [keystore-path password]."
+  [cert-pem key-pem]
+  (let [dir (-> cert-pem java.io.File. .getParentFile .toPath)
+        p12 (str (.resolve dir "keystore.p12"))
+        pass "bench"
+        cmd ["openssl" "pkcs12" "-export"
+             "-in" cert-pem "-inkey" key-pem
+             "-out" p12 "-name" "bench"
+             "-passout" (str "pass:" pass)]
+        proc (-> (ProcessBuilder. ^java.util.List cmd)
+                 (.redirectErrorStream true) (.start))]
+    (.waitFor proc)
+    (when-not (zero? (.exitValue proc))
+      (throw (ex-info (str "openssl pkcs12 failed: "
+                           (slurp (.getInputStream proc))) {})))
+    [p12 pass]))
+
+(defonce ^:private netty-h3-state (atom nil))
+(defonce ^:private jetty-h3-state (atom nil))
+
+(defn netty-h3-stop! []
+  (when-let [h @netty-h3-state]
+    (enso.bench.NettyH3BenchServer/stop h)
+    (reset! netty-h3-state nil))
+  :stopped)
+
+(defn netty-h3-start!
+  ([] (netty-h3-start! {:port 18444}))
+  ([{:keys [port]}]
+   (netty-h3-stop!)
+   (let [[cert key] (gen-cert-key!)
+         h (enso.bench.NettyH3BenchServer/start port cert key)]
+     (reset! netty-h3-state h)
+     {:h3-url (str "https://127.0.0.1:" port "/nope")})))
+
+(defn jetty-h3-stop! []
+  (when-let [h @jetty-h3-state]
+    (enso.bench.JettyH3BenchServer/stop h)
+    (reset! jetty-h3-state nil))
+  :stopped)
+
+(defn jetty-h3-start!
+  ([] (jetty-h3-start! {:port 18445}))
+  ([{:keys [port]}]
+   (jetty-h3-stop!)
+   (let [[cert key] (gen-cert-key!)
+         [p12 pass] (gen-p12! cert key)
+         h (enso.bench.JettyH3BenchServer/start port cert key p12 pass)]
+     (reset! jetty-h3-state h)
+     {:h3-url (str "https://127.0.0.1:" port "/nope")})))
+
+(defn compare-h3!
+  "Boot enso, Netty, Jetty h3 servers on distinct UDP ports, drive
+  identical `clients × per-client` quiche-client load against each,
+  return the wall-time / rps results side by side. Warms up each server
+  first to amortise JIT + TLS handshake."
+  ([] (compare-h3! {:clients 32 :per-client 1000}))
+  ([opts]
+   (let [enso-url (:h3-url (h3-start! {:h3-port 18443}))
+         netty-url (:h3-url (netty-h3-start!))
+         jetty-url (:h3-url (jetty-h3-start!))
+         warmup {:clients 4 :per-client 100}
+         run (fn [label url]
+               (drive-h3! url warmup)   ; warmup
+               (drive-h3! url warmup)
+               (let [r (drive-h3! url opts)]
+                 [label (select-keys r [:total-req :wall-ms :rps-est
+                                        :ok-clients :fail-clients])]))
+         results (into {} [(run :enso enso-url)
+                           (run :netty netty-url)
+                           (run :jetty jetty-url)])]
+     (h3-stop!)
+     (netty-h3-stop!)
+     (jetty-h3-stop!)
+     {:opts opts
+      :results results
+      :rps-ranking (->> results
+                        (map (fn [[k v]] [k (:rps-est v)]))
+                        (sort-by second >)
+                        (into []))})))
+
 ;; --- Allocation profiling --------------------------------------------------
 
 (defn profile-alloc-h3!

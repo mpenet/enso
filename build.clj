@@ -28,6 +28,16 @@
             :basis @basis
             :javac-opts ["--release" "22"]}))
 
+(defn javac-bench
+  "Compile bench-only Java sources (Netty + Jetty h3 servers for task #95).
+  Uses the bench alias basis so Netty/Jetty deps are on the compile path."
+  [_]
+  (javac nil)
+  (b/javac {:src-dirs ["bench/java"]
+            :class-dir class-dir
+            :basis (b/create-basis {:project "deps.edn" :aliases [:bench]})
+            :javac-opts ["--release" "22"]}))
+
 (defn shim
   "Build the enso_quiche JNI shim into target/native/<os>-<arch>/. Callers
   that don't need HTTP/3 can skip this."

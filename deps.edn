@@ -21,7 +21,14 @@
   :bench {:extra-deps {http-kit/http-kit {:mvn/version "2.8.0"}
                        ring/ring-jetty-adapter {:mvn/version "1.14.2"}
                        com.clojure-goes-fast/clj-async-profiler {:mvn/version "1.6.2"}
-                       nrepl/nrepl {:mvn/version "1.3.1"}}
+                       nrepl/nrepl {:mvn/version "1.3.1"}
+                       ;; --- Netty h3 for bench comparisons (task #95) ---
+                       io.netty.incubator/netty-incubator-codec-http3 {:mvn/version "0.0.28.Final"}
+                       io.netty.incubator/netty-incubator-codec-native-quic$osx-aarch_64 {:mvn/version "0.0.66.Final"}
+                       ;; --- Jetty h3 for bench comparisons (task #95) ---
+                       org.eclipse.jetty.http3/jetty-http3-server {:mvn/version "12.0.14"}
+                       org.eclipse.jetty.quic/jetty-quic-server {:mvn/version "12.0.14"}
+                       org.eclipse.jetty.quic/jetty-quic-quiche-jna {:mvn/version "12.0.14"}}
           :extra-paths ["bench"]
           :jvm-opts ["-Djdk.attach.allowAttachSelf"
                      "-XX:+UnlockDiagnosticVMOptions"
