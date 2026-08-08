@@ -4,8 +4,8 @@
   a live QUIC connection and are purely CPU-driven."
   (:require [clojure.test :refer [deftest is testing]])
   (:import (com.s_exp.enso.quiche.h3 H3FrameType H3FrameReader H3FrameWriter Varint)
-           (com.s_exp.enso.quiche.qpack NBitInteger NBitString QpackHuffman
-                                        QpackStaticTable)
+           (com.s_exp.enso.quiche.qpack NBitInteger NBitString QpackFieldSection
+                                        QpackHuffman QpackStaticTable)
            (java.nio ByteBuffer)))
 
 (set! *warn-on-reflection* true)
@@ -155,3 +155,56 @@
       (is (= (alength body)
              (reduce + (map #(alength (.-dataChunk %)) chunks))))
       (is (.-dataFinalChunk (last chunks))))))
+
+(defn- roundtrip-headers [pairs]
+  (let [encoded (QpackFieldSection/encode
+                 ^Iterable (mapv #(into-array String %) pairs))
+        decoded (QpackFieldSection/decode encoded)]
+    (mapv vec decoded)))
+
+(deftest qpack-field-section-indexed-static
+  ;; :method GET is index 17 in static table — should encode as single
+  ;; Indexed byte (0xC0 | 17 = 0xD1) after the two-byte prefix.
+  (let [encoded (QpackFieldSection/encode
+                 ^Iterable [(into-array String [":method" "GET"])])]
+    (is (= 3 (alength encoded)) "prefix (2) + one Indexed byte")
+    (is (= 0x00 (bit-and (aget encoded 0) 0xFF)))
+    (is (= 0x00 (bit-and (aget encoded 1) 0xFF)))
+    (is (= 0xD1 (bit-and (aget encoded 2) 0xFF)))))
+
+(deftest qpack-field-section-roundtrip-static-only
+  (let [pairs [[":method" "GET"]
+               [":scheme" "https"]
+               [":path" "/"]
+               [":status" "200"]]]
+    (is (= pairs (roundtrip-headers pairs)))))
+
+(deftest qpack-field-section-roundtrip-literal-name-ref
+  ;; :authority has index 0 (empty value), so "example.com" should encode
+  ;; as literal-with-name-ref (static).
+  (let [pairs [[":method" "GET"]
+               [":authority" "example.com"]
+               [":path" "/api"]]]
+    (is (= pairs (roundtrip-headers pairs)))))
+
+(deftest qpack-field-section-roundtrip-literal-literal
+  ;; Custom header not in static table — must encode as Literal Literal.
+  (let [pairs [[":method" "POST"]
+               ["x-custom-header" "some value"]
+               ["another-header" "!@#$% weird chars"]]]
+    (is (= pairs (roundtrip-headers pairs)))))
+
+(deftest qpack-field-section-lowercases-literal-names
+  ;; QPACK requires lowercase header names on the wire; our encoder
+  ;; normalises. Decoder must return lowercase.
+  (let [encoded (QpackFieldSection/encode
+                 ^Iterable [(into-array String ["X-Weird-CASE" "v"])])
+        decoded (QpackFieldSection/decode encoded)]
+    (is (= "x-weird-case" (aget ^"[Ljava.lang.String;" (first decoded) 0)))))
+
+(deftest qpack-field-section-large-value-huffman
+  (let [big-val (apply str (repeat 200 "abcdef"))
+        pairs [[":method" "GET"]
+               ["etag" big-val]]
+        roundtripped (roundtrip-headers pairs)]
+    (is (= pairs roundtripped))))

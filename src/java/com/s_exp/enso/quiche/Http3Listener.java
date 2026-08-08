@@ -3,7 +3,6 @@ package com.s_exp.enso.quiche;
 import com.s_exp.enso.Config;
 import com.s_exp.enso.RingHandler;
 import com.s_exp.enso.quiche.ffm.quiche_h;
-import com.s_exp.enso.quiche.ffm.quiche_h3_event_for_each_header$cb;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -76,17 +75,6 @@ public final class Http3Listener implements AutoCloseable {
     // on close(). Avoids Arena.ofConfined() + several allocate() calls
     // per received datagram.
     private Arena demuxArena;
-    // Shared HTTP/3 header-decode upcall stub. Allocated once at start()
-    // and reused across every Http3Connection. Per-connection stubs
-    // generated hidden classes into metaspace on every accept, which under
-    // load corrupted metaspace and caused JVM SIGSEGVs in
-    // MetaspaceArena::allocate_inner and HandleArea::oops_do.
-    private MemorySegment forEachHeaderCbSeg;
-    // Shared HTTP/3 config. Per-connection quiche_h3_config_new + free
-    // corrupted libmalloc's freelist on 0.29.3 (crashes in Frame::from_bytes
-    // → Vec::grow). Matches quiche's own example server: one config per
-    // server, not per connection.
-    private MemorySegment h3Config;
     private MemorySegment hVersion;
     private MemorySegment hType;
     private MemorySegment hScid, hScidLen;
@@ -122,30 +110,6 @@ public final class Http3Listener implements AutoCloseable {
         hDcidLen = demuxArena.allocate(ValueLayout.JAVA_LONG);
         hToken = demuxArena.allocate(2048);
         hTokenLen = demuxArena.allocate(ValueLayout.JAVA_LONG);
-
-        // Shared h3 config — one per listener lifetime. Freed at close().
-        h3Config = quiche_h.quiche_h3_config_new();
-        if (h3Config.address() == 0) {
-            throw new IOException("quiche_h3_config_new returned null");
-        }
-
-        // Allocate the shared header-decode upcall stub ONCE, on the
-        // listener-lifetime arena. Reused by every Http3Connection. The
-        // callback consults Http3Connection.CURRENT_COLLECTOR (a
-        // ThreadLocal set by the connection's owner thread at run() start)
-        // to know where to accumulate decoded header pairs.
-        forEachHeaderCbSeg = quiche_h3_event_for_each_header$cb.allocate(
-            (name, nameLen, value, valueLen, ctx) -> {
-                List<String[]> c = Http3Connection.CURRENT_COLLECTOR.get();
-                if (c == null) return 0;
-                byte[] n = name.reinterpret(nameLen).toArray(ValueLayout.JAVA_BYTE);
-                byte[] v = value.reinterpret(valueLen).toArray(ValueLayout.JAVA_BYTE);
-                c.add(new String[] {
-                    new String(n, StandardCharsets.UTF_8),
-                    new String(v, StandardCharsets.UTF_8)
-                });
-                return 0;
-            }, demuxArena);
 
         // Named platform threads for per-connection drivers; reused via
         // the cached pool so accept floods don't churn thread creation.
@@ -346,8 +310,6 @@ public final class Http3Listener implements AutoCloseable {
                 handler,
                 config.maxRequestBodyBytes,
                 connExecutor,
-                forEachHeaderCbSeg,
-                h3Config,
                 () -> conns.remove(key));
             Http3Connection prev = conns.putIfAbsent(key, h3conn);
             if (prev != null) {
@@ -378,9 +340,6 @@ public final class Http3Listener implements AutoCloseable {
         conns.clear();
         if (quicheConfig != null) {
             try { quicheConfig.close(); } catch (Throwable ignored) {}
-        }
-        if (h3Config != null && h3Config.address() != 0) {
-            try { quiche_h.quiche_h3_config_free(h3Config); } catch (Throwable ignored) {}
         }
         if (demuxArena != null) {
             try { demuxArena.close(); } catch (Throwable ignored) {}
