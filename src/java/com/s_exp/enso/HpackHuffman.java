@@ -3,7 +3,8 @@ package com.s_exp.enso;
 import java.io.IOException;
 
 /**
- * HPACK Huffman codec per RFC 7541 Appendix B.
+ * HPACK Huffman codec per RFC 7541 Appendix B. Also directly reused by the
+ * QPACK impl (RFC 9204 §5.2 uses the same 257-code static Huffman table).
  *
  * <p>Encoding: iterate each byte, look up its (code, bit-length), pack into
  * the output buffer.
@@ -101,7 +102,7 @@ public final class HpackHuffman {
     // ---- Encoder --------------------------------------------------------
 
     /** Returns the encoded length in bytes for {@code bytes}. */
-    static int encodedLength(byte[] bytes, int off, int len) {
+    public static int encodedLength(byte[] bytes, int off, int len) {
         long bits = 0;
         for (int i = 0; i < len; i++) {
             bits += CODES[bytes[off + i] & 0xFF] & 0xFF;
@@ -110,7 +111,7 @@ public final class HpackHuffman {
     }
 
     /** Encodes {@code bytes[off..off+len]} into {@code out} at {@code outOff}. Returns bytes written. */
-    static int encode(byte[] bytes, int off, int len, byte[] out, int outOff) {
+    public static int encode(byte[] bytes, int off, int len, byte[] out, int outOff) {
         long buffer = 0;
         int bits = 0;
         int written = 0;
