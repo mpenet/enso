@@ -7,6 +7,8 @@ import com.s_exp.enso.Response;
 import com.s_exp.enso.RingHandler;
 import com.s_exp.enso.quiche.ffm.quiche_h;
 import com.s_exp.enso.quiche.ffm.quiche_h3_event_for_each_header$cb;
+import com.s_exp.enso.quiche.jna.QuicheJna;
+import com.sun.jna.Pointer;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -92,7 +94,19 @@ final class Http3Connection implements AutoCloseable {
     // The header-decode bucket is a plain field — only ever touched by the
     // owner platform thread, so no ThreadLocal indirection.
     private final List<String[]> collector = new ArrayList<>(16);
-    private MemorySegment forEachHeaderCbSeg;
+    // Shared upcall stub — one instance for the whole listener. Owned by
+    // Http3Listener, passed in ctor. Per-connection stubs were leaking
+    // hidden classes into metaspace under connection churn (JDK 25 crashes
+    // in MetaspaceArena::allocate_inner).
+    private final MemorySegment forEachHeaderCbSeg;
+    // Shared listener-lifetime HTTP/3 config. Passed in at ctor.
+    private final MemorySegment h3Config;
+    // ThreadLocal used by the shared upcall stub to find the current
+    // connection's collector. The owner platform thread sets this once at
+    // run() start; the stub's callback reads it per header. Reverts the
+    // task-#73 optimisation because sharing the stub eliminates the
+    // metaspace churn that caused SIGSEGVs.
+    static final ThreadLocal<List<String[]>> CURRENT_COLLECTOR = new ThreadLocal<>();
     // Live request bodies keyed by stream_id. Owner-thread only, no
     // concurrent mutation — the map is unlocked.
     private final HashMap<Long, H3BodyPipe> bodyPipes = new HashMap<>();
@@ -105,6 +119,11 @@ final class Http3Connection implements AutoCloseable {
     private MemorySegment inBuf;          // inbound datagram scratch
     private MemorySegment outBuf;         // outbound datagram scratch
     private MemorySegment sendInfo;       // quiche_send_info out param
+    private MemorySegment recvInfo;       // quiche_recv_info out param
+    private MemorySegment peerSockaddr;   // pre-baked peer sockaddr bytes
+    private int peerSockaddrLen;
+    private MemorySegment localSockaddr;  // pre-baked local sockaddr bytes
+    private int localSockaddrLen;
     private MemorySegment evPtr;          // out-param for quiche_h3_conn_poll
     private MemorySegment bodyBuf;        // recv_body scratch (4 KiB)
 
@@ -116,6 +135,8 @@ final class Http3Connection implements AutoCloseable {
                     RingHandler handler,
                     long maxRequestBodyBytes,
                     Executor executor,
+                    MemorySegment forEachHeaderCbSeg,
+                    MemorySegment h3Config,
                     Runnable onClose) {
         this.cid = cid;
         this.conn = conn;
@@ -125,20 +146,9 @@ final class Http3Connection implements AutoCloseable {
         this.peer = peer;
         this.handler = handler;
         this.maxRequestBodyBytes = maxRequestBodyBytes;
+        this.forEachHeaderCbSeg = forEachHeaderCbSeg;
+        this.h3Config = h3Config;
         this.onClose = onClose;
-        // Bind the upcall stub against the connection-lifetime arena. The
-        // stub captures the ThreadLocal collector; each handleHeaders call
-        // clears + drains it around the for_each call.
-        this.forEachHeaderCbSeg = quiche_h3_event_for_each_header$cb.allocate(
-            (name, nameLen, value, valueLen, ctx) -> {
-                byte[] n = name.reinterpret(nameLen).toArray(ValueLayout.JAVA_BYTE);
-                byte[] v = value.reinterpret(valueLen).toArray(ValueLayout.JAVA_BYTE);
-                collector.add(new String[] {
-                    new String(n, StandardCharsets.UTF_8),
-                    new String(v, StandardCharsets.UTF_8)
-                });
-                return 0;
-            }, arena);
         // Pre-allocate fixed-size FFM scratch on the connection arena.
         // Reused across every iteration of the recv/poll/send loop —
         // saves an Arena.allocate per iteration for these slots.
@@ -147,6 +157,24 @@ final class Http3Connection implements AutoCloseable {
         this.sendInfo = arena.allocate(64);
         this.evPtr = arena.allocate(ValueLayout.ADDRESS);
         this.bodyBuf = arena.allocate(4096);
+        // Pre-bake sockaddrs + recvInfo on the connection arena. Sockaddrs
+        // don't change over the connection lifetime (no migration support
+        // yet). This eliminates the per-datagram Arena.ofConfined() churn
+        // in processRecv, which under load was suspected of interacting
+        // with libmalloc's freelist on JDK 25 (SIGTRAP-abort crashes).
+        Sockaddr.Encoded peerEnc = Sockaddr.encode(arena, peer);
+        this.peerSockaddr = peerEnc.segment();
+        this.peerSockaddrLen = peerEnc.length();
+        Sockaddr.Encoded localEnc = Sockaddr.encode(arena, local);
+        this.localSockaddr = localEnc.segment();
+        this.localSockaddrLen = localEnc.length();
+        this.recvInfo = arena.allocate(48);
+        long rip = 0;
+        recvInfo.set(ValueLayout.ADDRESS, rip, peerSockaddr); rip += 8;
+        recvInfo.set(ValueLayout.JAVA_INT, rip, peerSockaddrLen); rip += 4;
+        rip += 4;
+        recvInfo.set(ValueLayout.ADDRESS, rip, localSockaddr); rip += 8;
+        recvInfo.set(ValueLayout.JAVA_INT, rip, localSockaddrLen);
         // Owner runs on a shared platform-thread pool (see Http3Listener).
         // FutureTask lets close() join it — cached pool + reuse means we
         // don't spin up a thread per connection.
@@ -172,6 +200,11 @@ final class Http3Connection implements AutoCloseable {
         // Per-iteration variable-length scratch (header emission arrays,
         // occasional small allocations). Fixed-size FFM slots come from
         // the connection-lifetime `arena`.
+        // Publish this connection's collector so the shared upcall stub can
+        // reach it. Owner thread is dedicated to this loop for its lifetime,
+        // so a plain ThreadLocal.set here + remove in finally is enough.
+        // BIG-HAMMER BISECT: full loop.
+        CURRENT_COLLECTOR.set(collector);
         try (Arena scratch = Arena.ofConfined()) {
             while (running) {
                 drainIngress();
@@ -180,16 +213,12 @@ final class Http3Connection implements AutoCloseable {
                 drainOutbound(scratch);
                 processSend();
                 if (quiche_h.quiche_conn_is_closed(conn)) return;
-                if (!loggedEstablished && quiche_h.quiche_conn_is_established(conn)) {
-                    loggedEstablished = true;
-                    LOG.info("h3 handshake established with " + peer
-                        + " cid=" + HexFormat.of().formatHex(cid));
-                }
                 waitForWork();
             }
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "h3 conn driver crash", t);
         } finally {
+            CURRENT_COLLECTOR.remove();
             close();
         }
     }
@@ -225,11 +254,12 @@ final class Http3Connection implements AutoCloseable {
     private void maybeCreateH3() {
         if (h3conn != null) return;
         if (!quiche_h.quiche_conn_is_established(conn)) return;
-        MemorySegment cfg = quiche_h.quiche_h3_config_new();
-        if (cfg.address() == 0) {
-            LOG.warning("quiche_h3_config_new returned null");
-            return;
-        }
+        // Shared listener-lifetime h3 config. Per-conn h3_config_new + free
+        // was the root cause of libmalloc freelist corruption crashes seen
+        // in task #79: quiche_h3_config_free churn on 0.29.3 poisons the
+        // allocator. Matches quiche's own example server (one config for
+        // the whole server).
+        MemorySegment cfg = h3Config;
         try {
             h3conn = quiche_h.quiche_h3_conn_new_with_transport(conn, cfg);
             if (h3conn.address() == 0) {
@@ -238,9 +268,10 @@ final class Http3Connection implements AutoCloseable {
             } else {
                 LOG.info("h3 layer created for cid=" + HexFormat.of().formatHex(cid));
             }
-        } finally {
-            quiche_h.quiche_h3_config_free(cfg);
+        } catch (Throwable t) {
+            LOG.log(Level.WARNING, "quiche_h3_conn_new_with_transport threw", t);
         }
+        // Do NOT free h3Config — shared, listener owns it.
     }
 
     private void pollH3Events(Arena scratch) {
@@ -466,10 +497,13 @@ final class Http3Connection implements AutoCloseable {
             return;
         }
         if (hasBody) {
-            MemorySegment body = scratch.allocate(task.body.length);
-            MemorySegment.copy(task.body, 0, body, ValueLayout.JAVA_BYTE, 0, task.body.length);
-            long sent = quiche_h.quiche_h3_send_body(h3conn, conn, task.streamId,
-                body, task.body.length, true);
+            // JNA send_body — swap-in for FFM path that trips libmalloc
+            // freelist corruption on JDK 25 + macOS ARM64 (task #79).
+            // Same libquiche.dylib, different JVM→C marshalling layer.
+            Pointer h3p = new Pointer(h3conn.address());
+            Pointer cp = new Pointer(conn.address());
+            long sent = QuicheJna.INSTANCE.quiche_h3_send_body(
+                h3p, cp, task.streamId, task.body, task.body.length, true);
             if (sent < 0) {
                 LOG.info("h3 send_body rc=" + sent + " stream=" + task.streamId);
             }
@@ -492,25 +526,12 @@ final class Http3Connection implements AutoCloseable {
     }
 
     private void processRecv(byte[] datagram) throws IOException {
-        // Reuse ctor-allocated inBuf (2 * MAX_DATAGRAM_SIZE). sockaddrs
-        // and recvInfo are rebuilt per call — cheap on a confined-scoped
-        // arena and sidesteps subtle SharedArena visibility questions
-        // observed when we pre-baked recvInfo in the ctor.
-        try (Arena s = Arena.ofConfined()) {
-            MemorySegment.copy(datagram, 0, inBuf, ValueLayout.JAVA_BYTE, 0, datagram.length);
-            Sockaddr.Encoded fromEnc = Sockaddr.encode(s, peer);
-            Sockaddr.Encoded toEnc = Sockaddr.encode(s, local);
-            MemorySegment info = s.allocate(48);
-            long p = 0;
-            info.set(ValueLayout.ADDRESS, p, fromEnc.segment()); p += 8;
-            info.set(ValueLayout.JAVA_INT, p, fromEnc.length()); p += 4;
-            p += 4;
-            info.set(ValueLayout.ADDRESS, p, toEnc.segment()); p += 8;
-            info.set(ValueLayout.JAVA_INT, p, toEnc.length());
-            long rc = quiche_h.quiche_conn_recv(conn, inBuf, datagram.length, info);
-            if (rc < 0 && rc != quiche_h.QUICHE_ERR_DONE()) {
-                LOG.info("h3 quiche_conn_recv returned " + rc);
-            }
+        // All FFM buffers live on the connection arena — no per-call
+        // Arena.ofConfined() churn.
+        MemorySegment.copy(datagram, 0, inBuf, ValueLayout.JAVA_BYTE, 0, datagram.length);
+        long rc = quiche_h.quiche_conn_recv(conn, inBuf, datagram.length, recvInfo);
+        if (rc < 0 && rc != quiche_h.QUICHE_ERR_DONE()) {
+            LOG.info("h3 quiche_conn_recv returned " + rc);
         }
     }
 
@@ -565,9 +586,6 @@ final class Http3Connection implements AutoCloseable {
                 }
             }
         }
-        // Free native resources in the reverse order they were allocated —
-        // h3conn before conn, both before the arena that backs their
-        // scid/address buffers.
         try {
             if (h3conn != null) quiche_h.quiche_h3_conn_free(h3conn);
         } catch (Throwable ignored) {}
