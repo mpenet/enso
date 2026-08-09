@@ -33,6 +33,10 @@ public final class EnsoServer implements AutoCloseable {
     private final RingHandler handler;
     private final RingErrorHandler errorHandler;
     private final ExecutorService executor;
+    // Where request-handler tasks actually run. == executor when the user
+    // did not supply Config.workerExecutor, else the user's Executor (its
+    // lifecycle is theirs — we don't shutdown() external executors).
+    private final java.util.concurrent.Executor dispatchExecutor;
     private final Thread acceptor;
     private final Config config;
     private final Set<HttpConnection> connections = ConcurrentHashMap.newKeySet();
@@ -58,6 +62,8 @@ public final class EnsoServer implements AutoCloseable {
                 : new SslListener(config))
             : new PlainListener(config);
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
+        this.dispatchExecutor = config.workerExecutor != null
+            ? config.workerExecutor : this.executor;
         this.acceptor = Thread.ofPlatform()
             .name("enso-acceptor")
             .daemon(true)
@@ -124,16 +130,39 @@ public final class EnsoServer implements AutoCloseable {
         while (running) {
             try {
                 Socket socket = listener.accept();
-                socket.setTcpNoDelay(true);
+                applySocketOptions(socket);
                 if (config.idleTimeoutMillis > 0) {
                     socket.setSoTimeout(config.idleTimeoutMillis);
                 }
-                executor.execute(() -> dispatch(socket));
+                dispatchExecutor.execute(() -> dispatch(socket));
             } catch (IOException e) {
                 if (running) {
                     LOG.log(Level.WARNING, "accept failed", e);
                 }
             }
+        }
+    }
+
+    /**
+     * User-supplied ALPN list wins. Otherwise: advertise h2 + http/1.1 when
+     * http2 is enabled; null (JVM default = single protocol per cipher) when
+     * not. Explicit empty array means "clear ALPN".
+     */
+    private static String[] resolveAlpn(Config config) {
+        if (config.alpnProtocols != null) return config.alpnProtocols;
+        return config.http2 ? new String[] {"h2", "http/1.1"} : null;
+    }
+
+    private void applySocketOptions(Socket s) throws IOException {
+        s.setTcpNoDelay(config.soNodelay);
+        if (config.soLinger >= 0) {
+            s.setSoLinger(true, config.soLinger);
+        }
+        if (config.soRcvBuf > 0) {
+            s.setReceiveBufferSize(config.soRcvBuf);
+        }
+        if (config.soSndBuf > 0) {
+            s.setSendBufferSize(config.soSndBuf);
         }
     }
 
@@ -240,6 +269,7 @@ public final class EnsoServer implements AutoCloseable {
 
         PlainListener(Config config) throws IOException {
             this.channel = ServerSocketChannel.open();
+            this.channel.socket().setReuseAddress(config.soReuseAddr);
             this.channel.bind(new InetSocketAddress(config.host, config.port), config.backlog);
         }
 
@@ -272,18 +302,22 @@ public final class EnsoServer implements AutoCloseable {
             SSLServerSocketFactory factory = config.sslContext.getServerSocketFactory();
             this.serverSocket = (SSLServerSocket) factory.createServerSocket(
                 config.port, config.backlog, InetAddress.getByName(config.host));
+            serverSocket.setReuseAddress(config.soReuseAddr);
             if (config.sslNeedClientAuth) {
                 this.serverSocket.setNeedClientAuth(true);
             } else if (config.sslWantClientAuth) {
                 this.serverSocket.setWantClientAuth(true);
             }
-            if (config.http2) {
-                // Advertise both application protocols; "h2" first so ALPN-aware
-                // clients prefer HTTP/2 while HTTP/1.1-only clients still work.
-                javax.net.ssl.SSLParameters params = serverSocket.getSSLParameters();
-                params.setApplicationProtocols(new String[] {"h2", "http/1.1"});
-                serverSocket.setSSLParameters(params);
+            javax.net.ssl.SSLParameters params = serverSocket.getSSLParameters();
+            String[] alpn = resolveAlpn(config);
+            if (alpn != null) params.setApplicationProtocols(alpn);
+            if (config.enabledCipherSuites != null) {
+                params.setCipherSuites(config.enabledCipherSuites);
             }
+            if (config.enabledTlsProtocols != null) {
+                params.setProtocols(config.enabledTlsProtocols);
+            }
+            serverSocket.setSSLParameters(params);
         }
 
         @Override
@@ -320,19 +354,26 @@ public final class EnsoServer implements AutoCloseable {
             this.config = config;
             this.sslContext = config.sslContext;
             this.channel = ServerSocketChannel.open();
+            this.channel.socket().setReuseAddress(config.soReuseAddr);
             this.channel.bind(new InetSocketAddress(config.host, config.port), config.backlog);
         }
 
         @Override
         public Socket accept() throws IOException {
             SocketChannel sc = channel.accept();
-            sc.socket().setTcpNoDelay(true);
             SSLEngine engine = sslContext.createSSLEngine();
             engine.setUseClientMode(false);
             if (config.sslNeedClientAuth) engine.setNeedClientAuth(true);
             else if (config.sslWantClientAuth) engine.setWantClientAuth(true);
             javax.net.ssl.SSLParameters params = engine.getSSLParameters();
-            params.setApplicationProtocols(new String[] {"h2", "http/1.1"});
+            String[] alpn = resolveAlpn(config);
+            if (alpn != null) params.setApplicationProtocols(alpn);
+            if (config.enabledCipherSuites != null) {
+                params.setCipherSuites(config.enabledCipherSuites);
+            }
+            if (config.enabledTlsProtocols != null) {
+                params.setProtocols(config.enabledTlsProtocols);
+            }
             engine.setSSLParameters(params);
             return new TlsSocket(sc, engine).asSocket();
         }

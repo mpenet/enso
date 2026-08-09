@@ -2,6 +2,7 @@ package com.s_exp.enso.http3;
 
 import clojure.lang.IPersistentMap;
 import clojure.lang.PersistentArrayMap;
+import com.s_exp.enso.api.Config;
 import com.s_exp.enso.api.Request;
 import com.s_exp.enso.api.Response;
 import com.s_exp.enso.api.RingHandler;
@@ -73,6 +74,7 @@ final class Http3Connection implements AutoCloseable {
     private final byte[] peerIp;
     private final int peerPort;
     private final RingHandler handler;
+    private final Config config;
     private final long maxRequestBodyBytes;
     private final Runnable onClose;
 
@@ -100,7 +102,7 @@ final class Http3Connection implements AutoCloseable {
                     DatagramChannel out,
                     InetSocketAddress local, InetSocketAddress peer,
                     RingHandler handler,
-                    long maxRequestBodyBytes,
+                    Config config,
                     Executor executor,
                     Runnable onClose) {
         this.cid = cid;
@@ -113,7 +115,8 @@ final class Http3Connection implements AutoCloseable {
         this.peerIp = peer.getAddress().getAddress();
         this.peerPort = peer.getPort();
         this.handler = handler;
-        this.maxRequestBodyBytes = maxRequestBodyBytes;
+        this.config = config;
+        this.maxRequestBodyBytes = config.maxRequestBodyBytes;
         this.onClose = onClose;
 
         FutureTask<?> task = new FutureTask<>(this::run, null);
@@ -236,7 +239,7 @@ final class Http3Connection implements AutoCloseable {
     private void maybeInitH3() {
         if (session != null) return;
         if (!Quiche.connIsEstablished(conn)) return;
-        session = new Http3Session(conn);
+        session = new Http3Session(conn, config);
         session.ensureInitialised();
     }
 
@@ -311,11 +314,13 @@ final class Http3Connection implements AutoCloseable {
         headersList.clear();
         String statusStr = statusString(task.status);
         headersList.add(statusPair(statusStr));
+        boolean hasServer = false;
         for (Map.Entry<?, ?> e : task.headers.entrySet()) {
             String hn = String.valueOf(e.getKey()).toLowerCase();
             if (hn.equals("connection") || hn.equals("keep-alive")
                 || hn.equals("transfer-encoding") || hn.equals("upgrade")
                 || hn.equals("proxy-connection")) continue;
+            if (hn.equals("server")) hasServer = true;
             Object v = e.getValue();
             String vs = v == null ? "" : v.toString();
             // RFC 9114 §4.2: header names/values MUST NOT contain CR,
@@ -328,6 +333,9 @@ final class Http3Connection implements AutoCloseable {
                 continue;
             }
             headersList.add(new String[]{hn, vs});
+        }
+        if (!hasServer && config.serverHeader != null && !config.serverHeader.isEmpty()) {
+            headersList.add(new String[]{"server", config.serverHeader});
         }
         session.writeResponse(task.streamId, headersList, task.body);
     }

@@ -77,6 +77,7 @@ public final class HttpConnection implements Runnable {
     public volatile boolean idle;
     private long requestDeadlineNanos;
     private int currentSoTimeout = -1;
+    private int servedRequests;
 
     public HttpConnection(Socket socket, RingHandler handler, EnsoServer server) {
         this.socket = socket;
@@ -97,7 +98,13 @@ public final class HttpConnection implements Runnable {
             in = s.getInputStream();
             out = s.getOutputStream();
             while (server.isRunning() && handleOne()) {
-                // keep-alive loop
+                servedRequests++;
+                // Cap keep-alive reuse per connection to bound resource
+                // hold time (RFC-agnostic mitigation; nginx defaults to 1000).
+                if (config.maxKeepAliveRequests > 0
+                        && servedRequests >= config.maxKeepAliveRequests) {
+                    break;
+                }
             }
             flushHbuf();
         } catch (IOException e) {
@@ -121,7 +128,12 @@ public final class HttpConnection implements Runnable {
      */
     private int socketRead(byte[] dst, int off, int len) throws IOException {
         int requestTimeoutMs = config.requestTimeoutMillis;
-        int idleTimeoutMs = config.idleTimeoutMillis;
+        // Between requests, honor keepAliveTimeoutMillis if set (falls
+        // back to idleTimeoutMillis). Mid-request always uses the
+        // per-request budget.
+        int idleTimeoutMs = (idle && config.keepAliveTimeoutMillis > 0)
+            ? config.keepAliveTimeoutMillis
+            : config.idleTimeoutMillis;
         int deadlineMs = 0;
         if (requestDeadlineNanos != 0 && requestTimeoutMs > 0) {
             long remainingNs = requestDeadlineNanos - System.nanoTime();
@@ -539,6 +551,7 @@ public final class HttpConnection implements Runnable {
         boolean hasDate = false;
         boolean hasTransferEncoding = false;
         boolean hasAltSvc = false;
+        boolean hasServer = false;
         String connectionHeader = null;
         if (response.headers != null) {
             for (Map.Entry<?, ?> e : response.headers.entrySet()) {
@@ -559,6 +572,7 @@ public final class HttpConnection implements Runnable {
                         }
                     }
                     case 7 -> hasAltSvc = hasAltSvc || name.equalsIgnoreCase("alt-svc");
+                    case 6 -> hasServer = hasServer || name.equalsIgnoreCase("server");
                     case 17 -> hasTransferEncoding = hasTransferEncoding || name.equalsIgnoreCase("transfer-encoding");
                     default -> {
                     }
@@ -582,6 +596,9 @@ public final class HttpConnection implements Runnable {
         // upgrade on their next request. Handler-supplied Alt-Svc wins.
         if (!hasAltSvc && config.altSvcValue != null) {
             hHeader("alt-svc", config.altSvcValue);
+        }
+        if (!hasServer && config.serverHeader != null && !config.serverHeader.isEmpty()) {
+            hHeader("server", config.serverHeader);
         }
 
         boolean useChunked = false;

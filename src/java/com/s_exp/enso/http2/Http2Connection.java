@@ -133,8 +133,13 @@ public final class Http2Connection implements Runnable {
     // connection so back-to-back multi-frame requests don't reallocate.
     private int pendingStreamId = 0;
     private boolean pendingEndStream = false;
+    private int pendingContinuationCount = 0;
     private final java.io.ByteArrayOutputStream pendingHeaderBytes =
         new java.io.ByteArrayOutputStream(4096);
+    // CVE-2023-44487 mitigation counter. Total RST_STREAM frames received
+    // on this connection; kill the connection with ENHANCE_YOUR_CALM once
+    // it crosses config.http2StreamResetLimit (0 disables).
+    private int totalRstStreamsReceived = 0;
 
     // Scratch buffer for the framer thread's frame header reads. Writers
     // don't share it: writeFrame allocates a per-frame byte[] that carries
@@ -570,6 +575,13 @@ public final class Http2Connection implements Runnable {
             throw new Http2.ConnectionError(
                 Http2.ERROR_PROTOCOL_ERROR, "RST_STREAM on idle stream " + f.streamId);
         }
+        // CVE-2023-44487 rapid-reset mitigation.
+        int cap = server.config().http2StreamResetLimit;
+        if (cap > 0 && ++totalRstStreamsReceived > cap) {
+            throw new Http2.ConnectionError(
+                Http2.ERROR_ENHANCE_YOUR_CALM,
+                "RST_STREAM count exceeded limit " + cap);
+        }
         Http2Stream st = streams.remove(f.streamId);
         if (st != null) {
             st.state = Http2Stream.State.CLOSED;
@@ -653,6 +665,13 @@ public final class Http2Connection implements Runnable {
             throw new Http2.ConnectionError(
                 Http2.ERROR_PROTOCOL_ERROR, "CONTINUATION without preceding HEADERS");
         }
+        // Cap CONTINUATION frames per HEADERS to bound HPACK work.
+        int contCap = server.config().http2ContinuationLimit;
+        if (contCap > 0 && ++pendingContinuationCount > contCap) {
+            throw new Http2.ConnectionError(
+                Http2.ERROR_ENHANCE_YOUR_CALM,
+                "CONTINUATION count exceeded limit " + contCap);
+        }
         enforceHeaderListBudget(pendingHeaderBytes.size() + f.length);
         pendingHeaderBytes.write(f.payload, 0, f.length);
         if ((f.flags & Http2.FLAG_END_HEADERS) != 0) {
@@ -682,6 +701,7 @@ public final class Http2Connection implements Runnable {
     private void clearPendingHeaderState() {
         pendingStreamId = 0;
         pendingEndStream = false;
+        pendingContinuationCount = 0;
         pendingHeaderBytes.reset();
     }
 
@@ -981,6 +1001,7 @@ public final class Http2Connection implements Runnable {
             (respHeaders == null ? 0 : respHeaders.size()) + 1);
         fields.add(new Hpack.HeaderField(":status", Integer.toString(status)));
         boolean hasAltSvc = false;
+        boolean hasServer = false;
         if (respHeaders != null) {
             for (Map.Entry<?, ?> e : respHeaders.entrySet()) {
                 String name = String.valueOf(e.getKey()).toLowerCase();
@@ -991,6 +1012,7 @@ public final class Http2Connection implements Runnable {
                     continue;
                 }
                 if (name.equals("alt-svc")) hasAltSvc = true;
+                else if (name.equals("server")) hasServer = true;
                 Object v = e.getValue();
                 fields.add(new Hpack.HeaderField(name, v == null ? "" : v.toString()));
             }
@@ -998,6 +1020,9 @@ public final class Http2Connection implements Runnable {
         // Advertise h3 endpoint (RFC 7838). Handler-supplied Alt-Svc wins.
         if (!hasAltSvc && config.altSvcValue != null) {
             fields.add(new Hpack.HeaderField("alt-svc", config.altSvcValue));
+        }
+        if (!hasServer && config.serverHeader != null && !config.serverHeader.isEmpty()) {
+            fields.add(new Hpack.HeaderField("server", config.serverHeader));
         }
         boolean hasBody = body != null && !(body instanceof byte[] b && b.length == 0)
                                        && !(body instanceof String s && s.isEmpty());

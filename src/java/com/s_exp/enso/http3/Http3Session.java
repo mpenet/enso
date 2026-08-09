@@ -1,5 +1,6 @@
 package com.s_exp.enso.http3;
 
+import com.s_exp.enso.api.Config;
 import com.s_exp.enso.quiche.Quiche;
 import com.s_exp.enso.http3.qpack.QpackException;
 import com.s_exp.enso.http3.qpack.QpackFieldSection;
@@ -68,16 +69,21 @@ public final class Http3Session {
     private final Long2ObjectHashMap<ByteBuffer> peerUniHeaderBuf = new Long2ObjectHashMap<>();
     private boolean initialised = false;
 
-    // SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1). Our advertised
-    // value caps peer→us HEADERS payloads (matches Http3FrameReader accum
-    // cap). Peer's advertised value caps our outbound HEADERS uncompressed
-    // size (name+value+32 per pair, RFC 9204 §4.5.1); -1 means peer did
-    // not advertise, so no bound.
-    static final long LOCAL_MAX_FIELD_SECTION_SIZE = 64L * 1024L;
+    // SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1). Local value
+    // caps peer→us HEADERS payloads (matches Http3FrameReader accum cap).
+    // Peer's advertised value caps our outbound HEADERS uncompressed size
+    // (name+value+32 per pair, RFC 9204 §4.5.1); -1 means peer did not
+    // advertise, so no bound.
+    private final long localMaxFieldSectionSize;
+    private final long qpackMaxTableCapacity;
+    private final long qpackBlockedStreams;
     private long peerMaxFieldSectionSize = -1;
 
-    public Http3Session(long conn) {
+    public Http3Session(long conn, Config cfg) {
         this.conn = conn;
+        this.localMaxFieldSectionSize = cfg.http3MaxFieldSectionSize;
+        this.qpackMaxTableCapacity = cfg.http3QpackMaxTableCapacity;
+        this.qpackBlockedStreams = cfg.http3QpackBlockedStreams;
     }
 
     /**
@@ -102,9 +108,9 @@ public final class Http3Session {
         }
         if (!settingsSent) {
             ByteBuffer settings = Http3FrameWriter.settings(new long[]{
-                Http3SettingId.QPACK_MAX_TABLE_CAPACITY, 0,
-                Http3SettingId.QPACK_BLOCKED_STREAMS, 0,
-                Http3SettingId.MAX_FIELD_SECTION_SIZE, LOCAL_MAX_FIELD_SECTION_SIZE,
+                Http3SettingId.QPACK_MAX_TABLE_CAPACITY, qpackMaxTableCapacity,
+                Http3SettingId.QPACK_BLOCKED_STREAMS, qpackBlockedStreams,
+                Http3SettingId.MAX_FIELD_SECTION_SIZE, localMaxFieldSectionSize,
             });
             if (!writeAll(ctrlStreamId, settings, false)) return;
             settingsSent = true;

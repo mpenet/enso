@@ -65,18 +65,22 @@ public final class QuicheConfig implements AutoCloseable {
         Quiche.configSetMaxRecvUdpPayloadSize(ptr, cfg.http3MaxUdpPayloadSize);
         Quiche.configSetMaxSendUdpPayloadSize(ptr, cfg.http3MaxUdpPayloadSize);
         Quiche.configSetInitialMaxData(ptr, cfg.http3InitialMaxData);
-        // Per-stream windows sized to match the connection window / streams.
-        long perStream = Math.max(1L << 20,
+        // Per-stream windows: use explicit config when set, otherwise
+        // derive from connection window / stream count.
+        long derived = Math.max(1L << 20,
             cfg.http3InitialMaxData / Math.max(1, cfg.http3InitialMaxStreamsBidi));
-        Quiche.configSetInitialMaxStreamDataBidiLocal(ptr, perStream);
-        Quiche.configSetInitialMaxStreamDataBidiRemote(ptr, perStream);
-        Quiche.configSetInitialMaxStreamDataUni(ptr, perStream);
+        long bidiLocal  = cfg.http3InitialMaxStreamDataBidiLocal  >= 0 ? cfg.http3InitialMaxStreamDataBidiLocal  : derived;
+        long bidiRemote = cfg.http3InitialMaxStreamDataBidiRemote >= 0 ? cfg.http3InitialMaxStreamDataBidiRemote : derived;
+        long uni        = cfg.http3InitialMaxStreamDataUni        >= 0 ? cfg.http3InitialMaxStreamDataUni        : derived;
+        Quiche.configSetInitialMaxStreamDataBidiLocal(ptr, bidiLocal);
+        Quiche.configSetInitialMaxStreamDataBidiRemote(ptr, bidiRemote);
+        Quiche.configSetInitialMaxStreamDataUni(ptr, uni);
         Quiche.configSetInitialMaxStreamsBidi(ptr, cfg.http3InitialMaxStreamsBidi);
         // Peer needs 3 uni streams (control + QPACK enc/dec) plus any
-        // grease uni streams they may open (RFC 9114 §7.2.8 clients MAY
-        // open one). Bumped from 3 to 8 to leave headroom without
-        // needing on-demand MAX_STREAMS_UNI updates (task #142).
-        Quiche.configSetInitialMaxStreamsUni(ptr, 8);
+        // grease uni streams they may open (RFC 9114 §7.2.8). Default 8
+        // leaves headroom without needing on-demand MAX_STREAMS_UNI
+        // updates (task #142); validation enforces >= 3.
+        Quiche.configSetInitialMaxStreamsUni(ptr, cfg.http3InitialMaxStreamsUni);
         Quiche.configSetDisableActiveMigration(ptr, true);
     }
 

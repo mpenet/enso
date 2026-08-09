@@ -268,7 +268,7 @@ public final class Http3Listener implements AutoCloseable {
         Http3Connection h3conn = new Http3Connection(
             localCid, conn, channel, localAddr, from,
             handler,
-            config.maxRequestBodyBytes,
+            config,
             connExecutor,
             () -> { conns.remove(key); conns.remove(odKey); });
         Http3Connection prev = conns.putIfAbsent(key, h3conn);
