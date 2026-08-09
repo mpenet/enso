@@ -488,82 +488,89 @@ final class Http3Connection implements AutoCloseable {
             String n = hf[0];
             String v = hf[1];
             if (n.startsWith(":")) {
+                // RFC 9114 §4.1.3: pseudo-headers MUST all precede regular
+                // headers. Violation = H3_MESSAGE_ERROR at connection
+                // level (h3spec 14 / task #153).
                 if (seenRegular) {
-                    LOG.warning("h3 pseudo-header after regular, streamId=" + streamId);
-                    return;
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.H3_MESSAGE_ERROR,
+                        "pseudo-header '" + n + "' after regular header, streamId="
+                            + streamId);
                 }
-                // RFC 9114 §4.3.1: pseudo-headers MUST NOT appear more
-                // than once. Duplicate → malformed request; drop.
+                // RFC 9114 §4.1.1: request pseudo-headers MUST NOT appear
+                // more than once. Duplicate = H3_MESSAGE_ERROR (h3spec 11
+                // / task #150).
                 switch (n) {
                     case ":method" -> {
-                        if (method != null) {
-                            LOG.warning("h3 duplicate :method, streamId=" + streamId);
-                            return;
-                        }
+                        if (method != null) throw pseudoDup(":method", streamId);
                         method = v;
                     }
                     case ":path" -> {
-                        if (path != null) {
-                            LOG.warning("h3 duplicate :path, streamId=" + streamId);
-                            return;
-                        }
+                        if (path != null) throw pseudoDup(":path", streamId);
                         path = v;
                     }
                     case ":scheme" -> {
-                        if (scheme != null) {
-                            LOG.warning("h3 duplicate :scheme, streamId=" + streamId);
-                            return;
-                        }
+                        if (scheme != null) throw pseudoDup(":scheme", streamId);
                         scheme = v;
                     }
                     case ":authority" -> {
-                        if (authority != null) {
-                            LOG.warning("h3 duplicate :authority, streamId=" + streamId);
-                            return;
-                        }
+                        if (authority != null) throw pseudoDup(":authority", streamId);
                         authority = v;
                     }
-                    default -> { /* ignore unknown pseudo */ }
+                    default -> {
+                        // RFC 9114 §4.1.3: any pseudo not in the request
+                        // pseudo-set is prohibited = H3_MESSAGE_ERROR
+                        // (h3spec 13 / task #152).
+                        throw new Http3ConnectionException(
+                            Http3ConnectionException.H3_MESSAGE_ERROR,
+                            "prohibited pseudo-header '" + n
+                                + "' on request stream " + streamId);
+                    }
                 }
             } else {
                 seenRegular = true;
                 // RFC 9114 §4.2: header field names MUST be lowercase.
-                // Any uppercase char makes the request malformed.
+                // Any uppercase char = malformed = H3_MESSAGE_ERROR.
                 if (hasUppercase(n)) {
-                    LOG.warning("h3 uppercase header name '" + n
-                        + "' streamId=" + streamId);
-                    return;
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.H3_MESSAGE_ERROR,
+                        "uppercase header name '" + n + "' on stream " + streamId);
                 }
-                // §4.2 forbidden hop-by-hop headers. TE is allowed only if
-                // its value is exactly "trailers".
+                // §4.2 forbidden hop-by-hop headers = H3_MESSAGE_ERROR.
+                // TE is allowed only if its value is exactly "trailers".
                 if (n.equals("connection") || n.equals("keep-alive")
                     || n.equals("proxy-connection") || n.equals("transfer-encoding")
                     || n.equals("upgrade")) {
-                    LOG.warning("h3 forbidden header '" + n + "' streamId=" + streamId);
-                    return;
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.H3_MESSAGE_ERROR,
+                        "forbidden header '" + n + "' on stream " + streamId);
                 }
                 if (n.equals("te") && !"trailers".equals(v)) {
-                    LOG.warning("h3 TE header with non-trailers value, streamId="
-                        + streamId);
-                    return;
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.H3_MESSAGE_ERROR,
+                        "TE header with non-trailers value on stream " + streamId);
                 }
                 regular[rp++] = n;
                 regular[rp++] = v;
             }
         }
-        // RFC 9114 §4.3.1 request pseudo-header requirements:
+        // RFC 9114 §4.1.3 request pseudo-header requirements:
         //   - non-CONNECT: :method, :scheme, :path, :authority all REQUIRED
         //   - CONNECT: :method + :authority REQUIRED, :scheme + :path MUST
         //     be omitted.
+        // Missing / prohibited combinations = H3_MESSAGE_ERROR at connection
+        // level (h3spec 12 / task #151).
         boolean isConnect = "CONNECT".equals(method);
         if (method == null) {
-            LOG.warning("h3 request missing :method, streamId=" + streamId);
-            return;
+            throw new Http3ConnectionException(
+                Http3ConnectionException.H3_MESSAGE_ERROR,
+                "missing :method pseudo-header on stream " + streamId);
         }
         if (isConnect) {
             if (authority == null || scheme != null || path != null) {
-                LOG.warning("h3 malformed CONNECT pseudo-headers, streamId=" + streamId);
-                return;
+                throw new Http3ConnectionException(
+                    Http3ConnectionException.H3_MESSAGE_ERROR,
+                    "malformed CONNECT pseudo-headers on stream " + streamId);
             }
             // Fill in placeholder scheme/path so downstream Ring code
             // doesn't NPE on the tunnel-style request.
@@ -571,12 +578,14 @@ final class Http3Connection implements AutoCloseable {
             path = "";
         } else {
             if (path == null || scheme == null) {
-                LOG.warning("h3 request missing pseudo-headers, streamId=" + streamId);
-                return;
+                throw new Http3ConnectionException(
+                    Http3ConnectionException.H3_MESSAGE_ERROR,
+                    "missing required pseudo-header on stream " + streamId);
             }
             if (path.isEmpty() && (scheme.equals("http") || scheme.equals("https"))) {
-                LOG.warning("h3 empty :path for http(s), streamId=" + streamId);
-                return;
+                throw new Http3ConnectionException(
+                    Http3ConnectionException.H3_MESSAGE_ERROR,
+                    "empty :path for http(s) on stream " + streamId);
             }
         }
         String uri;
@@ -611,6 +620,12 @@ final class Http3Connection implements AutoCloseable {
             if (c >= 'A' && c <= 'Z') return true;
         }
         return false;
+    }
+
+    private static Http3ConnectionException pseudoDup(String name, long streamId) {
+        return new Http3ConnectionException(
+            Http3ConnectionException.H3_MESSAGE_ERROR,
+            "duplicate " + name + " on request stream " + streamId);
     }
 
     private void runHandler(long streamId, Request request) {

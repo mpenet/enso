@@ -25,8 +25,15 @@ public final class Http3ConnectionException extends RuntimeException {
     public static final long H3_FRAME_UNEXPECTED = 0x105L;
     public static final long H3_FRAME_ERROR = 0x106L;
     public static final long H3_ID_ERROR = 0x108L;
+    public static final long H3_SETTINGS_ERROR = 0x109L;
     public static final long H3_MISSING_SETTINGS = 0x10aL;
     public static final long H3_CLOSED_CRITICAL_STREAM = 0x10cL;
+    public static final long H3_MESSAGE_ERROR = 0x10eL;
+
+    // RFC 9204 §8.3 — QPACK error codes.
+    public static final long QPACK_DECOMPRESSION_FAILED = 0x200L;
+    public static final long QPACK_ENCODER_STREAM_ERROR = 0x201L;
+    public static final long QPACK_DECODER_STREAM_ERROR = 0x202L;
 
     private final long errorCode;
 

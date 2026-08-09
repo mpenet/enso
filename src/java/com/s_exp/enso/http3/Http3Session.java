@@ -150,17 +150,22 @@ public final class Http3Session {
             // Protocol-level violation → close the whole connection with
             // the H3 error code. Owner-thread driver observes
             // connIsClosed on next iteration and exits cleanly.
+            //
+            // Reason string sent as empty byte[] — some peer stacks
+            // (h3spec/haskell-quic) do strict predicate checks that
+            // reject non-empty reasons even when the app error code is
+            // correct (task #162). The full message is still logged
+            // server-side for our debugging.
             LOG.info("h3 closing connection code=0x"
                 + Long.toHexString(hce.errorCode()) + " reason="
                 + hce.getMessage());
-            byte[] reason = hce.getMessage() == null
-                ? new byte[0]
-                : hce.getMessage().getBytes(java.nio.charset.StandardCharsets.UTF_8);
             try {
-                Quiche.connClose(conn, true, hce.errorCode(), reason);
+                Quiche.connClose(conn, true, hce.errorCode(), EMPTY_REASON);
             } catch (Throwable ignored) {}
         }
     }
+
+    private static final byte[] EMPTY_REASON = new byte[0];
 
     /**
      * Encode and send a full HTTP/3 response back on a request stream.
@@ -253,17 +258,18 @@ public final class Http3Session {
                 try {
                     headers = QpackFieldSection.decode(f.payload);
                 } catch (QpackException qe) {
-                    // Per RFC 9204 §2.2: QPACK decoding errors that are
-                    // stream-level (e.g. dynamic-table refs under cap 0)
-                    // reset the affected stream; connection-level errors
-                    // close the whole connection. Under cap=0 all our
-                    // errors are stream-level.
-                    LOG.info("h3 QPACK error stream=" + streamId
-                        + " code=0x" + Long.toHexString(qe.errorCode())
-                        + " msg=" + qe.getMessage());
-                    resetStream(streamId, qe.errorCode());
+                    // RFC 9204 §2.2: any decode failure on a request
+                    // stream (bad static index, dynamic-ref-under-cap-0,
+                    // malformed literal) = connection-level error with
+                    // the QPACK code the decoder produced. h3spec 16 /
+                    // task #155 — we were resetting the stream instead
+                    // of closing the connection, so the error code never
+                    // reached the peer.
                     releaseReader(requestStreams.remove(streamId));
-                    return;
+                    throw new Http3ConnectionException(
+                        qe.errorCode(),
+                        "QPACK decode failed on stream " + streamId
+                            + ": " + qe.getMessage());
                 }
                 sink.onHeaders(streamId, headers);
             } else if (f.isDataChunk()) {
@@ -380,14 +386,130 @@ public final class Http3Session {
         } else {
             buf = ByteBuffer.wrap(data, off, len);
         }
+        // RFC 9114 §6.2.1 — control + QPACK enc/dec streams are
+        // "critical". Peer FIN on any of them = H3_CLOSED_CRITICAL_STREAM
+        // (h3spec 18 / task #157).
+        if (fin && knownType != null
+                && (knownType == Http3StreamType.CONTROL
+                    || knownType == Http3StreamType.QPACK_ENCODER
+                    || knownType == Http3StreamType.QPACK_DECODER)) {
+            throw new Http3ConnectionException(
+                Http3ConnectionException.H3_CLOSED_CRITICAL_STREAM,
+                "peer closed critical stream type=0x"
+                    + Long.toHexString(knownType) + " id=" + streamId);
+        }
         // Peer control stream: parse SETTINGS / GOAWAY / MAX_PUSH_ID.
         // Any protocol-level violation raises Http3ConnectionException which
         // onStreamData catches + translates into a quiche_conn_close.
         if (knownType == Http3StreamType.CONTROL) {
             handlePeerControlBytes(buf);
+        } else if (knownType == Http3StreamType.QPACK_ENCODER) {
+            // Under our advertised MAX_TABLE_CAPACITY=0, the ONLY
+            // encoder instruction we accept from the peer is Set Dynamic
+            // Table Capacity with value 0 (which is a no-op). Anything
+            // else = QPACK_ENCODER_STREAM_ERROR (h3spec 17 / task #156).
+            validatePeerQpackEncoderStream(buf);
+        } else if (knownType == Http3StreamType.QPACK_DECODER) {
+            // Peer decoder stream instructions must have non-zero
+            // arguments where required. Insert Count Increment = 0 is
+            // QPACK_DECODER_STREAM_ERROR (h3spec 19 / task #158).
+            validatePeerQpackDecoderStream(buf);
         }
-        // QPACK enc/dec streams under our cap=0 contract carry no
-        // meaningful data — drop.
+    }
+
+    /**
+     * RFC 9204 §4.1 — QPACK encoder-stream instructions. Under our
+     * advertised capacity=0 we reject any Set Dynamic Table Capacity
+     * with a non-zero value (only value=0 is a valid no-op) and any
+     * Insert With Name Reference / Insert With Literal Name / Duplicate
+     * (all of which imply peer wants a dynamic table).
+     */
+    private void validatePeerQpackEncoderStream(ByteBuffer buf) {
+        while (buf.hasRemaining()) {
+            int b = buf.get(buf.position()) & 0xFF;
+            // Set Dynamic Table Capacity: 001xxxxx (5-bit prefix int).
+            if ((b & 0xE0) == 0x20) {
+                long cap;
+                try {
+                    cap = com.s_exp.enso.http3.qpack.NBitInteger.decode(
+                        buf, 5, buf.get() & 0xFF);
+                } catch (Throwable ex) {
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.QPACK_ENCODER_STREAM_ERROR,
+                        "malformed Set Dynamic Table Capacity: " + ex.getMessage());
+                }
+                if (cap != 0) {
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.QPACK_ENCODER_STREAM_ERROR,
+                        "peer Set Dynamic Table Capacity=" + cap
+                            + " exceeds advertised limit 0");
+                }
+                continue;
+            }
+            // Any Insert With Name Reference (1xxxxxxx), Insert With
+            // Literal Name (01xxxxxx), or Duplicate (000xxxxx) implies
+            // peer wants a dynamic table — reject.
+            throw new Http3ConnectionException(
+                Http3ConnectionException.QPACK_ENCODER_STREAM_ERROR,
+                "peer QPACK encoder instruction 0x" + Integer.toHexString(b)
+                    + " not allowed under capacity=0");
+        }
+    }
+
+    /**
+     * RFC 9204 §4.4 — QPACK decoder-stream instructions. Insert Count
+     * Increment with argument 0 is a protocol error. Section Acknowledgment
+     * + Stream Cancellation carry stream IDs and are fine to ignore.
+     */
+    private void validatePeerQpackDecoderStream(ByteBuffer buf) {
+        while (buf.hasRemaining()) {
+            int b = buf.get(buf.position()) & 0xFF;
+            if ((b & 0xC0) == 0x00) {
+                // Insert Count Increment: 00xxxxxx (6-bit prefix int).
+                long inc;
+                try {
+                    inc = com.s_exp.enso.http3.qpack.NBitInteger.decode(
+                        buf, 6, buf.get() & 0xFF);
+                } catch (Throwable ex) {
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
+                        "malformed Insert Count Increment: " + ex.getMessage());
+                }
+                if (inc == 0) {
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
+                        "peer Insert Count Increment=0");
+                }
+                continue;
+            }
+            if ((b & 0x80) != 0) {
+                // Section Acknowledgment: 1xxxxxxx (7-bit prefix int).
+                try {
+                    com.s_exp.enso.http3.qpack.NBitInteger.decode(
+                        buf, 7, buf.get() & 0xFF);
+                } catch (Throwable ex) {
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
+                        "malformed Section Acknowledgment: " + ex.getMessage());
+                }
+                continue;
+            }
+            if ((b & 0xC0) == 0x40) {
+                // Stream Cancellation: 01xxxxxx (6-bit prefix int).
+                try {
+                    com.s_exp.enso.http3.qpack.NBitInteger.decode(
+                        buf, 6, buf.get() & 0xFF);
+                } catch (Throwable ex) {
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
+                        "malformed Stream Cancellation: " + ex.getMessage());
+                }
+                continue;
+            }
+            throw new Http3ConnectionException(
+                Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
+                "unknown QPACK decoder instruction 0x" + Integer.toHexString(b));
+        }
     }
 
     /**
@@ -430,9 +552,11 @@ public final class Http3Session {
                         "duplicate SETTINGS on peer control stream");
                 }
                 sawPeerSettings = true;
-                // We accept + ignore peer settings values. Under our
-                // advertised MAX_TABLE_CAPACITY=0 nothing they choose
-                // affects our encoding.
+                // RFC 9114 §7.2.4.1: any h2-reserved setting ID in an h3
+                // SETTINGS = H3_SETTINGS_ERROR (h3spec 15 / task #154).
+                // h2 IDs 0x02, 0x03, 0x04, 0x05 (RFC 7540 §6.5.2) are
+                // banned on the h3 wire.
+                validatePeerSettings(f.payload);
             } else if (f.type == Http3FrameType.HEADERS
                     || f.type == Http3FrameType.DATA
                     || f.type == Http3FrameType.PUSH_PROMISE) {
@@ -473,6 +597,45 @@ public final class Http3Session {
     private boolean sawPeerSettings;
     private boolean sawPeerGoaway;
     private long lastPeerGoawayId;
+
+    /** RFC 9114 §7.2.4.1 — h3 SETTINGS body is a sequence of (id, value) varint pairs. */
+    private void validatePeerSettings(byte[] payload) {
+        ByteBuffer b = ByteBuffer.wrap(payload);
+        while (b.hasRemaining()) {
+            long id, value;
+            try {
+                id = Http3Varint.decode(b);
+                if (!b.hasRemaining()) {
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.H3_FRAME_ERROR,
+                        "truncated SETTINGS (missing value for id 0x"
+                            + Long.toHexString(id) + ")");
+                }
+                value = Http3Varint.decode(b);
+            } catch (Http3ConnectionException hce) {
+                throw hce;
+            } catch (Throwable ex) {
+                throw new Http3ConnectionException(
+                    Http3ConnectionException.H3_FRAME_ERROR,
+                    "malformed SETTINGS payload: " + ex.getMessage());
+            }
+            // h2-reserved IDs (RFC 7540 §6.5.2): SETTINGS_ENABLE_PUSH,
+            // SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_INITIAL_WINDOW_SIZE,
+            // SETTINGS_MAX_FRAME_SIZE — MUST NOT appear in h3 SETTINGS.
+            if (id == 0x02 || id == 0x03 || id == 0x04 || id == 0x05
+                    || id == 0x06 /* SETTINGS_MAX_HEADER_LIST_SIZE — same ID both, ok */) {
+                if (id != 0x06) {
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.H3_SETTINGS_ERROR,
+                        "h2-reserved SETTINGS id 0x" + Long.toHexString(id)
+                            + " not allowed in h3");
+                }
+            }
+            // Peer settings values otherwise ignored under our
+            // advertised MAX_TABLE_CAPACITY=0.
+            @SuppressWarnings("unused") long ignored = value;
+        }
+    }
 
     /**
      * RFC 9114 §7.2.8 grease-type check. Reserved unassigned stream types
