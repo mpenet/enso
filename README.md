@@ -12,7 +12,7 @@ Built on/for virtual threads. Plain sync handler.
 - **WebSocket.** Ring 1.5+ listener shape. Text + binary, ping/pong, close handshake.
 - **SSE / long-poll.** Response body can be a function receiving a `ChunkedWriter` — push events over time with `flush!`.
 - **`StreamableResponseBody`.** Optional support for `ring.core.protocols` — user-extensible response body types.
-- **Fast.** ~5M rps pipelined depth 64 on a laptop (HTTP/1.1); ~894k rps HTTP/2 over TLS; ~54k rps HTTP/3 (matches Netty, ~5x Jetty).
+- **Fast.** ~5M rps pipelined depth 64 on a laptop (HTTP/1.1); ~894k rps HTTP/2 over TLS; ~53k rps HTTP/3 (edges out Netty by ~2%, ~19x Jetty).
 - **Low allocation.** ~0.001 sample/req at 1 MB TLAB interval — near-zero GC pressure on hot paths.
 - **Sendfile.** `File` response bodies dispatch via `FileChannel.transferTo(SocketChannel)` — zero-copy on plain HTTP.
 - **Correct.** Rejects request smuggling variants (duplicate `Content-Length`, `TE + CL`, obs-fold), header injection in responses, slowloris (per-request deadline), and enforces body-size caps.
@@ -148,11 +148,11 @@ Same JVM, same host, all three h3 servers boot in-process for apples-to-apples:
 
 | Server | rps | wall (ms) |
 |---|---:|---:|
-| **Ensō** | **54,157** | 5909 |
-| Netty h3 (incubator 0.0.28, native quic 0.0.66, BoringSSL, vendored quiche master snapshot) | 51,387 | 6227 |
-| Jetty h3 (12.0.14, JNA quiche) | 10,132 | 31,582 |
+| **Ensō** | **53,235** | 6011 |
+| Netty h3 (incubator 0.0.28, native quic 0.0.66, BoringSSL, vendored quiche master snapshot) | 52,253 | 6124 |
+| Jetty h3 (12.0.14, JNA quiche) | 2,766 | 115,707 |
 
-Ensō ~5% ahead of Netty (both use libquiche + JNI), ~5.3× Jetty (JNA path). 0 failures across all runs.
+Ensō ~2% ahead of Netty (both use libquiche + JNI), ~19× Jetty (JNA path). 0 failures across all runs.
 
 ### Allocation
 
