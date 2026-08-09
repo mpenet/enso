@@ -4,3 +4,4 @@ target/
 .lsp/.cache/
 .nrepl-port
 .agent-shell/
+*.log

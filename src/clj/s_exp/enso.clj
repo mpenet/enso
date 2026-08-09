@@ -1,9 +1,10 @@
 (ns s-exp.enso
   "Ring adapter backed by a zero-dependency Java core: blocking I/O on virtual
   threads, one virtual thread per connection."
-  (:import (com.s_exp.enso ChunkedWriter Config EnsoServer Response
-                           RingErrorHandler RingHandler StreamingBody
-                           WebSocketListener WebSocketSocket)))
+  (:import (com.s_exp.enso EnsoServer)
+           (com.s_exp.enso.api ChunkedWriter Config Response
+                               RingErrorHandler RingHandler StreamingBody)
+           (com.s_exp.enso.websocket WebSocketListener WebSocketSocket)))
 
 (set! *warn-on-reflection* true)
 
@@ -126,14 +127,60 @@
     (when-let [v (:chunk-buffer-size opts)] (.chunkBufferSize b (int v)))
     (when-let [v (:max-drain-bytes opts)] (.maxDrainBytes b (int v)))
     (when-let [v (:max-request-body-bytes opts)] (.maxRequestBodyBytes b (long v)))
+    ;; h1 keep-alive
+    (when-let [v (:max-keep-alive-requests opts)] (.maxKeepAliveRequests b (int v)))
+    (when-let [v (:keep-alive-timeout opts)] (.keepAliveTimeoutMillis b (int v)))
+    ;; TCP
+    (when (contains? opts :so-nodelay) (.soNodelay b (boolean (:so-nodelay opts))))
+    (when (contains? opts :so-reuse-addr) (.soReuseAddr b (boolean (:so-reuse-addr opts))))
+    (when-let [v (:so-linger opts)] (.soLinger b (int v)))
+    (when-let [v (:so-rcv-buf opts)] (.soRcvBuf b (int v)))
+    (when-let [v (:so-snd-buf opts)] (.soSndBuf b (int v)))
+    ;; TLS
     (when-let [v (:ssl-context opts)] (.sslContext b ^javax.net.ssl.SSLContext v))
     (when (:ssl-need-client-auth opts) (.sslNeedClientAuth b true))
     (when (:ssl-want-client-auth opts) (.sslWantClientAuth b true))
+    (when-let [v (:alpn-protocols opts)] (.alpnProtocols b (into-array String v)))
+    (when-let [v (:enabled-cipher-suites opts)] (.enabledCipherSuites b (into-array String v)))
+    (when-let [v (:enabled-tls-protocols opts)] (.enabledTlsProtocols b (into-array String v)))
+    (when-let [v (:ssl-session-cache-size opts)] (.sslSessionCacheSize b (int v)))
+    ;; h2
     (when (:http2 opts) (.http2 b true))
     (when-let [v (:http2-max-concurrent-streams opts)] (.http2MaxConcurrentStreams b (int v)))
     (when-let [v (:http2-initial-window-size opts)] (.http2InitialWindowSize b (int v)))
     (when-let [v (:http2-max-frame-size opts)] (.http2MaxFrameSize b (int v)))
     (when-let [v (:http2-max-header-list-size opts)] (.http2MaxHeaderListSize b (int v)))
+    (when-let [v (:http2-stream-reset-limit opts)] (.http2StreamResetLimit b (int v)))
+    (when-let [v (:http2-ping-interval opts)] (.http2PingIntervalMillis b (int v)))
+    (when-let [v (:http2-ping-timeout opts)] (.http2PingTimeoutMillis b (int v)))
+    (when-let [v (:http2-continuation-limit opts)] (.http2ContinuationLimit b (int v)))
+    (when (contains? opts :http2-enable-push) (.http2EnablePush b (boolean (:http2-enable-push opts))))
+    ;; h3
+    (when (:http3 opts) (.http3 b true))
+    (when-let [v (:http3-port opts)] (.http3Port b (int v)))
+    (when-let [v (:http3-max-idle-timeout opts)] (.http3MaxIdleTimeoutMs b (int v)))
+    (when-let [v (:http3-initial-max-data opts)] (.http3InitialMaxData b (long v)))
+    (when-let [v (:http3-initial-max-streams-bidi opts)] (.http3InitialMaxStreamsBidi b (int v)))
+    (when-let [v (:http3-initial-max-streams-uni opts)] (.http3InitialMaxStreamsUni b (int v)))
+    (when-let [v (:http3-max-udp-payload-size opts)] (.http3MaxUdpPayloadSize b (int v)))
+    (when-let [v (:http3-cert-path opts)] (.http3CertPath b ^String v))
+    (when-let [v (:http3-key-path opts)] (.http3KeyPath b ^String v))
+    (when (contains? opts :http3-stateless-retry) (.http3StatelessRetry b (boolean (:http3-stateless-retry opts))))
+    (when-let [v (:http3-max-field-section-size opts)] (.http3MaxFieldSectionSize b (int v)))
+    (when-let [v (:http3-qpack-max-table-capacity opts)] (.http3QpackMaxTableCapacity b (long v)))
+    (when-let [v (:http3-qpack-blocked-streams opts)] (.http3QpackBlockedStreams b (long v)))
+    (when-let [v (:http3-initial-max-stream-data-bidi-local opts)] (.http3InitialMaxStreamDataBidiLocal b (long v)))
+    (when-let [v (:http3-initial-max-stream-data-bidi-remote opts)] (.http3InitialMaxStreamDataBidiRemote b (long v)))
+    (when-let [v (:http3-initial-max-stream-data-uni opts)] (.http3InitialMaxStreamDataUni b (long v)))
+    (when-let [v (:http3-ack-delay-exponent opts)] (.http3AckDelayExponent b (int v)))
+    (when-let [v (:http3-max-ack-delay opts)] (.http3MaxAckDelay b (int v)))
+    (when-let [v (:http3-active-connection-id-limit opts)] (.http3ActiveConnectionIdLimit b (int v)))
+    ;; Alt-Svc
+    (when (contains? opts :advertise-alt-svc) (.advertiseAltSvc b (boolean (:advertise-alt-svc opts))))
+    (when-let [v (:alt-svc-max-age opts)] (.altSvcMaxAge b (int v)))
+    ;; Server-wide
+    (when-let [v (:server-header opts)] (.serverHeader b ^String v))
+    (when-let [v (:worker-executor opts)] (.workerExecutor b ^java.util.concurrent.Executor v))
     (.build b)))
 
 (defn run-server
@@ -158,6 +205,51 @@
     file transfer for File response bodies (no zero-copy on TLS).
   - `:ssl-need-client-auth` - require a valid client certificate (default false)
   - `:ssl-want-client-auth` - request but not require a client cert (default false)
+  - `:alpn-protocols` - seq of ALPN protocol IDs to advertise. Defaults to
+    `[\"h2\" \"http/1.1\"]` when `:http2` is enabled, otherwise JVM default.
+  - `:enabled-cipher-suites` - seq of cipher suite names to enable (JVM default when nil)
+  - `:enabled-tls-protocols` - seq of TLS protocol versions to enable (JVM default when nil)
+  - `:ssl-session-cache-size` - session cache size (0 = JVM default)
+
+  HTTP/1.1 keep-alive:
+  - `:max-keep-alive-requests` - cap on requests per connection, 0 = unlimited (default 1000)
+  - `:keep-alive-timeout` - between-request idle timeout in ms, 0 = fall back to
+    `:idle-timeout` (default 0). Distinct from mid-request idle.
+
+  TCP socket options (applied to acceptor + accepted sockets):
+  - `:so-nodelay` - TCP_NODELAY (default true)
+  - `:so-reuse-addr` - SO_REUSEADDR (default true)
+  - `:so-linger` - SO_LINGER seconds, -1 disables (default -1)
+  - `:so-rcv-buf` / `:so-snd-buf` - socket buffer sizes, 0 = OS default
+
+  HTTP/2 hardening:
+  - `:http2-stream-reset-limit` - RST_STREAM cap per connection, CVE-2023-44487
+    mitigation (default 400, matches Nginx)
+  - `:http2-continuation-limit` - CONTINUATION frames per HEADERS (default 64)
+  - `:http2-ping-interval` / `:http2-ping-timeout` - server-initiated PING
+    (interval 0 disables; timeout default 10000 ms)
+  - `:http2-enable-push` - advertise SETTINGS_ENABLE_PUSH (default false; we never push)
+
+  HTTP/3 advanced (QPACK, transport):
+  - `:http3-initial-max-streams-uni` - peer's unidirectional stream credit (default 8; min 3)
+  - `:http3-max-field-section-size` - SETTINGS_MAX_FIELD_SECTION_SIZE, our
+    inbound cap advertised to the peer (default 64 KiB, 0 = no limit)
+  - `:http3-qpack-max-table-capacity` - SETTINGS_QPACK_MAX_TABLE_CAPACITY (default 0 = static-table only)
+  - `:http3-qpack-blocked-streams` - SETTINGS_QPACK_BLOCKED_STREAMS (default 0)
+  - `:http3-initial-max-stream-data-bidi-local`
+  - `:http3-initial-max-stream-data-bidi-remote`
+  - `:http3-initial-max-stream-data-uni` - per-stream flow control windows.
+    Default -1 means derive from `:http3-initial-max-data` / stream count.
+  - `:http3-ack-delay-exponent` - RFC 9000 ack_delay_exponent, [0, 20]. -1 = quiche default
+  - `:http3-max-ack-delay` - RFC 9000 max_ack_delay ms, [0, 16383]. -1 = quiche default
+  - `:http3-active-connection-id-limit` - RFC 9000 active_connection_id_limit, >= 2. -1 = quiche default
+
+  Server-wide:
+  - `:server-header` - value emitted as the `Server:` response header. Nil/empty
+    omits the header (default nil). Handler-supplied `Server` header wins.
+  - `:worker-executor` - `java.util.concurrent.Executor` for request-handler
+    tasks. Nil = built-in virtual-thread-per-task (default). The server does not
+    shutdown() a user-supplied executor.
 
   Error handling:
   - `:error-handler` - `(fn [request throwable])` returning a Ring response map.
@@ -200,7 +292,7 @@
     `min(idle, remaining-request-budget)`. Set both to sensible values.
 
   Errors are routed through `java.util.logging` under the loggers
-  `com.s_exp.enso.HttpConnection` and `com.s_exp.enso.EnsoServer`. Wire a
+  `com.s_exp.enso.http1.HttpConnection` and `com.s_exp.enso.EnsoServer`. Wire a
   handler / SLF4J bridge in your application to redirect them."
   (^EnsoServer [handler]
    (run-server handler nil))

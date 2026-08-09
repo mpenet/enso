@@ -1,5 +1,11 @@
 package com.s_exp.enso;
 
+import com.s_exp.enso.api.Config;
+import com.s_exp.enso.api.RingErrorHandler;
+import com.s_exp.enso.api.RingHandler;
+import com.s_exp.enso.core.TlsSocket;
+import com.s_exp.enso.http1.HttpConnection;
+import com.s_exp.enso.http2.Http2Connection;
 import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -27,9 +33,18 @@ public final class EnsoServer implements AutoCloseable {
     private final RingHandler handler;
     private final RingErrorHandler errorHandler;
     private final ExecutorService executor;
+    // Where request-handler tasks actually run. == executor when the user
+    // did not supply Config.workerExecutor, else the user's Executor (its
+    // lifecycle is theirs — we don't shutdown() external executors).
+    private final java.util.concurrent.Executor dispatchExecutor;
     private final Thread acceptor;
     private final Config config;
     private final Set<HttpConnection> connections = ConcurrentHashMap.newKeySet();
+    // HTTP/3 listener kept as Object to avoid a static reference from
+    // EnsoServer to the quiche FFM classes; loaded reflectively when the
+    // http3 flag is set. Users with http3 disabled never trigger the FFM
+    // classloader.
+    private final AutoCloseable http3Listener;
     private volatile boolean running = true;
 
     public EnsoServer(RingHandler handler, Config config) throws IOException {
@@ -47,10 +62,40 @@ public final class EnsoServer implements AutoCloseable {
                 : new SslListener(config))
             : new PlainListener(config);
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
+        this.dispatchExecutor = config.workerExecutor != null
+            ? config.workerExecutor : this.executor;
         this.acceptor = Thread.ofPlatform()
             .name("enso-acceptor")
             .daemon(true)
             .unstarted(this::acceptLoop);
+        this.http3Listener = createHttp3Listener();
+    }
+
+    /**
+     * Reflective probe for the optional HTTP/3 listener. Keeping the
+     * dependency behind {@link Class#forName} means users with
+     * {@code :http3 false} never trigger classloading of the quiche FFM
+     * bindings and never touch libquiche.
+     */
+    private AutoCloseable createHttp3Listener() throws IOException {
+        if (!config.http3) return null;
+        try {
+            Class<?> cls = Class.forName("com.s_exp.enso.http3.Http3Listener");
+            AutoCloseable l = (AutoCloseable) cls
+                .getConstructor(Config.class, RingHandler.class, Object.class)
+                .newInstance(config, handler, this);
+            cls.getMethod("start").invoke(l);
+            return l;
+        } catch (ClassNotFoundException | NoClassDefFoundError e) {
+            throw new IllegalStateException(
+                "HTTP/3 support requires the com.s_exp.enso.quiche package "
+                + "(shipped with the main jar) plus libquiche installed. "
+                + "See README.", e);
+        } catch (Throwable t) {
+            Throwable root = t.getCause() != null ? t.getCause() : t;
+            throw new IllegalStateException(
+                "HTTP/3 listener failed to start: " + root.getMessage(), root);
+        }
     }
 
     public void start() {
@@ -61,23 +106,23 @@ public final class EnsoServer implements AutoCloseable {
         return listener.port();
     }
 
-    Config config() {
+    public Config config() {
         return config;
     }
 
-    RingErrorHandler errorHandler() {
+    public RingErrorHandler errorHandler() {
         return errorHandler;
     }
 
-    boolean isRunning() {
+    public boolean isRunning() {
         return running;
     }
 
-    void register(HttpConnection conn) {
+    public void register(HttpConnection conn) {
         connections.add(conn);
     }
 
-    void unregister(HttpConnection conn) {
+    public void unregister(HttpConnection conn) {
         connections.remove(conn);
     }
 
@@ -85,16 +130,39 @@ public final class EnsoServer implements AutoCloseable {
         while (running) {
             try {
                 Socket socket = listener.accept();
-                socket.setTcpNoDelay(true);
+                applySocketOptions(socket);
                 if (config.idleTimeoutMillis > 0) {
                     socket.setSoTimeout(config.idleTimeoutMillis);
                 }
-                executor.execute(() -> dispatch(socket));
+                dispatchExecutor.execute(() -> dispatch(socket));
             } catch (IOException e) {
                 if (running) {
                     LOG.log(Level.WARNING, "accept failed", e);
                 }
             }
+        }
+    }
+
+    /**
+     * User-supplied ALPN list wins. Otherwise: advertise h2 + http/1.1 when
+     * http2 is enabled; null (JVM default = single protocol per cipher) when
+     * not. Explicit empty array means "clear ALPN".
+     */
+    private static String[] resolveAlpn(Config config) {
+        if (config.alpnProtocols != null) return config.alpnProtocols;
+        return config.http2 ? new String[] {"h2", "http/1.1"} : null;
+    }
+
+    private void applySocketOptions(Socket s) throws IOException {
+        s.setTcpNoDelay(config.soNodelay);
+        if (config.soLinger >= 0) {
+            s.setSoLinger(true, config.soLinger);
+        }
+        if (config.soRcvBuf > 0) {
+            s.setReceiveBufferSize(config.soRcvBuf);
+        }
+        if (config.soSndBuf > 0) {
+            s.setSendBufferSize(config.soSndBuf);
         }
     }
 
@@ -159,6 +227,13 @@ public final class EnsoServer implements AutoCloseable {
             executor.shutdownNow();
         }
         connections.clear();
+        if (http3Listener != null) {
+            try {
+                http3Listener.close();
+            } catch (Exception e) {
+                LOG.log(Level.WARNING, "http3 listener close failed", e);
+            }
+        }
     }
 
     private void closeIdleConnections() {
@@ -194,6 +269,7 @@ public final class EnsoServer implements AutoCloseable {
 
         PlainListener(Config config) throws IOException {
             this.channel = ServerSocketChannel.open();
+            this.channel.socket().setReuseAddress(config.soReuseAddr);
             this.channel.bind(new InetSocketAddress(config.host, config.port), config.backlog);
         }
 
@@ -226,18 +302,22 @@ public final class EnsoServer implements AutoCloseable {
             SSLServerSocketFactory factory = config.sslContext.getServerSocketFactory();
             this.serverSocket = (SSLServerSocket) factory.createServerSocket(
                 config.port, config.backlog, InetAddress.getByName(config.host));
+            serverSocket.setReuseAddress(config.soReuseAddr);
             if (config.sslNeedClientAuth) {
                 this.serverSocket.setNeedClientAuth(true);
             } else if (config.sslWantClientAuth) {
                 this.serverSocket.setWantClientAuth(true);
             }
-            if (config.http2) {
-                // Advertise both application protocols; "h2" first so ALPN-aware
-                // clients prefer HTTP/2 while HTTP/1.1-only clients still work.
-                javax.net.ssl.SSLParameters params = serverSocket.getSSLParameters();
-                params.setApplicationProtocols(new String[] {"h2", "http/1.1"});
-                serverSocket.setSSLParameters(params);
+            javax.net.ssl.SSLParameters params = serverSocket.getSSLParameters();
+            String[] alpn = resolveAlpn(config);
+            if (alpn != null) params.setApplicationProtocols(alpn);
+            if (config.enabledCipherSuites != null) {
+                params.setCipherSuites(config.enabledCipherSuites);
             }
+            if (config.enabledTlsProtocols != null) {
+                params.setProtocols(config.enabledTlsProtocols);
+            }
+            serverSocket.setSSLParameters(params);
         }
 
         @Override
@@ -274,19 +354,26 @@ public final class EnsoServer implements AutoCloseable {
             this.config = config;
             this.sslContext = config.sslContext;
             this.channel = ServerSocketChannel.open();
+            this.channel.socket().setReuseAddress(config.soReuseAddr);
             this.channel.bind(new InetSocketAddress(config.host, config.port), config.backlog);
         }
 
         @Override
         public Socket accept() throws IOException {
             SocketChannel sc = channel.accept();
-            sc.socket().setTcpNoDelay(true);
             SSLEngine engine = sslContext.createSSLEngine();
             engine.setUseClientMode(false);
             if (config.sslNeedClientAuth) engine.setNeedClientAuth(true);
             else if (config.sslWantClientAuth) engine.setWantClientAuth(true);
             javax.net.ssl.SSLParameters params = engine.getSSLParameters();
-            params.setApplicationProtocols(new String[] {"h2", "http/1.1"});
+            String[] alpn = resolveAlpn(config);
+            if (alpn != null) params.setApplicationProtocols(alpn);
+            if (config.enabledCipherSuites != null) {
+                params.setCipherSuites(config.enabledCipherSuites);
+            }
+            if (config.enabledTlsProtocols != null) {
+                params.setProtocols(config.enabledTlsProtocols);
+            }
             engine.setSSLParameters(params);
             return new TlsSocket(sc, engine).asSocket();
         }
