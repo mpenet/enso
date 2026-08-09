@@ -178,6 +178,14 @@ jobs:
               export PATH="$HOME/.cargo/bin:$PATH"
               export JAVA_HOME=/usr/lib/jvm/default-jvm
 
+              # bindgen (used transitively by boring-sys) dlopens libclang.
+              # Musl-static rust binaries return "Dynamic loading not
+              # supported" from dlopen — force cargo to link build scripts
+              # + the final artifact dynamically against musl libc.so.
+              # LIBCLANG_PATH points bindgen at the apk-installed libclang.
+              export RUSTFLAGS="-C target-feature=-crt-static"
+              export LIBCLANG_PATH=/usr/lib/llvm17/lib
+
               if [ "$CACHE_HIT" != "true" ]; then
                 rm -rf quiche-src
                 git clone --depth 1 --branch "$QUICHE_VERSION" \
