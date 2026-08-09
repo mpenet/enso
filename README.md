@@ -1,5 +1,7 @@
 # Ensō
 
+/!\ WIP
+
 Fast, low-allocation, zero-dependency HTTP/1.1 + HTTP/2 + HTTP/3 Ring
 server adapter for Clojure. Java core optimized for Ring, not a wrapper.
 Built on/for virtual threads. Plain sync handler.
