@@ -123,9 +123,12 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------
-  # Alpine / musl builds. Separate job because the runner setup is
-  # different: everything runs inside an alpine container so libc,
-  # cmake, and clang all come from apk instead of setup-* actions.
+  # Alpine / musl builds. Runs on the host ubuntu runner (not inside a
+  # `container:`) so all JS-based actions (checkout, cache,
+  # upload-artifact) work on both amd64 and arm64 — JS Actions inside an
+  # alpine container aren't supported on ARM runners. Actual build steps
+  # shell into a docker container built from alpine:3.20 with the tools
+  # baked in.
   # Loader classifier is `linux-musl-<arch>` (Quiche.java probes musl
   # first when /lib/ld-musl-*.so.1 is present, falls back to glibc).
   # ---------------------------------------------------------------------
@@ -139,34 +142,8 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    container:
-      image: alpine:3.20
     steps:
-      - name: Install alpine build deps
-        run: |
-          # openjdk21 → we only need jni.h from JAVA_HOME/include (ABI
-          # stable across JDK versions; runtime jar loads on any 21+).
-          # openjdk25 isn't in Alpine 3.20 repos.
-          apk add --no-cache \
-            bash build-base cmake clang clang-dev llvm-dev \
-            perl python3 pkgconf openjdk21 curl git \
-            linux-headers openssl-dev
-
       - uses: actions/checkout@v4
-
-      - name: Install rustup (alpine ships no rustc new enough)
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Env sanity
-        run: |
-          echo "PATH=$PATH"
-          rustc --version
-          cargo --version
-          javac --version
-          echo "JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/default-jvm}"
 
       - name: Cache libquiche build
         id: quiche-cache
@@ -174,43 +151,57 @@ jobs:
         with:
           # Whole checkout (not just target/release) so that the header
           # under quiche-src/quiche/include/quiche.h survives cache hits.
-          # git clone is skipped when the cache resolves.
+          # git clone is skipped inside the container when the cache
+          # resolves.
           path: quiche-src
           key: quiche-${{ env.QUICHE_VERSION }}-linux-musl-${{ matrix.arch }}-v2
 
-      - name: Build libquiche ${{ env.QUICHE_VERSION }} (static)
-        if: steps.quiche-cache.outputs.cache-hit != 'true'
+      # openjdk21 is enough: we only need jni.h from JAVA_HOME/include
+      # (ABI stable across JDK versions; the runtime jar loads on any 21+).
+      # openjdk25 isn't in Alpine 3.20 repos.
+      - name: Build libquiche + enso_quiche shim (static, inside alpine)
+        env:
+          QUICHE_VERSION: ${{ env.QUICHE_VERSION }}
+          ARCH: ${{ matrix.arch }}
+          CACHE_HIT: ${{ steps.quiche-cache.outputs.cache-hit }}
         run: |
-          git clone --depth 1 --branch ${{ env.QUICHE_VERSION }} \
-            https://github.com/cloudflare/quiche.git quiche-src
-          cd quiche-src
-          cargo build --release --lib --features ffi,pkg-config-meta
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -e QUICHE_VERSION -e ARCH -e CACHE_HIT \
+            alpine:3.20 sh -eu -c '
+              apk add --no-cache \
+                bash build-base cmake clang clang-dev llvm-dev \
+                perl python3 pkgconf openjdk21 curl git \
+                linux-headers openssl-dev
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+              export PATH="$HOME/.cargo/bin:$PATH"
+              export JAVA_HOME=/usr/lib/jvm/default-jvm
 
-      - name: Assemble libquiche staging dir
-        run: |
-          mkdir -p /tmp/quiche/lib /tmp/quiche/include
-          cp quiche-src/target/release/libquiche.a /tmp/quiche/lib/
-          cp quiche-src/quiche/include/quiche.h /tmp/quiche/include/
+              if [ "$CACHE_HIT" != "true" ]; then
+                rm -rf quiche-src
+                git clone --depth 1 --branch "$QUICHE_VERSION" \
+                  https://github.com/cloudflare/quiche.git quiche-src
+                (cd quiche-src && cargo build --release --lib --features ffi,pkg-config-meta)
+              fi
 
-      - name: Build enso_quiche shim (static)
-        run: |
-          export JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/default-jvm}
-          make -C native/enso_quiche \
-            QUICHE_STATIC=1 \
-            QUICHE_INCLUDE_DIR=/tmp/quiche/include \
-            QUICHE_LIB_DIR=/tmp/quiche/lib
-          ls -la target/native/linux-${{ matrix.arch }}/
+              mkdir -p /tmp/quiche/lib /tmp/quiche/include
+              cp quiche-src/target/release/libquiche.a /tmp/quiche/lib/
+              cp quiche-src/quiche/include/quiche.h /tmp/quiche/include/
 
-      - name: Rename to musl classifier + smoke-test
-        run: |
-          mv target/native/linux-${{ matrix.arch }} \
-             target/native/linux-musl-${{ matrix.arch }}
-          file target/native/linux-musl-${{ matrix.arch }}/libenso_quiche.so
-          # Verify statically linked — no libquiche runtime dep.
-          if ldd target/native/linux-musl-${{ matrix.arch }}/libenso_quiche.so 2>&1 | grep -q libquiche; then
-            echo "ERROR: dynamic libquiche dep leaked" >&2
-            exit 1
-          fi
+              make -C native/enso_quiche \
+                QUICHE_STATIC=1 \
+                QUICHE_INCLUDE_DIR=/tmp/quiche/include \
+                QUICHE_LIB_DIR=/tmp/quiche/lib
+
+              # Rename to the musl classifier and smoke-test.
+              mv target/native/linux-$ARCH target/native/linux-musl-$ARCH
+              file target/native/linux-musl-$ARCH/libenso_quiche.so
+              if ldd target/native/linux-musl-$ARCH/libenso_quiche.so 2>&1 | grep -q libquiche; then
+                echo "ERROR: dynamic libquiche dep leaked" >&2
+                exit 1
+              fi
+            '
 
       - name: Upload per-platform artifact
         uses: actions/upload-artifact@v4
