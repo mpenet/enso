@@ -38,10 +38,6 @@ jobs:
             arch: arm64
             lib_ext: dylib
             runner: macos-14
-          - os: darwin
-            arch: amd64
-            lib_ext: dylib
-            runner: macos-13
           - os: linux
             arch: amd64
             lib_ext: so
