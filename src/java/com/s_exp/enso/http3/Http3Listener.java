@@ -6,8 +6,10 @@ import com.s_exp.enso.quiche.Quiche;
 import com.s_exp.enso.quiche.QuicheConfig;
 import com.s_exp.enso.quiche.RetryToken;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.net.StandardProtocolFamily;
 import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
 import java.security.SecureRandom;
@@ -73,8 +75,16 @@ public final class Http3Listener implements AutoCloseable {
         quicheConfig = new QuicheConfig(config);
 
         int port = config.http3Port > 0 ? config.http3Port : config.port;
-        channel = DatagramChannel.open();
-        channel.socket().bind(new InetSocketAddress(config.host, port));
+        // Match the address family of the configured host — force IPv4
+        // when the host resolves to an IPv4 address so a dual-stack
+        // socket doesn't source outbound datagrams from ::ffff:x.y.z.w
+        // (some middleboxes and simulated networks mishandle
+        // IPv4-mapped IPv6).
+        InetAddress hostAddr = InetAddress.getByName(config.host);
+        StandardProtocolFamily fam = hostAddr instanceof java.net.Inet6Address
+            ? StandardProtocolFamily.INET6 : StandardProtocolFamily.INET;
+        channel = DatagramChannel.open(fam);
+        channel.socket().bind(new InetSocketAddress(hostAddr, port));
         localAddr = (InetSocketAddress) channel.getLocalAddress();
 
         // Named platform threads for per-connection drivers; reused via
@@ -247,12 +257,13 @@ public final class Http3Listener implements AutoCloseable {
             return;
         }
         CidKey key = new CidKey(localCid);
+        CidKey odKey = new CidKey(odcid);
         Http3Connection h3conn = new Http3Connection(
             localCid, conn, channel, localAddr, from,
             handler,
             config.maxRequestBodyBytes,
             connExecutor,
-            () -> conns.remove(key));
+            () -> { conns.remove(key); conns.remove(odKey); });
         Http3Connection prev = conns.putIfAbsent(key, h3conn);
         if (prev != null) {
             // Extremely unlikely collision on 128-bit random CID; keep
@@ -261,6 +272,16 @@ public final class Http3Listener implements AutoCloseable {
             prev.enqueue(datagram);
             return;
         }
+        // Also route packets whose DCID is still the client's original
+        // (odcid) to this same connection. Client's second Initial packet
+        // — sent before it sees any server response — carries the same
+        // client-chosen DCID; without this alias every subsequent client
+        // Initial would trigger a fresh acceptNew and clobber the
+        // handshake (each Server Initial would use a different SCID, so
+        // the client can never latch onto ours). Aliasing is safe: quiche
+        // internally consumes/emits packets by our localCid; the odcid
+        // alias only matters for demux routing.
+        conns.putIfAbsent(odKey, h3conn);
         LOG.info("h3 accepted new connection cid="
             + HexFormat.of().formatHex(localCid) + " from " + from);
         h3conn.enqueue(datagram);

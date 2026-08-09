@@ -21,7 +21,7 @@ FROM debian:trixie-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash build-essential ca-certificates cmake curl git \
     clang libclang-dev llvm-dev \
-    libssl-dev pkg-config rlwrap \
+    libssl-dev libfontconfig1-dev pkg-config rlwrap \
     openjdk-25-jdk-headless \
  && rm -rf /var/lib/apt/lists/*
 
@@ -48,7 +48,7 @@ RUN curl -sSLO https://github.com/clojure/brew-install/releases/latest/download/
 # Build libquiche 0.29.3 with C FFI + BoringSSL vendor.
 RUN git clone --depth 1 --branch 0.29.3 https://github.com/cloudflare/quiche.git /tmp/quiche \
  && cd /tmp/quiche \
- && cargo build --release --features ffi -p quiche \
+ && cargo build --release --lib --features ffi,pkg-config-meta \
  && mkdir -p /opt/quiche/lib /opt/quiche/include \
  && cp target/release/libquiche.so /opt/quiche/lib/ \
  && cp quiche/include/quiche.h /opt/quiche/include/ \
@@ -72,7 +72,7 @@ RUN clj -T:build jar
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash ca-certificates curl rlwrap \
+    bash ca-certificates curl iproute2 rlwrap \
     openjdk-25-jre-headless \
  && rm -rf /var/lib/apt/lists/*
 
