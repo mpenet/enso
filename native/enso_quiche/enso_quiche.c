@@ -166,16 +166,28 @@ Java_com_s_1exp_enso_quiche_Quiche_accept(
         jlong config) {
     UNUSED(cls);
     jsize scidLen = (*env)->GetArrayLength(env, scidArr);
-    jsize odcidLen = (*env)->GetArrayLength(env, odcidArr);
     jbyte *scid = (*env)->GetByteArrayElements(env, scidArr, NULL);
-    jbyte *odcid = (*env)->GetByteArrayElements(env, odcidArr, NULL);
+    /* odcidArr is null when no stateless retry occurred; quiche then
+     * omits retry_source_connection_id from the server's transport
+     * params (RFC 9000 §18.2). Passing a non-null odcid here without
+     * having done a retry breaks the handshake — the client's
+     * transport-param validation rejects with TRANSPORT_PARAMETER_ERROR
+     * (code 0x8, reason "retry_source_connection_id does not match"). */
+    jbyte *odcid = NULL;
+    jsize odcidLen = 0;
+    if (odcidArr != NULL) {
+        odcidLen = (*env)->GetArrayLength(env, odcidArr);
+        odcid = (*env)->GetByteArrayElements(env, odcidArr, NULL);
+    }
 
     struct sockaddr_storage local, peer;
     socklen_t localLen = build_sockaddr(env, localIp, localPort, &local);
     socklen_t peerLen = build_sockaddr(env, peerIp, peerPort, &peer);
     if (localLen == 0 || peerLen == 0) {
         (*env)->ReleaseByteArrayElements(env, scidArr, scid, JNI_ABORT);
-        (*env)->ReleaseByteArrayElements(env, odcidArr, odcid, JNI_ABORT);
+        if (odcid != NULL) {
+            (*env)->ReleaseByteArrayElements(env, odcidArr, odcid, JNI_ABORT);
+        }
         return 0; /* Java treats 0 handle as null → accept failure. */
     }
 
@@ -187,7 +199,9 @@ Java_com_s_1exp_enso_quiche_Quiche_accept(
         (quiche_config *)(intptr_t)config);
 
     (*env)->ReleaseByteArrayElements(env, scidArr, scid, JNI_ABORT);
-    (*env)->ReleaseByteArrayElements(env, odcidArr, odcid, JNI_ABORT);
+    if (odcid != NULL) {
+        (*env)->ReleaseByteArrayElements(env, odcidArr, odcid, JNI_ABORT);
+    }
     return (jlong)(intptr_t)conn;
 }
 

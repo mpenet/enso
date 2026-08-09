@@ -187,8 +187,15 @@ public final class Http3Listener implements AutoCloseable {
             // allocate connection state. Peers that don't echo a valid
             // token get bounced with a retry challenge; peers that do get
             // their odcid restored so the handshake proceeds normally.
+            //
+            // retryOdcid is passed to quiche_accept — MUST be null when no
+            // stateless retry was performed. Passing the client's DCID
+            // here without a retry causes quiche to advertise
+            // retry_source_connection_id in its transport params, which
+            // spec-conformant clients reject with TRANSPORT_PARAMETER_ERROR
+            // (aioquic: "retry_source_connection_id does not match").
             byte[] localCid;
-            byte[] odcid;
+            byte[] retryOdcid;
             if (retryToken != null) {
                 if (tokenLen == 0) {
                     byte[] token = retryToken.mint(from, dcidBytes);
@@ -203,13 +210,13 @@ public final class Http3Listener implements AutoCloseable {
                     return;
                 }
                 localCid = dcidBytes;
-                odcid = verifiedOdcid;
+                retryOdcid = verifiedOdcid;
             } else {
                 localCid = new byte[LOCAL_CID_LEN];
                 rng.nextBytes(localCid);
-                odcid = dcidBytes;
+                retryOdcid = null;
             }
-            acceptNew(pkt, from, localCid, odcid);
+            acceptNew(pkt, from, localCid, dcidBytes, retryOdcid);
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "h3 onDatagram failed", t);
         }
@@ -239,7 +246,7 @@ public final class Http3Listener implements AutoCloseable {
     }
 
     private void acceptNew(byte[] datagram, InetSocketAddress from,
-                           byte[] localCid, byte[] odcid) {
+                           byte[] localCid, byte[] clientDcid, byte[] retryOdcid) {
         // First-line DoS gate — cheap and racy, real bound enforced below
         // via putIfAbsent semantics on the connection map.
         if (conns.size() >= MAX_CONNECTIONS) {
@@ -248,7 +255,7 @@ public final class Http3Listener implements AutoCloseable {
         byte[] localIp = localAddr.getAddress().getAddress();
         byte[] peerIp = from.getAddress().getAddress();
         long conn = Quiche.accept(
-            localCid, odcid,
+            localCid, retryOdcid,
             localIp, localAddr.getPort(),
             peerIp, from.getPort(),
             quicheConfig.handle());
@@ -257,7 +264,7 @@ public final class Http3Listener implements AutoCloseable {
             return;
         }
         CidKey key = new CidKey(localCid);
-        CidKey odKey = new CidKey(odcid);
+        CidKey odKey = new CidKey(clientDcid);
         Http3Connection h3conn = new Http3Connection(
             localCid, conn, channel, localAddr, from,
             handler,
