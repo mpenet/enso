@@ -196,29 +196,12 @@
 (def ^:private clojars-url "https://clojars.org/repo")
 (def ^:private clojars-repo-id "clojars")
 
-(defn- mvn-deploy!
-  "Shells out to `mvn deploy:deploy-file` for one artifact. Uses the
-  core-jar POM as authoritative — every classifier + fat artifact is
-  the same GAV, differentiated only by the classifier metadata Aether
-  attaches at deploy time. Credentials expected in ~/.m2/settings.xml
-  under server id `clojars`."
-  [{:keys [jar classifier pom]}]
-  (let [args (cond-> ["mvn" "-q" "-B" "deploy:deploy-file"
-                      (str "-Durl=" clojars-url)
-                      (str "-DrepositoryId=" clojars-repo-id)
-                      (str "-Dfile=" jar)
-                      (str "-DpomFile=" pom)
-                      "-DgeneratePom=false"]
-               classifier (conj (str "-Dclassifier=" classifier)))
-        {:keys [exit out err]} (apply shell/sh args)]
-    (when-not (zero? exit)
-      (throw (ex-info (str "mvn deploy failed for " jar)
-                      {:exit exit :out out :err err})))
-    (println "deployed" jar (when classifier (str "(classifier=" classifier ")")))))
-
 (defn deploy-jars
-  "Publish every jar under target/ to Clojars: core (no classifier),
-  each per-platform classifier jar, and the fat jar as classifier `all`.
+  "Publish core + every per-platform classifier + fat jar to Clojars in
+  a single atomic `mvn deploy:deploy-file` call. Clojars rejects any
+  redeploy against an existing version, so all sidecar artifacts have
+  to be attached to the same upload as the main jar. `-Dfiles`,
+  `-Dclassifiers`, `-Dtypes` are comma-separated parallel lists.
   Assumes CI has already run `jar-core`, `jar-classifier` per platform,
   and `jar-all`. POM comes from the core-jar staging dir. Credentials
   read from ~/.m2/settings.xml — CI writes it from repo secrets before
@@ -227,22 +210,41 @@
   (let [pom (format "target/jar-core-classes/META-INF/maven/%s/pom.xml" lib)]
     (when-not (.exists (java.io.File. pom))
       (throw (ex-info (str "missing " pom " — run jar-core first") {:pom pom})))
-    ;; Core: no classifier.
     (when-not (.exists (java.io.File. jar-core-file))
       (throw (ex-info (str "missing " jar-core-file) {})))
-    (mvn-deploy! {:jar jar-core-file :pom pom})
-    ;; Per-platform classifier jars — walk target/native/ for the list.
-    (let [native-dir (java.io.File. "target/native")]
-      (when (.exists native-dir)
-        (doseq [d (.listFiles native-dir)
-                :when (.isDirectory d)]
-          (let [classifier (.getName d)
-                jar (jar-classifier-file classifier)]
-            (when (.exists (java.io.File. jar))
-              (mvn-deploy! {:jar jar :classifier classifier :pom pom}))))))
-    ;; Fat jar → classifier `all`.
-    (when (.exists (java.io.File. jar-all-file))
-      (mvn-deploy! {:jar jar-all-file :classifier "all" :pom pom})))
+    ;; Collect sidecar artifacts: per-platform classifier jars +
+    ;; fat jar (as classifier `all`).
+    (let [classifier-jars (->> (some-> (java.io.File. "target/native")
+                                       .listFiles seq)
+                               (filter #(.isDirectory ^java.io.File %))
+                               (map #(vector (.getName ^java.io.File %)
+                                             (jar-classifier-file (.getName ^java.io.File %))))
+                               (filter (fn [[_ j]] (.exists (java.io.File. ^String j))))
+                               vec)
+          all-classifier? (.exists (java.io.File. jar-all-file))
+          sidecars (cond-> classifier-jars
+                     all-classifier? (conj ["all" jar-all-file]))
+          files (clojure.string/join "," (map second sidecars))
+          classifiers (clojure.string/join "," (map first sidecars))
+          types (clojure.string/join "," (repeat (count sidecars) "jar"))
+          args (cond-> ["mvn" "-B" "deploy:deploy-file"
+                        (str "-Durl=" clojars-url)
+                        (str "-DrepositoryId=" clojars-repo-id)
+                        (str "-Dfile=" jar-core-file)
+                        (str "-DpomFile=" pom)
+                        "-DgeneratePom=false"]
+                 (seq sidecars) (into [(str "-Dfiles=" files)
+                                       (str "-Dclassifiers=" classifiers)
+                                       (str "-Dtypes=" types)]))
+          {:keys [exit out err]} (apply shell/sh args)]
+      (println "deploying core +" (count sidecars) "sidecars:"
+               (mapv first sidecars))
+      (println out)
+      (when-not (zero? exit)
+        (println err)
+        (throw (ex-info "mvn deploy failed" {:exit exit})))
+      (println "deployed" jar-core-file
+               "+" (count sidecars) "classifier jars")))
   opts)
 
 (defn tag
