@@ -81,6 +81,15 @@ public final class QuicheConfig implements AutoCloseable {
         // leaves headroom without needing on-demand MAX_STREAMS_UNI
         // updates (task #142); validation enforces >= 3.
         Quiche.configSetInitialMaxStreamsUni(ptr, cfg.http3InitialMaxStreamsUni);
+        if (cfg.http3AckDelayExponent >= 0) {
+            Quiche.configSetAckDelayExponent(ptr, cfg.http3AckDelayExponent);
+        }
+        if (cfg.http3MaxAckDelay >= 0) {
+            Quiche.configSetMaxAckDelay(ptr, cfg.http3MaxAckDelay);
+        }
+        if (cfg.http3ActiveConnectionIdLimit >= 0) {
+            Quiche.configSetActiveConnectionIdLimit(ptr, cfg.http3ActiveConnectionIdLimit);
+        }
         Quiche.configSetDisableActiveMigration(ptr, true);
     }
 

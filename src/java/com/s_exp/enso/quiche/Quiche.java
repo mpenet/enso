@@ -194,6 +194,9 @@ public final class Quiche {
     public static native void configSetInitialMaxStreamDataUni(long config, long v);
     public static native void configSetInitialMaxStreamsBidi(long config, long v);
     public static native void configSetInitialMaxStreamsUni(long config, long v);
+    public static native void configSetAckDelayExponent(long config, long v);
+    public static native void configSetMaxAckDelay(long config, long v);
+    public static native void configSetActiveConnectionIdLimit(long config, long v);
     public static native void configSetDisableActiveMigration(long config, boolean v);
 
     // -----------------------------------------------------------------
