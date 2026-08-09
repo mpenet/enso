@@ -66,7 +66,7 @@
 ;; release-time helpers.
 
 (def jar-core-file (format "target/%s-%s.jar" (name lib) version))
-(def jar-all-file  (format "target/%s-%s-all.jar" (name lib) version))
+(def jar-all-file (format "target/%s-%s-all.jar" (name lib) version))
 (defn- jar-classifier-file [classifier]
   (format "target/%s-%s-%s.jar" (name lib) version classifier))
 
@@ -252,7 +252,7 @@
   and publishes core + every classifier + fat jar to Clojars."
   [opts]
   (sh
-   (format "git tag -a \"%s\" --no-sign -m \"Release %s\"" version version)
+   (format "git tag -a \"v%s\" --no-sign -m \"Release %s\"" version version)
    "git pull"
    "git push --follow-tags")
   opts)
