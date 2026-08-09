@@ -194,8 +194,8 @@ jobs:
                 # workspace build pulls in `datagram-socket`, which
                 # constructs libc::msghdr via struct-literal syntax —
                 # broken on musl where libc exposes private __pad
-                # fields not present in glibc's layout. quiche itself
-                # doesn't need datagram-socket for libquiche.a.
+                # fields not present in the glibc layout. quiche itself
+                # does not need datagram-socket for libquiche.a.
                 (cd quiche-src && cargo build --release -p quiche \
                   --features ffi,pkg-config-meta)
               fi
