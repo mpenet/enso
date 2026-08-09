@@ -141,9 +141,12 @@ jobs:
     steps:
       - name: Install alpine build deps
         run: |
+          # openjdk21 → we only need jni.h from JAVA_HOME/include (ABI
+          # stable across JDK versions; runtime jar loads on any 21+).
+          # openjdk25 isn't in Alpine 3.20 repos.
           apk add --no-cache \
             bash build-base cmake clang clang-dev llvm-dev \
-            perl python3 pkgconf openjdk25 curl git \
+            perl python3 pkgconf openjdk21 curl git \
             linux-headers openssl-dev
 
       - uses: actions/checkout@v4
