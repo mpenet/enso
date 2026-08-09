@@ -31,6 +31,9 @@ ARCH := $(UNAME_M)
 ifeq ($(ARCH),x86_64)
   ARCH := amd64
 endif
+ifeq ($(ARCH),aarch64)
+  ARCH := arm64
+endif
 
 # Output directory mirrors target/native/<os>-<arch>/ layout so build.clj
 # can locate the artifact per platform.

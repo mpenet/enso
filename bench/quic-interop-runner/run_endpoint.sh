@@ -32,9 +32,8 @@ KEY=/certs/priv.key
 # Emit the readiness marker the sim expects.
 echo "server-side listening on 443/udp for testcase=$TESTCASE" >&2
 
-exec java $JAVA_TOOL_OPTIONS \
-    -Denso.quiche.shim=/opt/native/linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/libenso_quiche.so \
-    -cp /opt/enso.jar \
-    clojure.main -i /opt/server.clj \
-    --report stderr \
-    -- "$TESTCASE" "$CERT" "$KEY" /www
+export ENSO_QUICHE_SHIM=/opt/native/linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/libenso_quiche.so
+
+exec clj -Sdeps "$(cat /opt/deps.edn)" \
+    -J-Denso.quiche.shim=$ENSO_QUICHE_SHIM \
+    -M -i /opt/server.clj -e "(-main \"$TESTCASE\" \"$CERT\" \"$KEY\" \"/www\")"

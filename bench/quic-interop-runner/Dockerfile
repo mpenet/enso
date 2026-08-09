@@ -72,12 +72,27 @@ RUN clj -T:build jar
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates openjdk-25-jre-headless \
+    bash ca-certificates curl rlwrap \
+    openjdk-25-jre-headless \
  && rm -rf /var/lib/apt/lists/*
+
+# Clojure CLI (runtime only). Pulls the Clojure jar into the local m2
+# cache once the CLI is used; we prime it below so first request doesn't
+# hit the network from inside the interop sandbox.
+RUN curl -sSLO https://github.com/clojure/brew-install/releases/latest/download/posix-install.sh \
+ && bash ./posix-install.sh \
+ && rm posix-install.sh
+
+# Prime the Clojure dep cache (Clojure jar + basis) so runtime doesn't
+# need network — quic-interop-runner may sandbox the container.
+RUN echo '{:paths ["."] :deps {org.clojure/clojure {:mvn/version "1.12.3"}}}' > /root/deps.edn \
+ && cd /root && clj -Sdeps '{}' -M -e ':ok' >/dev/null 2>&1 || true \
+ && rm /root/deps.edn
 
 COPY --from=builder /opt/quiche/lib/libquiche.so /usr/lib/
 COPY --from=builder /build/target/*.jar /opt/enso.jar
 COPY --from=builder /build/target/native /opt/native
+COPY bench/quic-interop-runner/deps.edn /opt/deps.edn
 COPY bench/quic-interop-runner/run_endpoint.sh /run_endpoint.sh
 COPY bench/quic-interop-runner/server.clj /opt/server.clj
 

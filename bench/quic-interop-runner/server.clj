@@ -8,13 +8,8 @@
 
 (require '[s-exp.enso :as enso])
 
-(defn -main [& _]
-  (let [args *command-line-args*
-        testcase (nth args 0)
-        cert (nth args 1)
-        key (nth args 2)
-        wwwroot (nth args 3)
-        srv (enso/run-server
+(defn -main [testcase cert key wwwroot]
+  (let [srv (enso/run-server
              (fn [{:keys [uri]}]
                (let [safe-path (subs (or uri "/") 1)
                      f (java.io.File. wwwroot safe-path)]
@@ -35,5 +30,3 @@
     (.addShutdownHook (Runtime/getRuntime)
                       (Thread. #(enso/stop srv)))
     @(promise)))
-
-(-main)
