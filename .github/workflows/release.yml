@@ -1,16 +1,18 @@
 name: release
 
 # Multi-platform h3-native release build. Produces a single fat jar under
-# ~/.m2 that bundles the JNI shim (libenso_quiche.<ext>) for all four
+# ~/.m2 that bundles the JNI shim (libenso_quiche.<ext>) for all five
 # supported (os, arch) pairs — libquiche 0.29.3 statically linked into
 # each shim so the shipped jar has no runtime deps beyond a modern JDK.
+# darwin-amd64 dropped (Intel Macs increasingly rare + macos-13 runner
+# queue times); Intel Mac users can dev-build via `make -C native/enso_quiche`.
 #
 # Trigger:
 #   - workflow_dispatch (manual button in the Actions tab)
 #   - push of any tag matching v*
 #
 # Outputs (attached to the release when triggered by a tag):
-#   target/enso-<version>.jar            — fat jar, all 4 platforms
+#   target/enso-<version>.jar            — fat jar, all 5 platforms
 #   target/native/<os>-<arch>/libenso_quiche.<ext>   — per-platform artifacts
 
 on:

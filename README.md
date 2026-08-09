@@ -49,11 +49,11 @@ Built on/for virtual threads. Plain sync handler.
 {:deps {com.s-exp/enso              {:mvn/version "1.0.0-alphaN"}
         com.s-exp/enso$darwin-arm64 {:mvn/version "1.0.0-alphaN"}}}
 
-;; fat jar, all six shims bundled
+;; fat jar, all five shims bundled
 {:deps {com.s-exp/enso$all {:mvn/version "1.0.0-alphaN"}}}
 ```
 
-Classifiers: `darwin-{arm64,amd64}`, `linux-{amd64,arm64}`,
+Classifiers: `darwin-arm64`, `linux-{amd64,arm64}`,
 `linux-musl-{amd64,arm64}`. Full detail in [doc/http3.md](doc/http3.md).
 
 ## Quick start

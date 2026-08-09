@@ -28,14 +28,14 @@ resolves the classifier artifact via the `$<classifier>` coord suffix.
 
 Available classifiers:
 
-- `darwin-arm64`, `darwin-amd64`
+- `darwin-arm64`
 - `linux-amd64`, `linux-arm64`
 - `linux-musl-amd64`, `linux-musl-arm64`
 
 Alpine/musl variants selected automatically at runtime when
 `/lib/ld-musl-*.so.1` is present; falls back to glibc shim otherwise.
 
-### Fat jar, all six shims bundled (~21 MB)
+### Fat jar, all five shims bundled (~18 MB)
 
 Single coord, no classifier picking. Pick this for uber-jar-based
 deploys or when you don't want to think about the target platform.
@@ -77,7 +77,7 @@ clojure -T:build javac-bench                # optional: Netty+Jetty bench server
 
 Static-link libquiche 0.29.3 into the shim so the resulting `.dylib`/`.so`
 has no runtime dep on system libquiche. Release CI
-(`.github/workflows/release.yml`) does this across six platforms and
+(`.github/workflows/release.yml`) does this across five platforms and
 packages every shim into the fat jar.
 
 To reproduce locally:
@@ -96,7 +96,8 @@ random name — safe for multi-JVM hosts) then `System.load`s it.
 
 ## Platform classifier resolution
 
-- macOS → `darwin-arm64` / `darwin-amd64`
+- macOS → `darwin-arm64` (Apple Silicon only; Intel Macs need a
+  dev/dynamic build via `make -C native/enso_quiche`)
 - Linux glibc → `linux-arm64` / `linux-amd64`
 - Linux musl (Alpine, Wolfi, Chimera) → `linux-musl-*`, fallback to
   `linux-*` if musl-built shim absent. Detection: `/lib/ld-musl-*.so.1`.

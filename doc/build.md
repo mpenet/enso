@@ -42,6 +42,6 @@ clojure -T:build javac-bench
 - `workflow_dispatch` (manual button in Actions tab)
 - tag push matching `v*`
 
-Builds native shims across 6 platforms (macOS x2, Linux glibc x2, Linux
+Builds native shims across 5 platforms (macOS arm64, Linux glibc x2, Linux
 musl x2), assembles per-classifier + fat + core jars, attaches to the
 release on tag push.
