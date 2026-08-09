@@ -190,7 +190,14 @@ jobs:
                 rm -rf quiche-src
                 git clone --depth 1 --branch "$QUICHE_VERSION" \
                   https://github.com/cloudflare/quiche.git quiche-src
-                (cd quiche-src && cargo build --release --lib --features ffi,pkg-config-meta)
+                # -p quiche restricts to the quiche crate only. Full
+                # workspace build pulls in `datagram-socket`, which
+                # constructs libc::msghdr via struct-literal syntax —
+                # broken on musl where libc exposes private __pad
+                # fields not present in glibc's layout. quiche itself
+                # doesn't need datagram-socket for libquiche.a.
+                (cd quiche-src && cargo build --release -p quiche \
+                  --features ffi,pkg-config-meta)
               fi
 
               mkdir -p /tmp/quiche/lib /tmp/quiche/include
