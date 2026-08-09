@@ -68,6 +68,14 @@ public final class Http3Session {
     private final Long2ObjectHashMap<ByteBuffer> peerUniHeaderBuf = new Long2ObjectHashMap<>();
     private boolean initialised = false;
 
+    // SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1). Our advertised
+    // value caps peer→us HEADERS payloads (matches Http3FrameReader accum
+    // cap). Peer's advertised value caps our outbound HEADERS uncompressed
+    // size (name+value+32 per pair, RFC 9204 §4.5.1); -1 means peer did
+    // not advertise, so no bound.
+    static final long LOCAL_MAX_FIELD_SECTION_SIZE = 64L * 1024L;
+    private long peerMaxFieldSectionSize = -1;
+
     public Http3Session(long conn) {
         this.conn = conn;
     }
@@ -96,6 +104,7 @@ public final class Http3Session {
             ByteBuffer settings = Http3FrameWriter.settings(new long[]{
                 Http3SettingId.QPACK_MAX_TABLE_CAPACITY, 0,
                 Http3SettingId.QPACK_BLOCKED_STREAMS, 0,
+                Http3SettingId.MAX_FIELD_SECTION_SIZE, LOCAL_MAX_FIELD_SECTION_SIZE,
             });
             if (!writeAll(ctrlStreamId, settings, false)) return;
             settingsSent = true;
@@ -181,10 +190,24 @@ public final class Http3Session {
         // halves JNI hops per response (task #143).
         int hdrsBudget = 32;
         int hn = headers.size();
+        long uncompressedSize = 0;
         for (int i = 0; i < hn; i++) {
             String[] hf = headers.get(i);
-            hdrsBudget += 24 + (hf[0] == null ? 0 : hf[0].length())
-                             + (hf[1] == null ? 0 : hf[1].length());
+            int nl = hf[0] == null ? 0 : hf[0].length();
+            int vl = hf[1] == null ? 0 : hf[1].length();
+            hdrsBudget += 24 + nl + vl;
+            // RFC 9204 §4.5.1: field-line size = name.length + value.length + 32.
+            uncompressedSize += nl + vl + 32L;
+        }
+        // Advisory check against peer's SETTINGS_MAX_FIELD_SECTION_SIZE.
+        // We proceed anyway (spec: peer MAY react with H3_EXCESSIVE_LOAD;
+        // rejecting here would drop a response the peer's stack might still
+        // handle), but log so oversize responses are diagnosable.
+        if (peerMaxFieldSectionSize >= 0
+                && uncompressedSize > peerMaxFieldSectionSize) {
+            LOG.warning("h3 response field-section size " + uncompressedSize
+                + " exceeds peer's SETTINGS_MAX_FIELD_SECTION_SIZE "
+                + peerMaxFieldSectionSize + " (stream=" + streamId + ")");
         }
         int total = hdrsBudget + (hasBody ? (16 + body.length) : 0);
         frameBuf = ensureFrameCap(frameBuf, total);
@@ -631,9 +654,15 @@ public final class Http3Session {
                             + " not allowed in h3");
                 }
             }
-            // Peer settings values otherwise ignored under our
-            // advertised MAX_TABLE_CAPACITY=0.
-            @SuppressWarnings("unused") long ignored = value;
+            // Known IDs we consume:
+            //   MAX_FIELD_SECTION_SIZE (0x06) — cap on our outbound HEADERS
+            //     uncompressed size (name+value+32 per pair, RFC 9204 §4.5.1).
+            //     Enforced in {@link #writeResponse}.
+            // Others (QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS) are
+            // silently ignored under our advertised MAX_TABLE_CAPACITY=0.
+            if (id == Http3SettingId.MAX_FIELD_SECTION_SIZE) {
+                peerMaxFieldSectionSize = value;
+            }
         }
     }
 
