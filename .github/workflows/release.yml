@@ -76,8 +76,11 @@ jobs:
         id: quiche-cache
         uses: actions/cache@v4
         with:
-          path: quiche-src/target/release
-          key: quiche-${{ env.QUICHE_VERSION }}-${{ matrix.os }}-${{ matrix.arch }}-v1
+          # Whole checkout (not just target/release) so that the header
+          # under quiche-src/quiche/include/quiche.h survives cache hits.
+          # git clone is skipped when the cache resolves.
+          path: quiche-src
+          key: quiche-${{ env.QUICHE_VERSION }}-${{ matrix.os }}-${{ matrix.arch }}-v2
 
       - name: Build libquiche ${{ env.QUICHE_VERSION }} (static)
         if: steps.quiche-cache.outputs.cache-hit != 'true'
@@ -169,8 +172,11 @@ jobs:
         id: quiche-cache
         uses: actions/cache@v4
         with:
-          path: quiche-src/target/release
-          key: quiche-${{ env.QUICHE_VERSION }}-linux-musl-${{ matrix.arch }}-v1
+          # Whole checkout (not just target/release) so that the header
+          # under quiche-src/quiche/include/quiche.h survives cache hits.
+          # git clone is skipped when the cache resolves.
+          path: quiche-src
+          key: quiche-${{ env.QUICHE_VERSION }}-linux-musl-${{ matrix.arch }}-v2
 
       - name: Build libquiche ${{ env.QUICHE_VERSION }} (static)
         if: steps.quiche-cache.outputs.cache-hit != 'true'
