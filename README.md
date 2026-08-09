@@ -4,7 +4,7 @@ Fast, low-allocation, zero-dependency HTTP/1.1 + HTTP/2 + HTTP/3 Ring server
 adapter for Clojure. Java core optimized for Ring, not a wrapper.
 Built on/for virtual threads. Plain sync handler.
 
-- **Zero third-party Java dependencies.** Java core + thin Clojure adapter. Clojure runtime is the only requirement. HTTP/3 pulls in system `libquiche` (dlopen'd via a small JNI shim shipped in the jar) and is opt-in.
+- **Zero third-party Java dependencies.** Java core + thin Clojure adapter. Clojure runtime is the only requirement. Release jars bundle a JNI shim per platform with libquiche statically linked in — no system libquiche install needed. HTTP/3 remains opt-in.
 - **Virtual threads, sync API.** One virtual thread per connection, blocking I/O. Handler is a plain Ring function — no async arity, no callbacks.
 - **HTTP/1.1 complete.** Keep-alive, pipelining, chunked transfer (request + response), 100-Continue, `Expect`, TLS via `SSLContext`.
 - **HTTP/2.** ALPN-negotiated over TLS (`:http2 true`). HPACK, flow control, CONTINUATION reassembly, streaming request/response bodies. Same Ring handler contract as HTTP/1.1 — `:protocol` becomes `"HTTP/2.0"`, everything else unchanged. 145/146 h2spec pass.
@@ -21,7 +21,12 @@ Built on/for virtual threads. Plain sync handler.
 
 - JDK 21+ (HTTP/3 requires 22+ for FFM-free JNI; see below)
 - Clojure 1.12+
-- For HTTP/3: system `libquiche` (Cloudflare quiche 0.29.x). macOS: `brew install cloudflare-quiche`. Linux: build from https://github.com/cloudflare/quiche with `--features ffi`.
+- For HTTP/3 (from a release): add a native jar next to the core jar. Three release flavors:
+  - `enso-<v>.jar` — core, no native shim, no h3 (smallest, ~200 KB).
+  - `enso-<v>-<os>-<arch>.jar` — per-platform classifier jar (~3.5 MB). One of `darwin-arm64`, `darwin-amd64`, `linux-amd64`, `linux-arm64`, `linux-musl-amd64`, `linux-musl-arm64`. Depend on this alongside core for h3 with zero libquiche install. (Alpine/musl variants pulled in automatically at runtime when `/lib/ld-musl-*.so.1` is present, glibc fallback otherwise.)
+  - `enso-<v>-all.jar` — fat jar with core + all six shims (~21 MB). Zero classifier picking; pick this if you distribute an uber-jar for multiple platforms.
+
+  For dev builds from source, see the HTTP/3 build section below.
 
 ## Quick start
 
@@ -209,8 +214,9 @@ Java sources compile to `target/classes`. `deps.edn` includes it on the classpat
 
 ### HTTP/3 (optional)
 
-The h3 layer needs a small JNI shim (`native/enso_quiche/enso_quiche.c`) that
-links against system `libquiche`:
+The h3 layer needs a small JNI shim (`native/enso_quiche/enso_quiche.c`).
+
+**Dev / local build** — dynamic-link against a system libquiche install:
 
 ```
 brew install cloudflare-quiche              # macOS
@@ -218,8 +224,22 @@ make -C native/enso_quiche                  # builds target/native/<os>-<arch>/l
 clojure -T:build javac-bench                # optional: builds the Netty+Jetty bench servers
 ```
 
-The built `.dylib`/`.so` is bundled under `META-INF/native/<os>-<arch>/` in the
-release jar; at load time `Quiche.java` extracts the shim into a per-JVM temp
+**Release / distributable build** — static-link libquiche 0.29.3 into the shim
+so the resulting `.dylib`/`.so` has no runtime dep on system libquiche. The
+release CI (`.github/workflows/release.yml`) does this across four platforms
+(`darwin-arm64`, `darwin-amd64`, `linux-amd64`, `linux-arm64`) and packages
+all four shims into a single fat jar. To reproduce locally:
+
+```
+git clone --depth 1 --branch 0.29.3 https://github.com/cloudflare/quiche.git /tmp/quiche
+(cd /tmp/quiche && cargo build --release --lib --features ffi,pkg-config-meta)
+make -C native/enso_quiche QUICHE_STATIC=1 \
+     QUICHE_INCLUDE_DIR=/tmp/quiche/quiche/include \
+     QUICHE_LIB_DIR=/tmp/quiche/target/release
+```
+
+Either way, the built `.dylib`/`.so` is bundled under `META-INF/native/<os>-<arch>/` in the
+jar; at load time `Quiche.java` extracts the shim into a per-JVM temp
 directory (unique random name — safe for multiple JVMs on the same host)
 before `System.load`ing it.
 

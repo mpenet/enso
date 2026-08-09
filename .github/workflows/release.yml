@@ -1,0 +1,293 @@
+name: release
+
+# Multi-platform h3-native release build. Produces a single fat jar under
+# ~/.m2 that bundles the JNI shim (libenso_quiche.<ext>) for all four
+# supported (os, arch) pairs — libquiche 0.29.3 statically linked into
+# each shim so the shipped jar has no runtime deps beyond a modern JDK.
+#
+# Trigger:
+#   - workflow_dispatch (manual button in the Actions tab)
+#   - push of any tag matching v*
+#
+# Outputs (attached to the release when triggered by a tag):
+#   target/enso-<version>.jar            — fat jar, all 4 platforms
+#   target/native/<os>-<arch>/libenso_quiche.<ext>   — per-platform artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+env:
+  # Version pinned in the release CI so all platforms build against the
+  # same libquiche revision. Bump in one place.
+  QUICHE_VERSION: '0.29.3'
+
+jobs:
+  # ---------------------------------------------------------------------
+  # One job per platform builds libquiche.a + statically-linked shim.
+  # Each uploads its per-platform artifact; the merge job below assembles
+  # the fat jar.
+  # ---------------------------------------------------------------------
+  build-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: darwin
+            arch: arm64
+            lib_ext: dylib
+            runner: macos-14
+          - os: darwin
+            arch: amd64
+            lib_ext: dylib
+            runner: macos-13
+          - os: linux
+            arch: amd64
+            lib_ext: so
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            lib_ext: so
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build deps
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev llvm-dev \
+            libfontconfig1-dev pkg-config
+
+      - name: Cache libquiche build
+        id: quiche-cache
+        uses: actions/cache@v4
+        with:
+          path: quiche-src/target/release
+          key: quiche-${{ env.QUICHE_VERSION }}-${{ matrix.os }}-${{ matrix.arch }}-v1
+
+      - name: Build libquiche ${{ env.QUICHE_VERSION }} (static)
+        if: steps.quiche-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch ${{ env.QUICHE_VERSION }} \
+            https://github.com/cloudflare/quiche.git quiche-src
+          cd quiche-src
+          cargo build --release --lib --features ffi,pkg-config-meta
+
+      - name: Assemble libquiche staging dir
+        run: |
+          mkdir -p /tmp/quiche/lib /tmp/quiche/include
+          cp quiche-src/target/release/libquiche.a /tmp/quiche/lib/
+          cp quiche-src/quiche/include/quiche.h /tmp/quiche/include/
+
+      - name: Build enso_quiche shim (static)
+        run: |
+          make -C native/enso_quiche \
+            QUICHE_STATIC=1 \
+            QUICHE_INCLUDE_DIR=/tmp/quiche/include \
+            QUICHE_LIB_DIR=/tmp/quiche/lib
+          ls -la target/native/${{ matrix.os }}-${{ matrix.arch }}/
+
+      - name: Smoke-test the shim
+        run: |
+          file target/native/${{ matrix.os }}-${{ matrix.arch }}/libenso_quiche.${{ matrix.lib_ext }}
+          # Verify no undefined external quiche symbols (static link done right).
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            ! ldd target/native/${{ matrix.os }}-${{ matrix.arch }}/libenso_quiche.${{ matrix.lib_ext }} | grep -q libquiche
+          else
+            ! otool -L target/native/${{ matrix.os }}-${{ matrix.arch }}/libenso_quiche.${{ matrix.lib_ext }} | grep -q libquiche
+          fi
+
+      - name: Upload per-platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libenso_quiche-${{ matrix.os }}-${{ matrix.arch }}
+          path: target/native/${{ matrix.os }}-${{ matrix.arch }}/libenso_quiche.${{ matrix.lib_ext }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # Alpine / musl builds. Separate job because the runner setup is
+  # different: everything runs inside an alpine container so libc,
+  # cmake, and clang all come from apk instead of setup-* actions.
+  # Loader classifier is `linux-musl-<arch>` (Quiche.java probes musl
+  # first when /lib/ld-musl-*.so.1 is present, falls back to glibc).
+  # ---------------------------------------------------------------------
+  build-native-musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: alpine:3.20
+    steps:
+      - name: Install alpine build deps
+        run: |
+          apk add --no-cache \
+            bash build-base cmake clang clang-dev llvm-dev \
+            perl python3 pkgconf openjdk25 curl git \
+            linux-headers openssl-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install rustup (alpine ships no rustc new enough)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Env sanity
+        run: |
+          echo "PATH=$PATH"
+          rustc --version
+          cargo --version
+          javac --version
+          echo "JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/default-jvm}"
+
+      - name: Cache libquiche build
+        id: quiche-cache
+        uses: actions/cache@v4
+        with:
+          path: quiche-src/target/release
+          key: quiche-${{ env.QUICHE_VERSION }}-linux-musl-${{ matrix.arch }}-v1
+
+      - name: Build libquiche ${{ env.QUICHE_VERSION }} (static)
+        if: steps.quiche-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch ${{ env.QUICHE_VERSION }} \
+            https://github.com/cloudflare/quiche.git quiche-src
+          cd quiche-src
+          cargo build --release --lib --features ffi,pkg-config-meta
+
+      - name: Assemble libquiche staging dir
+        run: |
+          mkdir -p /tmp/quiche/lib /tmp/quiche/include
+          cp quiche-src/target/release/libquiche.a /tmp/quiche/lib/
+          cp quiche-src/quiche/include/quiche.h /tmp/quiche/include/
+
+      - name: Build enso_quiche shim (static)
+        run: |
+          export JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/default-jvm}
+          make -C native/enso_quiche \
+            QUICHE_STATIC=1 \
+            QUICHE_INCLUDE_DIR=/tmp/quiche/include \
+            QUICHE_LIB_DIR=/tmp/quiche/lib
+          ls -la target/native/linux-${{ matrix.arch }}/
+
+      - name: Rename to musl classifier + smoke-test
+        run: |
+          mv target/native/linux-${{ matrix.arch }} \
+             target/native/linux-musl-${{ matrix.arch }}
+          file target/native/linux-musl-${{ matrix.arch }}/libenso_quiche.so
+          # Verify statically linked — no libquiche runtime dep.
+          if ldd target/native/linux-musl-${{ matrix.arch }}/libenso_quiche.so 2>&1 | grep -q libquiche; then
+            echo "ERROR: dynamic libquiche dep leaked" >&2
+            exit 1
+          fi
+
+      - name: Upload per-platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libenso_quiche-linux-musl-${{ matrix.arch }}
+          path: target/native/linux-musl-${{ matrix.arch }}/libenso_quiche.so
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # Assemble the fat jar with all 6 platform shims inside.
+  # ---------------------------------------------------------------------
+  package:
+    needs: [build-native, build-native-musl]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Clojure
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: 1.12.5.1654
+
+      - name: Cache Maven / Gitlibs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.deps.clj
+          key: ${{ runner.os }}-clj-${{ hashFiles('deps.edn') }}
+          restore-keys: ${{ runner.os }}-clj-
+
+      - name: Download all platform shims
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/native-artifacts
+          pattern: libenso_quiche-*
+
+      - name: Stage shims into target/native/<os>-<arch>/
+        run: |
+          for d in /tmp/native-artifacts/libenso_quiche-*; do
+            name=$(basename "$d")           # e.g. libenso_quiche-darwin-arm64
+            classifier=${name#libenso_quiche-}   # → darwin-arm64
+            mkdir -p target/native/$classifier
+            cp $d/libenso_quiche.* target/native/$classifier/
+          done
+          find target/native -type f
+
+      - name: Build core jar (no native)
+        run: clojure -T:build jar-core
+
+      - name: Build per-classifier native jars
+        run: |
+          for d in target/native/*/; do
+            classifier=$(basename "$d")
+            clojure -T:build jar-classifier :classifier "\"$classifier\""
+          done
+
+      - name: Build fat jar (all platforms bundled)
+        run: clojure -T:build jar-all
+
+      - name: Verify jar contents
+        run: |
+          for j in target/enso-*.jar; do
+            echo "== $(basename $j) ($(du -h $j | cut -f1)) =="
+            jar tf "$j" | grep -E '^META-INF/native/' | sort || echo "  (no native)"
+          done
+
+      - name: Upload jar artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: enso-jars
+          path: target/enso-*.jar
+          if-no-files-found: error
+
+      - name: Attach jars to release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/enso-*.jar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

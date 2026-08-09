@@ -1,0 +1,53 @@
+Ensō
+Copyright 2026 Max Penet
+
+This product bundles software licensed separately from Ensō itself. See
+LICENSE for Ensō's own MPL 2.0 terms. The bundled third-party components:
+
+------------------------------------------------------------------------
+Cloudflare quiche (statically linked into libenso_quiche release builds)
+------------------------------------------------------------------------
+
+  https://github.com/cloudflare/quiche
+  Version: 0.29.3
+
+  Copyright (C) 2018-2019, Cloudflare, Inc.
+  All rights reserved.
+
+  Licensed under the BSD 2-Clause License:
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
+
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+    A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+    HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+    SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+    LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+    DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+  Full license text: https://github.com/cloudflare/quiche/blob/master/COPYING
+
+------------------------------------------------------------------------
+BoringSSL (vendored inside quiche's static build)
+------------------------------------------------------------------------
+
+  https://boringssl.googlesource.com/boringssl/
+  Licensed under the OpenSSL License and the original SSLeay license,
+  plus ISC-style additions for BoringSSL-specific changes. See
+  https://boringssl.googlesource.com/boringssl/+/master/LICENSE for
+  the full combined text.

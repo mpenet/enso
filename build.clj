@@ -44,22 +44,39 @@
   [_]
   (sh "make -C native/enso_quiche"))
 
-(defn jar [_]
-  (javac nil)
-  (b/delete {:path jar-class-dir})
-  (b/copy-dir {:src-dirs [class-dir]
-               :target-dir jar-class-dir})
-  ;; Bundle the JNI shim per platform under META-INF/native/<os>-<arch>/.
-  ;; Quiche.java's loader extracts + System.load at runtime.
-  (when (.exists (java.io.File. "target/native"))
-    (b/copy-dir {:src-dirs ["target/native"]
-                 :target-dir (str jar-class-dir "/META-INF/native")}))
-  (b/write-pom {:class-dir jar-class-dir
+;; --- Jar assembly ----------------------------------------------------------
+;;
+;; We publish four flavors of the artifact:
+;;
+;;   enso-<v>.jar                — core (Java + Clojure, NO native shim).
+;;                                 Users bring their own libquiche (or add a
+;;                                 platform classifier jar).
+;;   enso-<v>-<os>-<arch>.jar    — per-classifier native jar. Contains only
+;;                                 META-INF/native/<os>-<arch>/libenso_quiche.
+;;                                 Netty-style: pull the one you need.
+;;   enso-<v>-all.jar            — fat jar with the core + all four static
+;;                                 shims. Ships zero-install for anyone who
+;;                                 doesn't want to think about classifiers.
+;;
+;; The `jar` task is the plain "whatever's under target/native/ gets bundled"
+;; behaviour we've always had — it's what dev use of `clj -T:build jar` will
+;; keep producing. `jar-all`, `jar-core`, and `jar-classifier` are the
+;; release-time helpers.
+
+(def jar-core-file (format "target/%s-%s.jar" (name lib) version))
+(def jar-all-file  (format "target/%s-%s-all.jar" (name lib) version))
+(defn- jar-classifier-file [classifier]
+  (format "target/%s-%s-%s.jar" (name lib) version classifier))
+
+(defn- write-pom-into
+  "Emit the shared pom.xml + attribution files into a jar staging dir."
+  [staging]
+  (b/write-pom {:class-dir staging
                 :lib lib
                 :version version
                 :basis @basis
                 :src-dirs ["src/clj"]
-                :pom-data [[:description "Zero-dep , near 0-alloc, High Performance Ring adapter for Clojure"]
+                :pom-data [[:description "Zero-dep, near 0-alloc, High Performance Ring adapter for Clojure"]
                            [:url "https://github.com/mpenet/enso"]
                            [:licenses
                             [:license
@@ -69,10 +86,90 @@
                             [:url "https://github.com/mpenet/enso"]
                             [:connection "scm:git:git://github.com/mpenet/enso.git"]
                             [:developerConnection "scm:git:ssh://git@github.com/mpenet/enso.git"]]]})
+  ;; NOTICE gets bundled at META-INF/NOTICE so downstream tools that
+  ;; aggregate ATTRIBUTION files pick up the quiche + BoringSSL notice.
+  (let [notice (java.io.File. "NOTICE")]
+    (when (.exists notice)
+      (let [dst (java.io.File. (str staging "/META-INF/NOTICE"))]
+        (.mkdirs (.getParentFile dst))
+        (java.nio.file.Files/copy
+         (.toPath notice) (.toPath dst)
+         ^"[Ljava.nio.file.CopyOption;"
+         (into-array java.nio.file.CopyOption
+                     [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))))))
+
+(defn jar
+  "Legacy / dev jar. Contents mirror what's staged under target/native/ at
+  call time — dynamic-linked shim if you `make -C native/enso_quiche`,
+  none if `target/native` is absent. For release flavors use
+  `jar-core`, `jar-all`, `jar-classifier`."
+  [_]
+  (javac nil)
+  (b/delete {:path jar-class-dir})
+  (b/copy-dir {:src-dirs [class-dir]
+               :target-dir jar-class-dir})
+  (when (.exists (java.io.File. "target/native"))
+    (b/copy-dir {:src-dirs ["target/native"]
+                 :target-dir (str jar-class-dir "/META-INF/native")}))
+  (write-pom-into jar-class-dir)
   (b/copy-dir {:src-dirs ["src/clj"]
                :target-dir jar-class-dir})
   (b/jar {:class-dir jar-class-dir
           :jar-file jar-file}))
+
+(defn- stage-core
+  "Common jar staging: Java classes + Clojure sources + pom. Leaves
+  target/native alone — caller decides which shims (if any) to add."
+  [staging]
+  (javac nil)
+  (b/delete {:path staging})
+  (b/copy-dir {:src-dirs [class-dir]
+               :target-dir staging})
+  (write-pom-into staging)
+  (b/copy-dir {:src-dirs ["src/clj"]
+               :target-dir staging}))
+
+(defn jar-core
+  "Core artifact: no native shim inside. Consumers who want HTTP/3 add a
+  matching classifier jar (see `jar-classifier`) or the `-all` fat jar."
+  [_]
+  (let [staging "target/jar-core-classes"]
+    (stage-core staging)
+    (b/jar {:class-dir staging
+            :jar-file jar-core-file})
+    {:jar-file jar-core-file}))
+
+(defn jar-classifier
+  "Per-platform native jar. Pass `:classifier \"darwin-arm64\"` (or
+  `linux-amd64`, etc.). Only META-INF/native/<classifier>/libenso_quiche.*
+  and the pom go in — no Java classes. Small (~3-4 MB per platform)
+  because it ships just the statically-linked shim."
+  [{:keys [classifier]}]
+  (when-not classifier (throw (ex-info ":classifier required" {})))
+  (let [staging (str "target/jar-" classifier "-classes")
+        src-dir (format "target/native/%s" classifier)]
+    (when-not (.exists (java.io.File. src-dir))
+      (throw (ex-info (str "no shim at " src-dir) {:classifier classifier})))
+    (b/delete {:path staging})
+    (b/copy-dir {:src-dirs [src-dir]
+                 :target-dir (str staging "/META-INF/native/" classifier)})
+    (write-pom-into staging)
+    (let [out (jar-classifier-file classifier)]
+      (b/jar {:class-dir staging :jar-file out})
+      {:jar-file out :classifier classifier})))
+
+(defn jar-all
+  "Fat jar with core + every shim present under target/native/. Assumes
+  the release CI has staged all four platform shims before calling."
+  [_]
+  (let [staging "target/jar-all-classes"]
+    (stage-core staging)
+    (when (.exists (java.io.File. "target/native"))
+      (b/copy-dir {:src-dirs ["target/native"]
+                   :target-dir (str staging "/META-INF/native")}))
+    (b/jar {:class-dir staging
+            :jar-file jar-all-file})
+    {:jar-file jar-all-file}))
 
 (defn install [_]
   (jar nil)
