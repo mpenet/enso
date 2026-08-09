@@ -172,7 +172,7 @@ jobs:
               apk add --no-cache \
                 bash build-base cmake clang clang-dev llvm-dev \
                 perl python3 pkgconf openjdk21 curl git \
-                linux-headers openssl-dev
+                linux-headers openssl-dev fontconfig-dev
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
                 | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
               export PATH="$HOME/.cargo/bin:$PATH"
