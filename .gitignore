@@ -6,3 +6,4 @@ target/
 .agent-shell/
 *.log
 /bench/quic-interop-runner/repo/
+bench/quic-interop-runner/repo

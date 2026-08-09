@@ -35,8 +35,24 @@ Built on/for virtual threads. Plain sync handler.
 
 - JDK 21+ (HTTP/3 requires 22+).
 - Clojure 1.12+.
-- HTTP/3 from a release jar: add a native jar next to the core jar. See
-  [doc/http3.md](doc/http3.md).
+- HTTP/3: add a matching classifier or the fat coord — see below.
+
+## deps.edn
+
+```clojure
+;; core only, no h3
+{:deps {com.s-exp/enso {:mvn/version "1.0.0-alphaN"}}}
+
+;; core + per-platform h3 shim
+{:deps {com.s-exp/enso              {:mvn/version "1.0.0-alphaN"}
+        com.s-exp/enso$darwin-arm64 {:mvn/version "1.0.0-alphaN"}}}
+
+;; fat jar, all six shims bundled
+{:deps {com.s-exp/enso$all {:mvn/version "1.0.0-alphaN"}}}
+```
+
+Classifiers: `darwin-{arm64,amd64}`, `linux-{amd64,arm64}`,
+`linux-musl-{amd64,arm64}`. Full detail in [doc/http3.md](doc/http3.md).
 
 ## Quick start
 

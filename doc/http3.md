@@ -7,20 +7,47 @@ of quiche's transport primitives. Same Ring handler contract as h1/h2 —
 
 ## From a release jar (zero libquiche install)
 
-Release jars bundle a statically-linked JNI shim per platform.
-Three flavors:
+Every release publishes core, per-classifier, and fat jars to Clojars.
+Three consumption patterns.
 
-- `enso-<v>.jar` — core, no native shim, no h3. Smallest (~200 KB).
-- `enso-<v>-<os>-<arch>.jar` — per-platform classifier jar (~3.5 MB). Add
-  alongside core for h3 with zero libquiche install. Classifiers:
-  - `darwin-arm64`, `darwin-amd64`
-  - `linux-amd64`, `linux-arm64`
-  - `linux-musl-amd64`, `linux-musl-arm64`
-- `enso-<v>-all.jar` — fat jar with core + all six shims (~21 MB). Pick
-  this if distributing an uber-jar for multiple platforms.
+### Core only, no h3 (~200 KB)
+
+```clojure
+{:deps {com.s-exp/enso {:mvn/version "1.0.0-alphaN"}}}
+```
+
+### Per-platform classifier (~3.5 MB)
+
+Add core plus the classifier matching your deploy target. `tools.deps`
+resolves the classifier artifact via the `$<classifier>` coord suffix.
+
+```clojure
+{:deps {com.s-exp/enso                 {:mvn/version "1.0.0-alphaN"}
+        com.s-exp/enso$darwin-arm64    {:mvn/version "1.0.0-alphaN"}}}
+```
+
+Available classifiers:
+
+- `darwin-arm64`, `darwin-amd64`
+- `linux-amd64`, `linux-arm64`
+- `linux-musl-amd64`, `linux-musl-arm64`
 
 Alpine/musl variants selected automatically at runtime when
 `/lib/ld-musl-*.so.1` is present; falls back to glibc shim otherwise.
+
+### Fat jar, all six shims bundled (~21 MB)
+
+Single coord, no classifier picking. Pick this for uber-jar-based
+deploys or when you don't want to think about the target platform.
+
+```clojure
+{:deps {com.s-exp/enso$all {:mvn/version "1.0.0-alphaN"}}}
+```
+
+### Release artifacts
+
+Every published version also lands on the GitHub release page as
+downloadable jar assets, if you prefer `:local/root` over Clojars.
 
 ## Enabling h3
 
