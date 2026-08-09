@@ -8,6 +8,10 @@ Built on/for virtual threads. Plain sync handler.
   Clojure runtime is the only requirement. Release jars bundle a JNI shim
   per platform with libquiche statically linked in — no system libquiche
   install needed. HTTP/3 remains opt-in.
+- **Fast.** ~5M rps pipelined depth 64 (HTTP/1.1); ~894k rps HTTP/2 over
+  TLS; ~53k rps HTTP/3 (edges Netty by ~2%, ~19× Jetty).
+- **Low allocation.** ~0.001 sample/req at 1 MB TLAB interval — near-zero
+  GC pressure on hot paths.
 - **Virtual threads, sync API.** One vthread per connection, blocking I/O.
   Handler is a plain Ring function — no async arity, no callbacks.
 - **HTTP/1.1 complete.** Keep-alive, pipelining, chunked transfer
@@ -22,10 +26,6 @@ Built on/for virtual threads. Plain sync handler.
 - **WebSocket.** Ring 1.5+ listener shape. Text + binary, ping/pong, close.
 - **SSE / long-poll.** Streaming writer response bodies with `flush!`.
 - **`StreamableResponseBody`.** Optional `ring.core.protocols` support.
-- **Fast.** ~5M rps pipelined depth 64 (HTTP/1.1); ~894k rps HTTP/2 over
-  TLS; ~53k rps HTTP/3 (edges Netty by ~2%, ~19× Jetty).
-- **Low allocation.** ~0.001 sample/req at 1 MB TLAB interval — near-zero
-  GC pressure on hot paths.
 - **Sendfile.** `File` bodies dispatch via
   `FileChannel.transferTo(SocketChannel)` — zero-copy on plain HTTP.
 - **Correct.** Rejects request smuggling, header injection, slowloris.
