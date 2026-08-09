@@ -1,6 +1,6 @@
 package com.s_exp.enso.http3.qpack;
 
-import com.s_exp.enso.HpackHuffman;
+import com.s_exp.enso.http2.HpackHuffman;
 import java.io.IOException;
 
 /**
