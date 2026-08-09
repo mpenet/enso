@@ -11,9 +11,10 @@ name: release
 #   - workflow_dispatch (manual button in the Actions tab)
 #   - push of any tag matching v*
 #
-# Outputs (attached to the release when triggered by a tag):
-#   target/enso-<version>.jar            — fat jar, all 5 platforms
-#   target/native/<os>-<arch>/libenso_quiche.<ext>   — per-platform artifacts
+# Outputs (uploaded as workflow artifacts + published to Clojars on tag):
+#   target/enso-<version>.jar            — core jar
+#   target/enso-<version>-<classifier>.jar — per-platform native jars
+#   target/enso-<version>-all.jar        — fat jar, all 5 platforms
 
 on:
   workflow_dispatch:
@@ -225,7 +226,7 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------
-  # Assemble the fat jar with all 6 platform shims inside.
+  # Assemble the fat jar with all 5 platform shims inside.
   # ---------------------------------------------------------------------
   package:
     needs: [build-native, build-native-musl]
@@ -296,14 +297,6 @@ jobs:
           name: enso-jars
           path: target/enso-*.jar
           if-no-files-found: error
-
-      - name: Attach jars to release (tag pushes only)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: target/enso-*.jar
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Publishes core + every per-classifier + fat jar to Clojars.
       # Users declare `com.s-exp/enso` (core), `com.s-exp/enso$<os>-<arch>`

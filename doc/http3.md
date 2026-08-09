@@ -44,10 +44,6 @@ deploys or when you don't want to think about the target platform.
 {:deps {com.s-exp/enso$all {:mvn/version "1.0.0-alphaN"}}}
 ```
 
-### Release artifacts
-
-Every published version also lands on the GitHub release page as
-downloadable jar assets, if you prefer `:local/root` over Clojars.
 
 ## Enabling h3
 

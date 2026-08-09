@@ -248,8 +248,8 @@
 (defn tag
   "Create annotated tag matching the computed `version`, then push it. The
   release CI workflow (`.github/workflows/release.yml`) triggers on tag
-  push — it builds shims, assembles jars, attaches to GitHub release,
-  and publishes core + every classifier + fat jar to Clojars."
+  push — it builds shims, assembles jars, and publishes core +
+  every classifier + fat jar to Clojars."
   [opts]
   (sh
    (format "git tag -a \"v%s\" --no-sign -m \"Release %s\"" version version)
