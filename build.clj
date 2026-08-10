@@ -6,7 +6,12 @@
             [deps-deploy.deps-deploy :as dd]))
 
 (def lib 'com.s-exp/enso)
-(def version (format "1.0.0-alpha%s" (b/git-count-revs nil)))
+;; CI tag-driven releases set ENSO_VERSION from `github.ref_name` with
+;; the leading `v` stripped, so e.g. tag `v1.0.0-alpha29` publishes
+;; `1.0.0-alpha29` on Clojars regardless of the local commit count.
+;; Local dev falls back to a git-count-based auto version.
+(def version (or (System/getenv "ENSO_VERSION")
+                 (format "1.0.0-alpha%s" (b/git-count-revs nil))))
 (def class-dir "target/classes")
 ;; Jar contents are staged separately from `class-dir`: target/classes
 ;; is on the dev/test/bench classpaths, and copying src/clj into it

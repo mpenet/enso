@@ -234,6 +234,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ENSO_VERSION picked up by build.clj — overrides the local
+      # git-count-based auto version. Tag `v1.0.0-alphaN` publishes
+      # `1.0.0-alphaN`. workflow_dispatch runs skip this step and fall
+      # back to the git-count version (useful for smoke testing).
+      - name: Derive ENSO_VERSION from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: echo "ENSO_VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+
       - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
