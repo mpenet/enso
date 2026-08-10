@@ -41,13 +41,15 @@ Built on/for virtual threads. Plain sync handler.
 
 ## deps.edn
 
+[![Clojars Project](https://img.shields.io/clojars/v/com.s-exp/enso.svg)](https://clojars.org/com.s-exp/enso)
+
 ```clojure
 ;; core only, no h3
-{:deps {com.s-exp/enso {:mvn/version "1.0.0-alphaN"}}}
+{:deps {com.s-exp/enso {:mvn/version "..."}}}
 
 ;; core + per-platform h3 shim
-{:deps {com.s-exp/enso              {:mvn/version "1.0.0-alphaN"}
-        com.s-exp/enso$darwin-arm64 {:mvn/version "1.0.0-alphaN"}}}
+{:deps {com.s-exp/enso              {:mvn/version "..."}
+        com.s-exp/enso$darwin-arm64 {:mvn/version "..."}}}
 ```
 
 Classifiers: `darwin-arm64`, `linux-{amd64,arm64}`,
