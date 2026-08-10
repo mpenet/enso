@@ -408,46 +408,41 @@ final class Http3Connection implements AutoCloseable {
     }
 
     /**
-     * Read up-to-CHUNK bytes from {@code src} and emit as a DATA frame.
-     * Repeats until either EOF (emit FIN, close src) or the stream's
-     * outbound Pending queue is non-empty after a write (peer flow
-     * control blocked). In the pending case the source is stashed in
-     * {@link #streamingSources} so {@link #resumeStreamingSources}
-     * resumes on a later owner-loop iteration. Prevents the 4096 × 256
-     * KiB Pending pile-up that would defeat the streaming memory win.
+     * Read one chunk from {@code src} and emit as a DATA frame. If more
+     * remains (no EOF), stash the source in {@link #streamingSources}
+     * so {@link #resumeStreamingSources} pumps the next chunk on the
+     * next owner-loop iteration. One-chunk-per-call bounds the worst-case
+     * owner starvation window to a single {@code InputStream.read}
+     * (≤ ~100ms on cold disk, sub-ms hot). Multi-chunk-in-one-iteration
+     * would also block ingress + other streams' traffic for the full
+     * duration.
      */
     private void pumpStreaming(long streamId, java.io.InputStream src) {
         byte[] buf = streamChunkBuf;
         try {
-            while (true) {
-                int n = readFully(src, buf);
-                boolean eof = n < buf.length;
-                if (n > 0) {
-                    session.writeBodyChunk(streamId, buf, 0, n, eof);
-                } else if (eof) {
-                    // Zero-body streaming — emit empty terminal DATA
-                    // with FIN so the peer sees EOM.
-                    session.writeBodyChunk(streamId, buf, 0, 0, true);
-                }
-                if (eof) {
-                    closeSourceQuiet(src);
-                    if (streamingSources.isEmpty()) {
-                        // Reclaim the 256 KiB scratch once no streams
-                        // are mid-body — otherwise a connection that
-                        // streams once pins the buffer for its lifetime.
-                        streamChunkBuf = null;
-                    }
-                    return;
-                }
-                // If the last writeBodyChunk deferred bytes to Pending,
-                // stop reading — otherwise we'd pull the entire source
-                // into pendingByStream's byte[] copies. Resume happens
-                // once the pending queue drains.
-                if (session.hasPendingWrites(streamId)) {
-                    streamingSources.put(streamId, src);
-                    return;
-                }
+            int n = readFully(src, buf);
+            boolean eof = n < buf.length;
+            if (n > 0) {
+                session.writeBodyChunk(streamId, buf, 0, n, eof);
+            } else if (eof) {
+                // Zero-body streaming — emit empty terminal DATA with
+                // FIN so the peer sees EOM.
+                session.writeBodyChunk(streamId, buf, 0, 0, true);
             }
+            if (eof) {
+                closeSourceQuiet(src);
+                if (streamingSources.isEmpty()) {
+                    // Reclaim the 256 KiB scratch once no streams are
+                    // mid-body — otherwise a connection that streams
+                    // once pins the buffer for its lifetime.
+                    streamChunkBuf = null;
+                }
+                return;
+            }
+            // Not EOF — park source for the next owner iteration.
+            // Also caps Pending pile-up: only one chunk enters per tick
+            // even if flow control never blocks.
+            streamingSources.put(streamId, src);
         } catch (java.io.IOException e) {
             LOG.warning("h3 stream body read failed stream=" + streamId
                 + ": " + e.getMessage());
