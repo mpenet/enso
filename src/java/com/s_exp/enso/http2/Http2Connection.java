@@ -1019,7 +1019,7 @@ public final class Http2Connection implements Runnable {
         boolean hasServer = false;
         if (respHeaders != null) {
             for (Map.Entry<?, ?> e : respHeaders.entrySet()) {
-                String name = String.valueOf(e.getKey()).toLowerCase();
+                String name = String.valueOf(e.getKey()).toLowerCase(java.util.Locale.ROOT);
                 if (name.equals("connection") || name.equals("transfer-encoding")
                     || name.equals("keep-alive") || name.equals("upgrade")
                     || name.equals("proxy-connection")) {
@@ -1416,7 +1416,17 @@ public final class Http2Connection implements Runnable {
         writeFrame(type, flags, streamId, payload, off, len);
     }
 
+    private int lastGoawayStreamId = Integer.MAX_VALUE;
+
     private void sendGoaway(int lastStreamId, int errorCode, String debugData) throws IOException {
+        // RFC 9113 §6.8: subsequent GOAWAYs on the same connection MUST
+        // carry a last-stream-ID <= the previous one. Clamp to the
+        // previous value so a second GOAWAY (e.g. writer thread failure
+        // firing after the framer's error path) doesn't advance the ID.
+        if (lastStreamId > lastGoawayStreamId) {
+            lastStreamId = lastGoawayStreamId;
+        }
+        lastGoawayStreamId = lastStreamId;
         byte[] debug = debugData == null ? EMPTY
             : debugData.getBytes(StandardCharsets.UTF_8);
         byte[] payload = new byte[8 + debug.length];

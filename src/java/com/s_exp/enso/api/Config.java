@@ -120,9 +120,12 @@ public final class Config {
         this.sslContext = b.sslContext;
         this.sslNeedClientAuth = b.sslNeedClientAuth;
         this.sslWantClientAuth = b.sslWantClientAuth;
-        this.alpnProtocols = b.alpnProtocols;
-        this.enabledCipherSuites = b.enabledCipherSuites;
-        this.enabledTlsProtocols = b.enabledTlsProtocols;
+        // Defensive-clone: fields are public final, but the array
+        // contents are mutable; without this a caller could mutate the
+        // builder's array after build() and change server behavior.
+        this.alpnProtocols = b.alpnProtocols == null ? null : b.alpnProtocols.clone();
+        this.enabledCipherSuites = b.enabledCipherSuites == null ? null : b.enabledCipherSuites.clone();
+        this.enabledTlsProtocols = b.enabledTlsProtocols == null ? null : b.enabledTlsProtocols.clone();
         this.sslSessionCacheSize = b.sslSessionCacheSize;
         this.http2 = b.http2;
         this.http2MaxConcurrentStreams = b.http2MaxConcurrentStreams;
@@ -263,9 +266,9 @@ public final class Config {
         public Builder sslContext(SSLContext v) { this.sslContext = v; return this; }
         public Builder sslNeedClientAuth(boolean v) { this.sslNeedClientAuth = v; return this; }
         public Builder sslWantClientAuth(boolean v) { this.sslWantClientAuth = v; return this; }
-        public Builder alpnProtocols(String[] v) { this.alpnProtocols = v; return this; }
-        public Builder enabledCipherSuites(String[] v) { this.enabledCipherSuites = v; return this; }
-        public Builder enabledTlsProtocols(String[] v) { this.enabledTlsProtocols = v; return this; }
+        public Builder alpnProtocols(String[] v) { this.alpnProtocols = v == null ? null : v.clone(); return this; }
+        public Builder enabledCipherSuites(String[] v) { this.enabledCipherSuites = v == null ? null : v.clone(); return this; }
+        public Builder enabledTlsProtocols(String[] v) { this.enabledTlsProtocols = v == null ? null : v.clone(); return this; }
         public Builder sslSessionCacheSize(int v) { this.sslSessionCacheSize = v; return this; }
         public Builder http2(boolean v) { this.http2 = v; return this; }
         public Builder http2MaxConcurrentStreams(int v) { this.http2MaxConcurrentStreams = v; return this; }
@@ -323,6 +326,14 @@ public final class Config {
             requirePositive("coalesceHighWater", coalesceHighWater);
             requirePositive("chunkBufferSize", chunkBufferSize);
             requirePositive("maxDrainBytes", maxDrainBytes);
+            // Upper cap on chunk buffer size: 16 MiB is already unreasonable
+            // (a single chunked-body read syscall). Prevents users from
+            // setting Integer.MAX_VALUE and OOMing ChunkedWriter on first
+            // write.
+            if (chunkBufferSize > 16 * 1024 * 1024) {
+                throw new IllegalArgumentException(
+                    "chunkBufferSize must be <= 16777216 (16 MiB), got " + chunkBufferSize);
+            }
             if (maxRequestBodyBytes < 0) {
                 throw new IllegalArgumentException(
                     "maxRequestBodyBytes must be >= 0 (0 disables), got " + maxRequestBodyBytes);

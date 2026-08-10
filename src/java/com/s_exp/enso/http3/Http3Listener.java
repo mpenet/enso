@@ -303,8 +303,12 @@ public final class Http3Listener implements AutoCloseable {
         // finally throws AsynchronousCloseException and peers never see
         // H3_NO_ERROR — task #133.
         running = false;
+        // Signal all conns in parallel (non-blocking flag-flip + wake).
+        // Serial c.close() at 3s each would take hours at 10k conns.
+        // Bounded connExecutor.awaitTermination below caps total wait
+        // regardless of conn count.
         for (Http3Connection c : conns.values()) {
-            try { c.close(); } catch (Throwable ignored) {}
+            try { c.signalClose(); } catch (Throwable ignored) {}
         }
         conns.clear();
         // Drain per-connection driver threads BEFORE freeing the shared
@@ -315,7 +319,7 @@ public final class Http3Listener implements AutoCloseable {
         if (connExecutor != null) {
             connExecutor.shutdown();
             try {
-                connExecutor.awaitTermination(2, TimeUnit.SECONDS);
+                connExecutor.awaitTermination(5, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

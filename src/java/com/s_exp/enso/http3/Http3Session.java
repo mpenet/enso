@@ -222,16 +222,16 @@ public final class Http3Session {
                 + peerMaxFieldSectionSize + " (stream=" + streamId + ")");
         }
         int total = hdrsBudget + (hasBody ? (16 + body.length) : 0);
-        frameBuf = ensureFrameCap(frameBuf, total);
-        frameBuf.clear();
-        Http3FrameWriter.appendHeadersFrom(frameBuf, headers);
+        ByteBuffer buf = ensureFrameCap(total);
+        buf.clear();
+        Http3FrameWriter.appendHeadersFrom(buf, headers);
         if (hasBody) {
-            Http3FrameWriter.appendData(frameBuf, body);
+            Http3FrameWriter.appendData(buf, body);
         }
-        frameBuf.flip();
+        buf.flip();
         // Single stream_send with fin=true — HEADERS + DATA travel
         // together, FIN can't outrun HEADERS.
-        writeAll(streamId, frameBuf, true);
+        writeAll(streamId, buf, true);
         releaseReader(requestStreams.remove(streamId));
     }
 
@@ -240,11 +240,20 @@ public final class Http3Session {
     // QPACK now encodes directly into this buffer (task #123), so a
     // separate qpackScratch is no longer needed.
     private ByteBuffer frameBuf = ByteBuffer.allocate(4096);
+    // Ceiling on the retained frameBuf. A one-off monster response
+    // would otherwise pin the largest buffer for the connection's whole
+    // lifetime. Above the cap: allocate a throwaway buffer for this
+    // response, keep the small one for the common case, let GC reclaim.
+    private static final int FRAME_BUF_MAX_KEEP = 256 * 1024;
 
-    private static ByteBuffer ensureFrameCap(ByteBuffer buf, int need) {
-        if (buf.capacity() >= need) return buf;
-        int newCap = Math.max(buf.capacity() * 2, need);
-        return ByteBuffer.allocate(newCap);
+    private ByteBuffer ensureFrameCap(int need) {
+        if (frameBuf.capacity() >= need) return frameBuf;
+        int newCap = Math.max(frameBuf.capacity() * 2, need);
+        ByteBuffer next = ByteBuffer.allocate(newCap);
+        if (newCap <= FRAME_BUF_MAX_KEEP) {
+            frameBuf = next;
+        }
+        return next;
     }
 
     // -----------------------------------------------------------------

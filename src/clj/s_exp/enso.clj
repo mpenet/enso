@@ -140,9 +140,9 @@
     (when-let [v (:ssl-context opts)] (.sslContext b ^javax.net.ssl.SSLContext v))
     (when (:ssl-need-client-auth opts) (.sslNeedClientAuth b true))
     (when (:ssl-want-client-auth opts) (.sslWantClientAuth b true))
-    (when-let [v (:alpn-protocols opts)] (.alpnProtocols b (into-array String v)))
-    (when-let [v (:enabled-cipher-suites opts)] (.enabledCipherSuites b (into-array String v)))
-    (when-let [v (:enabled-tls-protocols opts)] (.enabledTlsProtocols b (into-array String v)))
+    (when-let [v (:alpn-protocols opts)] (.alpnProtocols b (into-array String (map str v))))
+    (when-let [v (:enabled-cipher-suites opts)] (.enabledCipherSuites b (into-array String (map str v))))
+    (when-let [v (:enabled-tls-protocols opts)] (.enabledTlsProtocols b (into-array String (map str v))))
     (when-let [v (:ssl-session-cache-size opts)] (.sslSessionCacheSize b (int v)))
     ;; h2
     (when (:http2 opts) (.http2 b true))
@@ -206,7 +206,9 @@
     `[\"h2\" \"http/1.1\"]` when `:http2` is enabled, otherwise JVM default.
   - `:enabled-cipher-suites` - seq of cipher suite names to enable (JVM default when nil)
   - `:enabled-tls-protocols` - seq of TLS protocol versions to enable (JVM default when nil)
-  - `:ssl-session-cache-size` - session cache size (0 = JVM default)
+  - `:ssl-session-cache-size` - SSL session cache size in entries. 0 = JVM
+    default (10000 on OpenJDK). Larger caches help session-resumption hit
+    rate under many short-lived TLS clients.
 
   HTTP/1.1 keep-alive:
   - `:max-keep-alive-requests` - cap on requests per connection, 0 = unlimited (default 1000)

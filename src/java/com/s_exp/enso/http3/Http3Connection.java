@@ -316,7 +316,7 @@ final class Http3Connection implements AutoCloseable {
         headersList.add(statusPair(statusStr));
         boolean hasServer = false;
         for (Map.Entry<?, ?> e : task.headers.entrySet()) {
-            String hn = String.valueOf(e.getKey()).toLowerCase();
+            String hn = String.valueOf(e.getKey()).toLowerCase(java.util.Locale.ROOT);
             if (hn.equals("connection") || hn.equals("keep-alive")
                 || hn.equals("transfer-encoding") || hn.equals("upgrade")
                 || hn.equals("proxy-connection")) continue;
@@ -411,11 +411,9 @@ final class Http3Connection implements AutoCloseable {
 
     @Override
     public void close() {
-        // Signal-only. Native cleanup (quiche_conn_free) done exclusively
+        // Signal + join. Native cleanup (quiche_conn_free) done exclusively
         // by the owner thread in run()'s finally block.
-        if (!closed.compareAndSet(false, true)) return;
-        running = false;
-        ingress.offer(WAKE_SENTINEL);
+        if (!signalClose()) return;
         if (Thread.currentThread() == ownerThread) return;
         try {
             ownerFuture.get(3, TimeUnit.SECONDS);
@@ -427,6 +425,19 @@ final class Http3Connection implements AutoCloseable {
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
         } catch (Throwable ignored) {}
+    }
+
+    /**
+     * Non-blocking flag-flip + wake. Http3Listener.close fans this out
+     * across all conns in parallel then waits on the shared connExecutor
+     * once — replaces N × 3s serial waits.
+     * Returns false if already closed (idempotent).
+     */
+    boolean signalClose() {
+        if (!closed.compareAndSet(false, true)) return false;
+        running = false;
+        ingress.offer(WAKE_SENTINEL);
+        return true;
     }
 
     byte[] cid() { return cid; }

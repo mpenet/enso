@@ -199,6 +199,13 @@ public final class HpackHuffman {
      * accepted; anything longer is a COMPRESSION_ERROR.
      */
     public static byte[] decode(byte[] src, int off, int len) throws IOException {
+        // Guard against overflow in the worst-case size computation.
+        // (len * 8) / 5 overflows Integer.MAX_VALUE around len ~ 1.3e8;
+        // reject anything that could push us into negative before it hits
+        // `new byte[negative]` NegativeArraySizeException.
+        if (len < 0 || len > (Integer.MAX_VALUE / 8)) {
+            throw new IOException("HPACK: input length out of range: " + len);
+        }
         // Allocate a fresh output sized to the encoded worst case. Test path
         // and one-shot callers use this. Hot decoders should call
         // {@link #decodeInto} with a reusable scratch buffer.

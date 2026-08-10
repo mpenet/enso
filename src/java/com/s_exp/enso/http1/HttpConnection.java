@@ -251,6 +251,14 @@ public final class HttpConnection implements Runnable {
             writeError(400, "Invalid WebSocket handshake");
             return;
         }
+        // Reject upgrade requests carrying a body — RFC 6455 §4.1
+        // doesn't forbid it, but any bytes past the request headers
+        // would be misinterpreted as the first WebSocket frame after
+        // upgrade → framing error / disconnect.
+        if (currentBody != null) {
+            writeError(400, "WebSocket upgrade cannot carry a request body");
+            return;
+        }
         flushHbuf();
         String accept = WebSocketConnection.computeAccept(key.trim());
         StringBuilder sb = new StringBuilder(256);
@@ -1306,10 +1314,21 @@ public final class HttpConnection implements Runnable {
         }
 
         private void readTrailerAndTerminator() throws IOException {
+            // Cap total trailer bytes at maxHeaderBytes across all lines.
+            // scanLine bounds each individual line; without this a peer
+            // could stream unlimited short trailer lines and stall a
+            // connection open (slowloris-adjacent).
+            int totalBytes = 0;
+            int cap = config.maxHeaderBytes;
             while (true) {
+                int lineStart = pos;
                 int lineEnd = scanLine();
                 if (lineEnd < 0) {
                     throw new EOFException("unexpected EOF in trailer");
+                }
+                totalBytes += (lineEnd - lineStart) + 2; // include CRLF
+                if (totalBytes > cap) {
+                    throw new HttpError(431, "Request Header Fields Too Large");
                 }
                 boolean empty = lineEnd == pos;
                 pos = lineEnd + 2;

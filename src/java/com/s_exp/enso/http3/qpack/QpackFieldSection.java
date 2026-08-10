@@ -102,7 +102,7 @@ public final class QpackFieldSection {
                 need(buf, 1);
                 int vb = buf.get() & 0xFF;
                 String value = decodeStringSafe(buf, 7, vb);
-                out.add(new String[]{name.toLowerCase(), value});
+                out.add(new String[]{name.toLowerCase(java.util.Locale.ROOT), value});
             } else if ((b & 0xF0) == 0x10) {
                 throw new QpackException(
                     QpackException.QPACK_DECOMPRESSION_FAILED, true,
@@ -185,7 +185,7 @@ public final class QpackFieldSection {
     }
 
     private static void encodeOne(ByteBuffer out, String[] hf) {
-        String name = hf[0].toLowerCase();
+        String name = hf[0].toLowerCase(java.util.Locale.ROOT);
         String value = hf[1] == null ? "" : hf[1];
         int exact = QpackStaticTable.findExact(name, value);
         if (exact >= 0) {
@@ -216,7 +216,7 @@ public final class QpackFieldSection {
         out.put((byte) 0x00);
         out.put((byte) 0x00);
         for (String[] hf : headers) {
-            String name = hf[0].toLowerCase();
+            String name = hf[0].toLowerCase(java.util.Locale.ROOT);
             String value = hf[1] == null ? "" : hf[1];
             out = ensureRoom(out, name.length() + value.length() + 8);
             int exact = QpackStaticTable.findExact(name, value);
