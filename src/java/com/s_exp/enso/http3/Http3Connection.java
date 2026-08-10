@@ -310,9 +310,17 @@ final class Http3Connection implements AutoCloseable {
 
     private void sendResponse(ResponseTask task) {
         // Reusable owner-only headers list; cleared each call → no
-        // ArrayList alloc per response (task #126).
+        // ArrayList alloc per response (task #126). Per-pair String[]
+        // slots come from a bounded pool (headerPairPool) so a hot
+        // request path with N headers doesn't allocate N × 2-slot
+        // String[] on every response.
+        for (int i = 0, n = headersList.size(); i < n; i++) {
+            releasePair(headersList.get(i));
+        }
         headersList.clear();
         String statusStr = statusString(task.status);
+        // :status pair stays cached (interned via statusPairCache) —
+        // don't recycle it into the pool.
         headersList.add(statusPair(statusStr));
         boolean hasServer = false;
         for (Map.Entry<?, ?> e : task.headers.entrySet()) {
@@ -332,12 +340,37 @@ final class Http3Connection implements AutoCloseable {
                     + hn + "' streamId=" + task.streamId);
                 continue;
             }
-            headersList.add(new String[]{hn, vs});
+            headersList.add(acquirePair(hn, vs));
         }
         if (!hasServer && config.serverHeader != null && !config.serverHeader.isEmpty()) {
-            headersList.add(new String[]{"server", config.serverHeader});
+            headersList.add(acquirePair("server", config.serverHeader));
         }
         session.writeResponse(task.streamId, headersList, task.body);
+    }
+
+    // Bounded pool of 2-slot String[] pairs reused across responses on
+    // this connection. Cap kept small — typical responses have <15
+    // headers; excess just falls back to fresh allocs.
+    private static final int PAIR_POOL_CAP = 64;
+    private final java.util.ArrayDeque<String[]> headerPairPool =
+        new java.util.ArrayDeque<>(PAIR_POOL_CAP);
+
+    private String[] acquirePair(String name, String value) {
+        String[] p = headerPairPool.pollFirst();
+        if (p == null) p = new String[2];
+        p[0] = name; p[1] = value;
+        return p;
+    }
+
+    private void releasePair(String[] p) {
+        // Cached statusPair instances live forever in statusPairCache —
+        // interning key is p[0]==":status". Do NOT return those to the
+        // pool or their contents get clobbered.
+        if (p == null || ":status".equals(p[0])) return;
+        if (headerPairPool.size() < PAIR_POOL_CAP) {
+            p[0] = null; p[1] = null; // help GC on referenced strings
+            headerPairPool.offerFirst(p);
+        }
     }
 
     private static boolean containsCtl(String s) {
