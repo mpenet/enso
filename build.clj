@@ -2,8 +2,7 @@
   (:require [clojure.java.shell :as shell]
             [clojure.string]
             [clojure.tools.build.api :as b]
-            [clojure.tools.build.tasks.process :as p]
-            [deps-deploy.deps-deploy :as dd]))
+            [clojure.tools.build.tasks.process :as p]))
 
 (def lib 'com.s-exp/enso)
 ;; CI tag-driven releases set ENSO_VERSION from `github.ref_name` with
@@ -17,7 +16,6 @@
 ;; is on the dev/test/bench classpaths, and copying src/clj into it
 ;; leaves stale .clj snapshots that shadow the live sources.
 (def jar-class-dir "target/jar-classes")
-(def jar-file (format "target/%s-%s.jar" (name lib) version))
 (def basis (delay (b/create-basis {:project "deps.edn"})))
 (def target-dir "target")
 
@@ -33,7 +31,7 @@
   (b/javac {:src-dirs ["src/java"]
             :class-dir class-dir
             :basis @basis
-            :javac-opts ["--release" "22"]}))
+            :javac-opts ["--release" "21"]}))
 
 (defn javac-bench
   "Compile bench-only Java sources (Netty + Jetty h3 servers for task #95).
@@ -43,7 +41,7 @@
   (b/javac {:src-dirs ["bench/java"]
             :class-dir class-dir
             :basis (b/create-basis {:project "deps.edn" :aliases [:bench]})
-            :javac-opts ["--release" "22"]}))
+            :javac-opts ["--release" "21"]}))
 
 (defn shim
   "Build the enso_quiche JNI shim into target/native/<os>-<arch>/. Callers
@@ -122,7 +120,7 @@
   (b/copy-dir {:src-dirs ["src/clj"]
                :target-dir jar-class-dir})
   (b/jar {:class-dir jar-class-dir
-          :jar-file jar-file}))
+          :jar-file jar-core-file}))
 
 (defn- stage-core
   "Common jar staging: Java classes + Clojure sources + pom. Leaves
@@ -183,20 +181,8 @@
   (b/install {:basis @basis
               :lib lib
               :version version
-              :jar-file jar-file
+              :jar-file jar-core-file
               :class-dir jar-class-dir}))
-
-(defn deploy
-  "Legacy — publishes the dev jar produced by `jar`. Kept for local one-off
-  publishes. Release CI uses `deploy-core` against a pre-built core jar."
-  [opts]
-  (dd/deploy {:artifact jar-file
-              :pom-file (format "%s/META-INF/maven/%s/pom.xml"
-                                jar-class-dir
-                                lib)
-              :installer :remote
-              :sign-releases? false})
-  opts)
 
 (def ^:private clojars-url "https://clojars.org/repo")
 (def ^:private clojars-repo-id "clojars")
@@ -212,7 +198,23 @@
   read from ~/.m2/settings.xml — CI writes it from repo secrets before
   invoking."
   [opts]
-  (let [pom (format "target/jar-core-classes/META-INF/maven/%s/pom.xml" lib)]
+  (let [pom (format "target/jar-core-classes/META-INF/maven/%s/pom.xml" lib)
+        ;; Preflight: Clojars rejects any redeploy against an existing
+        ;; version. Half-deployed states (e.g. from a CI flake) wedge the
+        ;; tag forever. HEAD the core pom URL; abort with a clear message
+        ;; before we upload anything.
+        pom-url (format "%s/%s/%s/%s-%s.pom"
+                        clojars-url
+                        (clojure.string/replace (namespace lib) "." "/")
+                        (name lib) (name lib) version)
+        {:keys [exit out]} (shell/sh "curl" "-s" "-o" "/dev/null"
+                                     "-w" "%{http_code}"
+                                     "-I" pom-url)]
+    (when (and (zero? exit) (= "200" (clojure.string/trim (str out))))
+      (throw (ex-info (str "version " version
+                           " already published at " pom-url
+                           " — bump ENSO_VERSION or delete the artifact on Clojars")
+                      {:version version :url pom-url})))
     (when-not (.exists (java.io.File. pom))
       (throw (ex-info (str "missing " pom " — run jar-core first") {:pom pom})))
     (when-not (.exists (java.io.File. jar-core-file))

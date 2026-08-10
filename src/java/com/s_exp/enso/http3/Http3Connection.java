@@ -465,6 +465,13 @@ final class Http3Connection implements AutoCloseable {
                     LOG.info("h3 body size cap exceeded, stream=" + streamId);
                     bodyPipes.remove(streamId);
                     pipe.signalEnd();
+                    // Reset the QUIC stream in both directions so the peer
+                    // stops pushing DATA against a stream we already stopped
+                    // consuming. Without this, the next DATA arrives with
+                    // no pipe → "DATA before HEADERS" branch kills the
+                    // whole connection for a per-stream overflow.
+                    session.resetRequestStream(
+                        streamId, Http3ConnectionException.H3_MESSAGE_ERROR);
                     return;
                 }
             }

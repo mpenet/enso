@@ -41,6 +41,27 @@
 #define UNUSED(x) (void)(x)
 
 /*
+ * GetByteArrayElements returns NULL if the JVM can't pin/copy the array
+ * (OOM, or a pending exception on env). Every call site must check —
+ * a NULL pointer dereference inside quiche_* or memcpy crashes the JVM.
+ * On NULL return, an exception is already pending on env; caller returns
+ * an error sentinel and the pending exception surfaces on the Java side.
+ */
+#define GET_BYTES_OR_RETURN(dst, arr, ret)                                  \
+    do {                                                                    \
+        (dst) = (*env)->GetByteArrayElements(env, (arr), NULL);             \
+        if ((dst) == NULL) { return (ret); }                                \
+    } while (0)
+
+/* Same but for functions that already hold one or more pinned arrays —
+ * caller must release them before returning. */
+#define GET_BYTES_OR_GOTO(dst, arr, label)                                  \
+    do {                                                                    \
+        (dst) = (*env)->GetByteArrayElements(env, (arr), NULL);             \
+        if ((dst) == NULL) { goto label; }                                  \
+    } while (0)
+
+/*
  * Build a struct sockaddr from Java-side ip bytes + port. IPv4 → 4-byte
  * ipBytes, IPv6 → 16-byte ipBytes. Result is written into *out (must be
  * a sockaddr_storage-sized buffer). Returns socklen_t on success or 0
@@ -120,7 +141,8 @@ Java_com_s_1exp_enso_quiche_Quiche_configSetApplicationProtos(
         JNIEnv *env, jclass cls, jlong config, jbyteArray protos) {
     UNUSED(cls);
     jsize len = (*env)->GetArrayLength(env, protos);
-    jbyte *bytes = (*env)->GetByteArrayElements(env, protos, NULL);
+    jbyte *bytes;
+    GET_BYTES_OR_RETURN(bytes, protos, -1);
     int rc = quiche_config_set_application_protos(
         (quiche_config *)(intptr_t)config, (const uint8_t *)bytes, (size_t)len);
     (*env)->ReleaseByteArrayElements(env, protos, bytes, JNI_ABORT);
@@ -169,7 +191,8 @@ Java_com_s_1exp_enso_quiche_Quiche_accept(
         jlong config) {
     UNUSED(cls);
     jsize scidLen = (*env)->GetArrayLength(env, scidArr);
-    jbyte *scid = (*env)->GetByteArrayElements(env, scidArr, NULL);
+    jbyte *scid;
+    GET_BYTES_OR_RETURN(scid, scidArr, 0);
     /* odcidArr is null when no stateless retry occurred; quiche then
      * omits retry_source_connection_id from the server's transport
      * params (RFC 9000 §18.2). Passing a non-null odcid here without
@@ -181,6 +204,10 @@ Java_com_s_1exp_enso_quiche_Quiche_accept(
     if (odcidArr != NULL) {
         odcidLen = (*env)->GetArrayLength(env, odcidArr);
         odcid = (*env)->GetByteArrayElements(env, odcidArr, NULL);
+        if (odcid == NULL) {
+            (*env)->ReleaseByteArrayElements(env, scidArr, scid, JNI_ABORT);
+            return 0;
+        }
     }
 
     struct sockaddr_storage local, peer;
@@ -221,24 +248,27 @@ Java_com_s_1exp_enso_quiche_Quiche_retry(
     jsize tokLen = (*env)->GetArrayLength(env, tokenArr);
     jsize outLen = (*env)->GetArrayLength(env, outArr);
 
-    jbyte *scid = (*env)->GetByteArrayElements(env, scidArr, NULL);
-    jbyte *dcid = (*env)->GetByteArrayElements(env, dcidArr, NULL);
-    jbyte *newScid = (*env)->GetByteArrayElements(env, newScidArr, NULL);
-    jbyte *tok = (*env)->GetByteArrayElements(env, tokenArr, NULL);
-    jbyte *out = (*env)->GetByteArrayElements(env, outArr, NULL);
+    jbyte *scid = NULL, *dcid = NULL, *newScid = NULL, *tok = NULL, *out = NULL;
+    ssize_t rc = -1; /* QUICHE_ERR_DONE surrogate for unwind */
+    GET_BYTES_OR_GOTO(scid, scidArr, retry_unwind);
+    GET_BYTES_OR_GOTO(dcid, dcidArr, retry_unwind);
+    GET_BYTES_OR_GOTO(newScid, newScidArr, retry_unwind);
+    GET_BYTES_OR_GOTO(tok, tokenArr, retry_unwind);
+    GET_BYTES_OR_GOTO(out, outArr, retry_unwind);
 
-    ssize_t rc = quiche_retry(
+    rc = quiche_retry(
         (const uint8_t *)scid, (size_t)scidLen,
         (const uint8_t *)dcid, (size_t)dcidLen,
         (const uint8_t *)newScid, (size_t)newLen,
         (const uint8_t *)tok, (size_t)tokLen,
         (uint32_t)version, (uint8_t *)out, (size_t)outLen);
 
-    (*env)->ReleaseByteArrayElements(env, scidArr, scid, JNI_ABORT);
-    (*env)->ReleaseByteArrayElements(env, dcidArr, dcid, JNI_ABORT);
-    (*env)->ReleaseByteArrayElements(env, newScidArr, newScid, JNI_ABORT);
-    (*env)->ReleaseByteArrayElements(env, tokenArr, tok, JNI_ABORT);
-    (*env)->ReleaseByteArrayElements(env, outArr, out, 0); /* commit */
+retry_unwind:
+    if (out != NULL) (*env)->ReleaseByteArrayElements(env, outArr, out, 0); /* commit */
+    if (tok != NULL) (*env)->ReleaseByteArrayElements(env, tokenArr, tok, JNI_ABORT);
+    if (newScid != NULL) (*env)->ReleaseByteArrayElements(env, newScidArr, newScid, JNI_ABORT);
+    if (dcid != NULL) (*env)->ReleaseByteArrayElements(env, dcidArr, dcid, JNI_ABORT);
+    if (scid != NULL) (*env)->ReleaseByteArrayElements(env, scidArr, scid, JNI_ABORT);
     return (jlong)rc;
 }
 
@@ -251,18 +281,21 @@ Java_com_s_1exp_enso_quiche_Quiche_negotiateVersion(
     jsize dcidLen = (*env)->GetArrayLength(env, dcidArr);
     jsize outLen = (*env)->GetArrayLength(env, outArr);
 
-    jbyte *scid = (*env)->GetByteArrayElements(env, scidArr, NULL);
-    jbyte *dcid = (*env)->GetByteArrayElements(env, dcidArr, NULL);
-    jbyte *out = (*env)->GetByteArrayElements(env, outArr, NULL);
+    jbyte *scid = NULL, *dcid = NULL, *out = NULL;
+    ssize_t rc = -1;
+    GET_BYTES_OR_GOTO(scid, scidArr, negotiate_unwind);
+    GET_BYTES_OR_GOTO(dcid, dcidArr, negotiate_unwind);
+    GET_BYTES_OR_GOTO(out, outArr, negotiate_unwind);
 
-    ssize_t rc = quiche_negotiate_version(
+    rc = quiche_negotiate_version(
         (const uint8_t *)scid, (size_t)scidLen,
         (const uint8_t *)dcid, (size_t)dcidLen,
         (uint8_t *)out, (size_t)outLen);
 
-    (*env)->ReleaseByteArrayElements(env, scidArr, scid, JNI_ABORT);
-    (*env)->ReleaseByteArrayElements(env, dcidArr, dcid, JNI_ABORT);
-    (*env)->ReleaseByteArrayElements(env, outArr, out, 0);
+negotiate_unwind:
+    if (out != NULL) (*env)->ReleaseByteArrayElements(env, outArr, out, 0);
+    if (dcid != NULL) (*env)->ReleaseByteArrayElements(env, dcidArr, dcid, JNI_ABORT);
+    if (scid != NULL) (*env)->ReleaseByteArrayElements(env, scidArr, scid, JNI_ABORT);
     return (jlong)rc;
 }
 
@@ -280,10 +313,12 @@ Java_com_s_1exp_enso_quiche_Quiche_headerInfo(
         jbyteArray dcidArr, jlongArray dcidLenArr,
         jbyteArray tokenArr, jlongArray tokenLenArr) {
     UNUSED(cls);
-    jbyte *buf = (*env)->GetByteArrayElements(env, bufArr, NULL);
-    jbyte *scid = (*env)->GetByteArrayElements(env, scidArr, NULL);
-    jbyte *dcid = (*env)->GetByteArrayElements(env, dcidArr, NULL);
-    jbyte *token = (*env)->GetByteArrayElements(env, tokenArr, NULL);
+    jbyte *buf = NULL, *scid = NULL, *dcid = NULL, *token = NULL;
+    int rc = -1;
+    GET_BYTES_OR_GOTO(buf, bufArr, hdrinfo_unwind);
+    GET_BYTES_OR_GOTO(scid, scidArr, hdrinfo_unwind);
+    GET_BYTES_OR_GOTO(dcid, dcidArr, hdrinfo_unwind);
+    GET_BYTES_OR_GOTO(token, tokenArr, hdrinfo_unwind);
 
     jlong scidLenJ, dcidLenJ, tokenLenJ;
     (*env)->GetLongArrayRegion(env, scidLenArr, 0, 1, &scidLenJ);
@@ -296,7 +331,7 @@ Java_com_s_1exp_enso_quiche_Quiche_headerInfo(
     uint32_t version;
     uint8_t type;
 
-    int rc = quiche_header_info(
+    rc = quiche_header_info(
         (const uint8_t *)buf, (size_t)bufLen, (size_t)dcil,
         &version, &type,
         (uint8_t *)scid, &scidLen,
@@ -306,11 +341,13 @@ Java_com_s_1exp_enso_quiche_Quiche_headerInfo(
     /* On error paths quiche may have partially clobbered scid/dcid/token —
      * caller ignores them anyway, so skip the copy-back to avoid a real
      * memcpy in the pinned-array fallback. */
+hdrinfo_unwind: {
     jint releaseMode = (rc == 0) ? 0 : JNI_ABORT;
-    (*env)->ReleaseByteArrayElements(env, bufArr, buf, JNI_ABORT);
-    (*env)->ReleaseByteArrayElements(env, scidArr, scid, releaseMode);
-    (*env)->ReleaseByteArrayElements(env, dcidArr, dcid, releaseMode);
-    (*env)->ReleaseByteArrayElements(env, tokenArr, token, releaseMode);
+    if (token != NULL) (*env)->ReleaseByteArrayElements(env, tokenArr, token, releaseMode);
+    if (dcid != NULL) (*env)->ReleaseByteArrayElements(env, dcidArr, dcid, releaseMode);
+    if (scid != NULL) (*env)->ReleaseByteArrayElements(env, scidArr, scid, releaseMode);
+    if (buf != NULL) (*env)->ReleaseByteArrayElements(env, bufArr, buf, JNI_ABORT);
+}
 
     if (rc == 0) {
         jint vJ = (jint)version;
@@ -384,7 +421,8 @@ Java_com_s_1exp_enso_quiche_Quiche_connRecv(
         .from = (struct sockaddr *)&from, .from_len = fromLen,
         .to = (struct sockaddr *)&to, .to_len = toLen,
     };
-    jbyte *buf = (*env)->GetByteArrayElements(env, bufArr, NULL);
+    jbyte *buf;
+    GET_BYTES_OR_RETURN(buf, bufArr, -1);
     ssize_t rc = quiche_conn_recv(
         (quiche_conn *)(intptr_t)conn, (uint8_t *)buf, (size_t)bufLen, &info);
     (*env)->ReleaseByteArrayElements(env, bufArr, buf, JNI_ABORT);
@@ -399,7 +437,8 @@ Java_com_s_1exp_enso_quiche_Quiche_connSend(
     /* We ignore send_info for now (no path migration). Allocate on stack. */
     quiche_send_info info;
     memset(&info, 0, sizeof(info));
-    jbyte *out = (*env)->GetByteArrayElements(env, outArr, NULL);
+    jbyte *out;
+    GET_BYTES_OR_RETURN(out, outArr, -1);
     ssize_t rc = quiche_conn_send(
         (quiche_conn *)(intptr_t)conn, (uint8_t *)out, (size_t)outLen, &info);
     (*env)->ReleaseByteArrayElements(env, outArr, out, 0); /* commit */
@@ -412,8 +451,11 @@ Java_com_s_1exp_enso_quiche_Quiche_connClose(
         jboolean app, jlong err, jbyteArray reasonArr) {
     UNUSED(cls);
     jsize len = (reasonArr != NULL) ? (*env)->GetArrayLength(env, reasonArr) : 0;
-    jbyte *reason = (len > 0)
-        ? (*env)->GetByteArrayElements(env, reasonArr, NULL) : NULL;
+    jbyte *reason = NULL;
+    if (len > 0) {
+        reason = (*env)->GetByteArrayElements(env, reasonArr, NULL);
+        if (reason == NULL) return -1;
+    }
     int rc = quiche_conn_close(
         (quiche_conn *)(intptr_t)conn,
         app == JNI_TRUE, (uint64_t)err,
@@ -442,7 +484,8 @@ Java_com_s_1exp_enso_quiche_Quiche_connStreamRecv(
         jbyteArray outArr, jint outLen,
         jbooleanArray finOut, jlongArray errOut) {
     UNUSED(cls);
-    jbyte *out = (*env)->GetByteArrayElements(env, outArr, NULL);
+    jbyte *out;
+    GET_BYTES_OR_RETURN(out, outArr, -1);
     bool fin = false;
     uint64_t err = 0;
     ssize_t rc = quiche_conn_stream_recv(
@@ -463,7 +506,8 @@ Java_com_s_1exp_enso_quiche_Quiche_connStreamSend(
         JNIEnv *env, jclass cls, jlong conn, jlong streamId,
         jbyteArray bufArr, jint off, jint len, jboolean fin) {
     UNUSED(cls);
-    jbyte *buf = (*env)->GetByteArrayElements(env, bufArr, NULL);
+    jbyte *buf;
+    GET_BYTES_OR_RETURN(buf, bufArr, -1);
     uint64_t err = 0;
     ssize_t rc = quiche_conn_stream_send(
         (quiche_conn *)(intptr_t)conn, (uint64_t)streamId,

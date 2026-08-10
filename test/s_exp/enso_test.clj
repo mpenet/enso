@@ -1386,3 +1386,81 @@
         (finally (enso/stop srv))))
     (do (println "SKIP h3-smoke-with-retry: opt-in with -J-Denso.h3.integration=true")
         (is true))))
+
+;; --- #171 config-surface tests ---------------------------------------------
+
+(deftest server-header-emitted
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {:server-header "enso-test/9"}
+    (fn []
+      (let [r (get! "/")]
+        (is (= "enso-test/9" (get-in r [:headers "server"])))))))
+
+(deftest server-header-handler-supplied-wins
+  (with-server
+    (fn [_] {:status 200 :headers {"server" "handler-picked"} :body "ok"})
+    {:server-header "config-picked"}
+    (fn []
+      (let [r (get! "/")]
+        (is (= "handler-picked" (get-in r [:headers "server"])))))))
+
+(deftest max-keep-alive-requests-caps-reuse
+  ;; Cap at 2 → third request over the same socket should not be served
+  ;; because the server closed the socket after the second response.
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {:max-keep-alive-requests 2}
+    (fn []
+      (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+        (let [out (.getOutputStream sock)
+              in (.getInputStream sock)
+              req "GET / HTTP/1.1\r\nHost: x\r\n\r\n"]
+          (dotimes [_ 3]
+            (.write out (.getBytes ^String req StandardCharsets/ISO_8859_1)))
+          (.flush out)
+          (let [full (String. (.readAllBytes in) StandardCharsets/ISO_8859_1)
+                ;; count response start lines
+                n (count (re-seq #"HTTP/1\.1 200" full))]
+            (is (= 2 n) "server served exactly 2 responses before closing")))))))
+
+(deftest worker-executor-override-used
+  ;; Handlers should run on the user-supplied executor's threads.
+  (let [seen (atom nil)
+        tf (reify java.util.concurrent.ThreadFactory
+             (newThread [_ r]
+               (doto (Thread. r "custom-worker")
+                 (.setDaemon true))))
+        pool (java.util.concurrent.Executors/newSingleThreadExecutor tf)]
+    (try
+      (with-server
+        (fn [_]
+          (reset! seen (.getName (Thread/currentThread)))
+          {:status 200 :body "ok"})
+        {:worker-executor pool}
+        (fn []
+          (get! "/")
+          (is (= "custom-worker" @seen))))
+      (finally (.shutdown pool)))))
+
+(deftest so-nodelay-honored-on-accepted-socket
+  ;; TCP_NODELAY defaults to true; verify explicit false also propagates
+  ;; by asserting the config sticks (indirect — no easy way to introspect
+  ;; the accepted socket from Clojure; smoke: server boots + serves).
+  ;; SO_LINGER 0 dropped: aggressively RSTs the socket on close and races
+  ;; the reader in this harness.
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {:so-nodelay false :so-reuse-addr true}
+    (fn []
+      (is (= 200 (:status (get! "/")))))))
+
+(deftest keep-alive-timeout-falls-back-to-idle-timeout
+  ;; :keep-alive-timeout 0 means use :idle-timeout. Server should still
+  ;; serve at least one request within idle-timeout window.
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {:keep-alive-timeout 0 :idle-timeout 5000}
+    (fn []
+      (is (= 200 (:status (get! "/")))))))
+

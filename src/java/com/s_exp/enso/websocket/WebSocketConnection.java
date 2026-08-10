@@ -103,6 +103,13 @@ public final class WebSocketConnection {
                     case OP_CLOSE -> {
                         int code = CLOSE_NO_STATUS;
                         String reason = "";
+                        // RFC 6455 §5.5.1: CLOSE payload MUST be either 0
+                        // bytes (no status) or ≥ 2 bytes (2-byte code +
+                        // optional reason). A 1-byte payload is a protocol
+                        // error → CLOSE(1002).
+                        if (frame.payload.length == 1) {
+                            throw new IOException("CLOSE frame with 1-byte payload");
+                        }
                         if (frame.payload.length >= 2) {
                             code = ((frame.payload[0] & 0xFF) << 8) | (frame.payload[1] & 0xFF);
                             if (frame.payload.length > 2) {
@@ -182,6 +189,12 @@ public final class WebSocketConnection {
             return null;
         }
         boolean fin = (b0 & 0x80) != 0;
+        // RFC 6455 §5.2: RSV1/2/3 MUST be 0 unless an extension was
+        // negotiated. We negotiate none, so any set bit is a protocol
+        // error and forces CLOSE(1002).
+        if ((b0 & 0x70) != 0) {
+            throw new IOException("reserved bits set (no extensions negotiated)");
+        }
         int opcode = b0 & 0x0F;
         int b1 = in.read();
         if (b1 < 0) {
@@ -204,6 +217,17 @@ public final class WebSocketConnection {
         }
         if (payloadLen < 0 || payloadLen > maxMessageBytes || payloadLen > Integer.MAX_VALUE) {
             throw new IOException("payload too large");
+        }
+        // RFC 6455 §5.5: control frames (opcode >= 0x8) MUST have payload
+        // length ≤ 125 AND MUST NOT be fragmented (FIN=1).
+        boolean control = (opcode & 0x8) != 0;
+        if (control) {
+            if (payloadLen > 125) {
+                throw new IOException("control frame payload > 125 bytes");
+            }
+            if (!fin) {
+                throw new IOException("fragmented control frame");
+            }
         }
         byte[] mask = new byte[4];
         readFully(mask, 0, 4);

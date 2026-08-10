@@ -67,6 +67,12 @@ public final class Http3Session {
     private final Long2ObjectHashMap<Long> peerUniTypes = new Long2ObjectHashMap<>();
     // Peer uni streams whose type varint is only partially known.
     private final Long2ObjectHashMap<ByteBuffer> peerUniHeaderBuf = new Long2ObjectHashMap<>();
+    // Rolling accumulators for QPACK encoder/decoder streams — a single
+    // instruction (varint + optional payload) can straddle two stream_recv
+    // chunks, so we buffer partial trailing bytes and prepend them next call.
+    // Small cap since we expect only short instructions under capacity=0.
+    private ByteBuffer peerQpackEncAccum;
+    private ByteBuffer peerQpackDecAccum;
     private boolean initialised = false;
 
     // SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1). Local value
@@ -447,21 +453,64 @@ public final class Http3Session {
     }
 
     /**
+     * Append {@code more} onto the running accumulator {@code accum},
+     * returning a read-mode buffer positioned at the first unread byte.
+     * Grows if capacity is insufficient. Small init size (32) since QPACK
+     * instructions under capacity=0 are typically 1-9 bytes.
+     */
+    private static ByteBuffer appendToAccum(ByteBuffer accum, ByteBuffer more) {
+        int incoming = more.remaining();
+        if (accum == null || accum.remaining() == 0) {
+            int cap = Math.max(32, incoming);
+            ByteBuffer nb = ByteBuffer.allocate(cap);
+            nb.put(more);
+            nb.flip();
+            return nb;
+        }
+        int total = accum.remaining() + incoming;
+        ByteBuffer dst;
+        if (accum.capacity() >= total) {
+            accum.compact();     // read-mode → write-mode with unread at 0
+            dst = accum;
+        } else {
+            int cap = Math.max(total, accum.capacity() * 2);
+            dst = ByteBuffer.allocate(cap);
+            dst.put(accum);      // copy unread bytes
+        }
+        dst.put(more);
+        dst.flip();
+        return dst;
+    }
+
+    /**
      * RFC 9204 §4.1 — QPACK encoder-stream instructions. Under our
      * advertised capacity=0 we reject any Set Dynamic Table Capacity
      * with a non-zero value (only value=0 is a valid no-op) and any
      * Insert With Name Reference / Insert With Literal Name / Duplicate
      * (all of which imply peer wants a dynamic table).
+     *
+     * <p>Accepts a rolling accumulator: an instruction can span two
+     * stream_recv chunks (varint continuation bytes especially). On
+     * partial parse, the incomplete tail is buffered in
+     * {@link #peerQpackEncAccum} and prepended on the next call.
      */
     private void validatePeerQpackEncoderStream(ByteBuffer buf) {
-        while (buf.hasRemaining()) {
-            int b = buf.get(buf.position()) & 0xFF;
+        ByteBuffer work = appendToAccum(peerQpackEncAccum, buf);
+        while (work.hasRemaining()) {
+            int startPos = work.position();
+            int b = work.get(startPos) & 0xFF;
             // Set Dynamic Table Capacity: 001xxxxx (5-bit prefix int).
             if ((b & 0xE0) == 0x20) {
                 long cap;
                 try {
+                    work.get(); // consume first byte
                     cap = com.s_exp.enso.http3.qpack.NBitInteger.decode(
-                        buf, 5, buf.get() & 0xFF);
+                        work, 5, b);
+                } catch (java.nio.BufferUnderflowException ex) {
+                    // Incomplete instruction — rewind and buffer.
+                    work.position(startPos);
+                    peerQpackEncAccum = compactRemaining(work);
+                    return;
                 } catch (Throwable ex) {
                     throw new Http3ConnectionException(
                         Http3ConnectionException.QPACK_ENCODER_STREAM_ERROR,
@@ -483,62 +532,75 @@ public final class Http3Session {
                 "peer QPACK encoder instruction 0x" + Integer.toHexString(b)
                     + " not allowed under capacity=0");
         }
+        peerQpackEncAccum = null;
     }
 
     /**
      * RFC 9204 §4.4 — QPACK decoder-stream instructions. Insert Count
      * Increment with argument 0 is a protocol error. Section Acknowledgment
      * + Stream Cancellation carry stream IDs and are fine to ignore.
+     * Same partial-instruction handling as the encoder stream.
      */
     private void validatePeerQpackDecoderStream(ByteBuffer buf) {
-        while (buf.hasRemaining()) {
-            int b = buf.get(buf.position()) & 0xFF;
-            if ((b & 0xC0) == 0x00) {
-                // Insert Count Increment: 00xxxxxx (6-bit prefix int).
-                long inc;
-                try {
-                    inc = com.s_exp.enso.http3.qpack.NBitInteger.decode(
-                        buf, 6, buf.get() & 0xFF);
-                } catch (Throwable ex) {
-                    throw new Http3ConnectionException(
-                        Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
-                        "malformed Insert Count Increment: " + ex.getMessage());
+        ByteBuffer work = appendToAccum(peerQpackDecAccum, buf);
+        while (work.hasRemaining()) {
+            int startPos = work.position();
+            int b = work.get(startPos) & 0xFF;
+            try {
+                if ((b & 0xC0) == 0x00) {
+                    // Insert Count Increment: 00xxxxxx (6-bit prefix int).
+                    work.get();
+                    long inc = com.s_exp.enso.http3.qpack.NBitInteger.decode(
+                        work, 6, b);
+                    if (inc == 0) {
+                        throw new Http3ConnectionException(
+                            Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
+                            "peer Insert Count Increment=0");
+                    }
+                    continue;
                 }
-                if (inc == 0) {
-                    throw new Http3ConnectionException(
-                        Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
-                        "peer Insert Count Increment=0");
+                if ((b & 0x80) != 0) {
+                    // Section Acknowledgment: 1xxxxxxx (7-bit prefix int).
+                    work.get();
+                    com.s_exp.enso.http3.qpack.NBitInteger.decode(work, 7, b);
+                    continue;
                 }
-                continue;
-            }
-            if ((b & 0x80) != 0) {
-                // Section Acknowledgment: 1xxxxxxx (7-bit prefix int).
-                try {
-                    com.s_exp.enso.http3.qpack.NBitInteger.decode(
-                        buf, 7, buf.get() & 0xFF);
-                } catch (Throwable ex) {
-                    throw new Http3ConnectionException(
-                        Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
-                        "malformed Section Acknowledgment: " + ex.getMessage());
+                if ((b & 0xC0) == 0x40) {
+                    // Stream Cancellation: 01xxxxxx (6-bit prefix int).
+                    work.get();
+                    com.s_exp.enso.http3.qpack.NBitInteger.decode(work, 6, b);
+                    continue;
                 }
-                continue;
-            }
-            if ((b & 0xC0) == 0x40) {
-                // Stream Cancellation: 01xxxxxx (6-bit prefix int).
-                try {
-                    com.s_exp.enso.http3.qpack.NBitInteger.decode(
-                        buf, 6, buf.get() & 0xFF);
-                } catch (Throwable ex) {
-                    throw new Http3ConnectionException(
-                        Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
-                        "malformed Stream Cancellation: " + ex.getMessage());
-                }
-                continue;
+            } catch (java.nio.BufferUnderflowException ex) {
+                work.position(startPos);
+                peerQpackDecAccum = compactRemaining(work);
+                return;
+            } catch (Http3ConnectionException hce) {
+                throw hce;
+            } catch (Throwable ex) {
+                throw new Http3ConnectionException(
+                    Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
+                    "malformed QPACK decoder instruction: " + ex.getMessage());
             }
             throw new Http3ConnectionException(
                 Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
                 "unknown QPACK decoder instruction 0x" + Integer.toHexString(b));
         }
+        peerQpackDecAccum = null;
+    }
+
+    /**
+     * Return {@code work} as a fresh accumulator retaining only the
+     * unread bytes at [position, limit). Callers use this to persist
+     * incomplete-instruction tails across recv calls.
+     */
+    private static ByteBuffer compactRemaining(ByteBuffer work) {
+        int rem = work.remaining();
+        if (rem == 0) return null;
+        ByteBuffer tail = ByteBuffer.allocate(Math.max(32, rem));
+        tail.put(work);
+        tail.flip();
+        return tail;
     }
 
     /**
@@ -843,6 +905,20 @@ public final class Http3Session {
         pendingByStream.remove(streamId);
         peerUniTypes.remove(streamId);
         peerUniHeaderBuf.remove(streamId);
+    }
+
+    /**
+     * Terminate a request stream with {@code errorCode} on both directions
+     * (STOP_SENDING + RESET_STREAM), then drop any per-stream state. Used
+     * by the connection layer when the peer's body exceeds
+     * {@link Config#maxRequestBodyBytes} — without the shutdown the peer
+     * keeps sending DATA against a stream we already stopped consuming,
+     * next of which lands in the "DATA before HEADERS" branch and kills
+     * the whole connection.
+     */
+    public void resetRequestStream(long streamId, long errorCode) {
+        resetStream(streamId, errorCode);
+        forgetStream(streamId);
     }
 
     /**

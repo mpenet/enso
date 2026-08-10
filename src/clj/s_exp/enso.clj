@@ -151,10 +151,7 @@
     (when-let [v (:http2-max-frame-size opts)] (.http2MaxFrameSize b (int v)))
     (when-let [v (:http2-max-header-list-size opts)] (.http2MaxHeaderListSize b (int v)))
     (when-let [v (:http2-stream-reset-limit opts)] (.http2StreamResetLimit b (int v)))
-    (when-let [v (:http2-ping-interval opts)] (.http2PingIntervalMillis b (int v)))
-    (when-let [v (:http2-ping-timeout opts)] (.http2PingTimeoutMillis b (int v)))
     (when-let [v (:http2-continuation-limit opts)] (.http2ContinuationLimit b (int v)))
-    (when (contains? opts :http2-enable-push) (.http2EnablePush b (boolean (:http2-enable-push opts))))
     ;; h3
     (when (:http3 opts) (.http3 b true))
     (when-let [v (:http3-port opts)] (.http3Port b (int v)))
@@ -226,9 +223,23 @@
   - `:http2-stream-reset-limit` - RST_STREAM cap per connection, CVE-2023-44487
     mitigation (default 400, matches Nginx)
   - `:http2-continuation-limit` - CONTINUATION frames per HEADERS (default 64)
-  - `:http2-ping-interval` / `:http2-ping-timeout` - server-initiated PING
-    (interval 0 disables; timeout default 10000 ms)
-  - `:http2-enable-push` - advertise SETTINGS_ENABLE_PUSH (default false; we never push)
+
+  HTTP/3 (opt-in; requires PEM cert + key on disk since quiche loads them
+  itself rather than from `:ssl-context`):
+  - `:http3` (false) — enables HTTP/3 listener. `Alt-Svc` auto-advertised on
+    h1/h2 responses when both enabled.
+  - `:http3-cert-path`, `:http3-key-path` — PEM cert chain + private key.
+    Required when `:http3` is true.
+  - `:http3-port` — UDP port. Defaults to `:port` (co-exists on the same
+    port number over UDP + TCP).
+  - `:http3-max-idle-timeout` (30000) — quiche idle timeout in ms.
+  - `:http3-initial-max-data` (1 GiB) — connection flow control window.
+  - `:http3-initial-max-streams-bidi` (100) — concurrent request streams.
+  - `:http3-max-udp-payload-size` (1350) — MTU-safe default.
+  - `:http3-stateless-retry` (false) — force clients to prove reachability
+    before we allocate conn state (RFC 9000 §8.1.2). Enable under DDoS.
+  - `:advertise-alt-svc` — override auto behavior (auto = true iff `:http3`).
+  - `:alt-svc-max-age` (86400) — `ma=` field on the emitted `Alt-Svc`.
 
   HTTP/3 advanced (QPACK, transport):
   - `:http3-initial-max-streams-uni` - peer's unidirectional stream credit (default 8; min 3)

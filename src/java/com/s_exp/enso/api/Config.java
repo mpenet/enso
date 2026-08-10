@@ -56,13 +56,8 @@ public final class Config {
      * 0 disables — leave enabled unless you're behind a trusted LB.
      */
     public final int http2StreamResetLimit;
-    /** 0 disables server-initiated PING. */
-    public final int http2PingIntervalMillis;
-    public final int http2PingTimeoutMillis;
     /** Cap CONTINUATION frames per HEADERS to bound HPACK work. */
     public final int http2ContinuationLimit;
-    /** Whether to advertise SETTINGS_ENABLE_PUSH; we never push. */
-    public final boolean http2EnablePush;
     public final boolean http3;
     public final int http3Port;
     public final int http3MaxIdleTimeoutMs;
@@ -135,10 +130,7 @@ public final class Config {
         this.http2MaxFrameSize = b.http2MaxFrameSize;
         this.http2MaxHeaderListSize = b.http2MaxHeaderListSize;
         this.http2StreamResetLimit = b.http2StreamResetLimit;
-        this.http2PingIntervalMillis = b.http2PingIntervalMillis;
-        this.http2PingTimeoutMillis = b.http2PingTimeoutMillis;
         this.http2ContinuationLimit = b.http2ContinuationLimit;
-        this.http2EnablePush = b.http2EnablePush;
         this.http3 = b.http3;
         this.http3Port = b.http3Port;
         this.http3MaxIdleTimeoutMs = b.http3MaxIdleTimeoutMs;
@@ -222,10 +214,7 @@ public final class Config {
         // Post-CVE-2023-44487 default: cap RST_STREAM per connection.
         // Nginx uses 400; go with the same conservative number.
         private int http2StreamResetLimit = 400;
-        private int http2PingIntervalMillis = 0;
-        private int http2PingTimeoutMillis = 10_000;
         private int http2ContinuationLimit = 64;
-        private boolean http2EnablePush = false;
         private boolean http3;
         private int http3Port = 0;                      // 0 → reuse main port number over UDP
         private int http3MaxIdleTimeoutMs = 30_000;
@@ -284,10 +273,7 @@ public final class Config {
         public Builder http2MaxFrameSize(int v) { this.http2MaxFrameSize = v; return this; }
         public Builder http2MaxHeaderListSize(int v) { this.http2MaxHeaderListSize = v; return this; }
         public Builder http2StreamResetLimit(int v) { this.http2StreamResetLimit = v; return this; }
-        public Builder http2PingIntervalMillis(int v) { this.http2PingIntervalMillis = v; return this; }
-        public Builder http2PingTimeoutMillis(int v) { this.http2PingTimeoutMillis = v; return this; }
         public Builder http2ContinuationLimit(int v) { this.http2ContinuationLimit = v; return this; }
-        public Builder http2EnablePush(boolean v) { this.http2EnablePush = v; return this; }
         public Builder http3(boolean v) { this.http3 = v; return this; }
         public Builder http3Port(int v) { this.http3Port = v; return this; }
         public Builder http3MaxIdleTimeoutMs(int v) { this.http3MaxIdleTimeoutMs = v; return this; }
@@ -397,8 +383,6 @@ public final class Config {
                     "http2MaxHeaderListSize must be >= 0 (0 disables), got " + http2MaxHeaderListSize);
             }
             requireNonNegative("http2StreamResetLimit", http2StreamResetLimit);
-            requireNonNegative("http2PingIntervalMillis", http2PingIntervalMillis);
-            requireNonNegative("http2PingTimeoutMillis", http2PingTimeoutMillis);
             requirePositive("http2ContinuationLimit", http2ContinuationLimit);
             // HTTP/3.
             if (http3) {

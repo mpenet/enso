@@ -225,6 +225,9 @@ public final class HttpConnection implements Runnable {
             keepAlive = writeResponse(request, response);
         } catch (IllegalArgumentException e) {
             LOG.log(Level.WARNING, "invalid response from handler", e);
+            // Discard any partial header bytes accumulated in hbuf before
+            // the throw so the 500 is emitted cleanly.
+            hlen = 0;
             writeError(500, "Internal Server Error");
             return false;
         }
@@ -458,6 +461,10 @@ public final class HttpConnection implements Runnable {
             if (colon <= start) {
                 throw new HttpError(400, "Bad Request");
             }
+            // RFC 7230 §3.2 field-name = token (tchar only). Whitespace or
+            // CTL between name and ':' is a smuggling vector when a fronting
+            // proxy tokenises differently.
+            validateTokenBytes(start, colon);
             String name = HeaderNames.lookup(buf, start, colon);
             if (name == null) {
                 name = lowerAscii(start, colon);
@@ -470,6 +477,9 @@ public final class HttpConnection implements Runnable {
             while (ve > vs && (buf[ve - 1] == ' ' || buf[ve - 1] == '\t')) {
                 ve--;
             }
+            // NUL in a field value is a §3.2.6 protocol violation. CR/LF
+            // are already excluded by the CRLF terminator scan.
+            validateFieldValueBytes(vs, ve);
             String value = str(vs, ve);
             // Linear duplicate scan across scratch. Fast for typical N < 15.
             int dupIdx = -1;
@@ -481,8 +491,12 @@ public final class HttpConnection implements Runnable {
                 }
             }
             if (dupIdx >= 0) {
-                if (name.equals("content-length")) {
-                    // Request-smuggling vector; reject.
+                if (name.equals("content-length")
+                    || name.equals("transfer-encoding")
+                    || name.equals("host")) {
+                    // Request-smuggling vectors — duplicate framing headers
+                    // (RFC 9112 §6.1) or duplicate Host (§3.2.2) get rejected
+                    // rather than concatenated.
                     throw new HttpError(400, "Bad Request");
                 }
                 headerScratch[dupIdx + 1] = ((String) headerScratch[dupIdx + 1]) + "," + value;
@@ -498,11 +512,12 @@ public final class HttpConnection implements Runnable {
     }
 
     private boolean writeResponse(Request request, Response response) throws IOException {
-        // Validate response headers before any byte hits hbuf; a bad header now
-        // surfaces as IllegalArgumentException with hbuf untouched, so the
-        // catch in handleOne can send a clean 500 without splicing garbage.
-        validateHeaders(response.headers);
-
+        // Response header validation runs inline in hHeader — a single
+        // snapshot of the Object value gets validated + written, closing
+        // the TOCTOU where a racing toString could bypass a separate
+        // pre-scan. On throw, handleOne resets hlen to discard any
+        // partial hbuf state (nothing has flushed to the socket yet since
+        // header emit doesn't call flushHbuf).
         boolean keepAlive = request.protocol.equals("HTTP/1.1")
             && !"close".equalsIgnoreCase(request.header("connection"));
 
@@ -934,19 +949,28 @@ public final class HttpConnection implements Runnable {
     }
 
     private void hHeader(String name, Object value) {
+        // Snapshot Object → String once so validation matches emit exactly.
+        // A separate pre-scan would let a racing toString() bypass the check
+        // (TOCTOU); inline validation of the exact snapshot closes that gap.
+        // Numbers can't contain CR/LF/NUL, skip snapshot on the hot path.
+        rejectCrlf(name);
+        if (value instanceof Long || value instanceof Integer) {
+            hAppend(name);
+            hEnsure(2);
+            hbuf[hlen++] = ':';
+            hbuf[hlen++] = ' ';
+            if (value instanceof Long l) hAppendLong(l);
+            else hAppendLong((Integer) value);
+            hCrlf();
+            return;
+        }
+        String vs = value instanceof String s ? s : String.valueOf(value);
+        rejectCrlf(vs);
         hAppend(name);
         hEnsure(2);
         hbuf[hlen++] = ':';
         hbuf[hlen++] = ' ';
-        if (value instanceof String s) {
-            hAppend(s);
-        } else if (value instanceof Long l) {
-            hAppendLong(l);
-        } else if (value instanceof Integer i) {
-            hAppendLong(i);
-        } else {
-            hAppend(String.valueOf(value));
-        }
+        hAppend(vs);
         hCrlf();
     }
 
@@ -963,31 +987,6 @@ public final class HttpConnection implements Runnable {
             if (c == '\r' || c == '\n' || c == 0) {
                 throw new IllegalArgumentException(
                     "response header name/value contains illegal control character");
-            }
-        }
-    }
-
-    private static void validateHeaders(Map<?, ?> headers) {
-        if (headers == null) {
-            return;
-        }
-        for (Map.Entry<?, ?> e : headers.entrySet()) {
-            Object key = e.getKey();
-            String name = key instanceof String s ? s : String.valueOf(key);
-            rejectCrlf(name);
-            Object value = e.getValue();
-            if (value instanceof List<?> values) {
-                for (Object v : values) {
-                    if (v instanceof String s) {
-                        rejectCrlf(s);
-                    } else if (!(v instanceof Number)) {
-                        rejectCrlf(String.valueOf(v));
-                    }
-                }
-            } else if (value instanceof String s) {
-                rejectCrlf(s);
-            } else if (!(value instanceof Number)) {
-                rejectCrlf(String.valueOf(value));
             }
         }
     }
@@ -1047,6 +1046,8 @@ public final class HttpConnection implements Runnable {
             default -> {
             }
         }
+        // Uncommon or custom method: validate tchar-only per RFC 7230 §3.1.1.
+        validateTokenBytes(from, to);
         return str(from, to);
     }
 
@@ -1061,6 +1062,38 @@ public final class HttpConnection implements Runnable {
 
     private String str(int from, int to) {
         return new String(buf, from, to - from, StandardCharsets.ISO_8859_1);
+    }
+
+    /**
+     * RFC 7230 §3.2.6 tchar validation. Rejects any byte outside the
+     * token character set — protects against method/header-name smuggling
+     * where a fronting proxy tokenises differently from us on SP/CTL/
+     * control chars. Called on the header-name byte range in the request
+     * buffer (must precede lowercasing so uppercase alpha is accepted).
+     */
+    private void validateTokenBytes(int from, int to) {
+        for (int i = from; i < to; i++) {
+            int c = buf[i] & 0xFF;
+            boolean tchar =
+                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9')
+                || c == '!' || c == '#' || c == '$' || c == '%' || c == '&'
+                || c == '\'' || c == '*' || c == '+' || c == '-' || c == '.'
+                || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+            if (!tchar) {
+                throw new HttpError(400, "Bad Request");
+            }
+        }
+    }
+
+    /** Reject NUL / CR / LF anywhere in the value bytes. */
+    private void validateFieldValueBytes(int from, int to) {
+        for (int i = from; i < to; i++) {
+            int c = buf[i] & 0xFF;
+            if (c == 0 || c == '\r' || c == '\n') {
+                throw new HttpError(400, "Bad Request");
+            }
+        }
     }
 
     private String lowerAscii(int from, int to) {

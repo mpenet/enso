@@ -52,6 +52,10 @@ jobs:
             runner: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.runner }}
+    # Cargo builds of libquiche + BoringSSL under QEMU take 30-40 min;
+    # native takes 5-10. 60 min gives headroom without letting a hung
+    # linker consume the default 6h.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -142,6 +146,10 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # Cargo builds of libquiche + BoringSSL under QEMU take 30-40 min;
+    # native takes 5-10. 60 min gives headroom without letting a hung
+    # linker consume the default 6h.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -232,6 +240,7 @@ jobs:
   package:
     needs: [build-native, build-native-musl]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

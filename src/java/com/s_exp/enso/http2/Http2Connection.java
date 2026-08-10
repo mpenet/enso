@@ -782,6 +782,11 @@ public final class Http2Connection implements Runnable {
 
         // Decrement receive windows against the *full* frame length including
         // padding — flow control accounting is per RFC 9113 §6.9.1.
+        // Threading: handleData only runs on the framer vthread (single
+        // reader/writer of recvWindow + connRecvWindow), so the check
+        // outside flowLock cannot race a concurrent mutation. flowLock
+        // is only needed to serialise with the credit-return path further
+        // down (which touches connRecvUncredited).
         int frameLen = f.length;
         stream.recvWindow -= frameLen;
         flowLock.lock();
@@ -937,8 +942,18 @@ public final class Http2Connection implements Runnable {
                     }
                     seenContentLength = true;
                 }
+                // RFC 9113 §8.2.1: field values MUST NOT contain NUL, CR, LF.
+                // A downstream reverse proxy that re-emits into HTTP/1 would
+                // smuggle if we accepted these.
+                String v = hf.value;
+                for (int j = 0, n = v.length(); j < n; j++) {
+                    char c = v.charAt(j);
+                    if (c == 0 || c == '\r' || c == '\n') {
+                        return null;
+                    }
+                }
                 regular[rp++] = name;
-                regular[rp++] = hf.value;
+                regular[rp++] = v;
             }
         }
         if (method == null || path == null || scheme == null) {

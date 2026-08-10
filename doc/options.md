@@ -50,9 +50,6 @@ Requires `:ssl-context`. Cleartext h2c not supported.
 - `:http2-max-header-list-size` (8192) — bytes. Peer over the limit gets `GOAWAY(ENHANCE_YOUR_CALM)`. 0 disables.
 - `:http2-stream-reset-limit` (400) — RST_STREAM cap per connection. CVE-2023-44487 mitigation (matches Nginx). 0 disables.
 - `:http2-continuation-limit` (64) — CONTINUATION frames per HEADERS.
-- `:http2-ping-interval` (0) — server-initiated PING interval in ms. 0 disables.
-- `:http2-ping-timeout` (10000) — PING timeout in ms.
-- `:http2-enable-push` (false) — advertise SETTINGS_ENABLE_PUSH. We never push.
 
 ## HTTP/3
 
@@ -61,9 +58,9 @@ Requires PEM cert + key. Uses its own UDP socket; co-exists with h1/h2 on the sa
 - `:http3` (false) — enables HTTP/3 listener. Advertised via `Alt-Svc` on h1/h2 responses when both enabled.
 - `:http3-port` — UDP port. Defaults to `:port`.
 - `:http3-cert-path`, `:http3-key-path` — PEM cert chain + private key. **Required.**
-- `:http3-max-idle-timeout-ms` (30000) — quiche idle timeout.
+- `:http3-max-idle-timeout` (30000) — quiche idle timeout in ms.
 - `:http3-max-udp-payload-size` (1350) — MTU-safe.
-- `:http3-initial-max-data` (10 MiB) — connection flow control window.
+- `:http3-initial-max-data` (1 GiB) — connection flow control window.
 - `:http3-initial-max-streams-bidi` (100) — concurrent request streams per connection.
 - `:http3-initial-max-streams-uni` (8) — peer unidirectional stream credit. Min 3 (control + qpack enc/dec).
 - `:http3-stateless-retry` (false) — force clients to prove reachability before allocating conn state (RFC 9000 §8.1.2). Enable under DDoS.
