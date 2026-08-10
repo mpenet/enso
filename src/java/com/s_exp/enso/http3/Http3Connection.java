@@ -345,7 +345,75 @@ final class Http3Connection implements AutoCloseable {
         if (!hasServer && config.serverHeader != null && !config.serverHeader.isEmpty()) {
             headersList.add(acquirePair("server", config.serverHeader));
         }
-        session.writeResponse(task.streamId, headersList, task.body);
+        // Fast path: fully-materialised byte[] body → single stream_send
+        // for HEADERS + DATA + FIN (task #143 halved JNI hops here).
+        // Streaming path: File/InputStream stayed on the source instead
+        // of being read into a big byte[] (see ResponseTask.materialise).
+        if (task.bodySource == null) {
+            session.writeResponse(task.streamId, headersList, task.body);
+        } else {
+            streamResponse(task);
+        }
+    }
+
+    // Chunk size for streaming h3 responses. 256 KiB balances syscall
+    // count against per-chunk memory pressure. Kept as a heap byte[]
+    // reused across chunks on the owner thread.
+    private static final int STREAM_CHUNK_BYTES = 256 * 1024;
+    private byte[] streamChunkBuf;
+
+    private void streamResponse(ResponseTask task) {
+        session.writeHeadersOnly(task.streamId, headersList);
+        if (streamChunkBuf == null) {
+            streamChunkBuf = new byte[STREAM_CHUNK_BYTES];
+        }
+        java.io.InputStream src = null;
+        try {
+            src = openSource(task.bodySource);
+            byte[] buf = streamChunkBuf;
+            while (true) {
+                int n = readFully(src, buf);
+                boolean eof = n < buf.length;
+                if (n > 0) {
+                    session.writeBodyChunk(task.streamId, buf, 0, n, eof);
+                }
+                if (eof) {
+                    if (n == 0) {
+                        // Zero-body streaming — need to emit an empty
+                        // terminal DATA with FIN so the peer sees EOM.
+                        session.writeBodyChunk(task.streamId, buf, 0, 0, true);
+                    }
+                    return;
+                }
+            }
+        } catch (java.io.IOException e) {
+            LOG.warning("h3 stream body read failed stream=" + task.streamId
+                + ": " + e.getMessage());
+            // Best-effort close: send FIN with whatever we've already
+            // written so the peer doesn't hang.
+            try { session.writeBodyChunk(task.streamId, streamChunkBuf, 0, 0, true); }
+            catch (Throwable ignored) {}
+        } finally {
+            if (src != null) {
+                try { src.close(); } catch (java.io.IOException ignored) {}
+            }
+        }
+    }
+
+    private static java.io.InputStream openSource(Object src) throws java.io.IOException {
+        if (src instanceof java.io.InputStream is) return is;
+        if (src instanceof java.io.File f) return new java.io.FileInputStream(f);
+        throw new java.io.IOException("unsupported stream source: " + src.getClass());
+    }
+
+    private static int readFully(java.io.InputStream in, byte[] buf) throws java.io.IOException {
+        int total = 0;
+        while (total < buf.length) {
+            int n = in.read(buf, total, buf.length - total);
+            if (n < 0) return total;
+            total += n;
+        }
+        return total;
     }
 
     // Bounded pool of 2-slot String[] pairs reused across responses on
@@ -707,64 +775,43 @@ final class Http3Connection implements AutoCloseable {
     private static ResponseTask fallback500(long streamId) {
         return new ResponseTask(streamId, 500,
             java.util.Collections.singletonMap("content-type", "text/plain"),
-            "500 internal error".getBytes(StandardCharsets.UTF_8));
+            "500 internal error".getBytes(StandardCharsets.UTF_8),
+            null);
     }
 
+    /**
+     * A response task carries either a materialised {@code body} (byte[]
+     * or String → single stream_send fast-path) or a {@code bodySource}
+     * (File / InputStream → streamed as multiple DATA frames). Exactly
+     * one of {@code body} / {@code bodySource} is non-null; nil body
+     * means no DATA at all.
+     */
     private record ResponseTask(long streamId, int status,
-                                Map<?, ?> headers, byte[] body) {
+                                Map<?, ?> headers, byte[] body,
+                                Object bodySource) {
         static ResponseTask of(long streamId, Response r) {
-            byte[] body = materialise(r.body);
-            return new ResponseTask(streamId, r.status,
-                r.headers == null ? java.util.Collections.emptyMap() : r.headers,
-                body);
-        }
-
-        // Above this size we log a warning — h3's writeResponse packs
-        // HEADERS + DATA into one stream_send, so File/InputStream bodies
-        // materialise fully into memory here. A streaming rewrite that
-        // emits multi-frame DATA is future work; for now, callers who
-        // stream really large bodies should stick to h1/h2 where
-        // ChunkedWriter handles it.
-        private static final long BODY_MATERIALISE_WARN = 8L * 1024 * 1024;
-
-        private static byte[] materialise(Object rb) {
-            if (rb == null) return null;
+            Map<?, ?> hs = r.headers == null
+                ? java.util.Collections.emptyMap() : r.headers;
+            Object rb = r.body;
+            if (rb == null) {
+                return new ResponseTask(streamId, r.status, hs, null, null);
+            }
             if (rb instanceof byte[] b) {
-                if (b.length > BODY_MATERIALISE_WARN) warnLargeBody(b.length);
-                return b;
+                return new ResponseTask(streamId, r.status, hs, b, null);
             }
             if (rb instanceof String s) {
-                if (s.length() > BODY_MATERIALISE_WARN) warnLargeBody(s.length());
-                return s.getBytes(StandardCharsets.UTF_8);
+                return new ResponseTask(streamId, r.status, hs,
+                    s.getBytes(StandardCharsets.UTF_8), null);
             }
-            if (rb instanceof java.io.File f) {
-                if (f.length() > BODY_MATERIALISE_WARN) warnLargeBody(f.length());
-                try (java.io.InputStream in = new java.io.FileInputStream(f)) {
-                    return in.readAllBytes();
-                } catch (java.io.IOException e) {
-                    return ("read failed: " + e.getMessage())
-                        .getBytes(StandardCharsets.UTF_8);
-                }
+            if (rb instanceof java.io.File || rb instanceof java.io.InputStream) {
+                // Defer read — sendResponse's streaming path pulls
+                // chunks incrementally to keep large bodies off the heap.
+                return new ResponseTask(streamId, r.status, hs, null, rb);
             }
-            if (rb instanceof java.io.InputStream in) {
-                try (var s = in) {
-                    byte[] out = s.readAllBytes();
-                    if (out.length > BODY_MATERIALISE_WARN) warnLargeBody(out.length);
-                    return out;
-                } catch (java.io.IOException e) {
-                    return ("read failed: " + e.getMessage())
-                        .getBytes(StandardCharsets.UTF_8);
-                }
-            }
-            return ("[unsupported body type: " + rb.getClass().getName() + "]")
-                .getBytes(StandardCharsets.UTF_8);
-        }
-
-        private static void warnLargeBody(long bytes) {
-            LOG.warning("h3 response body " + bytes + " bytes materialised in "
-                + "memory — h3 currently emits HEADERS+DATA in a single "
-                + "stream_send. Large bodies pin heap; prefer h1/h2 for "
-                + "streaming until h3 supports incremental DATA emission.");
+            return new ResponseTask(streamId, r.status, hs,
+                ("[unsupported body type: " + rb.getClass().getName() + "]")
+                    .getBytes(StandardCharsets.UTF_8),
+                null);
         }
     }
 }

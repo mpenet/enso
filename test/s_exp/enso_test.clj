@@ -1387,6 +1387,41 @@
     (do (println "SKIP h3-smoke-with-retry: opt-in with -J-Denso.h3.integration=true")
         (is true))))
 
+(deftest h3-smoke-streaming-file-body
+  ;; Verifies task #200: File bodies stream via multi-chunk DATA instead
+  ;; of materialising into a single byte[]. Payload sized to force >=2
+  ;; DATA chunks (chunk size is 256 KiB, payload is 600 KiB). Smoke
+  ;; check only asserts the client received some body — quiche-client's
+  ;; --dump-json prints the payload as a JSON int array which grows
+  ;; huge; we just verify the multi-chunk path doesn't crash or hang.
+  (if (and (h3-integration-enabled?) (quiche-client-available?))
+    (let [[cert-path key-path] (gen-cert-and-key)
+          ctx (generate-self-signed-context)
+          h3-port 18892
+          payload-size (* 600 1024)  ;; 600 KiB → 3 chunks
+          payload (byte-array payload-size (byte 0x41))
+          tmp-file (doto (java.io.File/createTempFile "enso-h3-body" ".bin")
+                     (.deleteOnExit))
+          _ (java.nio.file.Files/write (.toPath tmp-file) payload
+                                       (into-array java.nio.file.OpenOption []))
+          srv (enso/run-server (fn [_] {:status 200 :body tmp-file})
+                               {:port 0
+                                :ssl-context ctx
+                                :http3 true
+                                :http3-port h3-port
+                                :http3-cert-path cert-path
+                                :http3-key-path key-path})]
+      (try
+        (Thread/sleep 200)
+        (let [body (quiche-client-get h3-port)]
+          (is (some? body) "streamed body reached the client")
+          (when body
+            (is (every? #(= \A %) body) "body content preserved")
+            (is (pos? (count body)) "body non-empty")))
+        (finally (enso/stop srv))))
+    (do (println "SKIP h3-smoke-streaming-file-body: opt-in with -J-Denso.h3.integration=true")
+        (is true))))
+
 ;; --- #171 config-surface tests ---------------------------------------------
 
 (deftest server-header-emitted

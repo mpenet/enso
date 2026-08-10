@@ -200,6 +200,64 @@ public final class Http3Session {
         // writeAll. Fixes ordering hazard where a deferred HEADERS could
         // reach quiche AFTER a fin=true DATA frame (task #131), and
         // halves JNI hops per response (task #143).
+        int hdrsBudget = computeHeadersBudget(streamId, headers);
+        int total = hdrsBudget + (hasBody ? (16 + body.length) : 0);
+        ByteBuffer buf = ensureFrameCap(total);
+        buf.clear();
+        Http3FrameWriter.appendHeadersFrom(buf, headers);
+        if (hasBody) {
+            Http3FrameWriter.appendData(buf, body);
+        }
+        buf.flip();
+        // Single stream_send with fin=true — HEADERS + DATA travel
+        // together, FIN can't outrun HEADERS.
+        writeAll(streamId, buf, true);
+        releaseReader(requestStreams.remove(streamId));
+    }
+
+    /**
+     * Emit HEADERS only (no FIN) — first half of a streaming response.
+     * Caller follows with one or more {@link #writeBodyChunk} calls;
+     * the terminal chunk carries FIN and releases the reader. The
+     * {@link #writeAll} in-order-per-stream invariant means later DATA
+     * chunks queue behind a deferred HEADERS frame automatically.
+     */
+    public void writeHeadersOnly(long streamId, List<String[]> headers) {
+        int hdrsBudget = computeHeadersBudget(streamId, headers);
+        ByteBuffer buf = ensureFrameCap(hdrsBudget);
+        buf.clear();
+        Http3FrameWriter.appendHeadersFrom(buf, headers);
+        buf.flip();
+        writeAll(streamId, buf, false);
+    }
+
+    /**
+     * Emit one DATA frame from {@code body[off..off+len]}. Set
+     * {@code fin=true} on the terminal chunk — releases the reader +
+     * closes the stream cleanly. May use the shared frameBuf for small
+     * chunks or allocate a per-call buffer above
+     * {@link #FRAME_BUF_MAX_KEEP} so a giant chunk doesn't pin memory
+     * on the connection.
+     */
+    public void writeBodyChunk(long streamId, byte[] body, int off, int len,
+                                boolean fin) {
+        int need = 16 + len; // varint length + type + payload budget
+        ByteBuffer buf = ensureFrameCap(need);
+        buf.clear();
+        Http3FrameWriter.appendDataRange(buf, body, off, len);
+        buf.flip();
+        writeAll(streamId, buf, fin);
+        if (fin) {
+            releaseReader(requestStreams.remove(streamId));
+        }
+    }
+
+    /**
+     * Compute frame-buffer budget for HEADERS + log advisory when the
+     * uncompressed size exceeds peer's SETTINGS_MAX_FIELD_SECTION_SIZE.
+     * Shared between {@link #writeResponse} and {@link #writeHeadersOnly}.
+     */
+    private int computeHeadersBudget(long streamId, List<String[]> headers) {
         int hdrsBudget = 32;
         int hn = headers.size();
         long uncompressedSize = 0;
@@ -221,18 +279,7 @@ public final class Http3Session {
                 + " exceeds peer's SETTINGS_MAX_FIELD_SECTION_SIZE "
                 + peerMaxFieldSectionSize + " (stream=" + streamId + ")");
         }
-        int total = hdrsBudget + (hasBody ? (16 + body.length) : 0);
-        ByteBuffer buf = ensureFrameCap(total);
-        buf.clear();
-        Http3FrameWriter.appendHeadersFrom(buf, headers);
-        if (hasBody) {
-            Http3FrameWriter.appendData(buf, body);
-        }
-        buf.flip();
-        // Single stream_send with fin=true — HEADERS + DATA travel
-        // together, FIN can't outrun HEADERS.
-        writeAll(streamId, buf, true);
-        releaseReader(requestStreams.remove(streamId));
+        return hdrsBudget;
     }
 
     // Response frame scratch — grows to largest response seen on this
@@ -792,6 +839,16 @@ public final class Http3Session {
             bytes = new byte[remaining];
             buf.get(bytes);
             off = 0;
+        }
+        // If a prior write to this stream already deferred bytes into
+        // pendingByStream, we MUST enqueue behind them — a fresh
+        // stream_send here would reach the peer BEFORE the earlier
+        // deferred bytes, reordering HEADERS vs DATA (task #131's shape
+        // extended to multi-frame streaming responses).
+        java.util.Deque<Pending> q = pendingByStream.get(streamId);
+        if (q != null && !q.isEmpty()) {
+            enqueuePending(streamId, copyOwned(bytes, off, remaining), fin);
+            return false;
         }
         long cap = Quiche.connStreamCapacity(conn, streamId);
         if (cap < 0) {

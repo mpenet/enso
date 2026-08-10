@@ -74,9 +74,18 @@ public final class Http3FrameWriter {
      * clear or flip. Companion to {@link #appendHeadersFrom}.
      */
     public static void appendData(ByteBuffer out, byte[] data) {
+        appendDataRange(out, data, 0, data.length);
+    }
+
+    /**
+     * Append a DATA frame covering {@code data[off..off+len]}. Used by
+     * the h3 streaming response path to emit multi-chunk bodies without
+     * concatenating them into one array.
+     */
+    public static void appendDataRange(ByteBuffer out, byte[] data, int off, int len) {
         Http3Varint.encode(out, Http3FrameType.DATA);
-        Http3Varint.encode(out, data.length);
-        out.put(data);
+        Http3Varint.encode(out, len);
+        out.put(data, off, len);
     }
 
     private static ByteBuffer writeFrame(ByteBuffer out, long type,
