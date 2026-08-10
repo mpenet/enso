@@ -719,11 +719,26 @@ final class Http3Connection implements AutoCloseable {
                 body);
         }
 
+        // Above this size we log a warning — h3's writeResponse packs
+        // HEADERS + DATA into one stream_send, so File/InputStream bodies
+        // materialise fully into memory here. A streaming rewrite that
+        // emits multi-frame DATA is future work; for now, callers who
+        // stream really large bodies should stick to h1/h2 where
+        // ChunkedWriter handles it.
+        private static final long BODY_MATERIALISE_WARN = 8L * 1024 * 1024;
+
         private static byte[] materialise(Object rb) {
             if (rb == null) return null;
-            if (rb instanceof byte[] b) return b;
-            if (rb instanceof String s) return s.getBytes(StandardCharsets.UTF_8);
+            if (rb instanceof byte[] b) {
+                if (b.length > BODY_MATERIALISE_WARN) warnLargeBody(b.length);
+                return b;
+            }
+            if (rb instanceof String s) {
+                if (s.length() > BODY_MATERIALISE_WARN) warnLargeBody(s.length());
+                return s.getBytes(StandardCharsets.UTF_8);
+            }
             if (rb instanceof java.io.File f) {
+                if (f.length() > BODY_MATERIALISE_WARN) warnLargeBody(f.length());
                 try (java.io.InputStream in = new java.io.FileInputStream(f)) {
                     return in.readAllBytes();
                 } catch (java.io.IOException e) {
@@ -733,7 +748,9 @@ final class Http3Connection implements AutoCloseable {
             }
             if (rb instanceof java.io.InputStream in) {
                 try (var s = in) {
-                    return s.readAllBytes();
+                    byte[] out = s.readAllBytes();
+                    if (out.length > BODY_MATERIALISE_WARN) warnLargeBody(out.length);
+                    return out;
                 } catch (java.io.IOException e) {
                     return ("read failed: " + e.getMessage())
                         .getBytes(StandardCharsets.UTF_8);
@@ -741,6 +758,13 @@ final class Http3Connection implements AutoCloseable {
             }
             return ("[unsupported body type: " + rb.getClass().getName() + "]")
                 .getBytes(StandardCharsets.UTF_8);
+        }
+
+        private static void warnLargeBody(long bytes) {
+            LOG.warning("h3 response body " + bytes + " bytes materialised in "
+                + "memory — h3 currently emits HEADERS+DATA in a single "
+                + "stream_send. Large bodies pin heap; prefer h1/h2 for "
+                + "streaming until h3 supports incremental DATA emission.");
         }
     }
 }

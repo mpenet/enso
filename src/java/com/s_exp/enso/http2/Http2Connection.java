@@ -714,6 +714,26 @@ public final class Http2Connection implements Runnable {
             throw new Http2.ConnectionError(
                 Http2.ERROR_COMPRESSION_ERROR, "HPACK decode failed: " + e.getMessage());
         }
+        // RFC 9113 §6.5.2: SETTINGS_MAX_HEADER_LIST_SIZE bounds the
+        // *decoded* size (32 + name + value bytes per field). The
+        // earlier enforceHeaderListBudget check on encoded bytes gates
+        // memory pressure during accumulation, but a Huffman-compressed
+        // peer could bypass the advertised cap by ~40%. Post-decode
+        // check enforces the spec-defined limit.
+        if (ownMaxHeaderListSize > 0) {
+            long decodedSize = 0;
+            for (int i = 0, n = fields.size(); i < n; i++) {
+                Hpack.HeaderField hf = fields.get(i);
+                decodedSize += 32L
+                    + (hf.name == null ? 0 : hf.name.length())
+                    + (hf.value == null ? 0 : hf.value.length());
+            }
+            if (decodedSize > ownMaxHeaderListSize) {
+                throw new Http2.ConnectionError(
+                    Http2.ERROR_ENHANCE_YOUR_CALM,
+                    "decoded header list " + decodedSize + " exceeds SETTINGS_MAX_HEADER_LIST_SIZE " + ownMaxHeaderListSize);
+            }
+        }
 
         Http2Stream stream = new Http2Stream(
             streamId, peerInitialWindowSize, ownInitialWindowSize);
