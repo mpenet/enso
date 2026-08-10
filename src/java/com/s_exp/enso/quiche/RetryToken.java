@@ -44,21 +44,32 @@ public final class RetryToken {
      * Initial; {@link #verify} then binds the peer to the same odcid.
      */
     public byte[] mint(InetSocketAddress peer, byte[] odcid) {
-        byte[] addr = addressBytes(peer);
-        byte[] body = new byte[MAGIC.length + addr.length + 1 + odcid.length];
-        int p = 0;
-        System.arraycopy(MAGIC, 0, body, p, MAGIC.length); p += MAGIC.length;
-        System.arraycopy(addr, 0, body, p, addr.length); p += addr.length;
-        body[p++] = (byte) odcid.length;
-        System.arraycopy(odcid, 0, body, p, odcid.length);
-        byte[] tag;
+        // Build body directly into `out[HMAC_LEN..]`, then HMAC over that
+        // region, then write tag into `out[0..HMAC_LEN]`. Task #145
+        // dropped the alloc from verify; this drops mint from 4 allocs
+        // to 1 (the returned array).
+        byte[] ip = peer.getAddress().getAddress();
+        int addrLen = ip.length + 3; // family byte + 2-byte port
+        int bodyLen = MAGIC.length + addrLen + 1 + odcid.length;
+        byte[] out = new byte[HMAC_LEN + bodyLen];
+        int p = HMAC_LEN;
+        System.arraycopy(MAGIC, 0, out, p, MAGIC.length); p += MAGIC.length;
+        out[p++] = (byte) (ip.length == 4 ? 4 : 6);
+        System.arraycopy(ip, 0, out, p, ip.length); p += ip.length;
+        int port = peer.getPort();
+        out[p++] = (byte) ((port >>> 8) & 0xFF);
+        out[p++] = (byte) (port & 0xFF);
+        out[p++] = (byte) odcid.length;
+        System.arraycopy(odcid, 0, out, p, odcid.length);
         synchronized (mac) {
             mac.reset();
-            tag = mac.doFinal(body);
+            mac.update(out, HMAC_LEN, bodyLen);
+            try {
+                mac.doFinal(out, 0);
+            } catch (javax.crypto.ShortBufferException e) {
+                throw new IllegalStateException("HMAC output overflow", e);
+            }
         }
-        byte[] out = new byte[HMAC_LEN + body.length];
-        System.arraycopy(tag, 0, out, 0, HMAC_LEN);
-        System.arraycopy(body, 0, out, HMAC_LEN, body.length);
         return out;
     }
 
