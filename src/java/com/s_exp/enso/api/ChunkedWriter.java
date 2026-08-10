@@ -33,6 +33,17 @@ public final class ChunkedWriter {
         write(data, 0, data.length);
     }
 
+    /**
+     * Writes a single byte into the pending chunk buffer. Used by
+     * {@code java.io.OutputStream} wrappers to avoid a per-byte
+     * {@code byte[]} allocation on the Clojure adapter side.
+     */
+    public void write(int b) {
+        ensureOpen();
+        ensureCapacity(1);
+        buf[len++] = (byte) b;
+    }
+
     /** Writes a range of bytes into the pending chunk buffer. */
     public void write(byte[] data, int off, int length) {
         ensureOpen();

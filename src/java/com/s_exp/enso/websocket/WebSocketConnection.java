@@ -299,10 +299,9 @@ public final class WebSocketConnection {
         if (buf == null) {
             return new byte[0];
         }
-        if (buf.hasArray() && buf.arrayOffset() == 0 && buf.position() == 0
-            && buf.limit() == buf.capacity()) {
-            return buf.array();
-        }
+        // Always copy — never alias the caller's backing array. Sends
+        // happen on the writer thread; a caller mutating the buffer
+        // after handing it off would corrupt an in-flight frame.
         byte[] arr = new byte[buf.remaining()];
         buf.duplicate().get(arr);
         return arr;

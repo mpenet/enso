@@ -90,7 +90,7 @@
       ([b]
        (if (bytes? b)
          (.write w ^bytes b)
-         (.write w (byte-array [(byte b)]))))
+         (.write w (int b))))
       ([b off len]
        (.write w ^bytes b (int off) (int len))))
     (flush [] (.flush w))
