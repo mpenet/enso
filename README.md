@@ -10,7 +10,7 @@ threads. Plain sync handler.
 
 - **Fast.** ~5M rps pipelined depth 64 (HTTP/1.1); ~894k rps HTTP/2 over
   TLS; ~53k rps HTTP/3 (edges Netty by ~2%, ~19× Jetty).
-  - **Low allocation.** ~0.001 sample/req at 1 MB TLAB interval — near-zero
+- **Low allocation.** ~0.001 sample/req at 1 MB TLAB interval — near-zero
   GC pressure on hot paths.
 - **Zero third-party Java dependencies.** Java core + thin Clojure adapter.
   Clojure runtime is the only requirement (for http1+2). Release jars bundle a
