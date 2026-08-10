@@ -97,6 +97,12 @@ final class Http3Connection implements AutoCloseable {
     // put/get/remove — task #122 alloc profile identified this as a
     // top boxed-primitive source.
     private final Long2ObjectHashMap<Http3BodyPipe> bodyPipes = new Long2ObjectHashMap<>();
+    // Streaming responses paused mid-body waiting for their Pending
+    // queue to drain (flow control). Owner-thread only; owner's main
+    // loop calls resumeStreamingSources between drainOutbound and
+    // processSend to feed the next chunk once space opens.
+    private final Long2ObjectHashMap<java.io.InputStream> streamingSources =
+        new Long2ObjectHashMap<>();
 
     Http3Connection(byte[] cid, long conn,
                     DatagramChannel out,
@@ -166,6 +172,11 @@ final class Http3Connection implements AutoCloseable {
                     // may have accepted new flow-control credit from the
                     // peer since our last attempt.
                     session.drainPendingWrites();
+                    // Feed more body chunks into paused streaming
+                    // responses whose Pending queues have since drained
+                    // (task #201 — otherwise 1 GiB files pile up in
+                    // Pending byte[]s and defeat the streaming fix).
+                    resumeStreamingSources();
                 }
                 processSend();
                 if (Quiche.connIsClosed(conn)) return;
@@ -188,6 +199,11 @@ final class Http3Connection implements AutoCloseable {
                 try { pipe.signalEnd(); } catch (Throwable ignored) {}
             });
             bodyPipes.clear();
+            // Close any streaming response sources (File handles, socket
+            // streams) mid-flight so a dropped connection doesn't leak
+            // file descriptors.
+            streamingSources.forEach((sid, src) -> closeSourceQuiet(src));
+            streamingSources.clear();
             // RFC 9114 §5.1 graceful close: if we haven't already been
             // closed (peer close, protocol error, timeout), emit a
             // H3_NO_ERROR CONNECTION_CLOSE and flush the resulting
@@ -349,60 +365,140 @@ final class Http3Connection implements AutoCloseable {
         // for HEADERS + DATA + FIN (task #143 halved JNI hops here).
         // Streaming path: File/InputStream stayed on the source instead
         // of being read into a big byte[] (see ResponseTask.materialise).
+        // Zero-length File short-circuits to the fast path so an empty
+        // response emits a single HEADERS(fin) frame instead of
+        // HEADERS(fin=false) + empty DATA(fin=true). InputStream can't
+        // know its length upfront — accept the 2-frame cost there.
         if (task.bodySource == null) {
             session.writeResponse(task.streamId, headersList, task.body);
+        } else if (task.bodySource instanceof java.io.File f && f.length() == 0) {
+            session.writeResponse(task.streamId, headersList, null);
         } else {
             streamResponse(task);
         }
     }
 
     // Chunk size for streaming h3 responses. 256 KiB balances syscall
-    // count against per-chunk memory pressure. Kept as a heap byte[]
-    // reused across chunks on the owner thread.
+    // count against per-chunk memory pressure. Lazily allocated on the
+    // first streaming response, released once the streaming loop
+    // finishes so long-lived idle connections that streamed once don't
+    // permanently pin 256 KiB. Owner-thread confined — no locking.
     private static final int STREAM_CHUNK_BYTES = 256 * 1024;
     private byte[] streamChunkBuf;
 
     private void streamResponse(ResponseTask task) {
-        session.writeHeadersOnly(task.streamId, headersList);
+        // Alloc scratch buf BEFORE writeHeadersOnly so the IOException
+        // handler always has a non-null buf to hand to writeBodyChunk on
+        // fin-emit fallback.
         if (streamChunkBuf == null) {
             streamChunkBuf = new byte[STREAM_CHUNK_BYTES];
         }
-        java.io.InputStream src = null;
+        session.writeHeadersOnly(task.streamId, headersList);
+        java.io.InputStream src;
         try {
             src = openSource(task.bodySource);
-            byte[] buf = streamChunkBuf;
+        } catch (java.io.IOException e) {
+            LOG.warning("h3 stream open failed stream=" + task.streamId
+                + ": " + e.getMessage());
+            try { session.writeBodyChunk(task.streamId, streamChunkBuf, 0, 0, true); }
+            catch (Throwable ignored) {}
+            return;
+        }
+        pumpStreaming(task.streamId, src);
+    }
+
+    /**
+     * Read up-to-CHUNK bytes from {@code src} and emit as a DATA frame.
+     * Repeats until either EOF (emit FIN, close src) or the stream's
+     * outbound Pending queue is non-empty after a write (peer flow
+     * control blocked). In the pending case the source is stashed in
+     * {@link #streamingSources} so {@link #resumeStreamingSources}
+     * resumes on a later owner-loop iteration. Prevents the 4096 × 256
+     * KiB Pending pile-up that would defeat the streaming memory win.
+     */
+    private void pumpStreaming(long streamId, java.io.InputStream src) {
+        byte[] buf = streamChunkBuf;
+        try {
             while (true) {
                 int n = readFully(src, buf);
                 boolean eof = n < buf.length;
                 if (n > 0) {
-                    session.writeBodyChunk(task.streamId, buf, 0, n, eof);
+                    session.writeBodyChunk(streamId, buf, 0, n, eof);
+                } else if (eof) {
+                    // Zero-body streaming — emit empty terminal DATA
+                    // with FIN so the peer sees EOM.
+                    session.writeBodyChunk(streamId, buf, 0, 0, true);
                 }
                 if (eof) {
-                    if (n == 0) {
-                        // Zero-body streaming — need to emit an empty
-                        // terminal DATA with FIN so the peer sees EOM.
-                        session.writeBodyChunk(task.streamId, buf, 0, 0, true);
+                    closeSourceQuiet(src);
+                    if (streamingSources.isEmpty()) {
+                        // Reclaim the 256 KiB scratch once no streams
+                        // are mid-body — otherwise a connection that
+                        // streams once pins the buffer for its lifetime.
+                        streamChunkBuf = null;
                     }
+                    return;
+                }
+                // If the last writeBodyChunk deferred bytes to Pending,
+                // stop reading — otherwise we'd pull the entire source
+                // into pendingByStream's byte[] copies. Resume happens
+                // once the pending queue drains.
+                if (session.hasPendingWrites(streamId)) {
+                    streamingSources.put(streamId, src);
                     return;
                 }
             }
         } catch (java.io.IOException e) {
-            LOG.warning("h3 stream body read failed stream=" + task.streamId
+            LOG.warning("h3 stream body read failed stream=" + streamId
                 + ": " + e.getMessage());
-            // Best-effort close: send FIN with whatever we've already
-            // written so the peer doesn't hang.
-            try { session.writeBodyChunk(task.streamId, streamChunkBuf, 0, 0, true); }
+            try { session.writeBodyChunk(streamId, buf, 0, 0, true); }
             catch (Throwable ignored) {}
-        } finally {
-            if (src != null) {
-                try { src.close(); } catch (java.io.IOException ignored) {}
-            }
+            closeSourceQuiet(src);
         }
     }
 
+    private long[] streamResumeScratch = new long[8];
+    private int streamResumeScratchLen;
+
+    private void resumeStreamingSources() {
+        if (streamingSources.isEmpty()) return;
+        // Long2ObjectHashMap.forEach doesn't allow removal during
+        // iteration — collect ready IDs into a scratch array first.
+        // Typical paused count is small (a few concurrent streams).
+        streamResumeScratchLen = 0;
+        if (streamResumeScratch.length < streamingSources.size()) {
+            streamResumeScratch = new long[streamingSources.size()];
+        }
+        streamingSources.forEach((sid, src) -> {
+            if (!session.hasPendingWrites(sid)) {
+                streamResumeScratch[streamResumeScratchLen++] = sid;
+            }
+        });
+        for (int i = 0; i < streamResumeScratchLen; i++) {
+            long sid = streamResumeScratch[i];
+            java.io.InputStream src = streamingSources.remove(sid);
+            if (src != null) pumpStreaming(sid, src);
+        }
+    }
+
+    private static void closeSourceQuiet(java.io.InputStream src) {
+        try { src.close(); } catch (java.io.IOException ignored) {}
+    }
+
     private static java.io.InputStream openSource(Object src) throws java.io.IOException {
-        if (src instanceof java.io.InputStream is) return is;
-        if (src instanceof java.io.File f) return new java.io.FileInputStream(f);
+        // Wrap non-buffered sources in a BufferedInputStream — our
+        // readFully hits the source in 256 KiB chunks, but decode /
+        // decompression streams (InflaterInputStream, wrapped socket
+        // streams) may otherwise do per-byte syscalls / decode work
+        // even when the caller supplies a big destination.
+        if (src instanceof java.io.BufferedInputStream bis) return bis;
+        if (src instanceof java.io.InputStream is) {
+            return new java.io.BufferedInputStream(is, STREAM_CHUNK_BYTES);
+        }
+        if (src instanceof java.io.File f) {
+            return new java.io.BufferedInputStream(
+                new java.io.FileInputStream(f), STREAM_CHUNK_BYTES);
+        }
         throw new java.io.IOException("unsupported stream source: " + src.getClass());
     }
 

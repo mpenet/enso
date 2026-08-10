@@ -233,11 +233,18 @@ public final class Http3Session {
 
     /**
      * Emit one DATA frame from {@code body[off..off+len]}. Set
-     * {@code fin=true} on the terminal chunk — releases the reader +
-     * closes the stream cleanly. May use the shared frameBuf for small
-     * chunks or allocate a per-call buffer above
+     * {@code fin=true} on the terminal chunk. May use the shared
+     * frameBuf for small chunks or allocate a per-call buffer above
      * {@link #FRAME_BUF_MAX_KEEP} so a giant chunk doesn't pin memory
      * on the connection.
+     *
+     * <p>When {@code fin=true}, the reader is returned to the pool
+     * eagerly — the request-side stream is done (peer already FIN'd
+     * inbound before we got to write a response). Outbound bytes may
+     * still be sitting in {@link #pendingByStream} at this point;
+     * {@link #drainPendingWrites} flushes them independently. Reader
+     * reuse is safe because {@link Http3FrameReader#reset} clears state
+     * on release and QUIC stream IDs are monotonic (no peer reuse).
      */
     public void writeBodyChunk(long streamId, byte[] body, int off, int len,
                                 boolean fin) {
@@ -958,6 +965,16 @@ public final class Http3Session {
     /** Exposed so the driver loop can skip parking when writes await capacity. */
     public boolean hasPendingWrites() {
         return !pendingByStream.isEmpty();
+    }
+
+    /**
+     * True iff {@code streamId} has outbound bytes still queued in
+     * {@link #pendingByStream}. Used by the streaming response pump to
+     * pause reading until the peer's flow-control window opens.
+     */
+    public boolean hasPendingWrites(long streamId) {
+        java.util.Deque<Pending> q = pendingByStream.get(streamId);
+        return q != null && !q.isEmpty();
     }
 
     /**

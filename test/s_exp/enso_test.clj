@@ -1397,7 +1397,9 @@
   (if (and (h3-integration-enabled?) (quiche-client-available?))
     (let [[cert-path key-path] (gen-cert-and-key)
           ctx (generate-self-signed-context)
-          h3-port 18892
+          ;; Random UDP port in the ephemeral range — avoid collision
+          ;; with prior tests or leftover local sockets.
+          h3-port (+ 20000 (rand-int 20000))
           payload-size (* 600 1024)  ;; 600 KiB → 3 chunks
           payload (byte-array payload-size (byte 0x41))
           tmp-file (doto (java.io.File/createTempFile "enso-h3-body" ".bin")
