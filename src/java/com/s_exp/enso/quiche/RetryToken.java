@@ -49,12 +49,11 @@ public final class RetryToken {
         // dropped the alloc from verify; this drops mint from 4 allocs
         // to 1 (the returned array).
         byte[] ip = peer.getAddress().getAddress();
-        int addrLen = ip.length + 3; // family byte + 2-byte port
+        int addrLen = ip.length + 2; // ip + 2-byte port (matches verify layout)
         int bodyLen = MAGIC.length + addrLen + 1 + odcid.length;
         byte[] out = new byte[HMAC_LEN + bodyLen];
         int p = HMAC_LEN;
         System.arraycopy(MAGIC, 0, out, p, MAGIC.length); p += MAGIC.length;
-        out[p++] = (byte) (ip.length == 4 ? 4 : 6);
         System.arraycopy(ip, 0, out, p, ip.length); p += ip.length;
         int port = peer.getPort();
         out[p++] = (byte) ((port >>> 8) & 0xFF);
@@ -120,13 +119,4 @@ public final class RetryToken {
         return diff == 0;
     }
 
-    private static byte[] addressBytes(InetSocketAddress addr) {
-        byte[] ip = addr.getAddress().getAddress();
-        byte[] out = new byte[ip.length + 2];
-        System.arraycopy(ip, 0, out, 0, ip.length);
-        int port = addr.getPort();
-        out[ip.length]     = (byte) ((port >>> 8) & 0xFF);
-        out[ip.length + 1] = (byte) (port & 0xFF);
-        return out;
-    }
 }
