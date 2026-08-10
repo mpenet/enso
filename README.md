@@ -75,6 +75,9 @@ Classifiers: `darwin-arm64`, `linux-{amd64,arm64}`,
 - [doc/performance.md](doc/performance.md) — bench numbers vs http-kit /
   Jetty / Aleph / Netty; allocation profile; reproduction steps.
 - [doc/build.md](doc/build.md) — build tasks, jar flavors, release CI.
+- [doc/h3-conformance.md](doc/h3-conformance.md) — h3spec suite results
+  (39/49 pass; all 10 residuals are libquiche 0.29.3 transport-layer
+  limitations; HTTP/3 + QPACK layers 100%).
 
 ## Prior art
 

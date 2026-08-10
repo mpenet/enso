@@ -800,6 +800,16 @@ final class Http3Connection implements AutoCloseable {
                     Http3ConnectionException.H3_MESSAGE_ERROR,
                     "missing required pseudo-header on stream " + streamId);
             }
+            // RFC 9114 §4.3.1: for http/https scheme requests, :authority
+            // is REQUIRED. Non-http(s) schemes may omit it — proxies +
+            // gateways translate.
+            if (authority == null
+                    && (scheme.equals("http") || scheme.equals("https"))) {
+                throw new Http3ConnectionException(
+                    Http3ConnectionException.H3_MESSAGE_ERROR,
+                    "missing :authority pseudo-header for " + scheme
+                        + " on stream " + streamId);
+            }
             if (path.isEmpty() && (scheme.equals("http") || scheme.equals("https"))) {
                 throw new Http3ConnectionException(
                     Http3ConnectionException.H3_MESSAGE_ERROR,

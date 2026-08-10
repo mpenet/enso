@@ -38,7 +38,7 @@ Warning: 0-RTT is not possible. Skipping this test. Use "h3spec -s 0-RTT" next t
 HTTP/3 servers
   MUST send H3_FRAME_UNEXPECTED if DATA is received before HEADERS [HTTP/3 4.1] [✔]
   MUST send H3_MESSAGE_ERROR if a pseudo-header is duplicated [HTTP/3 4.1.1] [✔]
-  MUST send H3_MESSAGE_ERROR if mandatory pseudo-header fields are absent [HTTP/3 4.1.3] [✘]
+  MUST send H3_MESSAGE_ERROR if mandatory pseudo-header fields are absent [HTTP/3 4.1.3] [✔]
   MUST send H3_MESSAGE_ERROR if prohibited pseudo-header fields are present[HTTP/3 4.1.3] [✔]
   MUST send H3_MESSAGE_ERROR if pseudo-header fields exist after fields [HTTP/3 4.1.3] [✔]
   MUST send H3_MISSING_SETTINGS if the first control frame is not SETTINGS [HTTP/3 6.2.1] [✔]
@@ -49,7 +49,7 @@ HTTP/3 servers
   MUST send H3_FRAME_UNEXPECTED if CANCEL_PUSH is received in a request stream [HTTP/3 7.2.5] [✔]
   MUST send QPACK_DECOMPRESSION_FAILED if an invalid static table index exits in a field line representation [QPACK 3.1] [✔]
   MUST send QPACK_ENCODER_STREAM_ERROR if a new dynamic table capacity value exceeds the limit [QPACK 4.1.3] [✔]
-  MUST send H3_CLOSED_CRITICAL_STREAM if a control stream is closed [QPACK 4.2] [✘]
+  MUST send H3_CLOSED_CRITICAL_STREAM if a control stream is closed [QPACK 4.2] [✔]
   MUST send QPACK_DECODER_STREAM_ERROR if Insert Count Increment is 0 [QPACK 4.4.3] [✔]
 
 Failures:
@@ -58,76 +58,63 @@ Failures:
   1) QUIC servers MUST send TRANSPORT_PARAMETER_ERROR if initial_source_connection_id is missing [Transport 7.3]
        did not get expected exception: QUICException
 
-  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if initial_source_connection_id is missing [Transport 7.3]/" --seed 1434735662
+  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if initial_source_connection_id is missing [Transport 7.3]/" --seed 1036989156
 
   TransportError.hs:61:32: 
   2) QUIC servers MUST send TRANSPORT_PARAMETER_ERROR if original_destination_connection_id is received [Transport 18.2]
        did not get expected exception: QUICException
 
-  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if original_destination_connection_id is received [Transport 18.2]/" --seed 1434735662
+  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if original_destination_connection_id is received [Transport 18.2]/" --seed 1036989156
 
   TransportError.hs:66:32: 
   3) QUIC servers MUST send TRANSPORT_PARAMETER_ERROR if preferred_address, is received [Transport 18.2]
        did not get expected exception: QUICException
 
-  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if preferred_address, is received [Transport 18.2]/" --seed 1434735662
+  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if preferred_address, is received [Transport 18.2]/" --seed 1036989156
 
   TransportError.hs:71:32: 
   4) QUIC servers MUST send TRANSPORT_PARAMETER_ERROR if retry_source_connection_id is received [Transport 18.2]
        did not get expected exception: QUICException
 
-  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if retry_source_connection_id is received [Transport 18.2]/" --seed 1434735662
+  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if retry_source_connection_id is received [Transport 18.2]/" --seed 1036989156
 
   TransportError.hs:76:32: 
   5) QUIC servers MUST send TRANSPORT_PARAMETER_ERROR if stateless_reset_token is received [Transport 18.2]
        did not get expected exception: QUICException
 
-  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if stateless_reset_token is received [Transport 18.2]/" --seed 1434735662
+  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if stateless_reset_token is received [Transport 18.2]/" --seed 1036989156
 
   TransportError.hs:81:32: 
   6) QUIC servers MUST send TRANSPORT_PARAMETER_ERROR if max_udp_payload_size < 1200 [Transport 7.4 and 18.2]
        did not get expected exception: QUICException
 
-  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if max_udp_payload_size < 1200 [Transport 7.4 and 18.2]/" --seed 1434735662
+  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if max_udp_payload_size < 1200 [Transport 7.4 and 18.2]/" --seed 1036989156
 
   TransportError.hs:86:32: 
   7) QUIC servers MUST send TRANSPORT_PARAMETER_ERROR if ack_delay_exponen > 20 [Transport 7.4 and 18.2]
        did not get expected exception: QUICException
 
-  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if ack_delay_exponen > 20 [Transport 7.4 and 18.2]/" --seed 1434735662
+  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if ack_delay_exponen > 20 [Transport 7.4 and 18.2]/" --seed 1036989156
 
   TransportError.hs:91:32: 
   8) QUIC servers MUST send TRANSPORT_PARAMETER_ERROR if max_ack_delay >= 2^14 [Transport 7.4 and 18.2]
        did not get expected exception: QUICException
 
-  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if max_ack_delay >= 2^14 [Transport 7.4 and 18.2]/" --seed 1434735662
+  To rerun use: --match "/QUIC servers/MUST send TRANSPORT_PARAMETER_ERROR if max_ack_delay >= 2^14 [Transport 7.4 and 18.2]/" --seed 1036989156
 
   TransportError.hs:104:32: 
   9) QUIC servers MUST send PROTOCOL_VIOLATION if reserved bits in Handshake are non-zero [Transport 17.2]
        did not get expected exception: QUICException
 
-  To rerun use: --match "/QUIC servers/MUST send PROTOCOL_VIOLATION if reserved bits in Handshake are non-zero [Transport 17.2]/" --seed 1434735662
+  To rerun use: --match "/QUIC servers/MUST send PROTOCOL_VIOLATION if reserved bits in Handshake are non-zero [Transport 17.2]/" --seed 1036989156
 
   TransportError.hs:114:32: 
   10) QUIC servers MUST send PROTOCOL_VIOLATION if reserved bits in Short are non-zero [Transport 17.2]
        did not get expected exception: QUICException
 
-  To rerun use: --match "/QUIC servers/MUST send PROTOCOL_VIOLATION if reserved bits in Short are non-zero [Transport 17.2]/" --seed 1434735662
+  To rerun use: --match "/QUIC servers/MUST send PROTOCOL_VIOLATION if reserved bits in Short are non-zero [Transport 17.2]/" --seed 1036989156
 
-  HTTP3Error.hs:70:21: 
-  11) HTTP/3 servers MUST send H3_MESSAGE_ERROR if mandatory pseudo-header fields are absent [HTTP/3 4.1.3]
-       did not get expected exception: QUICException
+Randomized with seed 1036989156
 
-  To rerun use: --match "/HTTP/3 servers/MUST send H3_MESSAGE_ERROR if mandatory pseudo-header fields are absent [HTTP/3 4.1.3]/" --seed 1434735662
-
-  HTTP3Error.hs:143:21: 
-  12) HTTP/3 servers MUST send H3_CLOSED_CRITICAL_STREAM if a control stream is closed [QPACK 4.2]
-       predicate failed on expected exception: QUICException
-       ApplicationProtocolErrorIsReceived (ApplicationProtocolError 268) "peer closed critical stream type=0x0 id=2"
-
-  To rerun use: --match "/HTTP/3 servers/MUST send H3_CLOSED_CRITICAL_STREAM if a control stream is closed [QPACK 4.2]/" --seed 1434735662
-
-Randomized with seed 1434735662
-
-Finished in 25.7221 seconds
-49 examples, 12 failures
+Finished in 24.9556 seconds
+49 examples, 10 failures
