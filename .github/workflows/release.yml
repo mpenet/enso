@@ -11,10 +11,11 @@ name: release
 #   - workflow_dispatch (manual button in the Actions tab)
 #   - push of any tag matching v*
 #
-# Outputs (uploaded as workflow artifacts + published to Clojars on tag):
-#   target/enso-<version>.jar            — core jar
-#   target/enso-<version>-<classifier>.jar — per-platform native jars
-#   target/enso-<version>-all.jar        — fat jar, all 5 platforms
+# Outputs:
+#   target/enso-<version>.jar            — core jar (Clojars + artifact)
+#   target/enso-<version>-<classifier>.jar — per-platform native jars (Clojars + artifact)
+#   target/enso-<version>-all.jar        — fat jar (workflow artifact only;
+#                                          exceeds Clojars per-file size limit)
 
 on:
   workflow_dispatch:

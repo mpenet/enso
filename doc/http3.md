@@ -35,15 +35,16 @@ Available classifiers:
 Alpine/musl variants selected automatically at runtime when
 `/lib/ld-musl-*.so.1` is present; falls back to glibc shim otherwise.
 
-### Fat jar, all five shims bundled (~18 MB)
-
-Single coord, no classifier picking. Pick this for uber-jar-based
-deploys or when you don't want to think about the target platform.
+For multi-platform uber-jars, declare multiple classifier deps side by side:
 
 ```clojure
-{:deps {com.s-exp/enso$all {:mvn/version "1.0.0-alphaN"}}}
+{:deps {com.s-exp/enso                    {:mvn/version "1.0.0-alphaN"}
+        com.s-exp/enso$darwin-arm64       {:mvn/version "1.0.0-alphaN"}
+        com.s-exp/enso$linux-amd64        {:mvn/version "1.0.0-alphaN"}
+        com.s-exp/enso$linux-musl-amd64   {:mvn/version "1.0.0-alphaN"}}}
 ```
 
+`Quiche.java` picks the matching shim from the classpath at load time.
 
 ## Enabling h3
 

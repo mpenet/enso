@@ -217,18 +217,18 @@
       (throw (ex-info (str "missing " pom " — run jar-core first") {:pom pom})))
     (when-not (.exists (java.io.File. jar-core-file))
       (throw (ex-info (str "missing " jar-core-file) {})))
-    ;; Collect sidecar artifacts: per-platform classifier jars +
-    ;; fat jar (as classifier `all`).
-    (let [classifier-jars (->> (some-> (java.io.File. "target/native")
-                                       .listFiles seq)
-                               (filter #(.isDirectory ^java.io.File %))
-                               (map #(vector (.getName ^java.io.File %)
-                                             (jar-classifier-file (.getName ^java.io.File %))))
-                               (filter (fn [[_ j]] (.exists (java.io.File. ^String j))))
-                               vec)
-          all-classifier? (.exists (java.io.File. jar-all-file))
-          sidecars (cond-> classifier-jars
-                     all-classifier? (conj ["all" jar-all-file]))
+    ;; Sidecar artifacts: per-platform classifier jars only. The fat
+    ;; jar (`jar-all`, ~18 MB) exceeds Clojars' per-file limit and gets
+    ;; a 413 — users needing multi-platform declare multiple classifier
+    ;; coords instead (netty-style). `jar-all` still builds locally
+    ;; for uber-jar-style deploys.
+    (let [sidecars (->> (some-> (java.io.File. "target/native")
+                                .listFiles seq)
+                        (filter #(.isDirectory ^java.io.File %))
+                        (map #(vector (.getName ^java.io.File %)
+                                      (jar-classifier-file (.getName ^java.io.File %))))
+                        (filter (fn [[_ j]] (.exists (java.io.File. ^String j))))
+                        vec)
           files (clojure.string/join "," (map second sidecars))
           classifiers (clojure.string/join "," (map first sidecars))
           types (clojure.string/join "," (repeat (count sidecars) "jar"))
