@@ -133,6 +133,7 @@ public final class Http2Connection implements Runnable {
     // connection so back-to-back multi-frame requests don't reallocate.
     private int pendingStreamId = 0;
     private boolean pendingEndStream = false;
+    private boolean pendingTrailers = false;
     private int pendingContinuationCount = 0;
     private final java.io.ByteArrayOutputStream pendingHeaderBytes =
         new java.io.ByteArrayOutputStream(4096);
@@ -598,12 +599,28 @@ public final class Http2Connection implements Runnable {
             throw new Http2.ConnectionError(
                 Http2.ERROR_PROTOCOL_ERROR, "invalid stream ID for HEADERS");
         }
-        if (f.streamId <= highestPeerStreamId) {
-            // We don't support trailers or stream re-use yet.
-            throw new Http2.ConnectionError(
-                Http2.ERROR_PROTOCOL_ERROR, "stream ID not strictly increasing");
+        Http2Stream existing = streams.get(f.streamId);
+        boolean trailers = existing != null;
+        if (!trailers) {
+            if (f.streamId <= highestPeerStreamId) {
+                throw new Http2.ConnectionError(
+                    Http2.ERROR_PROTOCOL_ERROR, "stream ID not strictly increasing");
+            }
+            highestPeerStreamId = f.streamId;
+        } else {
+            // RFC 9113 §8.1: a second HEADERS on an existing stream is a
+            // trailers block. Must set END_STREAM, must not appear on a
+            // stream that's already half-closed by the peer.
+            if ((f.flags & Http2.FLAG_END_STREAM) == 0) {
+                throw new Http2.ConnectionError(
+                    Http2.ERROR_PROTOCOL_ERROR, "trailer HEADERS without END_STREAM");
+            }
+            if (existing.state != Http2Stream.State.OPEN) {
+                throw new Http2.ConnectionError(
+                    Http2.ERROR_PROTOCOL_ERROR,
+                    "HEADERS on stream in state " + existing.state);
+            }
         }
-        highestPeerStreamId = f.streamId;
 
         // Peel padding, priority prefix.
         byte[] payload = f.payload;
@@ -650,13 +667,18 @@ public final class Http2Connection implements Runnable {
         boolean endHeaders = (f.flags & Http2.FLAG_END_HEADERS) != 0;
 
         if (endHeaders) {
-            finalizeHeaderBlock(f.streamId, endStream, payload, off, len);
+            if (trailers) {
+                finalizeTrailerBlock(existing, payload, off, len);
+            } else {
+                finalizeHeaderBlock(f.streamId, endStream, payload, off, len);
+            }
         } else {
             // Start accumulating; the next frame MUST be CONTINUATION on this
             // same stream (§6.10). The dispatch guard enforces the ordering.
             enforceHeaderListBudget(len);
             pendingStreamId = f.streamId;
             pendingEndStream = endStream;
+            pendingTrailers = trailers;
             pendingHeaderBytes.reset();
             pendingHeaderBytes.write(payload, off, len);
         }
@@ -682,8 +704,24 @@ public final class Http2Connection implements Runnable {
             byte[] block = pendingHeaderBytes.toByteArray();
             int streamId = pendingStreamId;
             boolean endStream = pendingEndStream;
+            boolean trailers = pendingTrailers;
             clearPendingHeaderState();
-            finalizeHeaderBlock(streamId, endStream, block, 0, block.length);
+            if (trailers) {
+                Http2Stream st = streams.get(streamId);
+                if (st == null) {
+                    // Stream vanished mid-CONTINUATION (RST). Drop the
+                    // trailers but still decode to keep HPACK in sync.
+                    try { hpackDecoder.decode(block, 0, block.length); }
+                    catch (IOException e) {
+                        throw new Http2.ConnectionError(
+                            Http2.ERROR_COMPRESSION_ERROR, "HPACK decode failed: " + e.getMessage());
+                    }
+                    return;
+                }
+                finalizeTrailerBlock(st, block, 0, block.length);
+            } else {
+                finalizeHeaderBlock(streamId, endStream, block, 0, block.length);
+            }
         }
     }
 
@@ -705,8 +743,34 @@ public final class Http2Connection implements Runnable {
     private void clearPendingHeaderState() {
         pendingStreamId = 0;
         pendingEndStream = false;
+        pendingTrailers = false;
         pendingContinuationCount = 0;
         pendingHeaderBytes.reset();
+    }
+
+    /**
+     * Trailer HEADERS on an already-open stream (RFC 9113 §8.1). Decode
+     * to keep HPACK in sync, validate no pseudo-headers appear, then
+     * signal end-of-body to the handler's request InputStream. Ring 1.5
+     * has no trailer surface so the fields are dropped.
+     */
+    private void finalizeTrailerBlock(Http2Stream stream, byte[] block,
+                                      int off, int len) throws IOException {
+        List<Hpack.HeaderField> fields;
+        try {
+            fields = hpackDecoder.decode(block, off, len);
+        } catch (IOException e) {
+            throw new Http2.ConnectionError(
+                Http2.ERROR_COMPRESSION_ERROR, "HPACK decode failed: " + e.getMessage());
+        }
+        for (Hpack.HeaderField hf : fields) {
+            if (!hf.name.isEmpty() && hf.name.charAt(0) == ':') {
+                throw new Http2.ConnectionError(
+                    Http2.ERROR_PROTOCOL_ERROR, "pseudo-header in trailers");
+            }
+        }
+        stream.state = Http2Stream.State.HALF_CLOSED_REMOTE;
+        stream.signalEndOfBody();
     }
 
     private void finalizeHeaderBlock(int streamId, boolean endStream,
@@ -1310,7 +1374,23 @@ public final class Http2Connection implements Runnable {
                     | ((long)(f.payload[i + 4] & 0xFF) <<  8)
                     |  (long)(f.payload[i + 5] & 0xFF);
             switch (id) {
-                case Http2.SETTINGS_HEADER_TABLE_SIZE -> peerHeaderTableSize = (int) v;
+                case Http2.SETTINGS_HEADER_TABLE_SIZE -> {
+                    // Cap our advertised max at whatever we've statically
+                    // configured — peer can only shrink, never force us
+                    // to grow past DEFAULT_HEADER_TABLE_SIZE.
+                    long clamped = Math.min(v, Http2.DEFAULT_HEADER_TABLE_SIZE);
+                    peerHeaderTableSize = (int) clamped;
+                    // Push through to the encoder so it emits a Dynamic
+                    // Table Size Update before the next HEADERS block.
+                    // Serialise with the writer path (hpackEncoder is
+                    // mutated under streamLock during encode).
+                    streamLock.lock();
+                    try {
+                        hpackEncoder.setMaxTableSize((int) clamped);
+                    } finally {
+                        streamLock.unlock();
+                    }
+                }
                 case Http2.SETTINGS_ENABLE_PUSH -> {
                     if (v != 0 && v != 1) {
                         throw new Http2.ConnectionError(

@@ -395,9 +395,25 @@ public final class Hpack {
         // Encoder-side dynamic table is separate from decoder's; peer maintains
         // its own view. We keep it only to compute indexed-name references.
         final DynamicTable table;
+        // Peer's most-recent SETTINGS_HEADER_TABLE_SIZE. We MUST NOT let
+        // our table exceed this. -1 = no pending update to emit.
+        private int pendingSizeUpdate = -1;
 
         public Encoder(int maxTableSize) {
             this.table = new DynamicTable(maxTableSize);
+        }
+
+        /**
+         * Apply peer's SETTINGS_HEADER_TABLE_SIZE. Per RFC 7541 §6.3 the
+         * next encoded block must begin with a Dynamic Table Size Update
+         * that carries the new cap so the peer's decoder stays in sync.
+         */
+        public void setMaxTableSize(int newMax) {
+            if (newMax < 0) return;
+            // Clamp our table to the new cap immediately (evicts entries
+            // as needed) and mark a size-update to emit on next block.
+            table.resize(newMax);
+            pendingSizeUpdate = newMax;
         }
 
         /** Encode a list of header fields into a fresh byte[]. */
@@ -409,6 +425,11 @@ public final class Hpack {
             }
             byte[] buf = new byte[cap];
             int p = 0;
+            if (pendingSizeUpdate >= 0) {
+                // §6.3: 001xxxxx pattern, 5-bit prefix.
+                p = encodeInteger(buf, p, 5, 0x20, pendingSizeUpdate);
+                pendingSizeUpdate = -1;
+            }
             for (HeaderField hf : fields) {
                 if (!hf.sensitive) {
                     int fullIdx = findFullIndex(hf.name, hf.value);
