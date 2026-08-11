@@ -1067,8 +1067,11 @@ public final class Http2Connection implements Runnable {
         if (rp == 0) {
             headers = PersistentArrayMap.EMPTY;
         } else {
-            // regular is already exactly rp long — pre-counted above.
-            headers = (IPersistentMap) PersistentArrayMap.createAsIfByAssoc(regular);
+            // Dedup duplicates before createAsIfByAssoc (throws on repeats).
+            // "cookie" per RFC 9113 §8.2.3, others per RFC 9110 §5.3.
+            Object[] merged = com.s_exp.enso.http3.Http3Connection
+                .mergeDuplicateHeaders(regular, rp);
+            headers = (IPersistentMap) PersistentArrayMap.createAsIfByAssoc(merged);
         }
 
         return new Request(method, uri, query, "HTTP/2.0",

@@ -104,6 +104,19 @@ public final class Http3FrameReader {
     public Frame poll() { return ready.pollFirst(); }
 
     /**
+     * True if the reader is mid-frame — either a partial header varint is
+     * buffered (position > 0 after drain) or a frame's payload is only
+     * partially consumed. Callers use this on FIN to detect a truncated
+     * final frame (RFC 9114 §7.1 → H3_FRAME_ERROR).
+     */
+    public boolean hasPartial() {
+        // pendingType >= 0 → header parsed, payload incomplete.
+        // buf.position() > 0 → bytes buffered but no header parsed yet
+        //   (drain() compacted unread bytes to the front).
+        return pendingType >= 0 || buf.position() > 0;
+    }
+
+    /**
      * Clear all reader state so the instance can be reused for a fresh
      * stream. Keeps the rolling {@link #buf} allocation to amortise it
      * across pooled reuse; the buffer's position is reset. Pooled by

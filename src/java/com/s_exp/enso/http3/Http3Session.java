@@ -7,6 +7,7 @@ import com.s_exp.enso.http3.qpack.QpackFieldSection;
 import com.s_exp.enso.util.Long2ObjectHashMap;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -377,6 +378,15 @@ public final class Http3Session {
             // (proper streaming skip is task #103).
         }
         if (fin) {
+            // RFC 9114 §7.1: stream MUST NOT terminate mid-frame. If the
+            // reader still holds partial bytes, the peer truncated the
+            // last frame — connection-level H3_FRAME_ERROR.
+            if (rs.reader.hasPartial()) {
+                discardReader(requestStreams.remove(streamId));
+                throw new Http3ConnectionException(
+                    Http3ConnectionException.H3_FRAME_ERROR,
+                    "stream " + streamId + " terminated mid-frame");
+            }
             sink.onFin(streamId);
             releaseReader(requestStreams.remove(streamId));
         }
@@ -862,7 +872,14 @@ public final class Http3Session {
         }
         long cap = Quiche.connStreamCapacity(conn, streamId);
         if (cap < 0) {
-            LOG.info("h3 stream_capacity stream=" + streamId + " rc=" + cap);
+            // Stream gone (STREAM_STOPPED/RESET) or transient DONE. Peer
+            // won't accept more; drop any deferred state so drainPending
+            // doesn't retry forever.
+            LOG.log(cap == Quiche.QUICHE_ERR_STREAM_STOPPED
+                        || cap == Quiche.QUICHE_ERR_STREAM_RESET
+                    ? Level.FINE : Level.WARNING,
+                "h3 stream_capacity stream=" + streamId + " rc=" + cap);
+            pendingByStream.remove(streamId);
             return false;
         }
         if (cap == 0) {
@@ -875,7 +892,14 @@ public final class Http3Session {
         boolean applyFin = fin && (chunk == remaining);
         long rc = Quiche.connStreamSend(conn, streamId, bytes, off, chunk, applyFin);
         if (rc < 0) {
-            LOG.info("h3 stream_send stream=" + streamId + " rc=" + rc);
+            // Peer reset (STREAM_STOPPED/RESET) is benign; other codes
+            // (FINAL_SIZE, INVALID_STREAM_STATE) indicate a bug on our
+            // side and must surface. Drop deferred state either way.
+            Level lvl = (rc == Quiche.QUICHE_ERR_STREAM_STOPPED
+                         || rc == Quiche.QUICHE_ERR_STREAM_RESET)
+                        ? Level.FINE : Level.WARNING;
+            LOG.log(lvl, "h3 stream_send stream=" + streamId + " rc=" + rc);
+            pendingByStream.remove(streamId);
             return false;
         }
         if (rc == remaining) return true;
@@ -920,13 +944,29 @@ public final class Http3Session {
             while (!q.isEmpty()) {
                 Pending p = q.peekFirst();
                 long cap = Quiche.connStreamCapacity(conn, streamId);
-                if (cap < 0) { q.clear(); break; }
+                if (cap < 0) {
+                    if (cap != Quiche.QUICHE_ERR_STREAM_STOPPED
+                        && cap != Quiche.QUICHE_ERR_STREAM_RESET) {
+                        LOG.warning("h3 stream_capacity stream="
+                            + streamId + " rc=" + cap);
+                    }
+                    q.clear();
+                    break;
+                }
                 if (cap == 0) break;
                 int chunk = (int) Math.min((long) p.len, cap);
                 boolean applyFin = p.fin && (chunk == p.len);
                 long rc = Quiche.connStreamSend(
                     conn, streamId, p.buf, p.off, chunk, applyFin);
-                if (rc < 0) { q.clear(); break; }
+                if (rc < 0) {
+                    if (rc != Quiche.QUICHE_ERR_STREAM_STOPPED
+                        && rc != Quiche.QUICHE_ERR_STREAM_RESET) {
+                        LOG.warning("h3 pending stream_send stream="
+                            + streamId + " rc=" + rc);
+                    }
+                    q.clear();
+                    break;
+                }
                 if (rc == 0) break;
                 p.off += (int) rc;
                 p.len -= (int) rc;
@@ -978,6 +1018,16 @@ public final class Http3Session {
     public boolean hasPendingWrites(long streamId) {
         java.util.Deque<Pending> q = pendingByStream.get(streamId);
         return q != null && !q.isEmpty();
+    }
+
+    /**
+     * True while {@code streamId} can still accept outbound bytes. False
+     * once quiche reports the stream as gone (STREAM_STOPPED / RESET).
+     * Streaming response pump checks this to abort parked sources
+     * whose peer has stopped listening.
+     */
+    public boolean streamAlive(long streamId) {
+        return Quiche.connStreamCapacity(conn, streamId) >= 0;
     }
 
     /**

@@ -33,6 +33,12 @@ public final class Quiche {
     public static final int QUICHE_MAX_CONN_ID_LEN = 20;
     public static final int QUICHE_PROTOCOL_VERSION = 0x00000001;
     public static final long QUICHE_ERR_DONE = -1L;
+    // Selected quiche error codes we react to explicitly. Complete enum
+    // lives in quiche.h — copy just the ones we branch on.
+    public static final long QUICHE_ERR_STREAM_STOPPED = -15L;
+    public static final long QUICHE_ERR_STREAM_RESET = -16L;
+    public static final long QUICHE_ERR_INVALID_STREAM_STATE = -6L;
+    public static final long QUICHE_ERR_FINAL_SIZE = -13L;
 
     // enum quiche_shutdown
     public static final int QUICHE_SHUTDOWN_READ = 0;

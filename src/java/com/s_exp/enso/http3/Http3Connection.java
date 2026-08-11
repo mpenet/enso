@@ -465,14 +465,30 @@ final class Http3Connection implements AutoCloseable {
             streamResumeScratch = new long[streamingSources.size()];
         }
         streamingSources.forEach((sid, src) -> {
-            if (!session.hasPendingWrites(sid)) {
+            // Bucket into resume vs abort. Stream can be gone (peer
+            // STOP_SENDING/RESET) — without this check, src stays parked
+            // forever and pins the fd until connection teardown.
+            if (!session.streamAlive(sid)) {
+                closeSourceQuiet(src);
+                streamResumeScratch[streamResumeScratchLen++] = -sid - 1;
+            } else if (!session.hasPendingWrites(sid)) {
                 streamResumeScratch[streamResumeScratchLen++] = sid;
             }
         });
         for (int i = 0; i < streamResumeScratchLen; i++) {
-            long sid = streamResumeScratch[i];
-            java.io.InputStream src = streamingSources.remove(sid);
-            if (src != null) pumpStreaming(sid, src);
+            long marker = streamResumeScratch[i];
+            if (marker < 0) {
+                // Aborted stream — src already closed above.
+                streamingSources.remove(-marker - 1);
+                continue;
+            }
+            java.io.InputStream src = streamingSources.remove(marker);
+            if (src != null) pumpStreaming(marker, src);
+        }
+        // Reclaim scratch buf if map drained via aborts (parallel to
+        // the EOF path in pumpStreaming).
+        if (streamingSources.isEmpty()) {
+            streamChunkBuf = null;
         }
     }
 
@@ -826,7 +842,11 @@ final class Http3Connection implements AutoCloseable {
         // build the Ring header map in a single createAsIfByAssoc call.
         regular[rp++] = "host";
         regular[rp++] = authority == null ? "" : authority;
-        IPersistentMap hmap = (IPersistentMap) PersistentArrayMap.createAsIfByAssoc(regular);
+        // Dedup duplicates before createAsIfByAssoc (which throws on
+        // repeated keys). Combine repeated fields per RFC 9110 §5.3;
+        // "cookie" uses "; " per RFC 9113 §8.2.3 (h3 inherits h2 rules).
+        Object[] merged = mergeDuplicateHeaders(regular, rp);
+        IPersistentMap hmap = (IPersistentMap) PersistentArrayMap.createAsIfByAssoc(merged);
 
         Http3BodyPipe pipe = new Http3BodyPipe(maxRequestBodyBytes);
         bodyPipes.put(streamId, pipe);
@@ -840,6 +860,54 @@ final class Http3Connection implements AutoCloseable {
         Thread.ofVirtual()
             .name("enso-h3-worker-" + streamId)
             .start(() -> runHandler(streamId, request));
+    }
+
+    /**
+     * Dedup name/value pairs in {@code arr[0..len]} (interleaved names +
+     * values). Duplicate names get their values joined per HTTP list-value
+     * combining: "; " for "cookie" (RFC 9113 §8.2.3), ", " otherwise
+     * (RFC 9110 §5.3). Returns an exact-fit Object[] with no repeats so
+     * the downstream {@code createAsIfByAssoc} won't throw.
+     */
+    static Object[] mergeDuplicateHeaders(Object[] arr, int len) {
+        // Fast path — no dups in the common case. Detect first, allocate
+        // second. len is even (name/value pairs).
+        boolean dup = false;
+        outer:
+        for (int i = 0; i < len; i += 2) {
+            String a = (String) arr[i];
+            for (int j = i + 2; j < len; j += 2) {
+                if (a.equals(arr[j])) { dup = true; break outer; }
+            }
+        }
+        if (!dup) {
+            if (arr.length == len) return arr;
+            Object[] fit = new Object[len];
+            System.arraycopy(arr, 0, fit, 0, len);
+            return fit;
+        }
+        // Slow path: linear compact + join.
+        Object[] out = new Object[len];
+        int op = 0;
+        for (int i = 0; i < len; i += 2) {
+            String name = (String) arr[i];
+            String value = (String) arr[i + 1];
+            int existing = -1;
+            for (int j = 0; j < op; j += 2) {
+                if (name.equals(out[j])) { existing = j; break; }
+            }
+            if (existing < 0) {
+                out[op++] = name;
+                out[op++] = value;
+            } else {
+                String sep = name.equals("cookie") ? "; " : ", ";
+                out[existing + 1] = out[existing + 1] + sep + value;
+            }
+        }
+        if (op == out.length) return out;
+        Object[] fit = new Object[op];
+        System.arraycopy(out, 0, fit, 0, op);
+        return fit;
     }
 
     private static boolean hasUppercase(String s) {
