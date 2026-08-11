@@ -1309,7 +1309,16 @@ public final class Http2Connection implements Runnable {
             }
             boolean last = (p + granted == endOff);
             int flags = (last && endStream) ? Http2.FLAG_END_STREAM : 0;
-            writeFrame(Http2.TYPE_DATA, flags, stream.id, buf, p, granted);
+            // Copy the chunk into a fresh byte[] so FrameSeg's byref
+            // payload holds a stable buffer. Streaming callers
+            // (streamInputStream, Http2DataOutputStream) reuse `buf`
+            // across iterations; without the copy the writer thread's
+            // batch coalesce could race the next in.read overwriting
+            // bytes it hasn't flushed yet. Owned-byte[] bodies pay the
+            // same copy — accepted tax for the shared invariant.
+            byte[] chunk = new byte[granted];
+            System.arraycopy(buf, p, chunk, 0, granted);
+            writeFrame(Http2.TYPE_DATA, flags, stream.id, chunk, 0, granted);
             p += granted;
         }
     }
