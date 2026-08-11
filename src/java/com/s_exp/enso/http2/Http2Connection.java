@@ -1069,8 +1069,8 @@ public final class Http2Connection implements Runnable {
         } else {
             // Dedup duplicates before createAsIfByAssoc (throws on repeats).
             // "cookie" per RFC 9113 §8.2.3, others per RFC 9110 §5.3.
-            Object[] merged = com.s_exp.enso.http3.Http3Connection
-                .mergeDuplicateHeaders(regular, rp);
+            Object[] merged = com.s_exp.enso.util.RingHeaders
+                .mergeDuplicates(regular, rp);
             headers = (IPersistentMap) PersistentArrayMap.createAsIfByAssoc(merged);
         }
 

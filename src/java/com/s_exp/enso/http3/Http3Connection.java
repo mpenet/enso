@@ -845,7 +845,7 @@ final class Http3Connection implements AutoCloseable {
         // Dedup duplicates before createAsIfByAssoc (which throws on
         // repeated keys). Combine repeated fields per RFC 9110 §5.3;
         // "cookie" uses "; " per RFC 9113 §8.2.3 (h3 inherits h2 rules).
-        Object[] merged = mergeDuplicateHeaders(regular, rp);
+        Object[] merged = com.s_exp.enso.util.RingHeaders.mergeDuplicates(regular, rp);
         IPersistentMap hmap = (IPersistentMap) PersistentArrayMap.createAsIfByAssoc(merged);
 
         Http3BodyPipe pipe = new Http3BodyPipe(maxRequestBodyBytes);
@@ -860,54 +860,6 @@ final class Http3Connection implements AutoCloseable {
         Thread.ofVirtual()
             .name("enso-h3-worker-" + streamId)
             .start(() -> runHandler(streamId, request));
-    }
-
-    /**
-     * Dedup name/value pairs in {@code arr[0..len]} (interleaved names +
-     * values). Duplicate names get their values joined per HTTP list-value
-     * combining: "; " for "cookie" (RFC 9113 §8.2.3), ", " otherwise
-     * (RFC 9110 §5.3). Returns an exact-fit Object[] with no repeats so
-     * the downstream {@code createAsIfByAssoc} won't throw.
-     */
-    static Object[] mergeDuplicateHeaders(Object[] arr, int len) {
-        // Fast path — no dups in the common case. Detect first, allocate
-        // second. len is even (name/value pairs).
-        boolean dup = false;
-        outer:
-        for (int i = 0; i < len; i += 2) {
-            String a = (String) arr[i];
-            for (int j = i + 2; j < len; j += 2) {
-                if (a.equals(arr[j])) { dup = true; break outer; }
-            }
-        }
-        if (!dup) {
-            if (arr.length == len) return arr;
-            Object[] fit = new Object[len];
-            System.arraycopy(arr, 0, fit, 0, len);
-            return fit;
-        }
-        // Slow path: linear compact + join.
-        Object[] out = new Object[len];
-        int op = 0;
-        for (int i = 0; i < len; i += 2) {
-            String name = (String) arr[i];
-            String value = (String) arr[i + 1];
-            int existing = -1;
-            for (int j = 0; j < op; j += 2) {
-                if (name.equals(out[j])) { existing = j; break; }
-            }
-            if (existing < 0) {
-                out[op++] = name;
-                out[op++] = value;
-            } else {
-                String sep = name.equals("cookie") ? "; " : ", ";
-                out[existing + 1] = out[existing + 1] + sep + value;
-            }
-        }
-        if (op == out.length) return out;
-        Object[] fit = new Object[op];
-        System.arraycopy(out, 0, fit, 0, op);
-        return fit;
     }
 
     private static boolean hasUppercase(String s) {
