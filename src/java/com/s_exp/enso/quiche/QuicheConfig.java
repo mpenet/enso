@@ -13,17 +13,28 @@ import java.nio.charset.StandardCharsets;
 public final class QuicheConfig implements AutoCloseable {
 
     private final long ptr;
+    private volatile boolean closed;
 
     public QuicheConfig(Config cfg) throws IOException {
         // Version 1 = the current wire version. quiche_config_new(0xbabababa)
         // is for version negotiation testing; we always advertise v1.
-        this.ptr = Quiche.configNew(Quiche.QUICHE_PROTOCOL_VERSION);
-        if (ptr == 0) {
+        long p = Quiche.configNew(Quiche.QUICHE_PROTOCOL_VERSION);
+        if (p == 0) {
             throw new IOException("quiche_config_new returned null");
         }
-        loadCertKey(cfg);
-        setApplicationProtos();
-        setKnobs(cfg);
+        this.ptr = p;
+        // Any throw from loadCertKey/setApplicationProtos/setKnobs would
+        // leak the freshly-allocated native config. Free on failure so
+        // callers that catch the IOException + retry don't leak.
+        try {
+            loadCertKey(cfg);
+            setApplicationProtos();
+            setKnobs(cfg);
+        } catch (Throwable t) {
+            Quiche.configFree(p);
+            closed = true;
+            throw t;
+        }
     }
 
     /** Raw {@code quiche_config *} handle for {@code quiche_accept}. */
@@ -94,7 +105,9 @@ public final class QuicheConfig implements AutoCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
+        if (closed) return;
+        closed = true;
         Quiche.configFree(ptr);
     }
 }

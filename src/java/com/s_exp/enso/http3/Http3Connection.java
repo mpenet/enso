@@ -667,7 +667,7 @@ final class Http3Connection implements AutoCloseable {
                 if (!pipe.enqueueChecked(chunk)) {
                     LOG.info("h3 body size cap exceeded, stream=" + streamId);
                     bodyPipes.remove(streamId);
-                    pipe.signalEnd();
+                    pipe.signalTruncated();
                     // Reset the QUIC stream in both directions so the peer
                     // stops pushing DATA against a stream we already stopped
                     // consuming. Without this, the next DATA arrives with

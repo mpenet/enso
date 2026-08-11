@@ -16,6 +16,7 @@ import java.util.concurrent.BlockingQueue;
 public final class Http3BodyPipe {
 
     private static final byte[] END_MARKER = new byte[0];
+    private static final byte[] TRUNCATED_MARKER = new byte[0];
 
     // Small ring — typical Ring bodies are 0..2 chunks. Under a body
     // burst larger than cap, enqueue briefly blocks the owner thread
@@ -61,6 +62,16 @@ public final class Http3BodyPipe {
 
     public void signalEnd() {
         putUninterruptibly(END_MARKER);
+    }
+
+    /**
+     * Signals that the body was truncated (peer body cap exceeded, stream
+     * reset). Subsequent reads from {@link #inputStream()} throw
+     * IOException instead of returning EOF, so the handler can't
+     * mistake a truncated body for a complete one.
+     */
+    public void signalTruncated() {
+        putUninterruptibly(TRUNCATED_MARKER);
     }
 
     /**
@@ -116,6 +127,11 @@ public final class Http3BodyPipe {
                 if (current == END_MARKER) {
                     eof = true;
                     return -1;
+                }
+                if (current == TRUNCATED_MARKER) {
+                    eof = true;
+                    throw new IOException(
+                        "HTTP/3 request body exceeded size cap; stream reset");
                 }
                 pos = 0;
             }

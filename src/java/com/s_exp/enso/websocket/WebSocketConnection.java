@@ -57,6 +57,10 @@ public final class WebSocketConnection {
     private final Object writeLock = new Object();
     private volatile boolean open = true;
     private final WebSocketSocket socketApi;
+    // Close state updated by CLOSE frames received in either the top-level
+    // dispatch or interleaved between message fragments (RFC 6455 §5.4).
+    private int closeCode = CLOSE_ABNORMAL;
+    private String closeReason = "";
 
     public WebSocketConnection(Socket socket, InputStream in, OutputStream out,
                         WebSocketListener listener, int maxMessageBytes) {
@@ -79,8 +83,8 @@ public final class WebSocketConnection {
      * followed by {@code onClose} has been invoked exactly once.
      */
     public void run() {
-        int closeCode = CLOSE_ABNORMAL;
-        String closeReason = "";
+        closeCode = CLOSE_ABNORMAL;
+        closeReason = "";
         try {
             listener.onOpen(socketApi);
         } catch (Throwable t) {
@@ -97,55 +101,58 @@ public final class WebSocketConnection {
                 if (frame == null) {
                     break;
                 }
+                if ((frame.opcode & 0x8) != 0) {
+                    handleControlFrame(frame);
+                    continue;
+                }
                 switch (frame.opcode) {
-                    case OP_PING -> listener.onPing(socketApi, ByteBuffer.wrap(frame.payload));
-                    case OP_PONG -> listener.onPong(socketApi, ByteBuffer.wrap(frame.payload));
-                    case OP_CLOSE -> {
-                        int code = CLOSE_NO_STATUS;
-                        String reason = "";
-                        // RFC 6455 §5.5.1: CLOSE payload MUST be either 0
-                        // bytes (no status) or ≥ 2 bytes (2-byte code +
-                        // optional reason). A 1-byte payload is a protocol
-                        // error → CLOSE(1002).
-                        if (frame.payload.length == 1) {
-                            throw new IOException("CLOSE frame with 1-byte payload");
-                        }
-                        if (frame.payload.length >= 2) {
-                            code = ((frame.payload[0] & 0xFF) << 8) | (frame.payload[1] & 0xFF);
-                            if (frame.payload.length > 2) {
-                                reason = new String(frame.payload, 2,
-                                                    frame.payload.length - 2,
-                                                    StandardCharsets.UTF_8);
-                            }
-                        }
-                        // echo close back if we haven't already
-                        if (open) {
-                            try {
-                                sendCloseFrame(code, reason);
-                            } catch (IOException ignored) {
-                            }
-                        }
-                        closeCode = code;
-                        closeReason = reason;
-                        open = false;
-                    }
                     case OP_TEXT, OP_BINARY -> {
                         accumulator.reset(frame.opcode);
                         accumulator.append(frame.payload);
                         while (!frame.fin) {
                             Frame next = readFrame();
-                            if (next == null || next.opcode != OP_CONTINUATION) {
-                                throw new IOException("expected continuation frame");
+                            if (next == null) {
+                                throw new IOException("connection closed mid-fragment");
+                            }
+                            // RFC 6455 §5.4: control frames MAY be
+                            // interjected between fragments of a data
+                            // message. Process inline; keep waiting for
+                            // the continuation frame.
+                            if ((next.opcode & 0x8) != 0) {
+                                handleControlFrame(next);
+                                if (!open) break;
+                                continue;
+                            }
+                            if (next.opcode != OP_CONTINUATION) {
+                                throw new IOException("expected continuation frame, got opcode " + next.opcode);
                             }
                             accumulator.append(next.payload);
                             frame = next;
                         }
-                        Object message = accumulator.finish();
-                        listener.onMessage(socketApi, message);
+                        if (open) {
+                            Object message = accumulator.finish();
+                            listener.onMessage(socketApi, message);
+                        }
                     }
+                    case OP_CONTINUATION -> throw new IOException("unexpected CONTINUATION with no in-flight message");
                     default -> throw new IOException("unknown opcode: " + frame.opcode);
                 }
             }
+        } catch (Utf8Exception e) {
+            // Only send our CLOSE(1007) if we haven't already echoed a
+            // peer CLOSE. Otherwise the peer sees two CLOSE frames.
+            if (open) {
+                try {
+                    sendCloseFrame(CLOSE_INVALID_UTF8, "invalid UTF-8");
+                } catch (IOException ignored) {
+                }
+            }
+            try {
+                listener.onError(socketApi, e);
+            } catch (Throwable ignored) {
+            }
+            closeCode = CLOSE_INVALID_UTF8;
+            closeReason = "invalid UTF-8";
         } catch (IOException e) {
             try {
                 listener.onError(socketApi, e);
@@ -166,6 +173,47 @@ public final class WebSocketConnection {
                 listener.onClose(socketApi, closeCode, closeReason);
             } catch (Throwable ignored) {
             }
+        }
+    }
+
+    private void handleControlFrame(Frame frame) throws IOException {
+        switch (frame.opcode) {
+            case OP_PING -> listener.onPing(socketApi, ByteBuffer.wrap(frame.payload));
+            case OP_PONG -> listener.onPong(socketApi, ByteBuffer.wrap(frame.payload));
+            case OP_CLOSE -> {
+                int code = CLOSE_NO_STATUS;
+                String reason = "";
+                // RFC 6455 §5.5.1: CLOSE payload MUST be either 0 bytes
+                // (no status) or ≥ 2 bytes (2-byte code + optional
+                // reason). A 1-byte payload is a protocol error.
+                if (frame.payload.length == 1) {
+                    throw new IOException("CLOSE frame with 1-byte payload");
+                }
+                if (frame.payload.length >= 2) {
+                    code = ((frame.payload[0] & 0xFF) << 8) | (frame.payload[1] & 0xFF);
+                    if (frame.payload.length > 2) {
+                        // RFC 6455 §7.1.6: CLOSE reason MUST be UTF-8.
+                        Utf8Validator v = new Utf8Validator();
+                        if (!v.feed(frame.payload, 2, frame.payload.length - 2)
+                            || !v.isComplete()) {
+                            throw new Utf8Exception("invalid UTF-8 in CLOSE reason");
+                        }
+                        reason = new String(frame.payload, 2,
+                                            frame.payload.length - 2,
+                                            StandardCharsets.UTF_8);
+                    }
+                }
+                if (open) {
+                    try {
+                        sendCloseFrame(code, reason);
+                    } catch (IOException ignored) {
+                    }
+                }
+                closeCode = code;
+                closeReason = reason;
+                open = false;
+            }
+            default -> throw new IOException("unknown control opcode: " + frame.opcode);
         }
     }
 
@@ -324,6 +372,7 @@ public final class WebSocketConnection {
         private byte[] buf = new byte[0];
         private int len;
         private int opcode;
+        private final Utf8Validator utf8 = new Utf8Validator();
 
         MessageAccumulator(int limit) {
             this.limit = limit;
@@ -332,6 +381,7 @@ public final class WebSocketConnection {
         void reset(int opcode) {
             this.opcode = opcode;
             this.len = 0;
+            utf8.reset();
         }
 
         void append(byte[] data) throws IOException {
@@ -346,16 +396,89 @@ public final class WebSocketConnection {
             }
             System.arraycopy(data, 0, buf, len, data.length);
             len += data.length;
+            // RFC 6455 §5.6 + §8.1: text messages MUST be valid UTF-8;
+            // invalid → CLOSE(1007). Validate incrementally so we fail
+            // fast on the offending fragment (Autobahn §6.4) instead of
+            // waiting for message end.
+            if (opcode == OP_TEXT) {
+                if (!utf8.feed(data, 0, data.length)) {
+                    throw new Utf8Exception("invalid UTF-8 in text message");
+                }
+            }
         }
 
-        Object finish() {
+        Object finish() throws IOException {
             byte[] payload = new byte[len];
             System.arraycopy(buf, 0, payload, 0, len);
             if (opcode == OP_TEXT) {
+                if (!utf8.isComplete()) {
+                    throw new Utf8Exception("truncated UTF-8 sequence at message end");
+                }
                 return new String(payload, StandardCharsets.UTF_8);
             }
             return ByteBuffer.wrap(payload);
         }
+    }
+
+    /**
+     * Incremental UTF-8 validator based on Björn Höhrmann's public-domain
+     * DFA (<a href="https://bjoern.hoehrmann.de/utf-8/decoder/dfa/">source</a>).
+     * State survives across {@link #feed} calls so callers can validate
+     * a stream of bytes split across arbitrary fragment boundaries. We
+     * skip codepoint reconstruction — validation only.
+     */
+    static final class Utf8Validator {
+        private static final byte[] TABLE = new byte[] {
+            // byte → character class (0..11)
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+            1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,
+            7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7, 7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+            8,8,2,2,2,2,2,2,2,2,2,2,2,2,2,2, 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
+            10,3,3,3,3,3,3,3,3,3,3,3,3,4,3,3, 11,6,6,6,5,8,8,8,8,8,8,8,8,8,8,8,
+            // (state, class) → next state, indexed as [256 + state + class]
+            0,12,24,36,60,96,84,12,12,12,48,72,
+            12, 0,12,12,12,12,12, 0,12, 0,12,12,
+            12,24,12,12,12,12,12,24,12,24,12,12,
+            12,12,12,12,12,12,12,24,12,12,12,12,
+            12,24,12,12,12,12,12,12,12,24,12,12,
+            12,12,12,12,12,12,12,36,12,36,12,12,
+            12,36,12,12,12,12,12,36,12,36,12,12,
+            12,36,12,12,12,12,12,12,12,12,12,12,
+        };
+        private static final int ACCEPT = 0;
+        private static final int REJECT = 12;
+
+        private int state = ACCEPT;
+
+        boolean feed(byte[] data, int off, int len) {
+            int s = state;
+            for (int i = 0; i < len; i++) {
+                int type = TABLE[data[off + i] & 0xFF] & 0xFF;
+                s = TABLE[256 + s + type] & 0xFF;
+                if (s == REJECT) {
+                    state = REJECT;
+                    return false;
+                }
+            }
+            state = s;
+            return true;
+        }
+
+        boolean isComplete() {
+            return state == ACCEPT;
+        }
+
+        void reset() {
+            state = ACCEPT;
+        }
+    }
+
+    /** Signals invalid UTF-8 so the close-code mapper can emit CLOSE(1007). */
+    private static final class Utf8Exception extends IOException {
+        Utf8Exception(String msg) { super(msg); }
     }
 
     private final class SocketImpl implements WebSocketSocket {

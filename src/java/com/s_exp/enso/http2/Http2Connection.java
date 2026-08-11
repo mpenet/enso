@@ -610,6 +610,10 @@ public final class Http2Connection implements Runnable {
         int off = 0;
         int len = f.length;
         if ((f.flags & Http2.FLAG_PADDED) != 0) {
+            if (len < 1) {
+                throw new Http2.ConnectionError(
+                    Http2.ERROR_PROTOCOL_ERROR, "HEADERS PADDED with no pad-length byte");
+            }
             int padLen = payload[0] & 0xFF;
             off = 1;
             len = len - 1 - padLen;
@@ -825,6 +829,10 @@ public final class Http2Connection implements Runnable {
         int off = 0;
         int len = frameLen;
         if ((f.flags & Http2.FLAG_PADDED) != 0) {
+            if (len < 1) {
+                throw new Http2.ConnectionError(
+                    Http2.ERROR_PROTOCOL_ERROR, "DATA PADDED with no pad-length byte");
+            }
             int padLen = payload[0] & 0xFF;
             off = 1;
             len = len - 1 - padLen;

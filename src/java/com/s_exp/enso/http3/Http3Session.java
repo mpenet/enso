@@ -322,7 +322,7 @@ public final class Http3Session {
         try {
             rs.reader.feed(data, off, len);
         } catch (IllegalStateException e) {
-            releaseReader(requestStreams.remove(streamId));
+            discardReader(requestStreams.remove(streamId));
             throw new Http3ConnectionException(
                 Http3ConnectionException.H3_FRAME_ERROR,
                 "request-stream reader: " + e.getMessage());
@@ -332,7 +332,7 @@ public final class Http3Session {
             try {
                 f = rs.reader.poll();
             } catch (IllegalStateException e) {
-                releaseReader(requestStreams.remove(streamId));
+                discardReader(requestStreams.remove(streamId));
                 throw new Http3ConnectionException(
                     Http3ConnectionException.H3_FRAME_ERROR,
                     "request-stream reader: " + e.getMessage());
@@ -345,7 +345,7 @@ public final class Http3Session {
                 || f.type == Http3FrameType.MAX_PUSH_ID
                 || f.type == Http3FrameType.CANCEL_PUSH
                 || f.type == Http3FrameType.PUSH_PROMISE) {
-                releaseReader(requestStreams.remove(streamId));
+                discardReader(requestStreams.remove(streamId));
                 throw new Http3ConnectionException(
                     Http3ConnectionException.H3_FRAME_UNEXPECTED,
                     "frame type 0x" + Long.toHexString(f.type)
@@ -363,7 +363,7 @@ public final class Http3Session {
                     // task #155 — we were resetting the stream instead
                     // of closing the connection, so the error code never
                     // reached the peer.
-                    releaseReader(requestStreams.remove(streamId));
+                    discardReader(requestStreams.remove(streamId));
                     throw new Http3ConnectionException(
                         qe.errorCode(),
                         "QPACK decode failed on stream " + streamId
@@ -523,7 +523,10 @@ public final class Http3Session {
      */
     private static ByteBuffer appendToAccum(ByteBuffer accum, ByteBuffer more) {
         int incoming = more.remaining();
-        if (accum == null || accum.remaining() == 0) {
+        // Only null check — remaining==0 with non-null accum is legitimate
+        // state that must NOT overwrite. compactRemaining returns null for
+        // rem==0, but conservative guard avoids future foot-guns.
+        if (accum == null) {
             int cap = Math.max(32, incoming);
             ByteBuffer nb = ByteBuffer.allocate(cap);
             nb.put(more);
@@ -1033,6 +1036,20 @@ public final class Http3Session {
             rs.reader.reset();
             readerPool.offerFirst(rs.reader);
         }
+    }
+
+    /**
+     * Drop a reader without returning it to the pool. Used on error
+     * paths that raise {@link Http3ConnectionException}: the reader may
+     * hold a partial frame with corrupt pending-length state; pooling
+     * risks handing bad state to a future stream. The whole session
+     * closes on the exception, so no future request will hit the pool
+     * on the SAME connection — but if a stream reset somehow surfaces
+     * without connection close, discarding is the safe default.
+     */
+    private void discardReader(RequestStream rs) {
+        // No-op; rs falls out of scope + GC. Named site for future
+        // observability. Reader is NOT reset (state may be poisoned).
     }
 
     /**

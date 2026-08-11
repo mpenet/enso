@@ -313,6 +313,8 @@ Java_com_s_1exp_enso_quiche_Quiche_headerInfo(
         jbyteArray dcidArr, jlongArray dcidLenArr,
         jbyteArray tokenArr, jlongArray tokenLenArr) {
     UNUSED(cls);
+    jsize bufArrLen = (*env)->GetArrayLength(env, bufArr);
+    if (bufLen < 0 || bufLen > bufArrLen) return -6;
     jbyte *buf = NULL, *scid = NULL, *dcid = NULL, *token = NULL;
     int rc = -1;
     GET_BYTES_OR_GOTO(buf, bufArr, hdrinfo_unwind);
@@ -324,6 +326,17 @@ Java_com_s_1exp_enso_quiche_Quiche_headerInfo(
     (*env)->GetLongArrayRegion(env, scidLenArr, 0, 1, &scidLenJ);
     (*env)->GetLongArrayRegion(env, dcidLenArr, 0, 1, &dcidLenJ);
     (*env)->GetLongArrayRegion(env, tokenLenArr, 0, 1, &tokenLenJ);
+
+    /* Caller-supplied max sizes must fit inside pinned arrays or quiche
+     * will write past the region. */
+    jsize scidArrLen = (*env)->GetArrayLength(env, scidArr);
+    jsize dcidArrLen = (*env)->GetArrayLength(env, dcidArr);
+    jsize tokenArrLen = (*env)->GetArrayLength(env, tokenArr);
+    if (scidLenJ < 0 || scidLenJ > scidArrLen ||
+        dcidLenJ < 0 || dcidLenJ > dcidArrLen ||
+        tokenLenJ < 0 || tokenLenJ > tokenArrLen) {
+        goto hdrinfo_unwind;
+    }
 
     size_t scidLen = (size_t)scidLenJ;
     size_t dcidLen = (size_t)dcidLenJ;
@@ -417,6 +430,11 @@ Java_com_s_1exp_enso_quiche_Quiche_connRecv(
     socklen_t fromLen = build_sockaddr(env, fromIp, fromPort, &from);
     socklen_t toLen = build_sockaddr(env, toIp, toPort, &to);
     if (fromLen == 0 || toLen == 0) return -6; /* QUICHE_ERR_INVALID_STATE (-1 = DONE would silent-drop) */
+    /* Bounds-check caller-supplied length against actual array length.
+     * A bug in the Java layer that passes bufLen > array.length would
+     * make libquiche read past the pinned region → OOB / crash. */
+    jsize arrLen = (*env)->GetArrayLength(env, bufArr);
+    if (bufLen < 0 || bufLen > arrLen) return -6;
     quiche_recv_info info = {
         .from = (struct sockaddr *)&from, .from_len = fromLen,
         .to = (struct sockaddr *)&to, .to_len = toLen,
@@ -434,6 +452,8 @@ Java_com_s_1exp_enso_quiche_Quiche_connSend(
         JNIEnv *env, jclass cls, jlong conn,
         jbyteArray outArr, jint outLen) {
     UNUSED(cls);
+    jsize arrLen = (*env)->GetArrayLength(env, outArr);
+    if (outLen < 0 || outLen > arrLen) return -6;
     /* We ignore send_info for now (no path migration). Allocate on stack. */
     quiche_send_info info;
     memset(&info, 0, sizeof(info));
@@ -484,6 +504,8 @@ Java_com_s_1exp_enso_quiche_Quiche_connStreamRecv(
         jbyteArray outArr, jint outLen,
         jbooleanArray finOut, jlongArray errOut) {
     UNUSED(cls);
+    jsize arrLen = (*env)->GetArrayLength(env, outArr);
+    if (outLen < 0 || outLen > arrLen) return -6;
     jbyte *out;
     GET_BYTES_OR_RETURN(out, outArr, -1);
     bool fin = false;
@@ -506,6 +528,8 @@ Java_com_s_1exp_enso_quiche_Quiche_connStreamSend(
         JNIEnv *env, jclass cls, jlong conn, jlong streamId,
         jbyteArray bufArr, jint off, jint len, jboolean fin) {
     UNUSED(cls);
+    jsize arrLen = (*env)->GetArrayLength(env, bufArr);
+    if (off < 0 || len < 0 || (jlong)off + (jlong)len > (jlong)arrLen) return -6;
     jbyte *buf;
     GET_BYTES_OR_RETURN(buf, bufArr, -1);
     uint64_t err = 0;
