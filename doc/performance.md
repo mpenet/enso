@@ -9,9 +9,9 @@ wrk against a plain 404 responder.
 
 | Workload | Ensō | http-kit | Jetty | Aleph |
 |---|---|---|---|---|
-| non-pipelined, `-c64` | **127.8k** | 123.8k | 110.5k | 85.8k |
+| non-pipelined, `-c64` | **126.9k** | 123.1k | 111.6k | 85.8k |
 | pipelined depth 16 | **1.88M** | 523k | 232k | 71k |
-| pipelined depth 64 | **5.13M** | 550k | 244k | 73k |
+| pipelined depth 64 | **5.19M** | 561k | 247k | 73k |
 
 Ensō leads across the board, especially on pipelined workloads.
 
@@ -37,11 +37,11 @@ streams each = **320,000 requests total**. Self-signed cert, plaintext
 
 | Server | rps | wall (ms) |
 |---|---:|---:|
-| **Ensō** | **53,235** | 6011 |
-| Netty h3 (incubator 0.0.28, native quic 0.0.66, BoringSSL, vendored quiche master) | 52,253 | 6124 |
-| Jetty h3 (12.0.14, JNA quiche) | 2,766 | 115,707 |
+| **Ensō** | **58,356** | 5484 |
+| Netty h3 (incubator 0.0.28, native quic 0.0.66, BoringSSL, vendored quiche master) | 43,268 | 7396 |
+| Jetty h3 (12.0.14, JNA quiche) | 2,804 | 114,142 |
 
-Ensō ~2% ahead of Netty (both use libquiche + JNI), ~19× Jetty (JNA path).
+Ensō ~35% ahead of Netty (both use libquiche + JNI), ~21× Jetty (JNA path).
 0 failures across all runs.
 
 ## Allocation

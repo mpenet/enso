@@ -8,8 +8,8 @@ server adapter for Clojure.
 Java core optimized for Ring, not a wrapper.  Built on/for virtual
 threads. Plain sync handler.
 
-- **Fast.** ~5M rps pipelined depth 64 (HTTP/1.1); ~894k rps HTTP/2 over
-  TLS; ~53k rps HTTP/3 (edges Netty by ~2%, ~19× Jetty).
+- **Fast.** ~5.2M rps pipelined depth 64 (HTTP/1.1); ~894k rps HTTP/2 over
+  TLS; ~58k rps HTTP/3 (~35% faster than Netty, ~21× Jetty).
 - **Low allocation.** ~0.001 sample/req at 1 MB TLAB interval — near-zero
   GC pressure on hot paths.
 - **Zero third-party Java dependencies.** Java core + thin Clojure adapter.
@@ -22,8 +22,8 @@ threads. Plain sync handler.
 - **HTTP/2.** ALPN over TLS (`:http2 true`). h2spec pass.
 - **HTTP/3.** Cloudflare `libquiche` over UDP via JNI shim. Pure-Java
   QPACK + H3 framing on top of quiche's transport primitives. Alt-Svc
-  auto-advertised from h1/h2 responses when h3 enabled. **Faster than
-  Netty h3 in bench** — see [doc/performance.md](doc/performance.md).
+  auto-advertised from h1/h2 responses when h3 enabled. **~35% faster
+  than Netty h3 in bench** — see [doc/performance.md](doc/performance.md).
 - **WebSocket.** Ring 1.5+ listener shape. 
 - **SSE / long-poll.** Streaming writer 
 - **Correct.** Rejects request smuggling, header injection, slowloris.
