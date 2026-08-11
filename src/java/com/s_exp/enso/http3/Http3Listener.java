@@ -133,11 +133,15 @@ public final class Http3Listener implements AutoCloseable {
                 if (from == null) continue;
                 buf.flip();
                 onDatagram(buf, (InetSocketAddress) from, scratch);
-            } catch (java.nio.channels.AsynchronousCloseException e) {
+            } catch (java.nio.channels.ClosedChannelException e) {
+                // Channel closed — real shutdown signal, exit.
                 return;
             } catch (IOException e) {
-                if (running) LOG.log(Level.WARNING, "h3 receive failed", e);
-                return;
+                // Transient: PortUnreachableException (ICMP), NoRouteToHost,
+                // etc. Log and keep serving other peers. Killing the whole
+                // demuxer here would take down every h3 connection over
+                // one misbehaving peer.
+                if (running) LOG.log(Level.WARNING, "h3 receive failed (continuing)", e);
             } catch (Throwable t) {
                 LOG.log(Level.WARNING, "h3 demux crash", t);
             }

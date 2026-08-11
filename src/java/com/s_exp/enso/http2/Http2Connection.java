@@ -76,11 +76,35 @@ public final class Http2Connection implements Runnable {
     // scheduler.
     private final ReentrantLock streamLock = new ReentrantLock();
 
-    // Outbound write queue. Workers enqueue framed byte[]s; a dedicated writer
-    // vthread drains and writes them to the socket. Coalesces concurrent
-    // responses across streams into a single flush cycle, cutting the
-    // per-response write() syscall cost. See DESIGN-http2.md, Phase 9.
-    private final ArrayDeque<byte[]> writeQueue = new ArrayDeque<>();
+    // Outbound write queue. Workers enqueue FrameSeg (9-byte header +
+    // payload slice); a dedicated writer vthread drains and writes them to
+    // the socket. Coalesces concurrent responses across streams into a
+    // single flush cycle, cutting the per-response write() syscall cost.
+    // FrameSeg avoids the old byte[9+len] envelope alloc — the payload
+    // buffer is referenced by (off, len), not copied. See DESIGN-http2.md,
+    // Phase 9.
+    private final ArrayDeque<FrameSeg> writeQueue = new ArrayDeque<>();
+
+    /**
+     * Frame envelope: header prefix + payload segment. Header is a
+     * freshly-allocated 9-byte array (cheap, TLAB-friendly). Payload is a
+     * reference into a caller-owned buffer that must remain stable until
+     * the writer drains it — typical sources (HPACK-encoded blocks,
+     * response DATA byte[]s) are fresh so this holds.
+     */
+    private static final class FrameSeg {
+        final byte[] header;
+        final byte[] payload;
+        final int off;
+        final int len;
+
+        FrameSeg(byte[] header, byte[] payload, int off, int len) {
+            this.header = header;
+            this.payload = payload;
+            this.off = off;
+            this.len = len;
+        }
+    }
     private final ReentrantLock queueLock = new ReentrantLock();
     private final Condition notEmpty = queueLock.newCondition();
     private final Condition notFull = queueLock.newCondition();
@@ -259,14 +283,14 @@ public final class Http2Connection implements Runnable {
     private static final int WRITER_SCRATCH_MAX = 1 << 20; // 1 MiB
 
     private void writerLoop() {
-        byte[][] batch = new byte[WRITE_BATCH_MAX][];
+        FrameSeg[] batch = new FrameSeg[WRITE_BATCH_MAX];
         byte[] scratch = new byte[16 * 1024];
         while (true) {
             int n = drainBatch(batch);
             if (n == 0) return;
             try {
                 int total = 0;
-                for (int i = 0; i < n; i++) total += batch[i].length;
+                for (int i = 0; i < n; i++) total += Http2.FRAME_HEADER_SIZE + batch[i].len;
                 byte[] dst;
                 if (total <= scratch.length) {
                     dst = scratch;
@@ -285,9 +309,13 @@ public final class Http2Connection implements Runnable {
                 }
                 int p = 0;
                 for (int i = 0; i < n; i++) {
-                    byte[] b = batch[i];
-                    System.arraycopy(b, 0, dst, p, b.length);
-                    p += b.length;
+                    FrameSeg fs = batch[i];
+                    System.arraycopy(fs.header, 0, dst, p, Http2.FRAME_HEADER_SIZE);
+                    p += Http2.FRAME_HEADER_SIZE;
+                    if (fs.len > 0) {
+                        System.arraycopy(fs.payload, fs.off, dst, p, fs.len);
+                        p += fs.len;
+                    }
                     batch[i] = null;
                 }
                 out.write(dst, 0, total);
@@ -309,7 +337,7 @@ public final class Http2Connection implements Runnable {
         }
     }
 
-    private int drainBatch(byte[][] batch) {
+    private int drainBatch(FrameSeg[] batch) {
         queueLock.lock();
         try {
             while (writeQueue.isEmpty()) {
@@ -332,11 +360,11 @@ public final class Http2Connection implements Runnable {
     }
 
     /**
-     * Appends {@code data} to the write queue. Blocks on {@link #notFull} when
+     * Appends {@code seg} to the write queue. Blocks on {@link #notFull} when
      * the queue is at hi-water so a slow socket applies back-pressure to
      * workers instead of ballooning memory.
      */
-    private void enqueue(byte[] data) throws IOException {
+    private void enqueue(FrameSeg seg) throws IOException {
         queueLock.lock();
         try {
             while (writeQueue.size() >= WRITE_QUEUE_MAX) {
@@ -348,7 +376,7 @@ public final class Http2Connection implements Runnable {
                     throw new IOException("interrupted waiting on write queue");
                 }
             }
-            writeQueue.addLast(data);
+            writeQueue.addLast(seg);
             notEmpty.signal();
         } finally {
             queueLock.unlock();
@@ -606,7 +634,12 @@ public final class Http2Connection implements Runnable {
                 throw new Http2.ConnectionError(
                     Http2.ERROR_PROTOCOL_ERROR, "stream ID not strictly increasing");
             }
-            highestPeerStreamId = f.streamId;
+            // Defer highestPeerStreamId bump until finalizeHeaderBlock
+            // commits streams.put — otherwise a mid-path failure (bad
+            // HPACK, header validation) leaves the counter advanced past
+            // a stream we never actually created. RFC 9113 §6.8 GOAWAY
+            // semantics rely on the last-stream-id reflecting streams
+            // "possibly acted on".
         } else {
             // RFC 9113 §8.1: a second HEADERS on an existing stream is a
             // trailers block. Must set END_STREAM, must not appear on a
@@ -811,6 +844,11 @@ public final class Http2Connection implements Runnable {
             stream.signalEndOfBody();
         }
         streams.put(streamId, stream);
+        // Advance last-received-stream-id only after commit so a GOAWAY
+        // sent later reports an accurate boundary (see comment in
+        // handleHeaders).
+        if (streamId > highestPeerStreamId) highestPeerStreamId = streamId;
+
 
         Request request = buildRequest(fields, stream);
         if (request == null) {
@@ -1104,17 +1142,45 @@ public final class Http2Connection implements Runnable {
         }
     }
 
+    // Codes 100..599 pre-formatted so hot-path :status pseudo-header
+    // skips Integer.toString per response.
+    private static final int STATUS_MIN = 100;
+    private static final String[] STATUS_STRINGS = buildStatusStrings();
+    private static String[] buildStatusStrings() {
+        String[] s = new String[500];
+        for (int i = 0; i < s.length; i++) s[i] = Integer.toString(STATUS_MIN + i);
+        return s;
+    }
+    private static String statusString(int code) {
+        int idx = code - STATUS_MIN;
+        if (idx >= 0 && idx < STATUS_STRINGS.length) return STATUS_STRINGS[idx];
+        return Integer.toString(code);
+    }
+
+    private static boolean hasUpperAscii(String s) {
+        for (int i = 0, n = s.length(); i < n; i++) {
+            char c = s.charAt(i);
+            if (c >= 'A' && c <= 'Z') return true;
+        }
+        return false;
+    }
+
     private void writeResponse(Http2Stream stream, int status,
                                Map<?, ?> respHeaders, Object body) throws IOException {
         // Assemble the header block: :status pseudo-header first, then user headers.
         List<Hpack.HeaderField> fields = new ArrayList<>(
             (respHeaders == null ? 0 : respHeaders.size()) + 1);
-        fields.add(new Hpack.HeaderField(":status", Integer.toString(status)));
+        fields.add(new Hpack.HeaderField(":status", statusString(status)));
         boolean hasAltSvc = false;
         boolean hasServer = false;
         if (respHeaders != null) {
             for (Map.Entry<?, ?> e : respHeaders.entrySet()) {
-                String name = String.valueOf(e.getKey()).toLowerCase(java.util.Locale.ROOT);
+                String rawName = String.valueOf(e.getKey());
+                // Skip toLowerCase alloc when caller already normalised
+                // — most Ring middleware emits lowercase names.
+                String name = hasUpperAscii(rawName)
+                    ? rawName.toLowerCase(java.util.Locale.ROOT)
+                    : rawName;
                 if (name.equals("connection") || name.equals("transfer-encoding")
                     || name.equals("keep-alive") || name.equals("upgrade")
                     || name.equals("proxy-connection")) {
@@ -1498,20 +1564,17 @@ public final class Http2Connection implements Runnable {
      */
     private void writeFrame(int type, int flags, int streamId,
                             byte[] payload, int off, int len) throws IOException {
-        byte[] frame = new byte[Http2.FRAME_HEADER_SIZE + len];
-        frame[0] = (byte) ((len >>> 16) & 0xFF);
-        frame[1] = (byte) ((len >>>  8) & 0xFF);
-        frame[2] = (byte) (len & 0xFF);
-        frame[3] = (byte) type;
-        frame[4] = (byte) flags;
-        frame[5] = (byte) ((streamId >>> 24) & 0x7F);
-        frame[6] = (byte) ((streamId >>> 16) & 0xFF);
-        frame[7] = (byte) ((streamId >>>  8) & 0xFF);
-        frame[8] = (byte) (streamId & 0xFF);
-        if (len > 0) {
-            System.arraycopy(payload, off, frame, Http2.FRAME_HEADER_SIZE, len);
-        }
-        enqueue(frame);
+        byte[] header = new byte[Http2.FRAME_HEADER_SIZE];
+        header[0] = (byte) ((len >>> 16) & 0xFF);
+        header[1] = (byte) ((len >>>  8) & 0xFF);
+        header[2] = (byte) (len & 0xFF);
+        header[3] = (byte) type;
+        header[4] = (byte) flags;
+        header[5] = (byte) ((streamId >>> 24) & 0x7F);
+        header[6] = (byte) ((streamId >>> 16) & 0xFF);
+        header[7] = (byte) ((streamId >>>  8) & 0xFF);
+        header[8] = (byte) (streamId & 0xFF);
+        enqueue(new FrameSeg(header, payload, off, len));
     }
 
     /**

@@ -289,6 +289,16 @@ public final class TlsSocket implements AutoCloseable {
         @Override public void setSoTimeout(int t) throws java.net.SocketException {
             tls.channel.socket().setSoTimeout(t);
         }
+        // AcceptLoop applies socket buffer sizes to whatever socket the
+        // listener produced. The default Socket impl has no backing fd on
+        // AdapterSocket and throws SocketException; forward to the real
+        // socket underneath the SocketChannel.
+        @Override public void setSendBufferSize(int size) throws java.net.SocketException {
+            tls.channel.socket().setSendBufferSize(size);
+        }
+        @Override public void setReceiveBufferSize(int size) throws java.net.SocketException {
+            tls.channel.socket().setReceiveBufferSize(size);
+        }
     }
 
     // ---- Input stream --------------------------------------------------

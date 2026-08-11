@@ -146,6 +146,12 @@ public final class HpackHuffman {
     private static final int[] TREE_LEFT;
     private static final int[] TREE_RIGHT;
     private static final int[] TREE_SYMBOL;
+    // 4-bit nibble decode acceleration. Built once from the bit-level
+    // tree below. Avoids the per-bit array-load + branch overhead of
+    // the tree walker at the cost of ~24 KiB static table.
+    private static final int NIBBLE_STATE_COUNT;
+    private static final int[] NIBBLE_TABLE;
+    private static final int[] NIBBLE_NEXT;
 
     static {
         // Upper bound on node count: 257 leaves + up to 30 internal per branch.
@@ -191,7 +197,52 @@ public final class HpackHuffman {
         TREE_LEFT = left;
         TREE_RIGHT = right;
         TREE_SYMBOL = symbol;
+        // Build 4-bit nibble decode table. For each (state, nibble) pair,
+        // precompute: next state, symbols emitted (0..2), and a validity
+        // flag. Skips ~4x the per-bit overhead of the tree walker: one
+        // table lookup per nibble instead of four bit-shift + array-load
+        // pairs plus per-bit branch.
+        int stateCount = next;
+        NIBBLE_STATE_COUNT = stateCount;
+        NIBBLE_TABLE = new int[stateCount * 16];
+        // Packed layout per entry (32 bits):
+        //   bits 24-31 : status  (0=ok, 1=invalid)
+        //   bits 20-23 : symbolCount (0..2)
+        //   bits 10-19 : symbol[1]  (9-bit fits 0..511)
+        //   bits  0- 9 : symbol[0]
+        //   bits 24..  : (also reused for state; separate slot below)
+        // We keep next-state in a parallel short[] to keep the packed
+        // int free for symbols.
+        NIBBLE_NEXT = new int[stateCount * 16];
+        for (int s = 0; s < stateCount; s++) {
+            for (int nib = 0; nib < 16; nib++) {
+                int node = s;
+                int sym0 = -1, sym1 = -1;
+                int count = 0;
+                boolean invalid = false;
+                for (int b = 3; b >= 0; b--) {
+                    int bit = (nib >>> b) & 1;
+                    node = (bit == 0) ? left[node] : right[node];
+                    if (node == -1) { invalid = true; break; }
+                    int sy = symbol[node];
+                    if (sy != -1) {
+                        if (count == 0) sym0 = sy;
+                        else if (count == 1) sym1 = sy;
+                        else { invalid = true; break; }
+                        count++;
+                        node = 0;
+                    }
+                }
+                int packed = (invalid ? 1 << 24 : 0)
+                    | (count << 20)
+                    | ((sym1 & 0x3FF) << 10)
+                    | (sym0 & 0x3FF);
+                NIBBLE_TABLE[s * 16 + nib] = packed;
+                NIBBLE_NEXT[s * 16 + nib] = node;
+            }
+        }
     }
+
 
     /**
      * Decodes Huffman-encoded {@code src[off..off+len]} into a fresh byte[].
@@ -221,48 +272,64 @@ public final class HpackHuffman {
      */
     public static int decodeInto(byte[] src, int off, int len, byte[] dst) throws IOException {
         int outLen = 0;
-        int node = 0;
-        int bitsSeen = 0;
+        int state = 0;
         for (int i = 0; i < len; i++) {
             int b = src[off + i] & 0xFF;
-            for (int bit = 7; bit >= 0; bit--) {
-                int taken = (b >>> bit) & 1;
-                node = (taken == 0) ? TREE_LEFT[node] : TREE_RIGHT[node];
-                bitsSeen++;
-                if (node == -1) {
-                    throw new IOException("HPACK Huffman: invalid code");
-                }
-                int sym = TREE_SYMBOL[node];
-                if (sym != -1) {
-                    if (sym == EOS_SYMBOL) {
-                        throw new IOException("HPACK Huffman: EOS symbol in stream");
-                    }
-                    if (outLen == dst.length) {
-                        throw new IOException("HPACK Huffman: output buffer overflow");
-                    }
-                    dst[outLen++] = (byte) sym;
-                    node = 0;
-                    bitsSeen = 0;
+            // Two nibble lookups per byte instead of eight bit-level tree
+            // walks. Each entry packs (invalidFlag | symbolCount | sym1 |
+            // sym0); next state lives in the parallel NIBBLE_NEXT array.
+            int hi = (b >>> 4) & 0xF;
+            int idx = state * 16 + hi;
+            int packed = NIBBLE_TABLE[idx];
+            if ((packed >>> 24) != 0) {
+                throw new IOException("HPACK Huffman: invalid code");
+            }
+            int count = (packed >>> 20) & 0xF;
+            if (count > 0) {
+                int s0 = packed & 0x3FF;
+                if (s0 == EOS_SYMBOL) throw new IOException("HPACK Huffman: EOS symbol in stream");
+                if (outLen == dst.length) throw new IOException("HPACK Huffman: output buffer overflow");
+                dst[outLen++] = (byte) s0;
+                if (count > 1) {
+                    int s1 = (packed >>> 10) & 0x3FF;
+                    if (s1 == EOS_SYMBOL) throw new IOException("HPACK Huffman: EOS symbol in stream");
+                    if (outLen == dst.length) throw new IOException("HPACK Huffman: output buffer overflow");
+                    dst[outLen++] = (byte) s1;
                 }
             }
+            state = NIBBLE_NEXT[idx];
+
+            int lo = b & 0xF;
+            idx = state * 16 + lo;
+            packed = NIBBLE_TABLE[idx];
+            if ((packed >>> 24) != 0) {
+                throw new IOException("HPACK Huffman: invalid code");
+            }
+            count = (packed >>> 20) & 0xF;
+            if (count > 0) {
+                int s0 = packed & 0x3FF;
+                if (s0 == EOS_SYMBOL) throw new IOException("HPACK Huffman: EOS symbol in stream");
+                if (outLen == dst.length) throw new IOException("HPACK Huffman: output buffer overflow");
+                dst[outLen++] = (byte) s0;
+                if (count > 1) {
+                    int s1 = (packed >>> 10) & 0x3FF;
+                    if (s1 == EOS_SYMBOL) throw new IOException("HPACK Huffman: EOS symbol in stream");
+                    if (outLen == dst.length) throw new IOException("HPACK Huffman: output buffer overflow");
+                    dst[outLen++] = (byte) s1;
+                }
+            }
+            state = NIBBLE_NEXT[idx];
         }
-        // Trailing bits must be a prefix of the EOS symbol (all 1s), at most 7 bits.
-        if (bitsSeen > 7) {
-            throw new IOException("HPACK Huffman: incomplete symbol at end of stream");
-        }
-        if (bitsSeen > 0) {
-            // Check trailing bits were all 1s by walking from the current node —
-            // it must be reachable from root by following only 'right' links.
+        // Trailing padding: state MUST be reachable from root by
+        // following ≤7 all-1 bits. Walk `right` from root and check.
+        if (state != 0) {
             int check = 0;
-            for (int i = 0; i < bitsSeen; i++) {
+            for (int i = 0; i < 8; i++) {
+                if (check == state) return outLen;
                 check = TREE_RIGHT[check];
-                if (check == -1) {
-                    throw new IOException("HPACK Huffman: invalid padding");
-                }
+                if (check == -1) break;
             }
-            if (check != node) {
-                throw new IOException("HPACK Huffman: invalid padding");
-            }
+            throw new IOException("HPACK Huffman: invalid padding");
         }
         return outLen;
     }

@@ -39,16 +39,19 @@ public final class HttpDates {
         long now = System.currentTimeMillis();
         long second = now / 1000;
         Snapshot cached = CACHE.get();
-        if (second != cached.second) {
-            String value = IMF_FIXDATE.format(Instant.ofEpochMilli(now));
-            byte[] line = ("Date: " + value + "\r\n").getBytes(StandardCharsets.ISO_8859_1);
-            Snapshot fresh = new Snapshot(second, value, line);
-            // Racy writers all produce the same value for a given second;
-            // whichever set() wins is fine — no CAS retry needed.
-            CACHE.set(fresh);
-            return fresh;
+        if (second == cached.second) return cached;
+        String value = IMF_FIXDATE.format(Instant.ofEpochMilli(now));
+        byte[] line = ("Date: " + value + "\r\n").getBytes(StandardCharsets.ISO_8859_1);
+        Snapshot fresh = new Snapshot(second, value, line);
+        // CAS instead of blind set: under scheduler pauses a slow thread
+        // computing second=N could overwrite a newer second=N+1 already
+        // installed by a faster thread. CAS makes stale writes lose so
+        // the cache always monotonically advances.
+        while (!CACHE.compareAndSet(cached, fresh)) {
+            cached = CACHE.get();
+            if (cached.second >= second) return cached;
         }
-        return cached;
+        return fresh;
     }
 
     private static final class Snapshot {

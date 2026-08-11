@@ -24,6 +24,12 @@ public final class RetryToken {
 
     private static final byte[] MAGIC = { 'e', 'n', '3', '0' };
     private static final int HMAC_LEN = 32; // SHA-256
+    // 8-byte issued-at (seconds since epoch, big-endian) folded into the
+    // token body between MAGIC and the peer address. Verify rejects
+    // tokens older than TOKEN_MAX_AGE_SECONDS. Bounds replay of a stolen
+    // token to a small window.
+    static final int ISSUED_AT_LEN = 8;
+    static final long TOKEN_MAX_AGE_SECONDS = 10;
 
     private final Mac mac;
 
@@ -50,10 +56,14 @@ public final class RetryToken {
         // to 1 (the returned array).
         byte[] ip = peer.getAddress().getAddress();
         int addrLen = ip.length + 2; // ip + 2-byte port (matches verify layout)
-        int bodyLen = MAGIC.length + addrLen + 1 + odcid.length;
+        int bodyLen = MAGIC.length + ISSUED_AT_LEN + addrLen + 1 + odcid.length;
         byte[] out = new byte[HMAC_LEN + bodyLen];
         int p = HMAC_LEN;
         System.arraycopy(MAGIC, 0, out, p, MAGIC.length); p += MAGIC.length;
+        long issuedAt = System.currentTimeMillis() / 1000L;
+        for (int i = 7; i >= 0; i--) {
+            out[p++] = (byte) ((issuedAt >>> (i * 8)) & 0xFF);
+        }
         System.arraycopy(ip, 0, out, p, ip.length); p += ip.length;
         int port = peer.getPort();
         out[p++] = (byte) ((port >>> 8) & 0xFF);
@@ -77,7 +87,7 @@ public final class RetryToken {
      *   address match; {@code null} on any mismatch.
      */
     public byte[] verify(byte[] token, InetSocketAddress peer) {
-        if (token == null || token.length < HMAC_LEN + MAGIC.length + 1) return null;
+        if (token == null || token.length < HMAC_LEN + MAGIC.length + ISSUED_AT_LEN + 1) return null;
         // Slice-based verify — no intermediate body[] / copyOfRange
         // (task #145). HMAC over the tail via mac.update(off,len).
         byte[] tag;
@@ -94,6 +104,15 @@ public final class RetryToken {
         for (int i = 0; i < MAGIC.length; i++) {
             if (p >= end || token[p++] != MAGIC[i]) return null;
         }
+        // 8-byte issued-at (seconds). Reject stale or future-dated tokens.
+        if (p + ISSUED_AT_LEN > end) return null;
+        long issuedAt = 0;
+        for (int i = 0; i < 8; i++) {
+            issuedAt = (issuedAt << 8) | (token[p++] & 0xFFL);
+        }
+        long nowSec = System.currentTimeMillis() / 1000L;
+        long age = nowSec - issuedAt;
+        if (age < -1 || age > TOKEN_MAX_AGE_SECONDS) return null;
         // Peer IP: 4 bytes v4 or 16 bytes v6.
         byte[] ip = peer.getAddress().getAddress();
         for (int i = 0; i < ip.length; i++) {

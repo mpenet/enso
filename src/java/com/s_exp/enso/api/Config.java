@@ -36,6 +36,15 @@ public final class Config {
     /** 0 → OS default. */
     public final int soSndBuf;
     public final SSLContext sslContext;
+    /**
+     * Live SSLContext supplier — called per-accept so cert rotation
+     * takes effect without restart. When non-null, wins over
+     * {@link #sslContext} for the accept path (the static field still
+     * mirrors the initial context so validation + one-off setup calls
+     * can inspect it). Callers typically back this with an
+     * {@code AtomicReference<SSLContext>} they atomically swap.
+     */
+    public final java.util.function.Supplier<SSLContext> sslContextProvider;
     public final boolean sslNeedClientAuth;
     public final boolean sslWantClientAuth;
     /** null → auto (h2 + http/1.1 when http2 enabled). */
@@ -118,6 +127,7 @@ public final class Config {
         this.soRcvBuf = b.soRcvBuf;
         this.soSndBuf = b.soSndBuf;
         this.sslContext = b.sslContext;
+        this.sslContextProvider = b.sslContextProvider;
         this.sslNeedClientAuth = b.sslNeedClientAuth;
         this.sslWantClientAuth = b.sslWantClientAuth;
         // Defensive-clone: fields are public final, but the array
@@ -203,6 +213,7 @@ public final class Config {
         private int soRcvBuf = 0;
         private int soSndBuf = 0;
         private SSLContext sslContext;
+        private java.util.function.Supplier<SSLContext> sslContextProvider;
         private boolean sslNeedClientAuth;
         private boolean sslWantClientAuth;
         private String[] alpnProtocols;
@@ -264,6 +275,9 @@ public final class Config {
         public Builder soRcvBuf(int v) { this.soRcvBuf = v; return this; }
         public Builder soSndBuf(int v) { this.soSndBuf = v; return this; }
         public Builder sslContext(SSLContext v) { this.sslContext = v; return this; }
+        public Builder sslContextProvider(java.util.function.Supplier<SSLContext> v) {
+            this.sslContextProvider = v; return this;
+        }
         public Builder sslNeedClientAuth(boolean v) { this.sslNeedClientAuth = v; return this; }
         public Builder sslWantClientAuth(boolean v) { this.sslWantClientAuth = v; return this; }
         public Builder alpnProtocols(String[] v) { this.alpnProtocols = v == null ? null : v.clone(); return this; }
@@ -309,6 +323,19 @@ public final class Config {
         private void validate() {
             if (host == null || host.isEmpty()) {
                 throw new IllegalArgumentException("host must be non-empty");
+            }
+            // serverHeader is written verbatim into the response headers.
+            // CR/LF or NUL would split into injected headers — response
+            // splitting vulnerability if the value comes from any config
+            // pipeline that ingests external input.
+            if (serverHeader != null) {
+                for (int i = 0, n = serverHeader.length(); i < n; i++) {
+                    char c = serverHeader.charAt(i);
+                    if (c == '\r' || c == '\n' || c == '\0') {
+                        throw new IllegalArgumentException(
+                            "serverHeader must not contain CR, LF, or NUL");
+                    }
+                }
             }
             if (port < 0 || port > 65535) {
                 throw new IllegalArgumentException("port must be in [0, 65535], got " + port);
@@ -359,6 +386,23 @@ public final class Config {
             if (sslNeedClientAuth && sslWantClientAuth) {
                 throw new IllegalArgumentException(
                     "sslNeedClientAuth and sslWantClientAuth are mutually exclusive");
+            }
+            // If both static context and provider are set, provider wins
+            // at runtime — flag as a config mistake so the caller notices.
+            if (sslContext != null && sslContextProvider != null) {
+                throw new IllegalArgumentException(
+                    "sslContext and sslContextProvider are mutually exclusive");
+            }
+            // Provider active: seed the static field from its current
+            // value so downstream code that only reads sslContext (e.g.,
+            // startup diagnostics) still sees a non-null context.
+            if (sslContext == null && sslContextProvider != null) {
+                SSLContext seed = sslContextProvider.get();
+                if (seed == null) {
+                    throw new IllegalArgumentException(
+                        "sslContextProvider returned null on initial call");
+                }
+                sslContext = seed;
             }
             if ((sslNeedClientAuth || sslWantClientAuth) && sslContext == null) {
                 throw new IllegalArgumentException(

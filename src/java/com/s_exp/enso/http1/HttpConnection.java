@@ -96,7 +96,13 @@ public final class HttpConnection implements Runnable {
         server.register(this);
         try (Socket s = socket) {
             in = s.getInputStream();
-            out = s.getOutputStream();
+            // BufferedOutputStream coalesces the small direct emissions
+            // (100-Continue, CHUNK_END trailer, error responses) with
+            // the following body write into a single syscall. Big writes
+            // that exceed the buffer size pass through directly per
+            // BufferedOutputStream's contract, so the streaming path
+            // isn't split.
+            out = new java.io.BufferedOutputStream(s.getOutputStream(), 8192);
             while (server.isRunning() && handleOne()) {
                 servedRequests++;
                 // Cap keep-alive reuse per connection to bound resource
@@ -107,6 +113,7 @@ public final class HttpConnection implements Runnable {
                 }
             }
             flushHbuf();
+            out.flush();
         } catch (IOException e) {
             // client went away or timed out
         } finally {
@@ -437,10 +444,24 @@ public final class HttpConnection implements Runnable {
                     break;
                 }
                 if (limit == buf.length) {
-                    if (buf.length >= config.maxHeaderBytes) {
-                        throw new HttpError(431, "Request Header Fields Too Large");
+                    // Compact before growing. Request line + prior header
+                    // lines sit at [0..start); reclaim them so a request
+                    // near maxHeaderBytes doesn't spuriously 431.
+                    if (start > 0) {
+                        int shift = start;
+                        System.arraycopy(buf, start, buf, 0, limit - start);
+                        limit -= shift;
+                        pos -= shift;
+                        start = 0;
+                        i -= shift;
+                        if (colon >= 0) colon -= shift;
                     }
-                    buf = Arrays.copyOf(buf, Math.min(buf.length * 2, config.maxHeaderBytes));
+                    if (limit == buf.length) {
+                        if (buf.length >= config.maxHeaderBytes) {
+                            throw new HttpError(431, "Request Header Fields Too Large");
+                        }
+                        buf = Arrays.copyOf(buf, Math.min(buf.length * 2, config.maxHeaderBytes));
+                    }
                 }
                 flushHbuf();
                 int n = socketRead(buf, limit, buf.length - limit);
@@ -714,6 +735,9 @@ public final class HttpConnection implements Runnable {
 
         if (!inlineOnly || !keepAlive || pos >= limit || hlen >= config.coalesceHighWater) {
             flushHbuf();
+            // Push through the BufferedOutputStream layer so the response
+            // hits the wire at end of request, not when the buffer fills.
+            out.flush();
         }
         return keepAlive;
     }
@@ -776,6 +800,10 @@ public final class HttpConnection implements Runnable {
             }
             return;
         }
+        // out is now a BufferedOutputStream (task #225). transferTo(sc)
+        // writes directly to the socket underneath, so any headers still
+        // sitting in the buffer would arrive AFTER the body. Flush first.
+        out.flush();
         try (FileChannel fc = FileChannel.open(file.toPath(), StandardOpenOption.READ)) {
             long remaining = fc.size();
             long position = 0;
@@ -877,10 +905,22 @@ public final class HttpConnection implements Runnable {
                 i++;
             }
             if (limit == buf.length) {
-                if (buf.length >= config.maxHeaderBytes) {
-                    throw new HttpError(431, "Request Header Fields Too Large");
+                // Compact stale front bytes (already consumed by earlier
+                // parseRequestLine call) before growing. Avoids a 431
+                // when the raw line would fit in maxHeaderBytes.
+                if (pos > 0) {
+                    int shift = pos;
+                    System.arraycopy(buf, pos, buf, 0, limit - pos);
+                    limit -= shift;
+                    pos = 0;
+                    i -= shift;
                 }
-                buf = Arrays.copyOf(buf, Math.min(buf.length * 2, config.maxHeaderBytes));
+                if (limit == buf.length) {
+                    if (buf.length >= config.maxHeaderBytes) {
+                        throw new HttpError(431, "Request Header Fields Too Large");
+                    }
+                    buf = Arrays.copyOf(buf, Math.min(buf.length * 2, config.maxHeaderBytes));
+                }
             }
             flushHbuf();
             int n = socketRead(buf, limit, buf.length - limit);
@@ -1149,10 +1189,15 @@ public final class HttpConnection implements Runnable {
 
     private abstract class RequestBody extends InputStream {
 
+        // Reused single-byte scratch for read() so a client using
+        // Reader.read()-style byte-at-a-time consumption doesn't allocate
+        // per call. Thread-confined — one RequestBody per stream, and the
+        // Ring handler runs on a single vthread.
+        private final byte[] oneByte = new byte[1];
+
         @Override
         public final int read() throws IOException {
-            byte[] one = new byte[1];
-            return read(one, 0, 1) < 0 ? -1 : one[0] & 0xFF;
+            return read(oneByte, 0, 1) < 0 ? -1 : oneByte[0] & 0xFF;
         }
 
         abstract boolean isFinished();

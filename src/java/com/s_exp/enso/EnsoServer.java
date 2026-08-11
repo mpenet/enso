@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLServerSocketFactory;
@@ -207,6 +208,20 @@ public final class EnsoServer implements AutoCloseable {
     public void close() throws IOException {
         running = false;
         listener.close();
+        // Kick off h3 shutdown in parallel with h1/h2. h3 drains graceful
+        // CONNECTION_CLOSE per conn (task #180 does this in parallel too);
+        // waiting on h1/h2 executor termination first would leave h3 conns
+        // no time to send their close frames before hard shutdown.
+        Thread h3CloseThread = null;
+        if (http3Listener != null) {
+            h3CloseThread = Thread.ofVirtual().name("enso-h3-close").start(() -> {
+                try {
+                    http3Listener.close();
+                } catch (Exception e) {
+                    LOG.log(Level.WARNING, "http3 listener close failed", e);
+                }
+            });
+        }
         closeIdleConnections();
         executor.shutdown();
         boolean clean = false;
@@ -227,11 +242,11 @@ public final class EnsoServer implements AutoCloseable {
             executor.shutdownNow();
         }
         connections.clear();
-        if (http3Listener != null) {
+        if (h3CloseThread != null) {
             try {
-                http3Listener.close();
-            } catch (Exception e) {
-                LOG.log(Level.WARNING, "http3 listener close failed", e);
+                h3CloseThread.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
         }
     }
@@ -347,12 +362,10 @@ public final class EnsoServer implements AutoCloseable {
     private static final class TlsChannelListener implements Listener {
 
         private final ServerSocketChannel channel;
-        private final javax.net.ssl.SSLContext sslContext;
         private final Config config;
 
         TlsChannelListener(Config config) throws IOException {
             this.config = config;
-            this.sslContext = config.sslContext;
             this.channel = ServerSocketChannel.open();
             this.channel.socket().setReuseAddress(config.soReuseAddr);
             this.channel.bind(new InetSocketAddress(config.host, config.port), config.backlog);
@@ -361,21 +374,40 @@ public final class EnsoServer implements AutoCloseable {
         @Override
         public Socket accept() throws IOException {
             SocketChannel sc = channel.accept();
-            SSLEngine engine = sslContext.createSSLEngine();
-            engine.setUseClientMode(false);
-            if (config.sslNeedClientAuth) engine.setNeedClientAuth(true);
-            else if (config.sslWantClientAuth) engine.setWantClientAuth(true);
-            javax.net.ssl.SSLParameters params = engine.getSSLParameters();
-            String[] alpn = resolveAlpn(config);
-            if (alpn != null) params.setApplicationProtocols(alpn);
-            if (config.enabledCipherSuites != null) {
-                params.setCipherSuites(config.enabledCipherSuites);
+            try {
+                // Reloadable SSL: read the live context per accept so cert
+                // rotation lands on new connections without restart.
+                SSLContext current = config.sslContextProvider != null
+                    ? config.sslContextProvider.get()
+                    : config.sslContext;
+                if (current == null) {
+                    throw new IOException("SSLContext provider returned null");
+                }
+                SSLEngine engine = current.createSSLEngine();
+                engine.setUseClientMode(false);
+                if (config.sslNeedClientAuth) engine.setNeedClientAuth(true);
+                else if (config.sslWantClientAuth) engine.setWantClientAuth(true);
+                javax.net.ssl.SSLParameters params = engine.getSSLParameters();
+                String[] alpn = resolveAlpn(config);
+                if (alpn != null) params.setApplicationProtocols(alpn);
+                if (config.enabledCipherSuites != null) {
+                    params.setCipherSuites(config.enabledCipherSuites);
+                }
+                if (config.enabledTlsProtocols != null) {
+                    params.setProtocols(config.enabledTlsProtocols);
+                }
+                engine.setSSLParameters(params);
+                return new TlsSocket(sc, engine).asSocket();
+            } catch (Throwable t) {
+                // Any failure between accept and TlsSocket construction
+                // (cipher/protocol misconfig, alloc, engine ctor) would
+                // leak sc's file descriptor. Close before rethrowing.
+                try { sc.close(); } catch (IOException ignored) {}
+                if (t instanceof IOException io) throw io;
+                if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error er) throw er;
+                throw new IOException("TLS engine setup failed", t);
             }
-            if (config.enabledTlsProtocols != null) {
-                params.setProtocols(config.enabledTlsProtocols);
-            }
-            engine.setSSLParameters(params);
-            return new TlsSocket(sc, engine).asSocket();
         }
 
         @Override

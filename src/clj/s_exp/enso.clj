@@ -138,6 +138,11 @@
     (when-let [v (:so-snd-buf opts)] (.soSndBuf b (int v)))
     ;; TLS
     (when-let [v (:ssl-context opts)] (.sslContext b ^javax.net.ssl.SSLContext v))
+    (when-let [v (:ssl-context-provider opts)]
+      (.sslContextProvider b ^java.util.function.Supplier
+                           (if (fn? v)
+                             (reify java.util.function.Supplier (get [_] (v)))
+                             v)))
     (when (:ssl-need-client-auth opts) (.sslNeedClientAuth b true))
     (when (:ssl-want-client-auth opts) (.sslWantClientAuth b true))
     (when-let [v (:alpn-protocols opts)] (.alpnProtocols b (into-array String (map str v))))
@@ -318,8 +323,15 @@
                      (handle [_ request throwable]
                        (some-> (error-handler request throwable) ->response))))
          server (EnsoServer. ring-handler error-h (build-config opts))]
-     (.start server)
-     server)))
+     ;; .start binds sockets + spins executors + can throw (port in use,
+     ;; SSL misconfig). Close the half-initialised server so we don't
+     ;; leak the acceptor / worker executor / h3 driver threads.
+     (try
+       (.start server)
+       server
+       (catch Throwable t
+         (try (.close server) (catch Throwable _))
+         (throw t))))))
 
 (defn port
   "Actual listening port of `server`."

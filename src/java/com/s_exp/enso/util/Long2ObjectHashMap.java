@@ -143,7 +143,14 @@ public final class Long2ObjectHashMap<V> {
     }
 
     public boolean containsKey(long key) {
-        return get(key) != null;
+        if (key == 0L) return hasZeroKey;
+        int i = index(key);
+        while (true) {
+            long k = keys[i];
+            if (k == 0L) return false;
+            if (k == key) return true;
+            i = (i + 1) & mask;
+        }
     }
 
     public void clear() {

@@ -27,7 +27,12 @@ final class Http2Stream {
     // peer's SETTINGS_INITIAL_WINDOW_SIZE by the connection; adjusted by
     // WINDOW_UPDATE frames.
     volatile long sendWindow;
-    volatile long recvWindow;
+    // Receive-side flow-control window (bytes we still let peer send).
+    // Mutated only from the framer thread (both DATA-consume and
+    // WINDOW_UPDATE-back paths run there), so plain long is safe. No
+    // other reader — kept non-volatile so a wide read isn't torn between
+    // -= and += back-to-back.
+    long recvWindow;
 
     // Optional declared Content-Length + running body byte count for §8.1.2.6
     // validation. -1 means "no Content-Length header".

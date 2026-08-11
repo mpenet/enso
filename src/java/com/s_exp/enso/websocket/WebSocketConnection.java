@@ -61,6 +61,14 @@ public final class WebSocketConnection {
     // dispatch or interleaved between message fragments (RFC 6455 §5.4).
     private int closeCode = CLOSE_ABNORMAL;
     private String closeReason = "";
+    // Reusable read scratch for mask (4 bytes) + payload. Grows on demand.
+    // Reset per frame; consumers must copy any bytes they retain past the
+    // readFrame return. Owned by the read vthread — no locking.
+    private byte[] readScratch = new byte[4 + 512];
+    // Reusable Frame instance returned by readFrame. Fields overwritten
+    // per call; consumers use fields inline and don't retain references
+    // to the Frame or its payload buffer past the current dispatch.
+    private final Frame currentFrame = new Frame();
 
     public WebSocketConnection(Socket socket, InputStream in, OutputStream out,
                         WebSocketListener listener, int maxMessageBytes) {
@@ -108,7 +116,7 @@ public final class WebSocketConnection {
                 switch (frame.opcode) {
                     case OP_TEXT, OP_BINARY -> {
                         accumulator.reset(frame.opcode);
-                        accumulator.append(frame.payload);
+                        accumulator.append(frame.payload, frame.off, frame.len);
                         while (!frame.fin) {
                             Frame next = readFrame();
                             if (next == null) {
@@ -126,8 +134,10 @@ public final class WebSocketConnection {
                             if (next.opcode != OP_CONTINUATION) {
                                 throw new IOException("expected continuation frame, got opcode " + next.opcode);
                             }
-                            accumulator.append(next.payload);
-                            frame = next;
+                            accumulator.append(next.payload, next.off, next.len);
+                            // `frame` and `next` are the same reusable
+                            // instance; `while (!frame.fin)` on the outer
+                            // iteration re-checks the freshly-read fin.
                         }
                         if (open) {
                             Object message = accumulator.finish();
@@ -178,28 +188,37 @@ public final class WebSocketConnection {
 
     private void handleControlFrame(Frame frame) throws IOException {
         switch (frame.opcode) {
-            case OP_PING -> listener.onPing(socketApi, ByteBuffer.wrap(frame.payload));
-            case OP_PONG -> listener.onPong(socketApi, ByteBuffer.wrap(frame.payload));
+            case OP_PING, OP_PONG -> {
+                // Copy so the listener can retain the buffer past the
+                // next readFrame (which mutates the shared scratch).
+                byte[] copy = new byte[frame.len];
+                System.arraycopy(frame.payload, frame.off, copy, 0, frame.len);
+                ByteBuffer bb = ByteBuffer.wrap(copy);
+                if (frame.opcode == OP_PING) listener.onPing(socketApi, bb);
+                else listener.onPong(socketApi, bb);
+            }
             case OP_CLOSE -> {
                 int code = CLOSE_NO_STATUS;
                 String reason = "";
+                int off = frame.off;
+                int len = frame.len;
                 // RFC 6455 §5.5.1: CLOSE payload MUST be either 0 bytes
                 // (no status) or ≥ 2 bytes (2-byte code + optional
                 // reason). A 1-byte payload is a protocol error.
-                if (frame.payload.length == 1) {
+                if (len == 1) {
                     throw new IOException("CLOSE frame with 1-byte payload");
                 }
-                if (frame.payload.length >= 2) {
-                    code = ((frame.payload[0] & 0xFF) << 8) | (frame.payload[1] & 0xFF);
-                    if (frame.payload.length > 2) {
+                if (len >= 2) {
+                    code = ((frame.payload[off] & 0xFF) << 8)
+                        | (frame.payload[off + 1] & 0xFF);
+                    if (len > 2) {
                         // RFC 6455 §7.1.6: CLOSE reason MUST be UTF-8.
                         Utf8Validator v = new Utf8Validator();
-                        if (!v.feed(frame.payload, 2, frame.payload.length - 2)
+                        if (!v.feed(frame.payload, off + 2, len - 2)
                             || !v.isComplete()) {
                             throw new Utf8Exception("invalid UTF-8 in CLOSE reason");
                         }
-                        reason = new String(frame.payload, 2,
-                                            frame.payload.length - 2,
+                        reason = new String(frame.payload, off + 2, len - 2,
                                             StandardCharsets.UTF_8);
                     }
                 }
@@ -277,14 +296,30 @@ public final class WebSocketConnection {
                 throw new IOException("fragmented control frame");
             }
         }
-        byte[] mask = new byte[4];
-        readFully(mask, 0, 4);
-        byte[] payload = new byte[(int) payloadLen];
-        readFully(payload, 0, payload.length);
-        for (int i = 0; i < payload.length; i++) {
-            payload[i] ^= mask[i & 3];
+        int plen = (int) payloadLen;
+        int need = 4 + plen;
+        if (readScratch.length < need) {
+            int cap = readScratch.length;
+            while (cap < need) cap <<= 1;
+            readScratch = new byte[cap];
         }
-        return new Frame(fin, opcode, payload);
+        readFully(readScratch, 0, 4);
+        readFully(readScratch, 4, plen);
+        // In-place unmask against the four leading mask bytes.
+        byte m0 = readScratch[0], m1 = readScratch[1],
+             m2 = readScratch[2], m3 = readScratch[3];
+        for (int i = 0; i < plen; i++) {
+            byte m = switch (i & 3) {
+                case 0 -> m0; case 1 -> m1; case 2 -> m2; default -> m3;
+            };
+            readScratch[4 + i] ^= m;
+        }
+        currentFrame.fin = fin;
+        currentFrame.opcode = opcode;
+        currentFrame.payload = readScratch;
+        currentFrame.off = 4;
+        currentFrame.len = plen;
+        return currentFrame;
     }
 
     private int readByte() throws IOException {
@@ -355,19 +390,27 @@ public final class WebSocketConnection {
         return arr;
     }
 
+    /**
+     * Reusable frame descriptor. Fields are overwritten by every
+     * {@link #readFrame} call — consumers must finish using them before
+     * the next read. {@link #payload} points into the shared read
+     * scratch; retain by copying, never by reference.
+     */
     private static final class Frame {
-        final boolean fin;
-        final int opcode;
-        final byte[] payload;
-
-        Frame(boolean fin, int opcode, byte[] payload) {
-            this.fin = fin;
-            this.opcode = opcode;
-            this.payload = payload;
-        }
+        boolean fin;
+        int opcode;
+        byte[] payload;
+        int off;
+        int len;
     }
 
     private static final class MessageAccumulator {
+        // Ceiling on retained scratch across messages. Above this,
+        // finish() shrinks back to the floor so a one-off large message
+        // doesn't pin memory for the connection's lifetime.
+        private static final int SHRINK_CEILING = 64 * 1024;
+        private static final int SHRINK_FLOOR = 4 * 1024;
+
         private final int limit;
         private byte[] buf = new byte[0];
         private int len;
@@ -384,24 +427,24 @@ public final class WebSocketConnection {
             utf8.reset();
         }
 
-        void append(byte[] data) throws IOException {
-            if (len + data.length > limit) {
+        void append(byte[] data, int off, int nBytes) throws IOException {
+            if (len + nBytes > limit) {
                 throw new IOException("message exceeds " + limit + " bytes");
             }
-            if (len + data.length > buf.length) {
-                int newLen = Math.max(buf.length * 2, len + data.length);
+            if (len + nBytes > buf.length) {
+                int newLen = Math.max(buf.length * 2, len + nBytes);
                 byte[] bigger = new byte[newLen];
                 System.arraycopy(buf, 0, bigger, 0, len);
                 buf = bigger;
             }
-            System.arraycopy(data, 0, buf, len, data.length);
-            len += data.length;
+            System.arraycopy(data, off, buf, len, nBytes);
+            len += nBytes;
             // RFC 6455 §5.6 + §8.1: text messages MUST be valid UTF-8;
             // invalid → CLOSE(1007). Validate incrementally so we fail
             // fast on the offending fragment (Autobahn §6.4) instead of
             // waiting for message end.
             if (opcode == OP_TEXT) {
-                if (!utf8.feed(data, 0, data.length)) {
+                if (!utf8.feed(data, off, nBytes)) {
                     throw new Utf8Exception("invalid UTF-8 in text message");
                 }
             }
@@ -410,6 +453,11 @@ public final class WebSocketConnection {
         Object finish() throws IOException {
             byte[] payload = new byte[len];
             System.arraycopy(buf, 0, payload, 0, len);
+            // Shrink scratch after a one-off large message so we don't
+            // retain a fat buffer for the connection's lifetime.
+            if (buf.length > SHRINK_CEILING) {
+                buf = new byte[SHRINK_FLOOR];
+            }
             if (opcode == OP_TEXT) {
                 if (!utf8.isComplete()) {
                     throw new Utf8Exception("truncated UTF-8 sequence at message end");

@@ -91,11 +91,13 @@
 
 (defn wrk!
   "Runs `wrk` against `url` and returns a parsed summary map. `depth` = pipeline
-  depth (1 for non-pipelined). Warms up first, then benches for `duration`."
+  depth (1 for non-pipelined). Runs *two* warmup passes before the bench so the
+  JIT has time to compile + inline the hot path — a single 5s warmup on cold
+  code leaves most methods still in interpreter tier."
   ([url] (wrk! url {}))
-  ([url {:keys [duration threads connections depth latency? warmup]
+  ([url {:keys [duration threads connections depth latency? warmup warmup-passes]
          :or {duration "8s" threads 4 connections 64 depth 1
-              latency? true warmup "5s"}}]
+              latency? true warmup "10s" warmup-passes 2}}]
    (let [base (if (> depth 1)
                 (let [f (write-lua! depth "/nope")]
                   [(str "-t" threads) (str "-c" connections) "-s" f])
@@ -103,7 +105,11 @@
          with-dur (fn [d]
                     (concat base (when latency? ["--latency"])
                             [(str "-d" d) url]))]
-     (apply sh/sh "wrk" (with-dur warmup))
+     ;; JIT warmup: two consecutive passes with the real bench workload
+     ;; shape (connections/depth match) so tier-1 → tier-4 promotion
+     ;; happens on the same call sites we measure.
+     (dotimes [_ warmup-passes]
+       (apply sh/sh "wrk" (with-dur warmup)))
      (let [{:keys [out]} (apply sh/sh "wrk" (with-dur duration))]
        (let [base (parse-wrk out)
              pct (into {}
@@ -177,7 +183,11 @@
 (defn h3-start!
   "Boots a single-server enso with h3 enabled. TCP port 0 (unused), UDP port
   fixed so h2load can target it. Handler is same plaintext shape as the h1
-  bench for apples-to-apples."
+  bench for apples-to-apples.
+
+  Knobs match Netty/Jetty defaults for fair comparison: no stateless retry
+  (Netty h3 example server doesn't enforce), 30s idle timeout, 100 max
+  concurrent streams — same as their defaults."
   ([] (h3-start! {:h3-port 18443}))
   ([{:keys [h3-port]}]
    (h3-stop!)
@@ -188,7 +198,12 @@
                :http3 true
                :http3-port h3-port
                :http3-cert-path cert
-               :http3-key-path key})]
+               :http3-key-path key
+               ;; Match Netty h3 example defaults so cross-server bench
+               ;; isn't biased by config drift.
+               :http3-stateless-retry false
+               :http3-max-idle-timeout 30000
+               :http3-initial-max-streams-bidi 100})]
      (reset! h3-state {:srv srv :h3-port h3-port :cert cert :key key})
      {:h3-url (str "https://127.0.0.1:" h3-port "/nope")})))
 
@@ -296,9 +311,14 @@
    (let [enso-url (:h3-url (h3-start! {:h3-port 18443}))
          netty-url (:h3-url (netty-h3-start!))
          jetty-url (:h3-url (jetty-h3-start!))
+         ;; JIT + TLS-cache warmup. Three passes with the real workload
+         ;; shape so tier-1 → tier-4 promotion + session cache warm-up
+         ;; happen on the same call sites we then measure. Two passes
+         ;; are usually enough for HotSpot; the third is cheap insurance.
          warmup {:clients 4 :per-client 100}
          run (fn [label url]
-               (drive-h3! url warmup)   ; warmup
+               (drive-h3! url warmup)
+               (drive-h3! url warmup)
                (drive-h3! url warmup)
                (let [r (drive-h3! url opts)]
                  [label (select-keys r [:total-req :wall-ms :rps-est
