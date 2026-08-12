@@ -1127,11 +1127,13 @@ public final class Http2Connection implements Runnable {
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "HTTP/2 handler threw", t);
         }
+        boolean head = "HEAD".equals(request.method);
         try {
             if (response == null) {
-                writeResponse(stream, 500, PersistentArrayMap.EMPTY, null);
+                writeResponse(stream, 500, PersistentArrayMap.EMPTY, null, head);
             } else {
-                writeResponse(stream, response.status, response.headers, response.body);
+                writeResponse(stream, response.status, response.headers,
+                              response.body, head);
             }
         } catch (IOException e) {
             // socket died mid-write; just drop the stream
@@ -1166,13 +1168,15 @@ public final class Http2Connection implements Runnable {
     }
 
     private void writeResponse(Http2Stream stream, int status,
-                               Map<?, ?> respHeaders, Object body) throws IOException {
+                               Map<?, ?> respHeaders, Object body,
+                               boolean head) throws IOException {
         // Assemble the header block: :status pseudo-header first, then user headers.
         List<Hpack.HeaderField> fields = new ArrayList<>(
             (respHeaders == null ? 0 : respHeaders.size()) + 1);
         fields.add(new Hpack.HeaderField(":status", statusString(status)));
         boolean hasAltSvc = false;
         boolean hasServer = false;
+        boolean hasContentLength = false;
         if (respHeaders != null) {
             for (Map.Entry<?, ?> e : respHeaders.entrySet()) {
                 String rawName = String.valueOf(e.getKey());
@@ -1189,6 +1193,7 @@ public final class Http2Connection implements Runnable {
                 }
                 if (name.equals("alt-svc")) hasAltSvc = true;
                 else if (name.equals("server")) hasServer = true;
+                else if (name.equals("content-length")) hasContentLength = true;
                 Object v = e.getValue();
                 fields.add(new Hpack.HeaderField(name, v == null ? "" : v.toString()));
             }
@@ -1202,6 +1207,25 @@ public final class Http2Connection implements Runnable {
         }
         boolean hasBody = body != null && !(body instanceof byte[] b && b.length == 0)
                                        && !(body instanceof String s && s.isEmpty());
+        // RFC 9110 §9.3.2 / §8.6: HEAD response MUST NOT include a body
+        // but SHOULD carry the same Content-Length the GET would return.
+        // Compute from byte[] or String bodies where we know the size;
+        // stream / File / StreamingBody sizes are unknown here so skip.
+        if (head) {
+            if (!hasContentLength && hasBody) {
+                long len = -1;
+                if (body instanceof byte[] bb) len = bb.length;
+                else if (body instanceof String ss)
+                    len = ss.getBytes(StandardCharsets.UTF_8).length;
+                if (len >= 0) {
+                    fields.add(new Hpack.HeaderField("content-length",
+                                                    Long.toString(len)));
+                }
+            }
+            // HEAD response is body-less on the wire regardless of the
+            // body type the handler returned.
+            hasBody = false;
+        }
 
         // HPACK encoder state (dynamic table) mutates as encode() runs. The
         // emitted header block must reach the peer in the same order the table

@@ -339,12 +339,14 @@ final class Http3Connection implements AutoCloseable {
         // don't recycle it into the pool.
         headersList.add(statusPair(statusStr));
         boolean hasServer = false;
+        boolean hasContentLength = false;
         for (Map.Entry<?, ?> e : task.headers.entrySet()) {
             String hn = String.valueOf(e.getKey()).toLowerCase(java.util.Locale.ROOT);
             if (hn.equals("connection") || hn.equals("keep-alive")
                 || hn.equals("transfer-encoding") || hn.equals("upgrade")
                 || hn.equals("proxy-connection")) continue;
             if (hn.equals("server")) hasServer = true;
+            else if (hn.equals("content-length")) hasContentLength = true;
             Object v = e.getValue();
             String vs = v == null ? "" : v.toString();
             // RFC 9114 §4.2: header names/values MUST NOT contain CR,
@@ -360,6 +362,27 @@ final class Http3Connection implements AutoCloseable {
         }
         if (!hasServer && config.serverHeader != null && !config.serverHeader.isEmpty()) {
             headersList.add(acquirePair("server", config.serverHeader));
+        }
+        // RFC 9110 §9.3.2 / §8.6: HEAD response MUST NOT emit a body,
+        // but SHOULD advertise the Content-Length the GET would return.
+        // Body size is known for materialised byte[] bodies (also for
+        // File — cheap .length() call). InputStream size is unknown so
+        // we skip the header there.
+        if (task.head && !hasContentLength) {
+            long len = -1;
+            if (task.body != null) len = task.body.length;
+            else if (task.bodySource instanceof java.io.File f) len = f.length();
+            if (len >= 0) {
+                headersList.add(acquirePair("content-length", Long.toString(len)));
+            }
+        }
+        if (task.head) {
+            // Close source (if any) since we won't stream it.
+            if (task.bodySource instanceof java.io.InputStream in) {
+                try { in.close(); } catch (java.io.IOException ignored) {}
+            }
+            session.writeResponse(task.streamId, headersList, null);
+            return;
         }
         // Fast path: fully-materialised byte[] body → single stream_send
         // for HEADERS + DATA + FIN (task #143 halved JNI hops here).
@@ -877,27 +900,28 @@ final class Http3Connection implements AutoCloseable {
     }
 
     private void runHandler(long streamId, Request request) {
+        boolean head = "HEAD".equals(request.method);
         try {
             Response response = handler.handle(request);
             ResponseTask task = response == null
-                ? fallback500(streamId)
-                : ResponseTask.of(streamId, response);
+                ? fallback500(streamId, head)
+                : ResponseTask.of(streamId, response, head);
             outbound.put(task);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "h3 handler threw for stream " + streamId, t);
-            try { outbound.put(fallback500(streamId)); } catch (InterruptedException e) {
+            try { outbound.put(fallback500(streamId, head)); } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
     }
 
-    private static ResponseTask fallback500(long streamId) {
+    private static ResponseTask fallback500(long streamId, boolean head) {
         return new ResponseTask(streamId, 500,
             java.util.Collections.singletonMap("content-type", "text/plain"),
             "500 internal error".getBytes(StandardCharsets.UTF_8),
-            null);
+            null, head);
     }
 
     /**
@@ -909,30 +933,30 @@ final class Http3Connection implements AutoCloseable {
      */
     private record ResponseTask(long streamId, int status,
                                 Map<?, ?> headers, byte[] body,
-                                Object bodySource) {
-        static ResponseTask of(long streamId, Response r) {
+                                Object bodySource, boolean head) {
+        static ResponseTask of(long streamId, Response r, boolean head) {
             Map<?, ?> hs = r.headers == null
                 ? java.util.Collections.emptyMap() : r.headers;
             Object rb = r.body;
             if (rb == null) {
-                return new ResponseTask(streamId, r.status, hs, null, null);
+                return new ResponseTask(streamId, r.status, hs, null, null, head);
             }
             if (rb instanceof byte[] b) {
-                return new ResponseTask(streamId, r.status, hs, b, null);
+                return new ResponseTask(streamId, r.status, hs, b, null, head);
             }
             if (rb instanceof String s) {
                 return new ResponseTask(streamId, r.status, hs,
-                    s.getBytes(StandardCharsets.UTF_8), null);
+                    s.getBytes(StandardCharsets.UTF_8), null, head);
             }
             if (rb instanceof java.io.File || rb instanceof java.io.InputStream) {
                 // Defer read — sendResponse's streaming path pulls
                 // chunks incrementally to keep large bodies off the heap.
-                return new ResponseTask(streamId, r.status, hs, null, rb);
+                return new ResponseTask(streamId, r.status, hs, null, rb, head);
             }
             return new ResponseTask(streamId, r.status, hs,
                 ("[unsupported body type: " + rb.getClass().getName() + "]")
                     .getBytes(StandardCharsets.UTF_8),
-                null);
+                null, head);
         }
     }
 }
