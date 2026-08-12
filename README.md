@@ -5,7 +5,7 @@
 Fast, low-allocation, zero-dependency* HTTP/1.1 + HTTP/2 + HTTP/3 Ring
 server adapter for Clojure. 
 
-Java core optimized for Ring, not a wrapper.  Built on/for virtual
+Java core optimized for Ring.  Built on/for virtual
 threads. Plain sync handler.
 
 - **Fast.** ~5.2M rps pipelined depth 64 (HTTP/1.1); ~894k rps HTTP/2 over
