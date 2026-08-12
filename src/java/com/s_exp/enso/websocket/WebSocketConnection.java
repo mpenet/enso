@@ -6,6 +6,10 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CoderResult;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -117,7 +121,13 @@ public final class WebSocketConnection {
                     case OP_TEXT, OP_BINARY -> {
                         accumulator.reset(frame.opcode);
                         accumulator.append(frame.payload, frame.off, frame.len);
-                        while (!frame.fin) {
+                        // Track the DATA-fragmentation fin locally.
+                        // `frame` and `next` share the reusable Frame
+                        // instance, so a control frame's own fin (always
+                        // 1 for PING/PONG) would falsely satisfy
+                        // `!frame.fin` and exit the loop mid-message.
+                        boolean dataFin = frame.fin;
+                        while (!dataFin) {
                             Frame next = readFrame();
                             if (next == null) {
                                 throw new IOException("connection closed mid-fragment");
@@ -135,9 +145,7 @@ public final class WebSocketConnection {
                                 throw new IOException("expected continuation frame, got opcode " + next.opcode);
                             }
                             accumulator.append(next.payload, next.off, next.len);
-                            // `frame` and `next` are the same reusable
-                            // instance; `while (!frame.fin)` on the outer
-                            // iteration re-checks the freshly-read fin.
+                            dataFin = next.fin;
                         }
                         if (open) {
                             Object message = accumulator.finish();
@@ -469,58 +477,82 @@ public final class WebSocketConnection {
     }
 
     /**
-     * Incremental UTF-8 validator based on Björn Höhrmann's public-domain
-     * DFA (<a href="https://bjoern.hoehrmann.de/utf-8/decoder/dfa/">source</a>).
-     * State survives across {@link #feed} calls so callers can validate
-     * a stream of bytes split across arbitrary fragment boundaries. We
-     * skip codepoint reconstruction — validation only.
+     * Incremental UTF-8 validator backed by {@link CharsetDecoder} in
+     * REPORT mode for both malformed and unmappable. State (partial
+     * multi-byte sequences) survives across {@link #feed} calls so a
+     * codepoint split across WebSocket fragments validates end-to-end.
+     * Slightly heavier than a hand-rolled DFA but bulletproof — the
+     * JDK's decoder has decades of correctness fixes behind it.
      */
     static final class Utf8Validator {
-        private static final byte[] TABLE = new byte[] {
-            // byte → character class (0..11)
-            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-            1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,
-            7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7, 7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-            8,8,2,2,2,2,2,2,2,2,2,2,2,2,2,2, 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
-            10,3,3,3,3,3,3,3,3,3,3,3,3,4,3,3, 11,6,6,6,5,8,8,8,8,8,8,8,8,8,8,8,
-            // (state, class) → next state, indexed as [256 + state + class]
-            0,12,24,36,60,96,84,12,12,12,48,72,
-            12, 0,12,12,12,12,12, 0,12, 0,12,12,
-            12,24,12,12,12,12,12,24,12,24,12,12,
-            12,12,12,12,12,12,12,24,12,12,12,12,
-            12,24,12,12,12,12,12,12,12,24,12,12,
-            12,12,12,12,12,12,12,36,12,36,12,12,
-            12,36,12,12,12,12,12,36,12,36,12,12,
-            12,36,12,12,12,12,12,12,12,12,12,12,
-        };
-        private static final int ACCEPT = 0;
-        private static final int REJECT = 12;
+        private final CharsetDecoder decoder;
+        private final CharBuffer out;
+        // Leftover bytes from the previous feed() call that formed an
+        // incomplete multi-byte sequence. Prepended to the next feed()
+        // input so cross-fragment codepoints validate correctly.
+        private ByteBuffer leftover;
+        // Set on the first REJECT so subsequent feed()s stay rejected.
+        private boolean rejected;
 
-        private int state = ACCEPT;
+        Utf8Validator() {
+            decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+            out = CharBuffer.allocate(1024);
+            leftover = null;
+            rejected = false;
+        }
 
         boolean feed(byte[] data, int off, int len) {
-            int s = state;
-            for (int i = 0; i < len; i++) {
-                int type = TABLE[data[off + i] & 0xFF] & 0xFF;
-                s = TABLE[256 + s + type] & 0xFF;
-                if (s == REJECT) {
-                    state = REJECT;
+            if (rejected) return false;
+            ByteBuffer in;
+            if (leftover != null) {
+                int lo = leftover.remaining();
+                ByteBuffer joined = ByteBuffer.allocate(lo + len);
+                joined.put(leftover);
+                joined.put(data, off, len);
+                joined.flip();
+                in = joined;
+                leftover = null;
+            } else {
+                in = ByteBuffer.wrap(data, off, len);
+            }
+            while (in.hasRemaining()) {
+                out.clear();
+                CoderResult cr = decoder.decode(in, out, false);
+                if (cr.isError()) {
+                    rejected = true;
                     return false;
                 }
+                if (cr.isUnderflow()) {
+                    // Incomplete sequence at end of input — stash for
+                    // next feed(). If the whole remainder is 0 bytes,
+                    // nothing to stash.
+                    if (in.hasRemaining()) {
+                        leftover = ByteBuffer.allocate(in.remaining());
+                        leftover.put(in).flip();
+                    }
+                    return true;
+                }
+                // Overflow: out buffer full, keep decoding.
             }
-            state = s;
             return true;
         }
 
+        /**
+         * True iff no partial multi-byte sequence remains and no prior
+         * feed() has rejected. Called at message-end to catch a
+         * truncated final codepoint.
+         */
         boolean isComplete() {
-            return state == ACCEPT;
+            if (rejected) return false;
+            return leftover == null || !leftover.hasRemaining();
         }
 
         void reset() {
-            state = ACCEPT;
+            decoder.reset();
+            leftover = null;
+            rejected = false;
         }
     }
 
