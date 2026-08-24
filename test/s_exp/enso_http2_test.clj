@@ -251,6 +251,33 @@
 
 ;; ---- HEAD via h2 ---------------------------------------------------------
 
+(deftest h2-per-request-timeout-returns-408
+  ;; Handler sleeps past the configured request-timeout. Server must
+  ;; emit 408 + reset the stream. Handler interruption unblocks the
+  ;; sleep so no zombie vthread lingers.
+  (let [interrupted? (atom false)
+        started (CountDownLatch. 1)]
+    (let [srv (enso/run-server
+               (fn [_]
+                 (.countDown started)
+                 (try (Thread/sleep 3000)
+                      (catch InterruptedException _
+                        (reset! interrupted? true)))
+                 {:status 200 :body "late"})
+               {:port 0
+                :http2 true
+                :ssl-context (gen-server-context)
+                :request-timeout 300})]
+      (try
+        (binding [*port* (enso/port srv)]
+          (let [resp (get! "/slow")]
+            (is (= 408 (.statusCode resp))
+                "expired handler → 408")
+            (is (.await started 2 TimeUnit/SECONDS))
+            (Thread/sleep 200)
+            (is @interrupted? "handler vthread interrupted on timeout")))
+        (finally (enso/stop srv))))))
+
 (deftest h2-head-omits-body-but-keeps-content-length
   (with-h2-server
     (fn [_] {:status 200 :body "hello"})

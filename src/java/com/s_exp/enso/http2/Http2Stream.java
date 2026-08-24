@@ -3,6 +3,7 @@ package com.s_exp.enso.http2;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Per-stream state for the HTTP/2 driver. Owns the request body pipe, the
@@ -38,6 +39,15 @@ final class Http2Stream {
     // validation. -1 means "no Content-Length header".
     long declaredContentLength = -1;
     long receivedBodyBytes = 0;
+
+    // First-writer-wins gate between the handler vthread and the
+    // per-request timeout task. Whichever CAS-flips true first owns the
+    // response for this stream; the other side must silently drop its
+    // work. Prevents a double-response race when the handler completes
+    // just as the timeout fires.
+    final AtomicBoolean responded = new AtomicBoolean(false);
+    // Handler thread reference for interruption on timeout.
+    volatile Thread handlerThread;
 
     // Body handling.
     private final LinkedBlockingQueue<byte[]> queue = new LinkedBlockingQueue<>();

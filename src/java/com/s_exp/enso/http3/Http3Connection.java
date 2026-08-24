@@ -103,6 +103,22 @@ final class Http3Connection implements AutoCloseable {
     // processSend to feed the next chunk once space opens.
     private final Long2ObjectHashMap<java.io.InputStream> streamingSources =
         new Long2ObjectHashMap<>();
+    // First-writer-wins gate per stream between handler vthread and
+    // per-request timeout scheduler. Concurrent map (touched from timer
+    // thread + owner + handler vthread).
+    private final java.util.concurrent.ConcurrentHashMap<Long,
+        java.util.concurrent.atomic.AtomicBoolean> respondedByStream =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<Long, Thread>
+        handlerThreads = new java.util.concurrent.ConcurrentHashMap<>();
+
+    // Daemon single-thread scheduler shared across all h3 connections.
+    private static final java.util.concurrent.ScheduledExecutorService TIMEOUT_SCHEDULER =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread th = new Thread(r, "enso-h3-request-timeout");
+            th.setDaemon(true);
+            return th;
+        });
 
     Http3Connection(byte[] cid, long conn,
                     DatagramChannel out,
@@ -204,6 +220,13 @@ final class Http3Connection implements AutoCloseable {
             // file descriptors.
             streamingSources.forEach((sid, src) -> closeSourceQuiet(src));
             streamingSources.clear();
+            // Drop pending-request timeout maps. Any in-flight timer
+            // firing after this point will find no entry and no-op.
+            respondedByStream.clear();
+            handlerThreads.forEach((sid, th) -> {
+                try { th.interrupt(); } catch (Throwable ignored) {}
+            });
+            handlerThreads.clear();
             // RFC 9114 §5.1 graceful close: if we haven't already been
             // closed (peer close, protocol error, timeout), emit a
             // H3_NO_ERROR CONNECTION_CLOSE and flush the resulting
@@ -392,12 +415,22 @@ final class Http3Connection implements AutoCloseable {
         // response emits a single HEADERS(fin) frame instead of
         // HEADERS(fin=false) + empty DATA(fin=true). InputStream can't
         // know its length upfront — accept the 2-frame cost there.
-        if (task.bodySource == null) {
-            session.writeResponse(task.streamId, headersList, task.body);
-        } else if (task.bodySource instanceof java.io.File f && f.length() == 0) {
-            session.writeResponse(task.streamId, headersList, null);
-        } else {
-            streamResponse(task);
+        try {
+            if (task.bodySource == null) {
+                session.writeResponse(task.streamId, headersList, task.body);
+            } else if (task.bodySource instanceof java.io.File f && f.length() == 0) {
+                session.writeResponse(task.streamId, headersList, null);
+            } else {
+                streamResponse(task);
+                return;
+            }
+        } finally {
+            // Fast paths only — streaming paths clear these in
+            // pumpStreaming when the source hits EOF (or via
+            // connection close). Timeout maps otherwise grow unbounded
+            // under a busy server.
+            respondedByStream.remove(task.streamId);
+            handlerThreads.remove(task.streamId);
         }
     }
 
@@ -454,6 +487,8 @@ final class Http3Connection implements AutoCloseable {
             }
             if (eof) {
                 closeSourceQuiet(src);
+                respondedByStream.remove(streamId);
+                handlerThreads.remove(streamId);
                 if (streamingSources.isEmpty()) {
                     // Reclaim the 256 KiB scratch once no streams are
                     // mid-body — otherwise a connection that streams
@@ -880,9 +915,53 @@ final class Http3Connection implements AutoCloseable {
             pipe.inputStream(),
             peer.getAddress(), localPort);
 
+        // Per-request timeout gate. Register the response CAS and
+        // schedule a timer; whichever side flips the CAS first (handler
+        // completion or timer expiry) owns the response. Timer path
+        // enqueues a 408 ResponseTask + interrupts the vthread; handler
+        // path enqueues its real response only if not already claimed.
+        respondedByStream.put(streamId,
+            new java.util.concurrent.atomic.AtomicBoolean(false));
+        java.util.concurrent.ScheduledFuture<?> timeout = null;
+        int timeoutMs = config.requestTimeoutMillis;
+        if (timeoutMs > 0) {
+            final long sid = streamId;
+            timeout = TIMEOUT_SCHEDULER.schedule(
+                () -> onRequestTimeout(sid),
+                timeoutMs,
+                java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+        final java.util.concurrent.ScheduledFuture<?> t = timeout;
         Thread.ofVirtual()
             .name("enso-h3-worker-" + streamId)
-            .start(() -> runHandler(streamId, request));
+            .start(() -> {
+                handlerThreads.put(streamId, Thread.currentThread());
+                try {
+                    runHandler(streamId, request);
+                } finally {
+                    if (t != null) t.cancel(false);
+                    handlerThreads.remove(streamId);
+                }
+            });
+    }
+
+    private void onRequestTimeout(long streamId) {
+        java.util.concurrent.atomic.AtomicBoolean flag =
+            respondedByStream.get(streamId);
+        if (flag == null || !flag.compareAndSet(false, true)) return;
+        Thread ht = handlerThreads.get(streamId);
+        if (ht != null) ht.interrupt();
+        // Enqueue 408 response. Owner thread picks it up + emits via
+        // session.writeResponse. If the stream is already gone
+        // (peer reset), the writeResponse just noops.
+        try {
+            outbound.put(new ResponseTask(streamId, 408,
+                java.util.Collections.singletonMap("content-type", "text/plain"),
+                "408 request timeout".getBytes(StandardCharsets.UTF_8),
+                null, false));
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static boolean hasUppercase(String s) {
@@ -906,11 +985,20 @@ final class Http3Connection implements AutoCloseable {
             ResponseTask task = response == null
                 ? fallback500(streamId, head)
                 : ResponseTask.of(streamId, response, head);
+            // First-writer-wins with the timeout task. If the timer
+            // already sent 408, drop the real response — writing it
+            // now would double-respond on the h3 stream.
+            java.util.concurrent.atomic.AtomicBoolean flag =
+                respondedByStream.get(streamId);
+            if (flag != null && !flag.compareAndSet(false, true)) return;
             outbound.put(task);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "h3 handler threw for stream " + streamId, t);
+            java.util.concurrent.atomic.AtomicBoolean flag =
+                respondedByStream.get(streamId);
+            if (flag != null && !flag.compareAndSet(false, true)) return;
             try { outbound.put(fallback500(streamId, head)); } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

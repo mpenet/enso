@@ -878,9 +878,53 @@ public final class Http2Connection implements Runnable {
             }
         }
 
+        // Per-request timeout. Shared scheduler fires at deadline; if
+        // the handler hasn't already produced a response (CAS on
+        // stream.responded), we emit a 408 + reset stream + interrupt
+        // the handler vthread. Handler races the timer on the same CAS
+        // — first to flip owns the response.
+        java.util.concurrent.ScheduledFuture<?> timeout = null;
+        if (config.requestTimeoutMillis > 0) {
+            final int timeoutMs = config.requestTimeoutMillis;
+            timeout = TIMEOUT_SCHEDULER.schedule(
+                () -> onRequestTimeout(stream),
+                timeoutMs,
+                java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+        final java.util.concurrent.ScheduledFuture<?> t = timeout;
         Thread.ofVirtual()
             .name("enso-h2-stream-" + streamId)
-            .start(() -> runHandler(stream, request));
+            .start(() -> {
+                stream.handlerThread = Thread.currentThread();
+                try {
+                    runHandler(stream, request);
+                } finally {
+                    if (t != null) t.cancel(false);
+                    stream.handlerThread = null;
+                }
+            });
+    }
+
+    // Daemon single-thread scheduler shared by all Http2Connections in
+    // this JVM. Timer tasks are cheap + short-lived; one thread is
+    // plenty. Daemon so JVM shutdown doesn't wait on it.
+    private static final java.util.concurrent.ScheduledExecutorService TIMEOUT_SCHEDULER =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread th = new Thread(r, "enso-h2-request-timeout");
+            th.setDaemon(true);
+            return th;
+        });
+
+    private void onRequestTimeout(Http2Stream stream) {
+        if (!stream.responded.compareAndSet(false, true)) return;
+        Thread ht = stream.handlerThread;
+        if (ht != null) ht.interrupt();
+        try {
+            writeResponseInternal(stream, 408, PersistentArrayMap.EMPTY, null, false);
+        } catch (IOException ignored) {
+            // Socket already dying — reset and move on.
+        }
+        resetStreamQuiet(stream.id, Http2.ERROR_INTERNAL_ERROR);
     }
 
     private void handleData(Frame f) throws IOException {
@@ -1128,12 +1172,21 @@ public final class Http2Connection implements Runnable {
             LOG.log(Level.WARNING, "HTTP/2 handler threw", t);
         }
         boolean head = "HEAD".equals(request.method);
+        // First-writer-wins with the timeout task. If the timeout has
+        // already claimed the response (408), drop what the handler
+        // built — writing it now would either double-respond on the
+        // stream (protocol error) or race with the reset already sent.
+        if (!stream.responded.compareAndSet(false, true)) {
+            stream.state = Http2Stream.State.CLOSED;
+            streams.remove(stream.id);
+            return;
+        }
         try {
             if (response == null) {
-                writeResponse(stream, 500, PersistentArrayMap.EMPTY, null, head);
+                writeResponseInternal(stream, 500, PersistentArrayMap.EMPTY, null, head);
             } else {
-                writeResponse(stream, response.status, response.headers,
-                              response.body, head);
+                writeResponseInternal(stream, response.status, response.headers,
+                                      response.body, head);
             }
         } catch (IOException e) {
             // socket died mid-write; just drop the stream
@@ -1167,9 +1220,9 @@ public final class Http2Connection implements Runnable {
         return false;
     }
 
-    private void writeResponse(Http2Stream stream, int status,
-                               Map<?, ?> respHeaders, Object body,
-                               boolean head) throws IOException {
+    private void writeResponseInternal(Http2Stream stream, int status,
+                                       Map<?, ?> respHeaders, Object body,
+                                       boolean head) throws IOException {
         // Assemble the header block: :status pseudo-header first, then user headers.
         List<Hpack.HeaderField> fields = new ArrayList<>(
             (respHeaders == null ? 0 : respHeaders.size()) + 1);
