@@ -6,6 +6,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.SocketAddress;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.util.concurrent.locks.ReentrantLock;
@@ -22,8 +23,8 @@ import javax.net.ssl.SSLSession;
  * shutdown).
  *
  * <p>The underlying channel stays in blocking mode; Loom parks virtual
- * threads that block inside {@link SocketChannel#read} / {@code write} via
- * the JDK poller with no carrier pin.
+ * threads that block on its reads (through the socket adaptor stream, so
+ * SO_TIMEOUT applies) / writes via the JDK poller with no carrier pin.
  *
  * <p>Thread model — read and write use disjoint buffers and disjoint SSLEngine
  * directions, so a framer vthread can call {@link RecordInputStream#read}
@@ -66,10 +67,19 @@ public final class TlsSocket implements AutoCloseable {
 
     private final InputStream in;
     private final OutputStream out;
+    // Ciphertext source. SocketChannel.read ignores SO_TIMEOUT; the socket
+    // adaptor's stream reads the same channel but honours it, which is what
+    // makes the idle / request timeouts apply to TLS connections.
+    private final InputStream netIn;
+    // Non-zero only while handshake(int) runs: wall-clock limit for the
+    // whole handshake, so a peer dripping bytes under SO_TIMEOUT can't
+    // hold it open indefinitely.
+    private long handshakeDeadlineNanos;
 
     public TlsSocket(SocketChannel channel, SSLEngine engine) throws IOException {
         this.channel = channel;
         this.engine = engine;
+        this.netIn = channel.socket().getInputStream();
         engine.setUseClientMode(false);
         SSLSession session = engine.getSession();
         int netSize = session.getPacketBufferSize();
@@ -85,11 +95,21 @@ public final class TlsSocket implements AutoCloseable {
         this.localPort = ((java.net.InetSocketAddress) channel.getLocalAddress()).getPort();
     }
 
-    /** Force the initial TLS handshake to run to completion. */
-    public void handshake() throws IOException {
+    /**
+     * Force the initial TLS handshake to run to completion within
+     * {@code timeoutMillis} (0 = no overall limit; each read is still bound
+     * by the socket's SO_TIMEOUT). Throws {@link SocketTimeoutException} when
+     * the limit passes. SO_TIMEOUT is restored afterwards.
+     */
+    public void handshake(int timeoutMillis) throws IOException {
         handshakeLock.lock();
+        java.net.Socket raw = channel.socket();
+        int soTimeout = raw.getSoTimeout();
         try {
             if (handshakeDone) return;
+            if (timeoutMillis > 0) {
+                handshakeDeadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
+            }
             engine.beginHandshake();
             HandshakeStatus hs = engine.getHandshakeStatus();
             while (hs != HandshakeStatus.FINISHED && hs != HandshakeStatus.NOT_HANDSHAKING) {
@@ -97,6 +117,10 @@ public final class TlsSocket implements AutoCloseable {
             }
             handshakeDone = true;
         } finally {
+            if (handshakeDeadlineNanos != 0) {
+                handshakeDeadlineNanos = 0;
+                raw.setSoTimeout(soTimeout);
+            }
             handshakeLock.unlock();
         }
     }
@@ -116,12 +140,14 @@ public final class TlsSocket implements AutoCloseable {
                 peerAppData.compact();
                 SSLEngineResult r = engine.unwrap(peerNetData, peerAppData);
                 peerNetData.compact();
+                // enlarge() expects (and returns) a write-mode buffer, so
+                // grow before flipping back to read mode.
+                if (r.getStatus() == Status.BUFFER_OVERFLOW) {
+                    peerAppData = enlarge(peerAppData, engine.getSession().getApplicationBufferSize());
+                }
                 peerAppData.flip();
                 if (r.getStatus() == Status.CLOSED) {
                     throw new EOFException("peer closed during handshake");
-                }
-                if (r.getStatus() == Status.BUFFER_OVERFLOW) {
-                    peerAppData = enlarge(peerAppData, engine.getSession().getApplicationBufferSize());
                 }
                 if (r.getStatus() == Status.BUFFER_UNDERFLOW) {
                     if (peerNetData.capacity() < engine.getSession().getPacketBufferSize()) {
@@ -153,8 +179,33 @@ public final class TlsSocket implements AutoCloseable {
 
     /** Refill peerNetData from the channel — buffer left in write-mode. */
     private void fillPeerNet() throws IOException {
-        int n = channel.read(peerNetData);
+        long deadline = handshakeDeadlineNanos;
+        if (deadline != 0) {
+            long remainingMs = (deadline - System.nanoTime()) / 1_000_000L;
+            if (remainingMs <= 0) {
+                throw new SocketTimeoutException("TLS handshake timed out");
+            }
+            java.net.Socket raw = channel.socket();
+            int soTimeout = raw.getSoTimeout();
+            if (soTimeout == 0 || soTimeout > remainingMs) {
+                raw.setSoTimeout((int) Math.min(remainingMs, Integer.MAX_VALUE));
+            }
+        }
+        int n = readNet();
         if (n < 0) throw new EOFException("peer closed");
+    }
+
+    /**
+     * Reads ciphertext into peerNetData (write-mode, heap-backed) through
+     * {@link #netIn} so SO_TIMEOUT applies. Returns the byte count or -1.
+     */
+    private int readNet() throws IOException {
+        ByteBuffer b = peerNetData;
+        int n = netIn.read(b.array(), b.arrayOffset() + b.position(), b.remaining());
+        if (n > 0) {
+            b.position(b.position() + n);
+        }
+        return n;
     }
 
     private void writeFully(ByteBuffer src) throws IOException {
@@ -239,6 +290,30 @@ public final class TlsSocket implements AutoCloseable {
     }
 
     /**
+     * Closes the channel at once, without close_notify. For forced teardown:
+     * {@link #close} waits for the write lock, which a writer stalled on a
+     * peer that stopped reading can hold indefinitely. Closing the channel
+     * unblocks such a writer (and a close() waiting behind it).
+     */
+    public void abort() throws IOException {
+        closed.set(true);
+        channel.close();
+    }
+
+    /**
+     * Closes {@code socket} at once, for forced teardown. A TLS close waits
+     * to send close_notify behind any writer stalled on a peer that stopped
+     * reading, so a {@link AdapterSocket} is aborted instead.
+     */
+    public static void forceClose(java.net.Socket socket) throws IOException {
+        if (socket instanceof AdapterSocket adapter) {
+            adapter.tls().abort();
+        } else {
+            socket.close();
+        }
+    }
+
+    /**
      * Wrap this TlsSocket in a {@link java.net.Socket} shim so it can be
      * passed to callers that expect the classic API. Only the accessors and
      * lifecycle methods the connection drivers actually use are overridden;
@@ -282,8 +357,9 @@ public final class TlsSocket implements AutoCloseable {
         // The AdapterSocket has no SocketImpl to forward to; no-op.
         @Override public void setTcpNoDelay(boolean on) { }
         // Per-request slowloris deadline from HttpConnection. Forward to the
-        // SocketChannel's underlying Socket — Loom's blocking-read implementation
-        // honours SO_TIMEOUT and unparks the vthread with SocketTimeoutException.
+        // SocketChannel's underlying Socket — ciphertext is read through its
+        // adaptor stream, which honours SO_TIMEOUT and unparks the vthread
+        // with SocketTimeoutException.
         // Without this override the HTTP/1.1 fallback path on the http2 TLS
         // listener loses its per-request timeout.
         @Override public void setSoTimeout(int t) throws java.net.SocketException {
@@ -335,9 +411,21 @@ public final class TlsSocket implements AutoCloseable {
          */
         private boolean fillPlaintext() throws IOException {
             peerAppData.compact();
+            try {
+                return unwrapUntilPlaintext();
+            } catch (IOException | RuntimeException | Error e) {
+                // A failed read (e.g. SO_TIMEOUT) must leave peerAppData in
+                // read mode holding only what was decrypted, never the
+                // compacted buffer's stale capacity as fresh plaintext.
+                peerAppData.flip();
+                throw e;
+            }
+        }
+
+        private boolean unwrapUntilPlaintext() throws IOException {
             while (true) {
                 if (peerNetData.position() == 0) {
-                    int n = channel.read(peerNetData);
+                    int n = readNet();
                     if (n < 0) {
                         peerAppData.flip();
                         return false;
@@ -367,7 +455,7 @@ public final class TlsSocket implements AutoCloseable {
                         if (peerNetData.capacity() < need) {
                             peerNetData = enlarge(peerNetData, need);
                         }
-                        int n = channel.read(peerNetData);
+                        int n = readNet();
                         if (n < 0) {
                             peerAppData.flip();
                             return false;
@@ -421,6 +509,16 @@ public final class TlsSocket implements AutoCloseable {
 
     private final class RecordOutputStream extends OutputStream {
 
+        // Callers (a BufferedOutputStream, the h2 writer's scratch) pass the
+        // same array on every write, so its wrapper is kept and re-pointed
+        // instead of allocated per call. Only buffer-sized arrays are kept:
+        // caching a large one-off body array would pin it in memory, and a
+        // per-call wrap is noise next to encrypting that much. Guarded by
+        // writeLock.
+        private static final int MAX_CACHED_ARRAY = 64 * 1024;
+        private byte[] wrappedArray;
+        private ByteBuffer wrapped;
+
         @Override
         public void write(int b) throws IOException {
             write(new byte[] { (byte) b }, 0, 1);
@@ -431,7 +529,17 @@ public final class TlsSocket implements AutoCloseable {
             if (len == 0) return;
             writeLock.lock();
             try {
-                ByteBuffer app = ByteBuffer.wrap(src, off, len);
+                ByteBuffer app;
+                if (src == wrappedArray) {
+                    app = wrapped;
+                    app.limit(off + len).position(off);
+                } else if (src.length <= MAX_CACHED_ARRAY) {
+                    app = ByteBuffer.wrap(src, off, len);
+                    wrapped = app;
+                    wrappedArray = src;
+                } else {
+                    app = ByteBuffer.wrap(src, off, len);
+                }
                 while (app.hasRemaining()) {
                     myNetData.clear();
                     SSLEngineResult r = engine.wrap(app, myNetData);

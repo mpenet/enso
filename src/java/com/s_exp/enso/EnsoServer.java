@@ -6,6 +6,7 @@ import com.s_exp.enso.api.RingHandler;
 import com.s_exp.enso.core.TlsSocket;
 import com.s_exp.enso.http1.HttpConnection;
 import com.s_exp.enso.http2.Http2Connection;
+import com.s_exp.enso.websocket.WebSocketConnection;
 import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -29,6 +30,8 @@ import javax.net.ssl.SSLServerSocketFactory;
 public final class EnsoServer implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(EnsoServer.class.getName());
+    private static final long ACCEPT_FAILURE_BACKOFF_MILLIS = 50;
+    private static final long SHUTDOWN_POLL_MILLIS = 10;
 
     private final Listener listener;
     private final RingHandler handler;
@@ -41,6 +44,7 @@ public final class EnsoServer implements AutoCloseable {
     private final Thread acceptor;
     private final Config config;
     private final Set<HttpConnection> connections = ConcurrentHashMap.newKeySet();
+    private final Set<Http2Connection> http2Connections = ConcurrentHashMap.newKeySet();
     // HTTP/3 listener kept as Object to avoid a static reference from
     // EnsoServer to the quiche FFM classes; loaded reflectively when the
     // http3 flag is set. Users with http3 disabled never trigger the FFM
@@ -83,8 +87,8 @@ public final class EnsoServer implements AutoCloseable {
         try {
             Class<?> cls = Class.forName("com.s_exp.enso.http3.Http3Listener");
             AutoCloseable l = (AutoCloseable) cls
-                .getConstructor(Config.class, RingHandler.class, Object.class)
-                .newInstance(config, handler, this);
+                .getConstructor(Config.class, RingHandler.class, RingErrorHandler.class)
+                .newInstance(config, handler, errorHandler);
             cls.getMethod("start").invoke(l);
             return l;
         } catch (ClassNotFoundException | NoClassDefFoundError e) {
@@ -127,20 +131,58 @@ public final class EnsoServer implements AutoCloseable {
         connections.remove(conn);
     }
 
+    public void register(Http2Connection conn) {
+        http2Connections.add(conn);
+    }
+
+    public void unregister(Http2Connection conn) {
+        http2Connections.remove(conn);
+    }
+
+    /**
+     * Failures are contained per iteration so one bad connection never stops
+     * the acceptor: a socket that can't be set up or dispatched is closed
+     * rather than leaked, and accept errors (e.g. EMFILE) back off briefly
+     * instead of spinning on a condition that persists.
+     */
     private void acceptLoop() {
         while (running) {
+            Socket socket;
             try {
-                Socket socket = listener.accept();
+                socket = listener.accept();
+            } catch (IOException e) {
+                if (running) {
+                    LOG.log(Level.WARNING, "accept failed", e);
+                    backOffAfterAcceptFailure();
+                }
+                continue;
+            } catch (RuntimeException e) {
+                // e.g. sslContextProvider threw; the listener already
+                // closed the accepted channel.
+                LOG.log(Level.WARNING, "connection setup failed", e);
+                continue;
+            }
+            try {
                 applySocketOptions(socket);
                 if (config.idleTimeoutMillis > 0) {
                     socket.setSoTimeout(config.idleTimeoutMillis);
                 }
                 dispatchExecutor.execute(() -> dispatch(socket));
-            } catch (IOException e) {
-                if (running) {
-                    LOG.log(Level.WARNING, "accept failed", e);
+            } catch (IOException | RuntimeException e) {
+                LOG.log(Level.WARNING, "connection dispatch failed", e);
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
                 }
             }
+        }
+    }
+
+    private static void backOffAfterAcceptFailure() {
+        try {
+            Thread.sleep(ACCEPT_FAILURE_BACKOFF_MILLIS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -179,9 +221,16 @@ public final class EnsoServer implements AutoCloseable {
         if (socket instanceof TlsSocket.AdapterSocket adapter) {
             try {
                 TlsSocket tls = adapter.tls();
-                tls.handshake();
+                // The handshake is the first part of reading a request, so
+                // the request budget bounds it (each read also stays under
+                // the idle timeout set at accept).
+                tls.handshake(config.requestTimeoutMillis);
                 String proto = tls.getApplicationProtocol();
                 if ("h2".equals(proto)) {
+                    // The idle timeout set at accept keeps bounding reads
+                    // until the preface and SETTINGS exchange completes;
+                    // Http2Connection then switches to its stream-aware
+                    // idle timer.
                     new Http2Connection(socket, handler, this).run();
                     return;
                 }
@@ -223,30 +272,79 @@ public final class EnsoServer implements AutoCloseable {
             });
         }
         closeIdleConnections();
+        closeWebSockets();
+        goAwayHttp2Connections();
         executor.shutdown();
         boolean clean = false;
         if (config.shutdownTimeoutMillis > 0) {
+            // Connections are waited on directly: with a user-supplied
+            // workerExecutor the internal executor runs no tasks, so its
+            // termination says nothing about in-flight requests.
+            long deadline = System.nanoTime() + config.shutdownTimeoutMillis * 1_000_000L;
             try {
-                clean = executor.awaitTermination(config.shutdownTimeoutMillis, TimeUnit.MILLISECONDS);
+                clean = awaitConnectionsDrained(deadline)
+                    && executor.awaitTermination(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
         if (!clean) {
-            forEachConnection(c -> {
-                try {
-                    c.socketRef().close();
-                } catch (IOException ignored) {
-                }
-            });
+            forEachConnection(c -> forceClose(c.socketRef()));
+            for (Http2Connection c : http2Connections) {
+                forceClose(c.socketRef());
+            }
             executor.shutdownNow();
         }
         connections.clear();
+        http2Connections.clear();
         if (h3CloseThread != null) {
             try {
                 h3CloseThread.join();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /** {@link TlsSocket#forceClose}, ignoring failures: teardown proceeds regardless. */
+    public static void forceClose(Socket socket) {
+        try {
+            TlsSocket.forceClose(socket);
+        } catch (IOException ignored) {
+        }
+    }
+
+    /** Polls until every HTTP/1 and HTTP/2 connection has unregistered or the deadline passes. */
+    private boolean awaitConnectionsDrained(long deadlineNanos) throws InterruptedException {
+        while (!(connections.isEmpty() && http2Connections.isEmpty())
+               && System.nanoTime() < deadlineNanos) {
+            Thread.sleep(SHUTDOWN_POLL_MILLIS);
+        }
+        return connections.isEmpty() && http2Connections.isEmpty();
+    }
+
+    /**
+     * GOAWAY(NO_ERROR) to every HTTP/2 connection: no new streams, close once
+     * in-flight ones finish. Each runs on its own virtual thread since
+     * goAway() may block behind a peer that stopped reading.
+     */
+    private void goAwayHttp2Connections() {
+        for (Http2Connection c : http2Connections) {
+            Thread.ofVirtual().name("enso-h2-goaway").start(c::goAway);
+        }
+    }
+
+    /**
+     * CLOSE 1001 to every open WebSocket so it finishes the closing
+     * handshake within the shutdown timeout. Each runs on its own virtual
+     * thread since the CLOSE may queue behind a writer stalled on a peer
+     * that stopped reading.
+     */
+    private void closeWebSockets() {
+        for (HttpConnection c : connections) {
+            WebSocketConnection ws = c.webSocket();
+            if (ws != null) {
+                Thread.ofVirtual().name("enso-ws-close").start(ws::shutdown);
             }
         }
     }
@@ -305,6 +403,13 @@ public final class EnsoServer implements AutoCloseable {
         }
     }
 
+    /** Applies {@code :ssl-session-cache-size}; 0 keeps the JVM default. */
+    private static void applySessionCacheSize(Config config, SSLContext ctx) {
+        if (config.sslSessionCacheSize > 0 && ctx != null) {
+            ctx.getServerSessionContext().setSessionCacheSize(config.sslSessionCacheSize);
+        }
+    }
+
     /**
      * TLS listener over {@link SSLServerSocket}. Sockets have no
      * {@link SocketChannel}; file bodies use the user-space transfer fallback.
@@ -314,6 +419,7 @@ public final class EnsoServer implements AutoCloseable {
         private final SSLServerSocket serverSocket;
 
         SslListener(Config config) throws IOException {
+            applySessionCacheSize(config, config.sslContext);
             SSLServerSocketFactory factory = config.sslContext.getServerSocketFactory();
             this.serverSocket = (SSLServerSocket) factory.createServerSocket(
                 config.port, config.backlog, InetAddress.getByName(config.host));
@@ -363,9 +469,14 @@ public final class EnsoServer implements AutoCloseable {
 
         private final ServerSocketChannel channel;
         private final Config config;
+        // Acceptor-thread only: the context last configured, so a provider
+        // returning the same one isn't reconfigured per accept.
+        private SSLContext configured;
 
         TlsChannelListener(Config config) throws IOException {
             this.config = config;
+            applySessionCacheSize(config, config.sslContext);
+            this.configured = config.sslContext;
             this.channel = ServerSocketChannel.open();
             this.channel.socket().setReuseAddress(config.soReuseAddr);
             this.channel.bind(new InetSocketAddress(config.host, config.port), config.backlog);
@@ -382,6 +493,10 @@ public final class EnsoServer implements AutoCloseable {
                     : config.sslContext;
                 if (current == null) {
                     throw new IOException("SSLContext provider returned null");
+                }
+                if (current != configured) {
+                    applySessionCacheSize(config, current);
+                    configured = current;
                 }
                 SSLEngine engine = current.createSSLEngine();
                 engine.setUseClientMode(false);

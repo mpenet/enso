@@ -202,3 +202,19 @@
     (let [f (.poll r)]
       (is (some? f) "frame assembled from drip feed")
       (is (= Http3FrameType/HEADERS (.type f))))))
+
+(deftest quiche-error-constants-match-quiche-h
+  ;; quiche.h enum quiche_error.
+  (is (= -6 com.s_exp.enso.quiche.Quiche/QUICHE_ERR_INVALID_STATE))
+  (is (= -7 com.s_exp.enso.quiche.Quiche/QUICHE_ERR_INVALID_STREAM_STATE)))
+
+(deftest config-rejects-qpack-dynamic-table
+  ;; The QPACK decoder only supports the static table (capacity 0);
+  ;; advertising more would invite encoder instructions we reject.
+  (is (thrown-with-msg? IllegalArgumentException #"http3QpackMaxTableCapacity"
+                        (-> (com.s_exp.enso.api.Config/builder)
+                            (.http3QpackMaxTableCapacity 4096)
+                            (.build))))
+  (is (some? (-> (com.s_exp.enso.api.Config/builder)
+                 (.http3QpackMaxTableCapacity 0)
+                 (.build)))))

@@ -1,29 +1,37 @@
 /*
  * JNI shim over cloudflare/libquiche for Enso's HTTP/3 layer.
  *
- * We use JNI (not FFM) because the FFM downcall path on JDK 25 + macOS
- * ARM64 corrupts libmalloc's freelist under connection churn (task
- * #86/#79; also see JDK-8357145 / JDK-8357268 that Netty steers around
- * in CleanerJava25.java). Netty's own quic layer uses a JNI shim of
- * this exact shape.
+ * Netty's quic layer uses a JNI shim of this same shape.
  *
  * Conventions:
  *   - All pointers cross the boundary as jlong (raw address). Java side
  *     treats them opaquely.
- *   - Byte arrays use GetByteArrayElements. HotSpot avoids the copy when
- *     the JVM can pin the underlying heap array. GetPrimitiveArrayCritical
- *     is NOT viable here because every downcall wraps a real quiche
- *     function call, which may itself invoke stdlib routines — the
- *     critical section rule (no JNI, no blocking, no lock-taking) is
- *     hard to guarantee across those.
- *   - Buffers we only read → JNI_ABORT on release (skip copy-back).
- *     Buffers we write into for the caller → commit (0).
+ *   - Per-packet / per-stream-call byte[] arguments use
+ *     GetPrimitiveArrayCritical: on HotSpot it returns the array's own
+ *     storage (GetByteArrayElements always copies the whole array in, and
+ *     back out unless JNI_ABORT). The critical-region rules hold because
+ *     the region spans exactly one quiche call: quiche never calls back
+ *     into the JVM (no qlog/keylog callbacks are installed) and doesn't
+ *     block on anything a Java thread holds; no other JNI function is
+ *     called while a region is open. Most calls return in microseconds,
+ *     but quiche_conn_recv runs the TLS handshake inline: the packet
+ *     carrying a ClientHello costs a CertificateVerify signature (around
+ *     1 ms with an RSA-2048 key, far less with ECDSA) inside the region.
+ *     On G1 (JDK 22+) a critical region pins just that array's heap
+ *     region; collectors without region pinning stall GC for that long.
+ *   - conn_send writes into a direct ByteBuffer (GetDirectBufferAddress),
+ *     which DatagramChannel.send can then use without its own copy.
+ *   - Cold-path calls (config, accept, retry, version negotiation) keep
+ *     GetByteArrayElements: JNI_ABORT on release for read-only buffers,
+ *     commit (0) for buffers we write into.
  *   - Sockaddrs are passed as (byte[] ip, int port). C builds the real
  *     struct sockaddr_in / _in6 on the JNI stack per call. Avoids
  *     shipping sockaddr_storage layout across the boundary (differs by
  *     OS) and keeps Java allocation-free.
  *   - Every function that can fail returns the raw quiche return code;
- *     Java handles QUICHE_ERR_DONE / < 0.
+ *     Java handles QUICHE_ERR_DONE / < 0. Invalid arguments detected by
+ *     the shim itself return SHIM_ERR_INVALID_ARGUMENT, outside quiche's
+ *     error range.
  */
 
 #include <jni.h>
@@ -39,6 +47,10 @@
 #include <quiche.h>
 
 #define UNUSED(x) (void)(x)
+
+/* Shim-detected bad arguments (bounds, address length). Distinct from
+ * every quiche_error value; mirrored by Quiche.SHIM_ERR_INVALID_ARGUMENT. */
+#define SHIM_ERR_INVALID_ARGUMENT (-10000)
 
 /*
  * GetByteArrayElements returns NULL if the JVM can't pin/copy the array
@@ -178,6 +190,13 @@ Java_com_s_1exp_enso_quiche_Quiche_configSetDisableActiveMigration(
         (quiche_config *)(intptr_t)config, v == JNI_TRUE);
 }
 
+JNIEXPORT void JNICALL
+Java_com_s_1exp_enso_quiche_Quiche_configVerifyPeer(
+        JNIEnv *env, jclass cls, jlong config, jboolean v) {
+    UNUSED(env); UNUSED(cls);
+    quiche_config_verify_peer((quiche_config *)(intptr_t)config, v == JNI_TRUE);
+}
+
 /* --------------------------------------------------------------------- */
 /* Accept / retry / negotiate / header_info                               */
 /* --------------------------------------------------------------------- */
@@ -232,6 +251,35 @@ Java_com_s_1exp_enso_quiche_Quiche_accept(
     if (odcid != NULL) {
         (*env)->ReleaseByteArrayElements(env, odcidArr, odcid, JNI_ABORT);
     }
+    return (jlong)(intptr_t)conn;
+}
+
+/* Client-side connection. Used by the test suite to drive the server
+ * over real QUIC with hand-built HTTP/3 frames. */
+JNIEXPORT jlong JNICALL
+Java_com_s_1exp_enso_quiche_Quiche_connect(
+        JNIEnv *env, jclass cls,
+        jstring serverName, jbyteArray scidArr,
+        jbyteArray localIp, jint localPort,
+        jbyteArray peerIp, jint peerPort,
+        jlong config) {
+    UNUSED(cls);
+    uint8_t scid[QUICHE_MAX_CONN_ID_LEN];
+    jsize scidLen = (*env)->GetArrayLength(env, scidArr);
+    if (scidLen > QUICHE_MAX_CONN_ID_LEN) return 0;
+    (*env)->GetByteArrayRegion(env, scidArr, 0, scidLen, (jbyte *)scid);
+    struct sockaddr_storage local, peer;
+    socklen_t localLen = build_sockaddr(env, localIp, localPort, &local);
+    socklen_t peerLen = build_sockaddr(env, peerIp, peerPort, &peer);
+    if (localLen == 0 || peerLen == 0) return 0;
+    const char *name = (*env)->GetStringUTFChars(env, serverName, NULL);
+    if (name == NULL) return 0;
+    quiche_conn *conn = quiche_connect(
+        name, scid, (size_t)scidLen,
+        (const struct sockaddr *)&local, localLen,
+        (const struct sockaddr *)&peer, peerLen,
+        (quiche_config *)(intptr_t)config);
+    (*env)->ReleaseStringUTFChars(env, serverName, name);
     return (jlong)(intptr_t)conn;
 }
 
@@ -300,79 +348,66 @@ negotiate_unwind:
 }
 
 /*
- * Header info out-params. Java pre-sizes scid/dcid/token to max length
- * and passes in the *max* size as scidLen[0]/dcidLen[0]/tokenLen[0].
- * quiche writes back the actual lengths.
+ * Parses the header of the datagram in the direct buffer bufObj[0, bufLen).
+ * Java passes the *max* sizes in scidLen[0]/dcidLen[0]/tokenLen[0]; on
+ * success they receive the actual lengths and only those bytes are copied
+ * into scid/dcid/token.
  */
 JNIEXPORT jint JNICALL
 Java_com_s_1exp_enso_quiche_Quiche_headerInfo(
         JNIEnv *env, jclass cls,
-        jbyteArray bufArr, jint bufLen, jint dcil,
+        jobject bufObj, jint bufLen, jint dcil,
         jintArray versionOut, jbyteArray typeOut,
         jbyteArray scidArr, jlongArray scidLenArr,
         jbyteArray dcidArr, jlongArray dcidLenArr,
         jbyteArray tokenArr, jlongArray tokenLenArr) {
     UNUSED(cls);
-    jsize bufArrLen = (*env)->GetArrayLength(env, bufArr);
-    if (bufLen < 0 || bufLen > bufArrLen) return -6;
-    jbyte *buf = NULL, *scid = NULL, *dcid = NULL, *token = NULL;
-    int rc = -1;
-    GET_BYTES_OR_GOTO(buf, bufArr, hdrinfo_unwind);
-    GET_BYTES_OR_GOTO(scid, scidArr, hdrinfo_unwind);
-    GET_BYTES_OR_GOTO(dcid, dcidArr, hdrinfo_unwind);
-    GET_BYTES_OR_GOTO(token, tokenArr, hdrinfo_unwind);
+    uint8_t *buf = (uint8_t *)(*env)->GetDirectBufferAddress(env, bufObj);
+    jlong cap = (*env)->GetDirectBufferCapacity(env, bufObj);
+    if (buf == NULL || bufLen < 0 || bufLen > cap) return SHIM_ERR_INVALID_ARGUMENT;
 
     jlong scidLenJ, dcidLenJ, tokenLenJ;
     (*env)->GetLongArrayRegion(env, scidLenArr, 0, 1, &scidLenJ);
     (*env)->GetLongArrayRegion(env, dcidLenArr, 0, 1, &dcidLenJ);
     (*env)->GetLongArrayRegion(env, tokenLenArr, 0, 1, &tokenLenJ);
-
-    /* Caller-supplied max sizes must fit inside pinned arrays or quiche
-     * will write past the region. */
-    jsize scidArrLen = (*env)->GetArrayLength(env, scidArr);
-    jsize dcidArrLen = (*env)->GetArrayLength(env, dcidArr);
-    jsize tokenArrLen = (*env)->GetArrayLength(env, tokenArr);
-    if (scidLenJ < 0 || scidLenJ > scidArrLen ||
-        dcidLenJ < 0 || dcidLenJ > dcidArrLen ||
-        tokenLenJ < 0 || tokenLenJ > tokenArrLen) {
-        goto hdrinfo_unwind;
+    /* Caller-supplied max sizes must fit both the Java arrays and our
+     * stack buffers. */
+    if (scidLenJ < 0 || scidLenJ > QUICHE_MAX_CONN_ID_LEN
+        || scidLenJ > (*env)->GetArrayLength(env, scidArr)
+        || dcidLenJ < 0 || dcidLenJ > QUICHE_MAX_CONN_ID_LEN
+        || dcidLenJ > (*env)->GetArrayLength(env, dcidArr)
+        || tokenLenJ < 0 || tokenLenJ > 4096
+        || tokenLenJ > (*env)->GetArrayLength(env, tokenArr)) {
+        return SHIM_ERR_INVALID_ARGUMENT;
     }
 
+    uint8_t scid[QUICHE_MAX_CONN_ID_LEN], dcid[QUICHE_MAX_CONN_ID_LEN], token[4096];
     size_t scidLen = (size_t)scidLenJ;
     size_t dcidLen = (size_t)dcidLenJ;
     size_t tokenLen = (size_t)tokenLenJ;
     uint32_t version;
     uint8_t type;
 
-    rc = quiche_header_info(
-        (const uint8_t *)buf, (size_t)bufLen, (size_t)dcil,
+    int rc = quiche_header_info(
+        buf, (size_t)bufLen, (size_t)dcil,
         &version, &type,
-        (uint8_t *)scid, &scidLen,
-        (uint8_t *)dcid, &dcidLen,
-        (uint8_t *)token, &tokenLen);
+        scid, &scidLen,
+        dcid, &dcidLen,
+        token, &tokenLen);
+    if (rc != 0) return (jint)rc;
 
-    /* On error paths quiche may have partially clobbered scid/dcid/token —
-     * caller ignores them anyway, so skip the copy-back to avoid a real
-     * memcpy in the pinned-array fallback. */
-hdrinfo_unwind: {
-    jint releaseMode = (rc == 0) ? 0 : JNI_ABORT;
-    if (token != NULL) (*env)->ReleaseByteArrayElements(env, tokenArr, token, releaseMode);
-    if (dcid != NULL) (*env)->ReleaseByteArrayElements(env, dcidArr, dcid, releaseMode);
-    if (scid != NULL) (*env)->ReleaseByteArrayElements(env, scidArr, scid, releaseMode);
-    if (buf != NULL) (*env)->ReleaseByteArrayElements(env, bufArr, buf, JNI_ABORT);
-}
-
-    if (rc == 0) {
-        jint vJ = (jint)version;
-        (*env)->SetIntArrayRegion(env, versionOut, 0, 1, &vJ);
-        jbyte tJ = (jbyte)type;
-        (*env)->SetByteArrayRegion(env, typeOut, 0, 1, &tJ);
-        jlong sJ = (jlong)scidLen, dJ = (jlong)dcidLen, tJl = (jlong)tokenLen;
-        (*env)->SetLongArrayRegion(env, scidLenArr, 0, 1, &sJ);
-        (*env)->SetLongArrayRegion(env, dcidLenArr, 0, 1, &dJ);
-        (*env)->SetLongArrayRegion(env, tokenLenArr, 0, 1, &tJl);
-    }
-    return (jint)rc;
+    jint vJ = (jint)version;
+    (*env)->SetIntArrayRegion(env, versionOut, 0, 1, &vJ);
+    jbyte tJ = (jbyte)type;
+    (*env)->SetByteArrayRegion(env, typeOut, 0, 1, &tJ);
+    (*env)->SetByteArrayRegion(env, scidArr, 0, (jsize)scidLen, (jbyte *)scid);
+    (*env)->SetByteArrayRegion(env, dcidArr, 0, (jsize)dcidLen, (jbyte *)dcid);
+    (*env)->SetByteArrayRegion(env, tokenArr, 0, (jsize)tokenLen, (jbyte *)token);
+    jlong sJ = (jlong)scidLen, dJ = (jlong)dcidLen, tJl = (jlong)tokenLen;
+    (*env)->SetLongArrayRegion(env, scidLenArr, 0, 1, &sJ);
+    (*env)->SetLongArrayRegion(env, dcidLenArr, 0, 1, &dJ);
+    (*env)->SetLongArrayRegion(env, tokenLenArr, 0, 1, &tJl);
+    return 0;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -419,6 +454,26 @@ Java_com_s_1exp_enso_quiche_Quiche_connOnTimeout(JNIEnv *env, jclass cls, jlong 
     quiche_conn_on_timeout((quiche_conn *)(intptr_t)conn);
 }
 
+/* Fills out[0] = 1 when the peer's CONNECTION_CLOSE was application
+ * level (0 for transport), out[1] = its error code. Returns false when
+ * the peer has not closed the connection. */
+JNIEXPORT jboolean JNICALL
+Java_com_s_1exp_enso_quiche_Quiche_connPeerError(
+        JNIEnv *env, jclass cls, jlong conn, jlongArray out) {
+    UNUSED(cls);
+    bool isApp = false;
+    uint64_t code = 0;
+    const uint8_t *reason = NULL;
+    size_t reasonLen = 0;
+    if (!quiche_conn_peer_error((quiche_conn *)(intptr_t)conn,
+                                &isApp, &code, &reason, &reasonLen)) {
+        return JNI_FALSE;
+    }
+    jlong vals[2] = { isApp ? 1 : 0, (jlong)code };
+    (*env)->SetLongArrayRegion(env, out, 0, 2, vals);
+    return JNI_TRUE;
+}
+
 JNIEXPORT jlong JNICALL
 Java_com_s_1exp_enso_quiche_Quiche_connRecv(
         JNIEnv *env, jclass cls, jlong conn,
@@ -429,39 +484,60 @@ Java_com_s_1exp_enso_quiche_Quiche_connRecv(
     struct sockaddr_storage from, to;
     socklen_t fromLen = build_sockaddr(env, fromIp, fromPort, &from);
     socklen_t toLen = build_sockaddr(env, toIp, toPort, &to);
-    if (fromLen == 0 || toLen == 0) return -6; /* QUICHE_ERR_INVALID_STATE (-1 = DONE would silent-drop) */
+    if (fromLen == 0 || toLen == 0) return SHIM_ERR_INVALID_ARGUMENT;
     /* Bounds-check caller-supplied length against actual array length.
      * A bug in the Java layer that passes bufLen > array.length would
-     * make libquiche read past the pinned region → OOB / crash. */
+     * make libquiche read past the array → OOB / crash. */
     jsize arrLen = (*env)->GetArrayLength(env, bufArr);
-    if (bufLen < 0 || bufLen > arrLen) return -6;
+    if (bufLen < 0 || bufLen > arrLen) return SHIM_ERR_INVALID_ARGUMENT;
     quiche_recv_info info = {
         .from = (struct sockaddr *)&from, .from_len = fromLen,
         .to = (struct sockaddr *)&to, .to_len = toLen,
     };
-    jbyte *buf;
-    GET_BYTES_OR_RETURN(buf, bufArr, -1);
+    /* quiche decrypts in place; the datagram array is the owner thread's
+     * own copy and discarded afterwards, so no copy-back is needed. */
+    uint8_t *buf = (*env)->GetPrimitiveArrayCritical(env, bufArr, NULL);
+    if (buf == NULL) return SHIM_ERR_INVALID_ARGUMENT;
     ssize_t rc = quiche_conn_recv(
-        (quiche_conn *)(intptr_t)conn, (uint8_t *)buf, (size_t)bufLen, &info);
-    (*env)->ReleaseByteArrayElements(env, bufArr, buf, JNI_ABORT);
+        (quiche_conn *)(intptr_t)conn, buf, (size_t)bufLen, &info);
+    (*env)->ReleasePrimitiveArrayCritical(env, bufArr, buf, JNI_ABORT);
     return (jlong)rc;
 }
 
+/*
+ * Writes one packet into the direct buffer outObj[0, outLen). On success
+ * the destination quiche chose (send_info.to — differs from the original
+ * peer after a NAT rebinding / migration) is written to toIpOut (4 or 16
+ * bytes) and toMetaOut = {port, ip length}. send_info.at (pacing) is not
+ * used.
+ */
 JNIEXPORT jlong JNICALL
 Java_com_s_1exp_enso_quiche_Quiche_connSend(
         JNIEnv *env, jclass cls, jlong conn,
-        jbyteArray outArr, jint outLen) {
+        jobject outObj, jint outLen,
+        jbyteArray toIpOut, jintArray toMetaOut) {
     UNUSED(cls);
-    jsize arrLen = (*env)->GetArrayLength(env, outArr);
-    if (outLen < 0 || outLen > arrLen) return -6;
-    /* We ignore send_info for now (no path migration). Allocate on stack. */
+    uint8_t *out = (uint8_t *)(*env)->GetDirectBufferAddress(env, outObj);
+    jlong cap = (*env)->GetDirectBufferCapacity(env, outObj);
+    if (out == NULL || outLen < 0 || outLen > cap) return SHIM_ERR_INVALID_ARGUMENT;
     quiche_send_info info;
     memset(&info, 0, sizeof(info));
-    jbyte *out;
-    GET_BYTES_OR_RETURN(out, outArr, -1);
     ssize_t rc = quiche_conn_send(
-        (quiche_conn *)(intptr_t)conn, (uint8_t *)out, (size_t)outLen, &info);
-    (*env)->ReleaseByteArrayElements(env, outArr, out, 0); /* commit */
+        (quiche_conn *)(intptr_t)conn, out, (size_t)outLen, &info);
+    if (rc < 0) return (jlong)rc;
+    jint meta[2] = { 0, 0 };
+    if (info.to.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&info.to;
+        meta[0] = ntohs(sin->sin_port);
+        meta[1] = 4;
+        (*env)->SetByteArrayRegion(env, toIpOut, 0, 4, (jbyte *)&sin->sin_addr);
+    } else if (info.to.ss_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&info.to;
+        meta[0] = ntohs(sin6->sin6_port);
+        meta[1] = 16;
+        (*env)->SetByteArrayRegion(env, toIpOut, 0, 16, (jbyte *)&sin6->sin6_addr);
+    }
+    (*env)->SetIntArrayRegion(env, toMetaOut, 0, 2, meta);
     return (jlong)rc;
 }
 
@@ -505,15 +581,15 @@ Java_com_s_1exp_enso_quiche_Quiche_connStreamRecv(
         jbooleanArray finOut, jlongArray errOut) {
     UNUSED(cls);
     jsize arrLen = (*env)->GetArrayLength(env, outArr);
-    if (outLen < 0 || outLen > arrLen) return -6;
-    jbyte *out;
-    GET_BYTES_OR_RETURN(out, outArr, -1);
+    if (outLen < 0 || outLen > arrLen) return SHIM_ERR_INVALID_ARGUMENT;
     bool fin = false;
     uint64_t err = 0;
+    uint8_t *out = (*env)->GetPrimitiveArrayCritical(env, outArr, NULL);
+    if (out == NULL) return SHIM_ERR_INVALID_ARGUMENT;
     ssize_t rc = quiche_conn_stream_recv(
         (quiche_conn *)(intptr_t)conn, (uint64_t)streamId,
-        (uint8_t *)out, (size_t)outLen, &fin, &err);
-    (*env)->ReleaseByteArrayElements(env, outArr, out, 0);
+        out, (size_t)outLen, &fin, &err);
+    (*env)->ReleasePrimitiveArrayCritical(env, outArr, out, 0);
     jboolean finJ = fin ? JNI_TRUE : JNI_FALSE;
     (*env)->SetBooleanArrayRegion(env, finOut, 0, 1, &finJ);
     if (errOut != NULL) {
@@ -529,15 +605,18 @@ Java_com_s_1exp_enso_quiche_Quiche_connStreamSend(
         jbyteArray bufArr, jint off, jint len, jboolean fin) {
     UNUSED(cls);
     jsize arrLen = (*env)->GetArrayLength(env, bufArr);
-    if (off < 0 || len < 0 || (jlong)off + (jlong)len > (jlong)arrLen) return -6;
-    jbyte *buf;
-    GET_BYTES_OR_RETURN(buf, bufArr, -1);
+    if (off < 0 || len < 0 || (jlong)off + (jlong)len > (jlong)arrLen) {
+        return SHIM_ERR_INVALID_ARGUMENT;
+    }
+    /* out_error_code (the peer's STOP_SENDING code) is not needed: the
+     * caller only distinguishes STREAM_STOPPED / STREAM_RESET. */
     uint64_t err = 0;
+    uint8_t *buf = (*env)->GetPrimitiveArrayCritical(env, bufArr, NULL);
+    if (buf == NULL) return SHIM_ERR_INVALID_ARGUMENT;
     ssize_t rc = quiche_conn_stream_send(
         (quiche_conn *)(intptr_t)conn, (uint64_t)streamId,
-        (const uint8_t *)(buf + off), (size_t)len,
-        fin == JNI_TRUE, &err);
-    (*env)->ReleaseByteArrayElements(env, bufArr, buf, JNI_ABORT);
+        buf + off, (size_t)len, fin == JNI_TRUE, &err);
+    (*env)->ReleasePrimitiveArrayCritical(env, bufArr, buf, JNI_ABORT);
     return (jlong)rc;
 }
 

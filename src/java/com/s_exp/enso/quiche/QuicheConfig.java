@@ -37,8 +37,13 @@ public final class QuicheConfig implements AutoCloseable {
         }
     }
 
-    /** Raw {@code quiche_config *} handle for {@code quiche_accept}. */
+    /**
+     * Raw {@code quiche_config *} handle for {@code quiche_accept}.
+     *
+     * @throws IllegalStateException once {@link #close} freed it
+     */
     public long handle() {
+        if (closed) throw new IllegalStateException("quiche config already freed");
         return ptr;
     }
 

@@ -79,7 +79,7 @@ public final class Config {
     public final boolean http3StatelessRetry;
     /** Advertised on outbound SETTINGS + enforced on peer→us HEADERS. */
     public final int http3MaxFieldSectionSize;
-    /** RFC 9204 SETTINGS_QPACK_MAX_TABLE_CAPACITY. 0 disables dynamic table. */
+    /** RFC 9204 SETTINGS_QPACK_MAX_TABLE_CAPACITY. Must be 0: dynamic table unsupported. */
     public final long http3QpackMaxTableCapacity;
     /** RFC 9204 SETTINGS_QPACK_BLOCKED_STREAMS. Only meaningful if capacity > 0. */
     public final long http3QpackBlockedStreams;
@@ -232,7 +232,9 @@ public final class Config {
         private boolean http3;
         private int http3Port = 0;                      // 0 → reuse main port number over UDP
         private int http3MaxIdleTimeoutMs = 30_000;
-        private long http3InitialMaxData = 1L << 30;    // 1 GiB
+        // Connection window: also bounds the unread request-body bytes
+        // quiche buffers per connection (it autotunes up to 24 MiB).
+        private long http3InitialMaxData = 16L << 20; // 16 MiB
         private int http3InitialMaxStreamsBidi = 100;
         private int http3InitialMaxStreamsUni = 8;
         private int http3MaxUdpPayloadSize = 1350;
@@ -472,9 +474,13 @@ public final class Config {
             }
             // RFC 9114 §7.2.4.1: 0 → no limit advertised.
             requireNonNegative("http3MaxFieldSectionSize", http3MaxFieldSectionSize);
-            if (http3QpackMaxTableCapacity < 0) {
+            // The QPACK decoder supports the static table only: a non-zero
+            // capacity would be advertised in SETTINGS, and the encoder
+            // instructions peers then send are rejected as errors.
+            if (http3QpackMaxTableCapacity != 0) {
                 throw new IllegalArgumentException(
-                    "http3QpackMaxTableCapacity must be >= 0, got " + http3QpackMaxTableCapacity);
+                    "http3QpackMaxTableCapacity must be 0 (dynamic table unsupported), got "
+                    + http3QpackMaxTableCapacity);
             }
             if (http3QpackBlockedStreams < 0) {
                 throw new IllegalArgumentException(

@@ -36,20 +36,32 @@ public final class Http3FrameReader {
         public final byte[] dataChunk;
         /** True when this is the final chunk of the DATA frame. */
         public final boolean dataFinalChunk;
+        /**
+         * True for a HEADERS frame longer than the reader's accumulation
+         * cap: its payload was skipped, {@link #payload} is null.
+         */
+        public final boolean oversized;
 
-        private Frame(long type, byte[] payload, byte[] dataChunk, boolean dataFinalChunk) {
+        private Frame(long type, byte[] payload, byte[] dataChunk, boolean dataFinalChunk,
+                      boolean oversized) {
             this.type = type;
             this.payload = payload;
             this.dataChunk = dataChunk;
             this.dataFinalChunk = dataFinalChunk;
+            this.oversized = oversized;
         }
 
+        /** Payload is empty for HTTP/2-reserved types (only the type matters). */
         public static Frame accumulated(long type, byte[] payload) {
-            return new Frame(type, payload, null, false);
+            return new Frame(type, payload, null, false, false);
         }
 
         public static Frame dataChunk(byte[] chunk, boolean finalChunk) {
-            return new Frame(Http3FrameType.DATA, null, chunk, finalChunk);
+            return new Frame(Http3FrameType.DATA, null, chunk, finalChunk, false);
+        }
+
+        static Frame oversizedHeaders() {
+            return new Frame(Http3FrameType.HEADERS, null, null, false, true);
         }
 
         public boolean isDataChunk() { return dataChunk != null; }
@@ -57,9 +69,12 @@ public final class Http3FrameReader {
 
     // Max bytes we buffer for a single non-DATA frame. Prevents an
     // adversary from OOMing us with a giant SETTINGS/HEADERS payload;
-    // legitimate values are ~KB. HEADERS gets bumped to the negotiated
-    // SETTINGS_MAX_FIELD_SECTION_SIZE by the caller if larger.
+    // legitimate values are ~KB. Request-stream readers are built with
+    // the field-section limit instead (see Http3Session).
     private static final int DEFAULT_MAX_ACCUM = 64 * 1024;
+    // Largest array the JVM reliably allocates.
+    private static final long MAX_BUFFER = Integer.MAX_VALUE - 8;
+    private static final byte[] EMPTY = new byte[0];
 
     private final int maxAccum;
     // Rolling input buffer. Retains bytes across feed() calls when a frame
@@ -70,6 +85,8 @@ public final class Http3FrameReader {
     private long pendingType = -1;
     private long pendingLength = -1;
     private long pendingConsumed = 0;   // bytes of payload already emitted (DATA path)
+    // Current frame's payload is being discarded (oversized HEADERS).
+    private boolean skipping;
 
     private final Deque<Frame> ready = new ArrayDeque<>();
 
@@ -127,6 +144,7 @@ public final class Http3FrameReader {
         pendingType = -1;
         pendingLength = -1;
         pendingConsumed = 0;
+        skipping = false;
         ready.clear();
     }
 
@@ -143,18 +161,18 @@ public final class Http3FrameReader {
         buf.put(data, off, len);
     }
 
+    // maxAccum is enforced on frame payloads in drainPayload, not here:
+    // after a drain the buffer holds at most a partial frame header or
+    // one accumulated payload already checked against maxAccum, so it
+    // never grows past maxAccum + 16 + the largest single feed.
     private void ensureCapacity(int need) {
         if (buf.remaining() < need) {
-            long target = Math.max((long) buf.capacity() * 2L,
-                (long) buf.position() + (long) need);
-            long ceiling = (long) maxAccum + 16L;
-            if (target > ceiling) {
-                if ((long) buf.position() + (long) need > ceiling) {
-                    throw new IllegalStateException(
-                        "Http3FrameReader input would exceed maxAccum=" + maxAccum);
-                }
-                target = ceiling;
+            long fit = (long) buf.position() + (long) need;
+            if (fit > MAX_BUFFER) {
+                throw new IllegalStateException("Http3FrameReader input exceeds " + MAX_BUFFER);
             }
+            long target = Math.min(MAX_BUFFER, Math.max(fit,
+                Math.min((long) buf.capacity() * 2L, (long) maxAccum + 16L + need)));
             ByteBuffer bigger = ByteBuffer.allocate((int) target);
             buf.flip();
             bigger.put(buf);
@@ -206,7 +224,22 @@ public final class Http3FrameReader {
         // Unknown types (and other reserved types) MUST be discarded per
         // RFC 9114 §7.2.8. Peer could set arbitrary lengths — stream-skip
         // rather than accumulate, so we never OOM on adversarial input.
+        if (skipping) return skipPayload();
+        // HTTP/2-only types are reported (the caller rejects them) and
+        // their payload discarded.
+        if (Http3FrameType.isReservedHttp2(pendingType)) {
+            ready.add(Frame.accumulated(pendingType, EMPTY));
+            skipping = true;
+            return skipPayload();
+        }
         if (!isKnownAccumulatedType(pendingType)) {
+            return skipPayload();
+        }
+        // An oversized field section is a per-request condition (RFC 9114
+        // §4.2.2), not a framing error: report it and discard the payload.
+        if (pendingType == Http3FrameType.HEADERS && pendingLength > maxAccum) {
+            ready.add(Frame.oversizedHeaders());
+            skipping = true;
             return skipPayload();
         }
         // Known bounded types — cap enforced. HEADERS/SETTINGS/GOAWAY
@@ -244,6 +277,7 @@ public final class Http3FrameReader {
             pendingType = -1;
             pendingLength = -1;
             pendingConsumed = 0;
+            skipping = false;
             return true;
         }
         int take = (int) Math.min(remaining, buf.remaining());
@@ -254,6 +288,7 @@ public final class Http3FrameReader {
             pendingType = -1;
             pendingLength = -1;
             pendingConsumed = 0;
+            skipping = false;
         }
         return true;
     }

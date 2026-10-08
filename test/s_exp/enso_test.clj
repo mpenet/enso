@@ -178,7 +178,7 @@
       (fn []
         (request! (str "GET / HTTP/1.1\r\nHost: x\r\nX-Repeat: a\r\nX-Repeat: b\r\n"
                        "Connection: close\r\n\r\n"))
-        (is (= "a,b" @captured))))))
+        (is (= "a, b" @captured))))))
 
 (deftest expect-100-continue
   (with-server echo-handler nil
@@ -697,6 +697,23 @@
               (is (= "hello get" (:body r)))))))
       (finally (enso/stop srv)))))
 
+(deftest tls-request-scheme-https
+  (let [srv (enso/run-server
+             (fn [req] {:status 200 :body (name (:scheme req))})
+             {:port 0 :ssl-context (generate-self-signed-context)})]
+    (try
+      (let [factory (.getSocketFactory (trust-all-context))]
+        (with-open [sock (.createSocket factory "127.0.0.1" (int (enso/port srv)))]
+          (.startHandshake sock)
+          (let [out (.getOutputStream sock)
+                in (.getInputStream sock)]
+            (.write out (.getBytes "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                                   StandardCharsets/ISO_8859_1))
+            (.flush out)
+            (let [r (parse-response (String. (.readAllBytes in) StandardCharsets/ISO_8859_1))]
+              (is (= "https" (:body r)))))))
+      (finally (enso/stop srv)))))
+
 (deftest tls-file-body-fallback
   (let [f (java.io.File/createTempFile "enso-tls" ".bin")
         payload (byte-array (mapv byte (repeat 5000 (int \y))))]
@@ -903,6 +920,21 @@
             (is (str/includes? raw "line 1"))
             (is (str/includes? raw "line 2"))))))))
 
+(deftest seq-body-takes-own-streaming-path
+  ;; Seq bodies are streamed by enso directly, ahead of the
+  ;; StreamableResponseBody check (whose satisfies? is slow on misses),
+  ;; even though ring.core.protocols also extends ISeq.
+  (with-redefs-fn {#'enso/write-body-to-stream-fn
+                   (fn [& _] (throw (AssertionError. "protocol path taken")))}
+    (fn []
+      (with-server
+        (fn [_] {:status 200 :body (list "a" "b" 3)}) nil
+        (fn []
+          (let [r (parse-response
+                   (request! "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))]
+            (is (= 200 (:status r)))
+            (is (str/includes? (:body r) "ab3"))))))))
+
 (deftest websocket-echo
   (let [received (atom [])
         opened (CountDownLatch. 1)
@@ -1098,8 +1130,9 @@
   (let [tok (com.s_exp.enso.quiche.RetryToken.)
         peer (java.net.InetSocketAddress. "127.0.0.1" 55555)
         odcid (byte-array (map byte [1 2 3 4 5 6 7 8]))
-        minted (.mint tok peer odcid)
-        verified (.verify tok minted peer)]
+        scid (byte-array 16 (byte 9))
+        ^bytes minted (.mint tok peer odcid scid)
+        verified (.verify tok minted 0 (alength minted) peer scid 16)]
     (is (some? verified) "valid token verifies")
     (is (= (seq odcid) (seq verified)) "verified odcid matches minted")))
 
@@ -1108,36 +1141,37 @@
         peer1 (java.net.InetSocketAddress. "127.0.0.1" 55555)
         peer2 (java.net.InetSocketAddress. "127.0.0.1" 55556)
         odcid (byte-array (map byte [1 2 3 4]))
-        minted (.mint tok peer1 odcid)]
-    (is (nil? (.verify tok minted peer2)) "same IP different port must fail")))
+        scid (byte-array 16 (byte 9))
+        ^bytes minted (.mint tok peer1 odcid scid)]
+    (is (nil? (.verify tok minted 0 (alength minted) peer2 scid 16)) "same IP different port must fail")))
 
 (deftest h3-retry-token-wrong-ip-rejected
   (let [tok (com.s_exp.enso.quiche.RetryToken.)
         peer1 (java.net.InetSocketAddress. "127.0.0.1" 55555)
         peer2 (java.net.InetSocketAddress. "10.0.0.1" 55555)
         odcid (byte-array (map byte [1 2 3 4]))
-        minted (.mint tok peer1 odcid)]
-    (is (nil? (.verify tok minted peer2)) "different IP must fail")))
+        scid (byte-array 16 (byte 9))
+        ^bytes minted (.mint tok peer1 odcid scid)]
+    (is (nil? (.verify tok minted 0 (alength minted) peer2 scid 16)) "different IP must fail")))
 
 (deftest h3-retry-token-tampered-rejected
   (let [tok (com.s_exp.enso.quiche.RetryToken.)
         peer (java.net.InetSocketAddress. "127.0.0.1" 55555)
         odcid (byte-array (map byte [1 2 3 4 5 6 7 8]))
-        ^bytes minted (.mint tok peer odcid)]
+        scid (byte-array 16 (byte 9))
+        ^bytes minted (.mint tok peer odcid scid)]
     (aset minted 40 (byte (bit-xor (aget minted 40) 0x01)))
-    (is (nil? (.verify tok minted peer)) "byte-flip in odcid body rejected")))
+    (is (nil? (.verify tok minted 0 (alength minted) peer scid 16)) "byte-flip in odcid body rejected")))
 
 (deftest h3-retry-token-truncated-rejected
   (let [tok (com.s_exp.enso.quiche.RetryToken.)
         peer (java.net.InetSocketAddress. "127.0.0.1" 55555)
         odcid (byte-array (map byte [1 2 3 4]))
-        ^bytes minted (.mint tok peer odcid)
-        chopped (byte-array (- (alength minted) 10))]
-    (System/arraycopy minted 0 chopped 0 (alength chopped))
-    (is (some? (.verify tok minted peer)) "sanity: full token verifies")
-    (is (nil? (.verify tok chopped peer)) "truncated token rejected")
-    (is (nil? (.verify tok (byte-array 0) peer)) "empty token rejected")
-    (is (nil? (.verify tok nil peer)) "nil token rejected")))
+        scid (byte-array 16 (byte 9))
+        ^bytes minted (.mint tok peer odcid scid)]
+    (is (some? (.verify tok minted 0 (alength minted) peer scid 16)) "sanity: full token verifies")
+    (is (nil? (.verify tok minted 0 (- (alength minted) 10) peer scid 16)) "truncated token rejected")
+    (is (nil? (.verify tok minted 0 0 peer scid 16)) "empty token rejected")))
 
 (deftest h3-retry-token-different-instances-mint-differently
   ;; Fresh HMAC key per RetryToken instance — a token minted by one
@@ -1146,8 +1180,9 @@
         t2 (com.s_exp.enso.quiche.RetryToken.)
         peer (java.net.InetSocketAddress. "127.0.0.1" 55555)
         odcid (byte-array (map byte [1 2 3]))
-        m1 (.mint t1 peer odcid)]
-    (is (nil? (.verify t2 m1 peer)) "cross-instance verify must fail")))
+        scid (byte-array 16 (byte 9))
+        ^bytes m1 (.mint t1 peer odcid scid)]
+    (is (nil? (.verify t2 m1 0 (alength m1) peer scid 16)) "cross-instance verify must fail")))
 
 (deftest h3-body-pipe-basic
   (let [pipe (com.s_exp.enso.http3.Http3BodyPipe.)

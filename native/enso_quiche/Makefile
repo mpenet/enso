@@ -32,6 +32,8 @@ ifeq ($(UNAME_S),Darwin)
   # network detection → SystemConfiguration). libSystem covers
   # pthread/dl/m so no explicit -l needed.
   STATIC_SYSLIBS := -framework CoreFoundation -framework Security -framework SystemConfiguration
+  # Export only the JNI entry points (see exports.map for the rationale).
+  EXPORT_FLAGS := -Wl,-exported_symbol,_Java_*
 else
   OS := linux
   LIB_EXT := so
@@ -40,6 +42,9 @@ else
   # BoringSSL vendored inside libquiche.a pulls in pthread + dl; -lm is
   # cheap and covered by rustc's static musl variants too.
   STATIC_SYSLIBS := -lpthread -ldl -lm
+  # Export only the JNI entry points; keep libquiche.a's own (BoringSSL)
+  # symbols local.
+  EXPORT_FLAGS := -Wl,--version-script=$(CURDIR)/exports.map -Wl,--exclude-libs,ALL
 endif
 
 ARCH := $(UNAME_M)
@@ -54,7 +59,8 @@ OUT_DIR := $(CURDIR)/../../target/native/$(OS)-$(ARCH)
 OUT := $(OUT_DIR)/libenso_quiche.$(LIB_EXT)
 
 CFLAGS ?= -O2 -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter
-CFLAGS += -I$(JAVA_HOME)/include -I$(JNI_MD_INC) -I$(QUICHE_INCLUDE_DIR)
+# JNIEXPORT marks the entry points visible; everything else stays hidden.
+CFLAGS += -fvisibility=hidden -I$(JAVA_HOME)/include -I$(JNI_MD_INC) -I$(QUICHE_INCLUDE_DIR)
 
 ifdef QUICHE_STATIC
   # Static link libquiche.a into the shim so the resulting .dylib/.so
@@ -65,7 +71,7 @@ ifdef QUICHE_STATIC
   # (-force_load / --whole-archive) tripped over ld64 duplicate-symbol
   # errors on modern macOS because libquiche.a already embeds a full
   # copy of BoringSSL.
-  LDFLAGS := $(DYNAMIC_LINK_FLAG) \
+  LDFLAGS := $(DYNAMIC_LINK_FLAG) $(EXPORT_FLAGS) \
     $(QUICHE_LIB_DIR)/libquiche.a \
     $(STATIC_SYSLIBS)
 else
@@ -75,7 +81,7 @@ else
     LDFLAGS := $(DYNAMIC_LINK_FLAG) -Wl,-rpath,@loader_path -Wl,-rpath,$(QUICHE_LIB_DIR) \
       -L$(QUICHE_LIB_DIR) -lquiche
   else
-    LDFLAGS := $(DYNAMIC_LINK_FLAG) -Wl,-rpath,$$$$ORIGIN -Wl,-rpath,$(QUICHE_LIB_DIR) \
+    LDFLAGS := $(DYNAMIC_LINK_FLAG) -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,$(QUICHE_LIB_DIR) \
       -L$(QUICHE_LIB_DIR) -lquiche
   endif
 endif
@@ -86,12 +92,12 @@ SRC := enso_quiche.c
 
 all: $(OUT)
 
-$(OUT): $(SRC)
+$(OUT): $(SRC) Makefile exports.map $(QUICHE_INCLUDE_DIR)/quiche.h
 	@mkdir -p $(OUT_DIR)
 	$(CC) $(CFLAGS) $(SRC) -o $(OUT) $(LDFLAGS)
 	@echo "Built $(OUT) ($$(du -h $(OUT) | cut -f1))"
 
-debug: CFLAGS := -O0 -g -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter -I$(JAVA_HOME)/include -I$(JNI_MD_INC) -I$(QUICHE_INCLUDE_DIR)
+debug: CFLAGS := -O0 -g -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter -fvisibility=hidden -I$(JAVA_HOME)/include -I$(JNI_MD_INC) -I$(QUICHE_INCLUDE_DIR)
 debug: $(OUT)
 
 clean:

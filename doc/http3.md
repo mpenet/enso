@@ -3,11 +3,14 @@
 HTTP/3 rides Cloudflare `libquiche` over UDP via a small JNI shim
 (`native/enso_quiche/enso_quiche.c`). Pure-Java QPACK + H3 framing on top
 of quiche's transport primitives. Same Ring handler contract as h1/h2 —
-`:protocol` becomes `"HTTP/3.0"`.
+`:protocol` becomes `"HTTP/3.0"`, `:scheme` is `:https` — except that
+WebSocket is not available (a WebSocket response is answered 501).
 
 ## From a release jar (zero libquiche install)
 
-Every release publishes core, per-classifier, and fat jars to Clojars.
+Every release publishes the core and per-classifier jars to Clojars. The
+fat jar exceeds Clojars' file-size limit; it is built by release CI as a
+workflow artifact and locally with `clojure -T:build jar-all`.
 Three consumption patterns.
 
 ### Core only, no h3 (~200 KB)

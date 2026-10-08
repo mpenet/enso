@@ -1,6 +1,7 @@
 package com.s_exp.enso.http3;
 
 import com.s_exp.enso.api.Config;
+import com.s_exp.enso.core.HttpFields;
 import com.s_exp.enso.quiche.Quiche;
 import com.s_exp.enso.http3.qpack.QpackException;
 import com.s_exp.enso.http3.qpack.QpackFieldSection;
@@ -11,11 +12,9 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Pure-Java HTTP/3 session state on top of the QUIC transport primitives
- * exposed by the {@link Quiche} JNI shim. Replaces the {@code quiche_h3_*}
- * FFM calls that triggered libmalloc freelist corruption crashes on
- * macOS ARM64 + JDK 25 (see task #79/#86; the JNI migration in #111 also
- * moved us off FFM entirely).
+ * Pure-Java HTTP/3 session state (framing, QPACK, stream rules) on top of
+ * the QUIC transport primitives exposed by the {@link Quiche} JNI shim;
+ * quiche's own {@code quiche_h3_*} layer is not used.
  *
  * <p>Scope is v1-server:
  * <ul>
@@ -27,8 +26,10 @@ import java.util.logging.Logger;
  *       {@link QpackFieldSection} for why).
  *   <li>Route incoming stream bytes by stream type: request stream
  *       (bidi client-initiated) → per-stream {@link Http3FrameReader}.
- *       Peer uni streams: read the first varint to identify type; we
- *       currently only bother parsing the peer's control stream.
+ *       Peer uni streams: read the first varint to identify type, then
+ *       parse the control stream, validate QPACK encoder/decoder
+ *       instructions against our capacity of 0, and discard unknown /
+ *       grease streams.
  *   <li>Write HEADERS + DATA + FIN back on request streams via
  *       {@link #writeResponse}.
  * </ul>
@@ -57,14 +58,15 @@ public final class Http3Session {
     // Per-request state; keyed by client-bidi stream id.
     private final Long2ObjectHashMap<RequestStream> requestStreams = new Long2ObjectHashMap<>();
     // First-seen peer stream IDs for the three singleton uni-stream types.
-    // RFC 9114 §6.2.1: duplicates MUST close the connection with
-    // H3_STREAM_CREATION_ERROR (task #100 wires the connection close;
-    // for now we log + drop the duplicate stream).
+    // RFC 9114 §6.2.1 / RFC 9204 §4.2: duplicates close the connection
+    // with H3_STREAM_CREATION_ERROR.
     private long peerControlStreamId = -1;
     private long peerQpackEncStreamId = -1;
     private long peerQpackDecStreamId = -1;
-    // Peer uni streams that we've identified. Value = stream type varint.
-    // Streams whose type hasn't arrived yet aren't in this map.
+    // Peer uni streams that we've identified. Value = stream type varint
+    // (unknown / grease types included until they end, so their later
+    // bytes are discarded, never re-read as a type). Streams whose type
+    // hasn't arrived yet aren't in this map.
     private final Long2ObjectHashMap<Long> peerUniTypes = new Long2ObjectHashMap<>();
     // Peer uni streams whose type varint is only partially known.
     private final Long2ObjectHashMap<ByteBuffer> peerUniHeaderBuf = new Long2ObjectHashMap<>();
@@ -77,11 +79,15 @@ public final class Http3Session {
     private boolean initialised = false;
 
     // SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1). Local value
-    // caps peer→us HEADERS payloads (matches Http3FrameReader accum cap).
-    // Peer's advertised value caps our outbound HEADERS uncompressed size
-    // (name+value+32 per pair, RFC 9204 §4.5.1); -1 means peer did not
-    // advertise, so no bound.
+    // is what we advertise (0 = not advertised; see fieldSectionCap).
+    // Peer's advertised value is checked against our outbound HEADERS
+    // uncompressed size (name+value+32 per pair, RFC 9204 §4.5.1) — an
+    // advisory check that only logs; -1 means peer did not advertise.
     private final long localMaxFieldSectionSize;
+    // What we actually accept: the advertised limit, or when none is
+    // advertised (0 = no limit) UNADVERTISED_FIELD_SECTION_CAP. Bounds
+    // both the HEADERS frames we buffer and their decoded size.
+    private final int fieldSectionCap;
     private final long qpackMaxTableCapacity;
     private final long qpackBlockedStreams;
     private long peerMaxFieldSectionSize = -1;
@@ -89,16 +95,18 @@ public final class Http3Session {
     public Http3Session(long conn, Config cfg) {
         this.conn = conn;
         this.localMaxFieldSectionSize = cfg.http3MaxFieldSectionSize;
+        this.fieldSectionCap = cfg.http3MaxFieldSectionSize > 0
+            ? cfg.http3MaxFieldSectionSize : UNADVERTISED_FIELD_SECTION_CAP;
         this.qpackMaxTableCapacity = cfg.http3QpackMaxTableCapacity;
         this.qpackBlockedStreams = cfg.http3QpackBlockedStreams;
     }
 
     /**
      * Open our three server-uni streams (control + QPACK enc/dec) and
-     * emit our initial SETTINGS. Idempotent and retry-safe: if any
-     * sub-step short-writes (peer hasn't extended enough uni-stream
-     * credit yet), the completion flags stay unset and the next call
-     * resumes from the first still-pending step. Task #114.
+     * emit our initial SETTINGS. Idempotent and retry-safe: short writes
+     * are queued in {@link #pendingByStream}; if a stream can't be
+     * opened at all (peer's uni-stream limit), the completion flags stay
+     * unset and the next call resumes from the first still-pending step.
      */
     public void ensureInitialised() {
         if (initialised) return;
@@ -114,11 +122,16 @@ public final class Http3Session {
             ctrlTypeSent = true;
         }
         if (!settingsSent) {
-            ByteBuffer settings = Http3FrameWriter.settings(new long[]{
-                Http3SettingId.QPACK_MAX_TABLE_CAPACITY, qpackMaxTableCapacity,
-                Http3SettingId.QPACK_BLOCKED_STREAMS, qpackBlockedStreams,
-                Http3SettingId.MAX_FIELD_SECTION_SIZE, localMaxFieldSectionSize,
-            });
+            // MAX_FIELD_SECTION_SIZE = 0 in config means "no limit": the
+            // setting is omitted (an advertised 0 would forbid any field).
+            ByteBuffer settings = Http3FrameWriter.settings(localMaxFieldSectionSize > 0
+                ? new long[]{
+                    Http3SettingId.QPACK_MAX_TABLE_CAPACITY, qpackMaxTableCapacity,
+                    Http3SettingId.QPACK_BLOCKED_STREAMS, qpackBlockedStreams,
+                    Http3SettingId.MAX_FIELD_SECTION_SIZE, localMaxFieldSectionSize}
+                : new long[]{
+                    Http3SettingId.QPACK_MAX_TABLE_CAPACITY, qpackMaxTableCapacity,
+                    Http3SettingId.QPACK_BLOCKED_STREAMS, qpackBlockedStreams});
             if (!writeAll(ctrlStreamId, settings, false)) return;
             settingsSent = true;
         }
@@ -143,7 +156,8 @@ public final class Http3Session {
      * Feed inbound stream data. Router dispatches by stream type — bidi
      * request streams accumulate in a per-stream frame reader; peer uni
      * streams get their type identified from the first varint and then
-     * either parsed (control) or ignored (QPACK enc/dec under cap 0).
+     * are parsed (control), validated (QPACK encoder/decoder instructions
+     * under capacity 0) or discarded (unknown / grease types).
      */
     public void onStreamData(long streamId, byte[] data, boolean fin,
                               RequestSink sink) {
@@ -169,25 +183,57 @@ public final class Http3Session {
             // Server-uni: ignored (that's our own outbound). Server-bidi:
             // unused in H3.
         } catch (Http3ConnectionException hce) {
-            // Protocol-level violation → close the whole connection with
-            // the H3 error code. Owner-thread driver observes
-            // connIsClosed on next iteration and exits cleanly.
-            //
-            // Reason string sent as empty byte[] — some peer stacks
-            // (h3spec/haskell-quic) do strict predicate checks that
-            // reject non-empty reasons even when the app error code is
-            // correct (task #162). The full message is still logged
-            // server-side for our debugging.
-            LOG.info("h3 closing connection code=0x"
-                + Long.toHexString(hce.errorCode()) + " reason="
-                + hce.getMessage());
-            try {
-                Quiche.connClose(conn, true, hce.errorCode(), EMPTY_REASON);
-            } catch (Throwable ignored) {}
+            closeConnection(hce);
         }
     }
 
+    /**
+     * Protocol-level violation → close the whole connection with the H3
+     * error code. Owner-thread driver observes connIsClosed on next
+     * iteration and exits cleanly.
+     *
+     * <p>Reason string sent as empty byte[] — some peer stacks
+     * (h3spec/haskell-quic) do strict predicate checks that reject
+     * non-empty reasons even when the app error code is correct (task
+     * #162). The full message is still logged server-side for our
+     * debugging.
+     */
+    private void closeConnection(Http3ConnectionException hce) {
+        LOG.info("h3 closing connection code=0x"
+            + Long.toHexString(hce.errorCode()) + " reason="
+            + hce.getMessage());
+        try {
+            Quiche.connClose(conn, true, hce.errorCode(), EMPTY_REASON);
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * The peer reset {@code streamId} (stream_recv reported
+     * STREAM_RESET). Resetting a control or QPACK stream closes the
+     * connection with H3_CLOSED_CRITICAL_STREAM (RFC 9114 §6.2.1, RFC
+     * 9204 §4.2). For any other stream only the read-side state is
+     * dropped: RESET_STREAM ends just the peer's sending side (RFC 9000
+     * §3.2), so response bytes still queued for it are sent.
+     */
+    public void onStreamReset(long streamId) {
+        if (streamId == peerControlStreamId || streamId == peerQpackEncStreamId
+                || streamId == peerQpackDecStreamId) {
+            closeConnection(new Http3ConnectionException(
+                Http3ConnectionException.H3_CLOSED_CRITICAL_STREAM,
+                "peer reset critical stream " + streamId));
+            return;
+        }
+        forgetReadSide(streamId);
+    }
+
     private static final byte[] EMPTY_REASON = new byte[0];
+
+    // Field-section ceiling when no SETTINGS_MAX_FIELD_SECTION_SIZE is
+    // advertised. RFC 9114 §4.2.2 lets a server reject any request whose
+    // headers it won't process; without a ceiling a peer could make us
+    // buffer and decode arbitrarily large HEADERS on every stream. 1 MiB
+    // matches Go net/http's default header limit (DefaultMaxHeaderBytes).
+    static final int UNADVERTISED_FIELD_SECTION_CAP = 1 << 20;
 
     /**
      * Encode and send a full HTTP/3 response back on a request stream.
@@ -197,31 +243,42 @@ public final class Http3Session {
     public void writeResponse(long streamId, List<String[]> headers,
                                byte[] body) {
         boolean hasBody = body != null && body.length > 0;
-        // Encode HEADERS + DATA into a single frame buffer + single
-        // writeAll. Fixes ordering hazard where a deferred HEADERS could
-        // reach quiche AFTER a fin=true DATA frame (task #131), and
-        // halves JNI hops per response (task #143).
+        // Small bodies: HEADERS + DATA encoded into the frame buffer and
+        // handed over in one stream_send (task #143). Large bodies: HEADERS
+        // + the DATA frame header from the frame buffer, then the payload
+        // straight from the body array — deferred by reference, never
+        // copied (the response owns it). writeBytes keeps per-stream
+        // order, so FIN can't outrun HEADERS (task #131).
+        boolean inline = hasBody && body.length <= INLINE_BODY_MAX;
         int hdrsBudget = computeHeadersBudget(streamId, headers);
-        int total = hdrsBudget + (hasBody ? (16 + body.length) : 0);
-        ByteBuffer buf = ensureFrameCap(total);
+        ByteBuffer buf = ensureFrameCap(hdrsBudget + (hasBody ? 16 : 0) + (inline ? body.length : 0));
         buf.clear();
         Http3FrameWriter.appendHeadersFrom(buf, headers);
-        if (hasBody) {
+        if (inline) {
             Http3FrameWriter.appendData(buf, body);
+        } else if (hasBody) {
+            Http3Varint.encode(buf, Http3FrameType.DATA);
+            Http3Varint.encode(buf, body.length);
         }
         buf.flip();
-        // Single stream_send with fin=true — HEADERS + DATA travel
-        // together, FIN can't outrun HEADERS.
-        writeAll(streamId, buf, true);
-        releaseReader(requestStreams.remove(streamId));
+        if (hasBody && !inline) {
+            if (writeAll(streamId, buf, false)) {
+                writeBytes(streamId, body, 0, body.length, true, false);
+            }
+        } else {
+            writeAll(streamId, buf, true);
+        }
+        stopReadingRequest(streamId);
     }
+
+    // Bodies up to this size are copied into the frame buffer (one JNI
+    // call); larger ones are sent from their own array.
+    private static final int INLINE_BODY_MAX = 16 * 1024;
 
     /**
      * Emit HEADERS only (no FIN) — first half of a streaming response.
-     * Caller follows with one or more {@link #writeBodyChunk} calls;
-     * the terminal chunk carries FIN and releases the reader. The
-     * {@link #writeAll} in-order-per-stream invariant means later DATA
-     * chunks queue behind a deferred HEADERS frame automatically.
+     * Body bytes follow via {@link #sendStreamBytes} once
+     * {@link #hasPendingWrites(long)} reports the HEADERS flushed.
      */
     public void writeHeadersOnly(long streamId, List<String[]> headers) {
         int hdrsBudget = computeHeadersBudget(streamId, headers);
@@ -233,31 +290,52 @@ public final class Http3Session {
     }
 
     /**
-     * Emit one DATA frame from {@code body[off..off+len]}. Set
-     * {@code fin=true} on the terminal chunk. May use the shared
-     * frameBuf for small chunks or allocate a per-call buffer above
-     * {@link #FRAME_BUF_MAX_KEEP} so a giant chunk doesn't pin memory
-     * on the connection.
+     * Hand up to {@code len} bytes to quiche right now, bounded by flow
+     * control, bypassing the deferred-write queue. Used by streamed
+     * response bodies, which keep their own position and only call this
+     * once {@link #hasPendingWrites(long)} is false. FIN is applied only
+     * if every byte is accepted. When {@code fin} is set the response is
+     * complete (see {@link #stopReadingRequest}).
      *
-     * <p>When {@code fin=true}, the reader is returned to the pool
-     * eagerly — the request-side stream is done (peer already FIN'd
-     * inbound before we got to write a response). Outbound bytes may
-     * still be sitting in {@link #pendingByStream} at this point;
-     * {@link #drainPendingWrites} flushes them independently. Reader
-     * reuse is safe because {@link Http3FrameReader#reset} clears state
-     * on release and QUIC stream IDs are monotonic (no peer reuse).
+     * @return bytes accepted (possibly 0), or -1 once the stream can no
+     *   longer take data (peer STOP_SENDING / reset).
      */
-    public void writeBodyChunk(long streamId, byte[] body, int off, int len,
-                                boolean fin) {
-        int need = 16 + len; // varint length + type + payload budget
-        ByteBuffer buf = ensureFrameCap(need);
-        buf.clear();
-        Http3FrameWriter.appendDataRange(buf, body, off, len);
-        buf.flip();
-        writeAll(streamId, buf, fin);
-        if (fin) {
-            releaseReader(requestStreams.remove(streamId));
+    public int sendStreamBytes(long streamId, byte[] b, int off, int len, boolean fin) {
+        long rc = Quiche.connStreamSend(conn, streamId, b, off, len, fin);
+        if (rc == Quiche.QUICHE_ERR_DONE) return 0;
+        if (rc < 0) {
+            LOG.log(rc == Quiche.QUICHE_ERR_STREAM_STOPPED
+                        || rc == Quiche.QUICHE_ERR_STREAM_RESET ? Level.FINE : Level.WARNING,
+                "h3 stream_send stream=" + streamId + " rc=" + rc);
+            return -1;
         }
+        if (fin && rc == len) stopReadingRequest(streamId);
+        return (int) rc;
+    }
+
+    /**
+     * True once nobody can receive what we send on {@code streamId}: the
+     * peer stopped our sending side (STOP_SENDING) or the stream is gone.
+     */
+    public boolean sendStopped(long streamId) {
+        return Quiche.connStreamCapacity(conn, streamId) < 0;
+    }
+
+    /**
+     * The response on {@code streamId} is complete. If the request is
+     * still arriving (no FIN yet), we no longer need it: RFC 9114 §4.1.2
+     * says to abort reading with STOP_SENDING(H3_NO_ERROR); quiche then
+     * discards further stream data. Without this, the dropped reader
+     * state would make later body bytes parse as frame headers.
+     * Reader reuse is safe because {@link Http3FrameReader#reset} clears
+     * state on release and QUIC stream IDs are never reused.
+     */
+    private void stopReadingRequest(long streamId) {
+        RequestStream rs = requestStreams.remove(streamId);
+        if (rs == null) return;
+        Quiche.connStreamShutdown(conn, streamId, Quiche.QUICHE_SHUTDOWN_READ,
+            Http3ConnectionException.H3_NO_ERROR);
+        releaseReader(rs);
     }
 
     /**
@@ -266,16 +344,18 @@ public final class Http3Session {
      * Shared between {@link #writeResponse} and {@link #writeHeadersOnly}.
      */
     private int computeHeadersBudget(long streamId, List<String[]> headers) {
-        int hdrsBudget = 32;
+        // Frame type + fixed 8-byte length + QPACK prefix, then an upper
+        // bound per field on the bytes the encoder actually writes.
+        int hdrsBudget = 16;
         int hn = headers.size();
         long uncompressedSize = 0;
         for (int i = 0; i < hn; i++) {
             String[] hf = headers.get(i);
-            int nl = hf[0] == null ? 0 : hf[0].length();
-            int vl = hf[1] == null ? 0 : hf[1].length();
-            hdrsBudget += 24 + nl + vl;
-            // RFC 9204 §4.5.1: field-line size = name.length + value.length + 32.
-            uncompressedSize += nl + vl + 32L;
+            hdrsBudget += QpackFieldSection.maxEncodedLength(hf[0], hf[1]);
+            // RFC 9204 §4.5.1: field-line size = name + value octets + 32.
+            uncompressedSize += hf[0].length()
+                + (hf[1] == null ? 0 : hf[1].length())
+                + 32L;
         }
         // Advisory check against peer's SETTINGS_MAX_FIELD_SECTION_SIZE.
         // We proceed anyway (spec: peer MAY react with H3_EXCESSIVE_LOAD;
@@ -345,18 +425,39 @@ public final class Http3Session {
                 || f.type == Http3FrameType.GOAWAY
                 || f.type == Http3FrameType.MAX_PUSH_ID
                 || f.type == Http3FrameType.CANCEL_PUSH
-                || f.type == Http3FrameType.PUSH_PROMISE) {
+                || f.type == Http3FrameType.PUSH_PROMISE
+                || Http3FrameType.isReservedHttp2(f.type)) {
                 discardReader(requestStreams.remove(streamId));
                 throw new Http3ConnectionException(
                     Http3ConnectionException.H3_FRAME_UNEXPECTED,
                     "frame type 0x" + Long.toHexString(f.type)
                         + " forbidden on request stream " + streamId);
             }
+            if (f.oversized) {
+                LOG.fine("h3 stream " + streamId + " reset: HEADERS exceeds "
+                    + "field section limit " + fieldSectionCap);
+                rejectRequest(streamId, Http3ConnectionException.H3_EXCESSIVE_LOAD, sink);
+                return;
+            }
             if (f.type == Http3FrameType.HEADERS) {
+                // RFC 9114 §4.1: HEADERS, DATA*, optional trailing
+                // HEADERS; anything after the trailers is an invalid
+                // frame sequence.
+                if (rs.phase == RequestStream.TRAILERS) {
+                    discardReader(requestStreams.remove(streamId));
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.H3_FRAME_UNEXPECTED,
+                        "HEADERS after trailers on request stream " + streamId);
+                }
                 List<String[]> headers;
                 try {
-                    headers = QpackFieldSection.decode(f.payload);
+                    headers = QpackFieldSection.decode(f.payload, fieldSectionCap);
                 } catch (QpackException qe) {
+                    if (qe.isStreamLevel()) {
+                        LOG.fine("h3 stream " + streamId + " reset: " + qe.getMessage());
+                        rejectRequest(streamId, qe.errorCode(), sink);
+                        return;
+                    }
                     // RFC 9204 §2.2: any decode failure on a request
                     // stream (bad static index, dynamic-ref-under-cap-0,
                     // malformed literal) = connection-level error with
@@ -370,9 +471,34 @@ public final class Http3Session {
                         "QPACK decode failed on stream " + streamId
                             + ": " + qe.getMessage());
                 }
-                sink.onHeaders(streamId, headers);
+                try {
+                    if (rs.phase == RequestStream.HEADERS) {
+                        rs.phase = RequestStream.BODY;
+                        sink.onHeaders(streamId, headers);
+                    } else {
+                        // Trailers: validated, then dropped (Ring has no
+                        // trailer surface).
+                        rs.phase = RequestStream.TRAILERS;
+                        validateTrailers(streamId, headers);
+                    }
+                } catch (Http3StreamException se) {
+                    streamError(streamId, se, sink);
+                    return;
+                }
             } else if (f.isDataChunk()) {
-                sink.onData(streamId, f.dataChunk, f.dataFinalChunk);
+                if (rs.phase != RequestStream.BODY) {
+                    discardReader(requestStreams.remove(streamId));
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.H3_FRAME_UNEXPECTED,
+                        (rs.phase == RequestStream.HEADERS ? "DATA before HEADERS"
+                            : "DATA after trailers") + " on request stream " + streamId);
+                }
+                try {
+                    sink.onData(streamId, f.dataChunk);
+                } catch (Http3StreamException se) {
+                    streamError(streamId, se, sink);
+                    return;
+                }
             }
             // Unknown/other frame types silently ignored per RFC 9114 §9
             // (proper streaming skip is task #103).
@@ -387,9 +513,55 @@ public final class Http3Session {
                     Http3ConnectionException.H3_FRAME_ERROR,
                     "stream " + streamId + " terminated mid-frame");
             }
-            sink.onFin(streamId);
+            try {
+                sink.onFin(streamId);
+            } catch (Http3StreamException se) {
+                streamError(streamId, se, sink);
+                return;
+            }
             releaseReader(requestStreams.remove(streamId));
         }
+    }
+
+    /** RFC 9114 §4.1.2 / §4.3: no pseudo-headers, valid names and values. */
+    private static void validateTrailers(long streamId, List<String[]> fields) {
+        for (int i = 0, n = fields.size(); i < n; i++) {
+            String[] f = fields.get(i);
+            if (!validFieldName(f[0]) || !validFieldValue(f[1])) {
+                throw new Http3StreamException(Http3ConnectionException.H3_MESSAGE_ERROR,
+                    "invalid trailer field '" + f[0] + "' on stream " + streamId);
+            }
+        }
+    }
+
+    /** RFC 9114 §4.2: a non-empty lowercase token (so never a pseudo-header). */
+    static boolean validFieldName(String s) {
+        return HttpFields.isLowercaseToken(s, 0);
+    }
+
+    /** RFC 9114 §10.3: CR, LF and NUL are never valid in a field value. */
+    static boolean validFieldValue(String s) {
+        for (int i = 0, n = s.length(); i < n; i++) {
+            char c = s.charAt(i);
+            if (c == '\r' || c == '\n' || c == '\0') return false;
+        }
+        return true;
+    }
+
+    private void streamError(long streamId, Http3StreamException se, RequestSink sink) {
+        LOG.fine("h3 stream " + streamId + " reset 0x"
+            + Long.toHexString(se.errorCode()) + ": " + se.getMessage());
+        rejectRequest(streamId, se.errorCode(), sink);
+    }
+
+    /**
+     * Stream error on a request stream (RFC 9114 §8): reset it in both
+     * directions and tell the sink, which abandons whatever the request
+     * had started (body pipe, handler, response).
+     */
+    private void rejectRequest(long streamId, long errorCode, RequestSink sink) {
+        resetRequestStream(streamId, errorCode);
+        sink.onReset(streamId);
     }
 
     private void resetStream(long streamId, long errorCode) {
@@ -436,52 +608,39 @@ public final class Http3Session {
             long type = Http3Varint.decode(readView);
             peerUniHeaderBuf.remove(streamId);
             // Reject a second CONTROL / QPACK-ENCODER / QPACK-DECODER
-            // stream (RFC 9114 §6.2.1). Drop the offending stream; a
-            // future task will escalate to a connection-level close.
+            // stream (RFC 9114 §6.2.1, RFC 9204 §4.2).
             if (type == Http3StreamType.CONTROL) {
-                if (peerControlStreamId >= 0 && peerControlStreamId != streamId) {
-                    LOG.warning("h3 duplicate peer CONTROL stream id="
-                        + streamId + " first=" + peerControlStreamId);
-                    return;
-                }
+                if (peerControlStreamId >= 0) throw duplicateStream("control", streamId);
                 peerControlStreamId = streamId;
             } else if (type == Http3StreamType.QPACK_ENCODER) {
-                if (peerQpackEncStreamId >= 0 && peerQpackEncStreamId != streamId) {
-                    LOG.warning("h3 duplicate peer QPACK ENCODER stream id="
-                        + streamId + " first=" + peerQpackEncStreamId);
-                    return;
-                }
+                if (peerQpackEncStreamId >= 0) throw duplicateStream("QPACK encoder", streamId);
                 peerQpackEncStreamId = streamId;
             } else if (type == Http3StreamType.QPACK_DECODER) {
-                if (peerQpackDecStreamId >= 0 && peerQpackDecStreamId != streamId) {
-                    LOG.warning("h3 duplicate peer QPACK DECODER stream id="
-                        + streamId + " first=" + peerQpackDecStreamId);
-                    return;
-                }
+                if (peerQpackDecStreamId >= 0) throw duplicateStream("QPACK decoder", streamId);
                 peerQpackDecStreamId = streamId;
             } else if (type == 0x01L /* PUSH */) {
-                // RFC 9114 §6.2.2: server-initiated push MUST NOT arrive on
-                // a client uni stream. Treat as H3_STREAM_CREATION_ERROR.
-                LOG.warning("h3 client-initiated PUSH stream id=" + streamId);
-                resetStream(streamId, Http3ConnectionException.H3_STREAM_CREATION_ERROR);
-                return;
-            } else if (isGreaseType(type)) {
-                // RFC 9114 §7.2.8: grease types (0x1f * N + 0x21) MUST be
-                // ignored — read + discard silently.
-                peerUniTypes.put(streamId, type);
-                return;
+                // RFC 9114 §6.2.2: only servers push; a client-initiated
+                // push stream is a connection error.
+                throw new Http3ConnectionException(
+                    Http3ConnectionException.H3_STREAM_CREATION_ERROR,
+                    "client-initiated push stream " + streamId);
             } else {
-                // RFC 9114 §6.2.3: any other type = MUST STOP_SENDING with
-                // H3_STREAM_CREATION_ERROR. We only shut the read side so
-                // peer stops sending; write side is theirs to close.
-                LOG.info("h3 unknown peer uni stream type=0x"
-                    + Long.toHexString(type) + " id=" + streamId);
-                try {
-                    Quiche.connStreamShutdown(
-                        conn, streamId,
-                        Quiche.QUICHE_SHUTDOWN_READ,
-                        Http3ConnectionException.H3_STREAM_CREATION_ERROR);
-                } catch (Throwable ignored) {}
+                // Grease (RFC 9114 §7.2.8) or unknown type (§6.2): recorded
+                // until the stream ends so the rest of it is discarded
+                // without being re-read as a type. Unknown types also get
+                // STOP_SENDING with H3_STREAM_CREATION_ERROR so the peer
+                // stops sending.
+                if (!fin) peerUniTypes.put(streamId, type);
+                if (!isGreaseType(type)) {
+                    LOG.fine("h3 unknown peer uni stream type=0x"
+                        + Long.toHexString(type) + " id=" + streamId);
+                    try {
+                        Quiche.connStreamShutdown(
+                            conn, streamId,
+                            Quiche.QUICHE_SHUTDOWN_READ,
+                            Http3ConnectionException.H3_STREAM_CREATION_ERROR);
+                    } catch (Throwable ignored) {}
+                }
                 return;
             }
             peerUniTypes.put(streamId, type);
@@ -522,6 +681,10 @@ public final class Http3Session {
             // arguments where required. Insert Count Increment = 0 is
             // QPACK_DECODER_STREAM_ERROR (h3spec 19 / task #158).
             validatePeerQpackDecoderStream(buf);
+        } else if (fin) {
+            // A grease / unknown stream ended (critical ones can't reach
+            // here): nothing more will arrive on it.
+            peerUniTypes.remove(streamId);
         }
     }
 
@@ -612,10 +775,13 @@ public final class Http3Session {
     }
 
     /**
-     * RFC 9204 §4.4 — QPACK decoder-stream instructions. Insert Count
-     * Increment with argument 0 is a protocol error. Section Acknowledgment
-     * + Stream Cancellation carry stream IDs and are fine to ignore.
-     * Same partial-instruction handling as the encoder stream.
+     * RFC 9204 §4.4 — QPACK decoder-stream instructions. Our encoder never
+     * uses the dynamic table (every field section has Required Insert
+     * Count 0), so Section Acknowledgment (§4.4.1: no section left to
+     * acknowledge) and Insert Count Increment (§4.4.3: zero, or beyond
+     * the zero entries we inserted) are always QPACK_DECODER_STREAM_ERROR.
+     * Stream Cancellation is fine to ignore. Same partial-instruction
+     * handling as the encoder stream.
      */
     private void validatePeerQpackDecoderStream(ByteBuffer buf) {
         ByteBuffer work = appendToAccum(peerQpackDecAccum, buf);
@@ -628,18 +794,18 @@ public final class Http3Session {
                     work.get();
                     long inc = com.s_exp.enso.http3.qpack.NBitInteger.decode(
                         work, 6, b);
-                    if (inc == 0) {
-                        throw new Http3ConnectionException(
-                            Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
-                            "peer Insert Count Increment=0");
-                    }
-                    continue;
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
+                        "peer Insert Count Increment=" + inc + " but no dynamic table entries");
                 }
                 if ((b & 0x80) != 0) {
                     // Section Acknowledgment: 1xxxxxxx (7-bit prefix int).
                     work.get();
-                    com.s_exp.enso.http3.qpack.NBitInteger.decode(work, 7, b);
-                    continue;
+                    long sid = com.s_exp.enso.http3.qpack.NBitInteger.decode(work, 7, b);
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.QPACK_DECODER_STREAM_ERROR,
+                        "peer Section Acknowledgment for stream " + sid
+                            + " but no field section used the dynamic table");
                 }
                 if ((b & 0xC0) == 0x40) {
                     // Stream Cancellation: 01xxxxxx (6-bit prefix int).
@@ -726,7 +892,8 @@ public final class Http3Session {
                 validatePeerSettings(f.payload);
             } else if (f.type == Http3FrameType.HEADERS
                     || f.type == Http3FrameType.DATA
-                    || f.type == Http3FrameType.PUSH_PROMISE) {
+                    || f.type == Http3FrameType.PUSH_PROMISE
+                    || Http3FrameType.isReservedHttp2(f.type)) {
                 throw new Http3ConnectionException(
                     Http3ConnectionException.H3_FRAME_UNEXPECTED,
                     "frame type 0x" + Long.toHexString(f.type)
@@ -768,6 +935,9 @@ public final class Http3Session {
     /** RFC 9114 §7.2.4.1 — h3 SETTINGS body is a sequence of (id, value) varint pairs. */
     private void validatePeerSettings(byte[] payload) {
         ByteBuffer b = ByteBuffer.wrap(payload);
+        // Ids seen so far (each pair is ≥ 2 bytes).
+        long[] seen = new long[payload.length / 2];
+        int seenCount = 0;
         while (b.hasRemaining()) {
             long id, value;
             try {
@@ -786,6 +956,15 @@ public final class Http3Session {
                     Http3ConnectionException.H3_FRAME_ERROR,
                     "malformed SETTINGS payload: " + ex.getMessage());
             }
+            // RFC 9114 §7.2.4: an identifier MUST NOT occur twice.
+            for (int i = 0; i < seenCount; i++) {
+                if (seen[i] == id) {
+                    throw new Http3ConnectionException(
+                        Http3ConnectionException.H3_SETTINGS_ERROR,
+                        "duplicate SETTINGS id 0x" + Long.toHexString(id));
+                }
+            }
+            seen[seenCount++] = id;
             // h2-reserved IDs (RFC 7540 §6.5.2): SETTINGS_ENABLE_PUSH,
             // SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_INITIAL_WINDOW_SIZE,
             // SETTINGS_MAX_FRAME_SIZE — MUST NOT appear in h3 SETTINGS.
@@ -799,15 +978,22 @@ public final class Http3Session {
                 }
             }
             // Known IDs we consume:
-            //   MAX_FIELD_SECTION_SIZE (0x06) — cap on our outbound HEADERS
-            //     uncompressed size (name+value+32 per pair, RFC 9204 §4.5.1).
-            //     Enforced in {@link #writeResponse}.
+            //   MAX_FIELD_SECTION_SIZE (0x06) — peer's limit on our outbound
+            //     HEADERS uncompressed size (name+value+32 per pair, RFC 9204
+            //     §4.5.1). Checked, advisory only (logged), in
+            //     computeHeadersBudget.
             // Others (QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS) are
             // silently ignored under our advertised MAX_TABLE_CAPACITY=0.
             if (id == Http3SettingId.MAX_FIELD_SECTION_SIZE) {
                 peerMaxFieldSectionSize = value;
             }
         }
+    }
+
+    private static Http3ConnectionException duplicateStream(String kind, long streamId) {
+        return new Http3ConnectionException(
+            Http3ConnectionException.H3_STREAM_CREATION_ERROR,
+            "second peer " + kind + " stream " + streamId);
     }
 
     /**
@@ -828,38 +1014,41 @@ public final class Http3Session {
     }
 
     /**
-     * Blocking send of an entire ByteBuffer over a stream. In v1 we assume
-     * quiche_conn_stream_send accepts the full buffer in one call for our
-     * small header/frame sizes; if quiche returns a short write we retry
-     * once. Larger streaming payloads (big response bodies) get chunked at
-     * the caller.
-     */
-    /**
-     * Try to send the buffer's bytes on {@code streamId}. Checks stream
-     * capacity first to avoid the busy-spin path when peer flow control
-     * is closed. On partial or capacity=0, copies the un-sent remainder
-     * into an owned byte[] and enqueues it in {@link #pendingByStream}
-     * for later resumption by {@link #drainPendingWrites}. FIN is only
+     * Try to send the buffer's bytes on {@code streamId}. Whatever flow
+     * control doesn't accept now is copied out of the (reused) buffer and
+     * enqueued in {@link #pendingByStream} for later resumption by
+     * {@link #drainPendingWrites}. FIN is only
      * applied on the terminal call that consumes the last byte — matches
      * RFC 9000 §4.5 semantics; earlier partials must use fin=false so a
      * short-write doesn't strand the FIN signal.
      *
-     * @return true iff every byte was sent in this call (FIN, if
-     *   requested, was applied).
+     * @return true when every byte was either sent or queued behind
+     *   earlier deferred bytes; false when the stream can't take them
+     *   (reset, stopped, stream limit).
      */
     private boolean writeAll(long streamId, ByteBuffer buf, boolean fin) {
         int remaining = buf.remaining();
-        byte[] bytes;
-        int off;
         if (buf.hasArray()) {
-            bytes = buf.array();
-            off = buf.arrayOffset() + buf.position();
+            byte[] bytes = buf.array();
+            int off = buf.arrayOffset() + buf.position();
             buf.position(buf.limit());
-        } else {
-            bytes = new byte[remaining];
-            buf.get(bytes);
-            off = 0;
+            return writeBytes(streamId, bytes, off, remaining, fin, true);
         }
+        byte[] bytes = new byte[remaining];
+        buf.get(bytes);
+        return writeBytes(streamId, bytes, 0, remaining, fin, false);
+    }
+
+    /**
+     * {@link #writeAll} over {@code bytes[off, off+len)}. {@code scratch}
+     * says the caller reuses the array: deferred bytes are then copied;
+     * otherwise (an owned response body) the deferral references it.
+     * quiche's stream_send clamps to flow-control credit (DONE when none)
+     * and creates our own uni streams on first use, so no separate
+     * capacity check is needed.
+     */
+    private boolean writeBytes(long streamId, byte[] bytes, int off, int len,
+                               boolean fin, boolean scratch) {
         // If a prior write to this stream already deferred bytes into
         // pendingByStream, we MUST enqueue behind them — a fresh
         // stream_send here would reach the peer BEFORE the earlier
@@ -867,30 +1056,12 @@ public final class Http3Session {
         // extended to multi-frame streaming responses).
         java.util.Deque<Pending> q = pendingByStream.get(streamId);
         if (q != null && !q.isEmpty()) {
-            enqueuePending(streamId, copyOwned(bytes, off, remaining), fin);
-            return false;
+            defer(streamId, bytes, off, len, fin, scratch);
+            return true;
         }
-        long cap = Quiche.connStreamCapacity(conn, streamId);
-        if (cap < 0) {
-            // Stream gone (STREAM_STOPPED/RESET) or transient DONE. Peer
-            // won't accept more; drop any deferred state so drainPending
-            // doesn't retry forever.
-            LOG.log(cap == Quiche.QUICHE_ERR_STREAM_STOPPED
-                        || cap == Quiche.QUICHE_ERR_STREAM_RESET
-                    ? Level.FINE : Level.WARNING,
-                "h3 stream_capacity stream=" + streamId + " rc=" + cap);
-            pendingByStream.remove(streamId);
-            return false;
-        }
-        if (cap == 0) {
-            // No credit right now — copy the payload out of caller's
-            // reused scratch and defer.
-            enqueuePending(streamId, copyOwned(bytes, off, remaining), fin);
-            return false;
-        }
-        int chunk = (int) Math.min((long) remaining, cap);
-        boolean applyFin = fin && (chunk == remaining);
-        long rc = Quiche.connStreamSend(conn, streamId, bytes, off, chunk, applyFin);
+        long rc = Quiche.connStreamSend(conn, streamId, bytes, off, len, fin);
+        // DONE = no flow-control credit; defer the whole payload.
+        if (rc == Quiche.QUICHE_ERR_DONE) rc = 0;
         if (rc < 0) {
             // Peer reset (STREAM_STOPPED/RESET) is benign; other codes
             // (FINAL_SIZE, INVALID_STREAM_STATE) indicate a bug on our
@@ -902,22 +1073,27 @@ public final class Http3Session {
             pendingByStream.remove(streamId);
             return false;
         }
-        if (rc == remaining) return true;
+        // quiche applies FIN only when it took every byte.
+        if (rc == len) return true;
         // Partial: enqueue what wasn't sent (may be entire chunk on rc==0,
         // or leftover past what capacity accepted).
         int written = (int) rc;
-        enqueuePending(streamId,
-            copyOwned(bytes, off + written, remaining - written), fin);
-        return false;
+        defer(streamId, bytes, off + written, len - written, fin, scratch);
+        return true;
     }
 
-    private static byte[] copyOwned(byte[] src, int off, int len) {
-        byte[] out = new byte[len];
-        System.arraycopy(src, off, out, 0, len);
-        return out;
+    private void defer(long streamId, byte[] bytes, int off, int len,
+                       boolean fin, boolean scratch) {
+        if (scratch) {
+            byte[] own = new byte[len];
+            System.arraycopy(bytes, off, own, 0, len);
+            enqueuePending(streamId, new Pending(own, 0, len, fin));
+        } else {
+            enqueuePending(streamId, new Pending(bytes, off, len, fin));
+        }
     }
 
-    private void enqueuePending(long streamId, byte[] bytes, boolean fin) {
+    private void enqueuePending(long streamId, Pending p) {
         // Init cap 2 — most streams only defer 1-2 items when flow
         // control blocks. ArrayDeque default is 16 which allocates a
         // ~128-byte Object[] per new stream (task #144).
@@ -926,7 +1102,7 @@ public final class Http3Session {
             q = new java.util.ArrayDeque<>(2);
             pendingByStream.put(streamId, q);
         }
-        q.addLast(new Pending(bytes, fin));
+        q.addLast(p);
     }
 
     /**
@@ -940,46 +1116,7 @@ public final class Http3Session {
         // pendingRemovals to drop empty entries. Long2ObjectHashMap
         // doesn't support removal during iteration.
         pendingRemovalsSize = 0;
-        pendingByStream.forEach((streamId, q) -> {
-            while (!q.isEmpty()) {
-                Pending p = q.peekFirst();
-                long cap = Quiche.connStreamCapacity(conn, streamId);
-                if (cap < 0) {
-                    if (cap != Quiche.QUICHE_ERR_STREAM_STOPPED
-                        && cap != Quiche.QUICHE_ERR_STREAM_RESET) {
-                        LOG.warning("h3 stream_capacity stream="
-                            + streamId + " rc=" + cap);
-                    }
-                    q.clear();
-                    break;
-                }
-                if (cap == 0) break;
-                int chunk = (int) Math.min((long) p.len, cap);
-                boolean applyFin = p.fin && (chunk == p.len);
-                long rc = Quiche.connStreamSend(
-                    conn, streamId, p.buf, p.off, chunk, applyFin);
-                if (rc < 0) {
-                    if (rc != Quiche.QUICHE_ERR_STREAM_STOPPED
-                        && rc != Quiche.QUICHE_ERR_STREAM_RESET) {
-                        LOG.warning("h3 pending stream_send stream="
-                            + streamId + " rc=" + rc);
-                    }
-                    q.clear();
-                    break;
-                }
-                if (rc == 0) break;
-                p.off += (int) rc;
-                p.len -= (int) rc;
-                if (p.len == 0) q.pollFirst();
-            }
-            if (q.isEmpty()) {
-                if (pendingRemovalsSize == pendingRemovals.length) {
-                    pendingRemovals = java.util.Arrays.copyOf(
-                        pendingRemovals, pendingRemovals.length * 2);
-                }
-                pendingRemovals[pendingRemovalsSize++] = streamId;
-            }
-        });
+        pendingByStream.forEach(drainPendingStream);
         for (int i = 0; i < pendingRemovalsSize; i++) {
             pendingByStream.remove(pendingRemovals[i]);
         }
@@ -988,16 +1125,53 @@ public final class Http3Session {
     private long[] pendingRemovals = new long[8];
     private int pendingRemovalsSize;
 
+    // Allocated once rather than as a capturing lambda on every
+    // drainPendingWrites call.
+    private final Long2ObjectHashMap.EntryConsumer<java.util.Deque<Pending>> drainPendingStream =
+        this::drainPending;
+
+    /** Retry one stream's deferred writes, recording it once drained. */
+    private void drainPending(long streamId, java.util.Deque<Pending> q) {
+        while (!q.isEmpty()) {
+            Pending p = q.peekFirst();
+            // quiche clamps to credit and applies FIN only when every
+            // byte is taken.
+            long rc = Quiche.connStreamSend(
+                conn, streamId, p.buf, p.off, p.len, p.fin);
+            if (rc == Quiche.QUICHE_ERR_DONE) break;
+            if (rc < 0) {
+                if (rc != Quiche.QUICHE_ERR_STREAM_STOPPED
+                    && rc != Quiche.QUICHE_ERR_STREAM_RESET) {
+                    LOG.warning("h3 pending stream_send stream="
+                        + streamId + " rc=" + rc);
+                }
+                q.clear();
+                break;
+            }
+            if (rc == 0) break;
+            p.off += (int) rc;
+            p.len -= (int) rc;
+            if (p.len == 0) q.pollFirst();
+        }
+        if (q.isEmpty()) {
+            if (pendingRemovalsSize == pendingRemovals.length) {
+                pendingRemovals = java.util.Arrays.copyOf(
+                    pendingRemovals, pendingRemovals.length * 2);
+            }
+            pendingRemovals[pendingRemovalsSize++] = streamId;
+        }
+    }
+
     /** Per-stream deferred write: what quiche's flow control blocked. */
     private static final class Pending {
         byte[] buf;
         int off;
         int len;
         final boolean fin;
-        Pending(byte[] buf, boolean fin) {
+        Pending(byte[] buf, int off, int len, boolean fin) {
             this.buf = buf;
-            this.off = 0;
-            this.len = buf.length;
+            this.off = off;
+            this.len = len;
             this.fin = fin;
         }
     }
@@ -1021,24 +1195,17 @@ public final class Http3Session {
     }
 
     /**
-     * True while {@code streamId} can still accept outbound bytes. False
-     * once quiche reports the stream as gone (STREAM_STOPPED / RESET).
-     * Streaming response pump checks this to abort parked sources
-     * whose peer has stopped listening.
+     * Drop all session-level state for a stream once both its directions
+     * are terminated; without this, per-stream maps accumulate under
+     * reset floods (task #140).
      */
-    public boolean streamAlive(long streamId) {
-        return Quiche.connStreamCapacity(conn, streamId) >= 0;
+    private void forgetStream(long streamId) {
+        forgetReadSide(streamId);
+        pendingByStream.remove(streamId);
     }
 
-    /**
-     * Drop all session-level state for a stream. Called by the transport
-     * driver when quiche_conn_stream_recv reports a terminal error
-     * (STOP_SENDING / RESET_STREAM); without this, per-stream maps
-     * accumulate under peer reset-flood (task #140).
-     */
-    public void forgetStream(long streamId) {
+    private void forgetReadSide(long streamId) {
         releaseReader(requestStreams.remove(streamId));
-        pendingByStream.remove(streamId);
         peerUniTypes.remove(streamId);
         peerUniHeaderBuf.remove(streamId);
     }
@@ -1046,11 +1213,11 @@ public final class Http3Session {
     /**
      * Terminate a request stream with {@code errorCode} on both directions
      * (STOP_SENDING + RESET_STREAM), then drop any per-stream state. Used
-     * by the connection layer when the peer's body exceeds
-     * {@link Config#maxRequestBodyBytes} — without the shutdown the peer
-     * keeps sending DATA against a stream we already stopped consuming,
-     * next of which lands in the "DATA before HEADERS" branch and kills
-     * the whole connection.
+     * for stream errors (e.g. a body over {@link Config#maxRequestBodyBytes})
+     * and by the connection when a streamed response aborts — without the
+     * shutdown the peer keeps sending DATA against a stream we already
+     * stopped consuming, next of which lands in the "DATA before HEADERS"
+     * branch and kills the whole connection.
      */
     public void resetRequestStream(long streamId, long errorCode) {
         resetStream(streamId, errorCode);
@@ -1062,7 +1229,10 @@ public final class Http3Session {
      * owner-only access.
      */
     private static final class RequestStream {
+        // Frame-sequence position (RFC 9114 §4.1).
+        static final int HEADERS = 0, BODY = 1, TRAILERS = 2;
         final Http3FrameReader reader;
+        int phase = HEADERS;
         RequestStream(Http3FrameReader reader) { this.reader = reader; }
     }
 
@@ -1077,7 +1247,14 @@ public final class Http3Session {
 
     private Http3FrameReader acquireReader() {
         Http3FrameReader r = readerPool.pollFirst();
-        return r != null ? r : new Http3FrameReader();
+        if (r != null) return r;
+        // The limit counts decoded bytes (name + value + 32 per field). A
+        // field line's encoding is shorter than that unless the encoder
+        // picks a Huffman code longer than the raw literal (up to 30 bits
+        // per octet), which no sensible encoder does; so the same limit
+        // bounds the HEADERS frames we buffer, and a longer frame is
+        // rejected as oversized.
+        return new Http3FrameReader(fieldSectionCap);
     }
 
     private void releaseReader(RequestStream rs) {
@@ -1104,11 +1281,16 @@ public final class Http3Session {
 
     /**
      * Callback surface for the Ring bridge. Called on the owner thread
-     * while draining a request stream's ingress bytes.
+     * while draining a request stream's ingress bytes. A callback may
+     * throw {@link Http3StreamException}: the session then resets the
+     * stream and calls {@link #onReset}.
      */
     public interface RequestSink {
         void onHeaders(long streamId, List<String[]> headers);
-        void onData(long streamId, byte[] chunk, boolean finalChunk);
+        /** Body bytes from a DATA frame; the body ends at {@link #onFin}. */
+        void onData(long streamId, byte[] chunk);
         void onFin(long streamId);
+        /** The session reset {@code streamId} with a stream error. */
+        void onReset(long streamId);
     }
 }

@@ -4,12 +4,15 @@
   (:import (com.s_exp.enso EnsoServer)
            (com.s_exp.enso.api ChunkedWriter Config Response
                                RingErrorHandler RingHandler StreamingBody)
-           (com.s_exp.enso.websocket WebSocketListener WebSocketSocket)))
+           (com.s_exp.enso.core HttpFields)
+           (com.s_exp.enso.websocket WebSocketListener WebSocketSocket)
+           (java.nio ByteBuffer)))
 
 (set! *warn-on-reflection* true)
 
 (declare ^:private streamable-body-proto write-body-to-stream-fn
-         chunked-writer->output-stream)
+         chunked-writer->output-stream ws-listener-proto ws-ping-listener-proto
+         ws-protocol-fns)
 
 (defn- coerce-body [response body]
   (cond
@@ -25,6 +28,18 @@
       (write [_ writer]
         (body writer)))
 
+    ;; Ring seq body → stream element-by-element via chunked transfer, mirroring
+    ;; Ring's default ISeq StreamableResponseBody impl. Avoids materialising
+    ;; large lazy seqs into a single String. Checked before the protocol
+    ;; below so common body types never pay for satisfies?.
+    (seq? body)
+    (let [charset (HttpFields/responseCharset (:headers response))]
+      (reify StreamingBody
+        (write [_ writer]
+          (doseq [chunk body]
+            (.write writer (.getBytes ^String (str chunk) charset)))
+          (.flush writer))))
+
     ;; Ring's StreamableResponseBody protocol: any user-extended body type.
     ;; Written via chunked transfer encoding — the body drives its own writes
     ;; onto the wrapped OutputStream, flushed per user's write-body-to-stream
@@ -36,19 +51,9 @@
         (let [os (chunked-writer->output-stream writer)]
           (write-body-to-stream-fn body response os))))
 
-    ;; Ring seq body → stream element-by-element via chunked transfer, mirroring
-    ;; Ring's default ISeq StreamableResponseBody impl. Avoids materialising
-    ;; large lazy seqs into a single String.
-    (seq? body)
-    (reify StreamingBody
-      (write [_ writer]
-        (doseq [chunk body]
-          (.write writer ^String (str chunk)))
-        (.flush writer)))
-
     :else body))
 
-(defn- ring-listener->java
+(defn- map-listener->java
   "Converts a WebSocket listener map into a WebSocketListener. Keys:
   `:on-open` `:on-message` `:on-ping` `:on-pong` `:on-error` `:on-close`."
   ^WebSocketListener [listener]
@@ -69,6 +74,98 @@
       (onPong [_ socket data] (on-pong socket data))
       (onError [_ socket t] (on-error socket t))
       (onClose [_ socket code reason] (on-close socket code reason)))))
+
+(defn- protocol-listener->java
+  "Converts a `ring.websocket.protocols/Listener` implementation into a
+  WebSocketListener. `on-ping` dispatches to `PingListener` when the
+  listener implements it, otherwise answers with a pong."
+  ^WebSocketListener [listener]
+  (let [{:keys [on-open on-message on-ping on-pong on-error on-close]} ws-protocol-fns
+        ping-listener? (satisfies? ws-ping-listener-proto listener)]
+    (reify WebSocketListener
+      (onOpen [_ socket] (on-open listener socket))
+      (onMessage [_ socket message] (on-message listener socket message))
+      (onPing [_ socket data]
+        (if ping-listener?
+          (on-ping listener socket data)
+          (try (.sendPong ^WebSocketSocket socket data) (catch Exception _))))
+      (onPong [_ socket data] (on-pong listener socket data))
+      (onError [_ socket t] (on-error listener socket t))
+      (onClose [_ socket code reason] (on-close listener socket code reason)))))
+
+(defn- ring-listener->java
+  "Converts a `:ring.websocket/listener` value: a map of `:on-*` fns, or,
+  when ring.websocket.protocols is on the classpath, anything implementing
+  its Listener protocol. Records are maps too, so they are checked for the
+  protocol before being read as a map of `:on-*` fns."
+  ^WebSocketListener [listener]
+  (cond
+    (and (map? listener) (not (record? listener)))
+    (map-listener->java listener)
+
+    (and ws-listener-proto (satisfies? ws-listener-proto listener))
+    (protocol-listener->java listener)
+
+    (map? listener)
+    (map-listener->java listener)
+
+    :else
+    (throw (IllegalArgumentException.
+            (str "unsupported :ring.websocket/listener: " (class listener))))))
+
+(defn- send-message! [^WebSocketSocket socket message]
+  (cond
+    (instance? CharSequence message) (.sendText socket ^CharSequence message)
+    (instance? ByteBuffer message) (.sendBinary socket ^ByteBuffer message)
+    :else (throw (IllegalArgumentException.
+                  (str "unsupported websocket message type: " (class message))))))
+
+(defn- ->byte-buffer ^ByteBuffer [data]
+  (if (bytes? data) (ByteBuffer/wrap ^bytes data) data))
+
+;; Optional support for Ring's websocket protocols (Ring 1.11+). When
+;; ring.websocket.protocols is on the classpath, listeners implementing its
+;; Listener protocol are accepted and the socket handed to listeners
+;; implements Socket and AsyncSocket, so ring.websocket/send & co work.
+(defonce ^:private ws-protocols-ns
+  (try
+    (require 'ring.websocket.protocols)
+    (find-ns 'ring.websocket.protocols)
+    (catch Throwable _ nil)))
+
+(defn- ws-protocol-var [sym]
+  (when ws-protocols-ns
+    @(ns-resolve ws-protocols-ns sym)))
+
+(defonce ^:private ws-listener-proto (ws-protocol-var 'Listener))
+(defonce ^:private ws-ping-listener-proto (ws-protocol-var 'PingListener))
+
+(defonce ^:private ws-protocol-fns
+  (when ws-protocols-ns
+    (into {}
+          (map (fn [k] [k (ws-protocol-var (symbol (name k)))]))
+          [:on-open :on-message :on-ping :on-pong :on-error :on-close])))
+
+(when ws-protocols-ns
+  (extend WebSocketSocket
+    (ws-protocol-var 'Socket)
+    {:-open? (fn [^WebSocketSocket socket] (.isOpen socket))
+     :-send (fn [socket message] (send-message! socket message))
+     :-ping (fn [^WebSocketSocket socket data] (.sendPing socket (->byte-buffer data)))
+     :-pong (fn [^WebSocketSocket socket data] (.sendPong socket (->byte-buffer data)))
+     :-close (fn [^WebSocketSocket socket code reason] (.close socket (int code) reason))}
+    (ws-protocol-var 'AsyncSocket)
+    ;; Sends complete synchronously on the caller's (virtual) thread,
+    ;; which keeps per-socket message order; callbacks run once the
+    ;; frame is written.
+    {:-send-async (fn [socket message succeed fail]
+                    (when (try
+                            (send-message! socket message)
+                            true
+                            (catch Throwable t
+                              (fail t)
+                              false))
+                      (succeed)))}))
 
 ;; Optional support for Ring's StreamableResponseBody protocol. When
 ;; ring.core.protocols is on the classpath, any body value satisfying the
@@ -104,7 +201,7 @@
     (throw (IllegalArgumentException. "handler returned nil response")))
   (if (websocket-response? response)
     (Response. 101
-               nil
+               (:headers response)
                nil
                (ring-listener->java (:ring.websocket/listener response))
                (:ring.websocket/protocol response))
@@ -195,7 +292,12 @@
   - `:backlog` - accept queue length (default 1024)
 
   Timeouts:
-  - `:idle-timeout` - per-read socket timeout in ms, 0 disables (default 30000)
+  - `:idle-timeout` - per-read socket timeout in ms, 0 disables (default 30000).
+    On HTTP/2 it instead closes the connection with GOAWAY after this long
+    with no active streams (`:keep-alive-timeout` takes precedence when set),
+    bounds the wait for the client preface and aborts a connection whose
+    writes make no progress for this long. On a WebSocket it bounds how long
+    no frame may arrive from the client; the server then closes with 1001 \"idle timeout\".
   - `:request-timeout` - wall-clock deadline for reading a full request in ms,
     0 disables (default 30000). Slowloris protection.
   - `:shutdown-timeout` - graceful shutdown wait for in-flight requests in ms
@@ -205,15 +307,18 @@
   - `:ssl-context` - `javax.net.ssl.SSLContext`. When set, listens as TLS with
     the context's keystore/truststore/protocols. Falls back to a user-space
     file transfer for File response bodies (no zero-copy on TLS).
+  - `:ssl-context-provider` - fn (or `java.util.function.Supplier`) returning
+    an `SSLContext`, exclusive with `:ssl-context`. Called at startup and,
+    with `:http2`, per accepted connection so rotated certs apply to new
+    connections.
   - `:ssl-need-client-auth` - require a valid client certificate (default false)
   - `:ssl-want-client-auth` - request but not require a client cert (default false)
   - `:alpn-protocols` - seq of ALPN protocol IDs to advertise. Defaults to
     `[\"h2\" \"http/1.1\"]` when `:http2` is enabled, otherwise JVM default.
   - `:enabled-cipher-suites` - seq of cipher suite names to enable (JVM default when nil)
   - `:enabled-tls-protocols` - seq of TLS protocol versions to enable (JVM default when nil)
-  - `:ssl-session-cache-size` - SSL session cache size in entries. 0 = JVM
-    default (10000 on OpenJDK). Larger caches help session-resumption hit
-    rate under many short-lived TLS clients.
+  - `:ssl-session-cache-size` - server TLS session cache size, set on every SSL
+    context the server uses; 0 keeps the JVM default (default 0)
 
   HTTP/1.1 keep-alive:
   - `:max-keep-alive-requests` - cap on requests per connection, 0 = unlimited (default 1000)
@@ -226,9 +331,16 @@
   - `:so-linger` - SO_LINGER seconds, -1 disables (default -1)
   - `:so-rcv-buf` / `:so-snd-buf` - socket buffer sizes, 0 = OS default
 
+  HTTP/2 (TLS + ALPN only, requires `:ssl-context`):
+  - `:http2` - advertise and serve \"h2\" (default false)
+  - `:http2-max-concurrent-streams` (100), `:http2-initial-window-size`
+    (1 MiB), `:http2-max-frame-size` (16384),
+    `:http2-max-header-list-size` (8192, 0 disables enforcement)
+
   HTTP/2 hardening:
-  - `:http2-stream-reset-limit` - RST_STREAM cap per connection, CVE-2023-44487
-    mitigation (default 400, matches Nginx)
+  - `:http2-stream-reset-limit` - client RST_STREAMs allowed per connection,
+    refilling at that many per 30 seconds; above it the connection ends with
+    ENHANCE_YOUR_CALM. CVE-2023-44487 mitigation (default 400)
   - `:http2-continuation-limit` - CONTINUATION frames per HEADERS (default 64)
 
   HTTP/3 (opt-in; requires PEM cert + key on disk since quiche loads them
@@ -240,7 +352,7 @@
   - `:http3-port` — UDP port. Defaults to `:port` (co-exists on the same
     port number over UDP + TCP).
   - `:http3-max-idle-timeout` (30000) — quiche idle timeout in ms.
-  - `:http3-initial-max-data` (1 GiB) — connection flow control window.
+  - `:http3-initial-max-data` (16 MiB) — connection flow control window.
   - `:http3-initial-max-streams-bidi` (100) — concurrent request streams.
   - `:http3-max-udp-payload-size` (1350) — MTU-safe default.
   - `:http3-stateless-retry` (false) — force clients to prove reachability
@@ -251,13 +363,15 @@
   HTTP/3 advanced (QPACK, transport):
   - `:http3-initial-max-streams-uni` - peer's unidirectional stream credit (default 8; min 3)
   - `:http3-max-field-section-size` - SETTINGS_MAX_FIELD_SECTION_SIZE, our
-    inbound cap advertised to the peer (default 64 KiB, 0 = no limit)
-  - `:http3-qpack-max-table-capacity` - SETTINGS_QPACK_MAX_TABLE_CAPACITY (default 0 = static-table only)
+    inbound cap advertised to the peer (default 64 KiB; 0 = not advertised,
+    request headers are then still capped at 1 MiB)
+  - `:http3-qpack-max-table-capacity` - SETTINGS_QPACK_MAX_TABLE_CAPACITY; must
+    be 0 (static-table only, no dynamic table support)
   - `:http3-qpack-blocked-streams` - SETTINGS_QPACK_BLOCKED_STREAMS (default 0)
   - `:http3-initial-max-stream-data-bidi-local`
   - `:http3-initial-max-stream-data-bidi-remote`
   - `:http3-initial-max-stream-data-uni` - per-stream flow control windows.
-    Default -1 means derive from `:http3-initial-max-data` / stream count.
+    Default -1 means max(1 MiB, `:http3-initial-max-data` / stream count).
   - `:http3-ack-delay-exponent` - RFC 9000 ack_delay_exponent, [0, 20]. -1 = quiche default
   - `:http3-max-ack-delay` - RFC 9000 max_ack_delay ms, [0, 16383]. -1 = quiche default
   - `:http3-active-connection-id-limit` - RFC 9000 active_connection_id_limit, >= 2. -1 = quiche default
@@ -273,6 +387,7 @@
   - `:error-handler` - `(fn [request throwable])` returning a Ring response map.
     Invoked when the main handler throws or returns nil. If the error handler
     itself throws or returns nil, a fallback 500 text response is sent.
+    Applies to HTTP/1.1, HTTP/2 and HTTP/3 alike.
 
   Buffers / limits (tune only if you know why):
   - `:request-buffer-size` - initial request parse buffer size (default 16384).
@@ -295,8 +410,9 @@
     ignores a POST body larger than this, keep-alive is dropped.
   - `:max-request-body-bytes` - cap for the incoming request body in bytes,
     0 disables (default 10 MiB). Content-Length above the cap → 413 upfront;
-    chunked bodies get 413 mid-stream once the cap is exceeded. Also caps
-    WebSocket frame payload size (uses same limit).
+    bodies without one fail mid-stream once the cap is exceeded. Enforced on
+    every protocol. Also caps reassembled WebSocket message size
+    (CLOSE 1009 above; 10 MiB when this is 0).
 
   Interaction notes:
   - `:request-buffer-size` and `:max-header-bytes` should typically be equal
@@ -310,8 +426,9 @@
     `min(idle, remaining-request-budget)`. Set both to sensible values.
 
   Errors are routed through `java.util.logging` under the loggers
-  `com.s_exp.enso.http1.HttpConnection` and `com.s_exp.enso.EnsoServer`. Wire a
-  handler / SLF4J bridge in your application to redirect them."
+  `com.s_exp.enso.http1.HttpConnection`, `com.s_exp.enso.http2.Http2Connection`,
+  `com.s_exp.enso.http3.*` and `com.s_exp.enso.EnsoServer`. Wire a handler /
+  SLF4J bridge in your application to redirect them."
   (^EnsoServer [handler]
    (run-server handler nil))
   (^EnsoServer [handler {:keys [error-handler] :as opts}]

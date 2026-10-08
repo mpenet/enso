@@ -1,5 +1,7 @@
 package com.s_exp.enso.util;
 
+import java.util.HashMap;
+
 /**
  * Shared helpers for building the Ring headers map from a raw list of
  * (name, value) pairs parsed off the wire.
@@ -8,15 +10,24 @@ public final class RingHeaders {
 
     private RingHeaders() {}
 
+    // Up to this many fields, pairwise name comparison beats hashing.
+    // Above it a hash index keeps merging linear: one HTTP/3 HEADERS
+    // block can decode to tens of thousands of fields.
+    private static final int SCAN_MAX_PAIRS = 16;
+
     /**
      * Dedup name/value pairs in {@code arr[0..len]} (interleaved names +
      * values). Duplicate names get their values joined per HTTP list-value
      * combining: "; " for "cookie" (RFC 9113 §8.2.3), ", " otherwise
      * (RFC 9110 §5.3). Returns an exact-fit {@code Object[]} with no
      * repeated keys so a downstream
-     * {@code PersistentArrayMap.createAsIfByAssoc} won't throw.
+     * {@code PersistentArrayMap.createAsIfByAssoc} won't throw. Names keep
+     * the order of their first occurrence.
      */
     public static Object[] mergeDuplicates(Object[] arr, int len) {
+        if (len > SCAN_MAX_PAIRS * 2) {
+            return mergeIndexed(arr, len);
+        }
         boolean dup = false;
         outer:
         for (int i = 0; i < len; i += 2) {
@@ -44,10 +55,55 @@ public final class RingHeaders {
                 out[op++] = name;
                 out[op++] = value;
             } else {
-                String sep = name.equals("cookie") ? "; " : ", ";
-                out[existing + 1] = out[existing + 1] + sep + value;
+                out[existing + 1] = out[existing + 1] + separator(name) + value;
             }
         }
+        return fit(out, op);
+    }
+
+    private static Object[] mergeIndexed(Object[] arr, int len) {
+        HashMap<String, Integer> index = new HashMap<>(len);
+        Object[] out = new Object[len];
+        // Per output pair, a builder for names seen more than once, so
+        // joining N values costs O(total length) rather than O(N^2).
+        StringBuilder[] joined = null;
+        int op = 0;
+        for (int i = 0; i < len; i += 2) {
+            String name = (String) arr[i];
+            String value = (String) arr[i + 1];
+            Integer existing = index.putIfAbsent(name, op);
+            if (existing == null) {
+                out[op++] = name;
+                out[op++] = value;
+            } else {
+                int pair = existing >>> 1;
+                if (joined == null) {
+                    joined = new StringBuilder[len >>> 1];
+                }
+                StringBuilder sb = joined[pair];
+                if (sb == null) {
+                    sb = new StringBuilder((String) out[existing + 1]);
+                    joined[pair] = sb;
+                }
+                sb.append(separator(name)).append(value);
+            }
+        }
+        if (joined == null) {
+            return arr.length == len ? arr : fit(out, op);
+        }
+        for (int pair = 0; pair < joined.length; pair++) {
+            if (joined[pair] != null) {
+                out[(pair << 1) + 1] = joined[pair].toString();
+            }
+        }
+        return fit(out, op);
+    }
+
+    private static String separator(String name) {
+        return name.equals("cookie") ? "; " : ", ";
+    }
+
+    private static Object[] fit(Object[] out, int op) {
         if (op == out.length) return out;
         Object[] fit = new Object[op];
         System.arraycopy(out, 0, fit, 0, op);

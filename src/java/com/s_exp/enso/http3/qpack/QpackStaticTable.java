@@ -19,8 +19,8 @@ public final class QpackStaticTable {
 
     /** Name → lowest static-table index for that name. */
     public static final Map<String, Integer> NAME_INDEX = new HashMap<>();
-    /** name+"\0"+value → static-table index for that exact pair. */
-    public static final Map<String, Integer> NAME_VALUE_INDEX = new HashMap<>();
+    /** Name → every static-table index carrying that name. */
+    private static final Map<String, int[]> NAME_INDICES = new HashMap<>();
 
     static {
         TABLE = new String[][] {
@@ -132,7 +132,10 @@ public final class QpackStaticTable {
             String name = TABLE[i][0];
             String value = TABLE[i][1];
             NAME_INDEX.putIfAbsent(name, i);
-            NAME_VALUE_INDEX.put(name + '\0' + value, i);
+            int[] prev = NAME_INDICES.get(name);
+            int[] next = prev == null ? new int[1] : java.util.Arrays.copyOf(prev, prev.length + 1);
+            next[next.length - 1] = i;
+            NAME_INDICES.put(name, next);
         }
     }
 
@@ -144,8 +147,12 @@ public final class QpackStaticTable {
 
     /** @return index of exact name+value match, or -1. */
     public static int findExact(String name, String value) {
-        Integer i = NAME_VALUE_INDEX.get(name + '\0' + value);
-        return i == null ? -1 : i;
+        int[] candidates = NAME_INDICES.get(name);
+        if (candidates == null) return -1;
+        for (int i : candidates) {
+            if (TABLE[i][1].equals(value)) return i;
+        }
+        return -1;
     }
 
     /** @return index of first entry with matching name, or -1. */

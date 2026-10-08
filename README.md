@@ -24,14 +24,17 @@ threads. Plain sync handler.
   QPACK + H3 framing on top of quiche's transport primitives. Alt-Svc
   auto-advertised from h1/h2 responses when h3 enabled. **~35% faster
   than Netty h3 in bench** — see [doc/performance.md](doc/performance.md).
-- **WebSocket.** Ring 1.5+ listener shape. 
+- **WebSocket.** HTTP/1.1 upgrade, Ring 1.11+ websocket API: listener
+  maps, plus `ring.websocket.protocols` listeners and sockets when that
+  library is on the classpath. RFC 6455 closing handshake and close codes.
 - **SSE / long-poll.** Streaming writer 
 - **Correct.** Rejects request smuggling, header injection, slowloris.
-  CVE-2023-44487 rapid-reset mitigation. Body-size caps enforced.
+  CVE-2023-44487 rapid-reset mitigation. Request body-size caps enforced
+  on every protocol.
 
 ## Requirements
 
-- JDK 21+ (HTTP/3 requires 22+).
+- JDK 21+ (all protocols; HTTP/3 goes through a JNI shim).
 - Clojure 1.12+.
 - HTTP/3: add a matching classifier — see below.
 

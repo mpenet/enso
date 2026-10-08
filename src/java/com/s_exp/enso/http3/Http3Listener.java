@@ -1,6 +1,7 @@
 package com.s_exp.enso.http3;
 
 import com.s_exp.enso.api.Config;
+import com.s_exp.enso.api.RingErrorHandler;
 import com.s_exp.enso.api.RingHandler;
 import com.s_exp.enso.quiche.Quiche;
 import com.s_exp.enso.quiche.QuicheConfig;
@@ -42,9 +43,23 @@ public final class Http3Listener implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(Http3Listener.class.getName());
 
+    // Retry / Version Negotiation packets are small; this bounds them.
     private static final int MAX_DATAGRAM_SIZE = 1350;
+    // Covers the largest UDP payload (65,507 bytes over IPv4, 65,527 over
+    // IPv6). The receive buffer must hold any datagram a peer sends:
+    // DatagramChannel.receive silently drops what doesn't fit, and a
+    // client sizes its first Initials before it has seen our
+    // max_udp_payload_size (RFC 9000 §14.1).
+    private static final int MAX_RECV_DATAGRAM = 65535;
     private static final int LOCAL_CID_LEN = 16;
     private static final int MAX_TOKEN_LEN = 2048;
+    // RFC 9000 §14.1: a client's Initial travels in a datagram of at least
+    // 1200 bytes; smaller ones are discarded. Also the floor for answering
+    // with Version Negotiation or Retry, keeping those replies below the
+    // 3x anti-amplification limit for a spoofed source.
+    private static final int MIN_INITIAL_DATAGRAM = 1200;
+    // quiche_header_info packet types.
+    private static final int TYPE_INITIAL = 1;
     // Hard cap on concurrent QUIC connections per listener. Above this,
     // new Initials are dropped so a flood of unique-DCID packets can't
     // exhaust memory / thread count.
@@ -52,8 +67,7 @@ public final class Http3Listener implements AutoCloseable {
 
     private final Config config;
     private final RingHandler handler;
-    @SuppressWarnings("unused") // reserved for stop-signal callbacks
-    private final Object server;
+    private final RingErrorHandler errorHandler;
     private DatagramChannel channel;
     private QuicheConfig quicheConfig;
     private Thread demux;
@@ -61,13 +75,17 @@ public final class Http3Listener implements AutoCloseable {
     private InetSocketAddress localAddr;
     private final SecureRandom rng = new SecureRandom();
     private final ConcurrentHashMap<CidKey, Http3Connection> conns = new ConcurrentHashMap<>();
+    // Live connections (conns also holds an alias entry per connection).
+    private final java.util.concurrent.atomic.AtomicInteger connCount =
+        new java.util.concurrent.atomic.AtomicInteger();
     private RetryToken retryToken;
     private ExecutorService connExecutor;
 
-    public Http3Listener(Config config, RingHandler handler, Object server) {
+    /** {@code errorHandler} may be null: a failing handler then gets a plain 500. */
+    public Http3Listener(Config config, RingHandler handler, RingErrorHandler errorHandler) {
         this.config = config;
         this.handler = handler;
-        this.server = server;
+        this.errorHandler = errorHandler;
     }
 
     public void start() throws IOException {
@@ -121,10 +139,14 @@ public final class Http3Listener implements AutoCloseable {
         final long[] dcidLenA = new long[1];
         final byte[] tokenBuf = new byte[MAX_TOKEN_LEN];
         final long[] tokenLenA = new long[1];
+        // Lookup-only key over dcidBuf, re-pointed per datagram.
+        final CidKey lookup = new CidKey(dcidBuf, 0);
     }
 
     private void demuxLoop() {
-        ByteBuffer buf = ByteBuffer.allocateDirect(2 * MAX_DATAGRAM_SIZE);
+        // Sized to the largest possible UDP payload, not the
+        // max_udp_payload_size we advertise, so no datagram is truncated.
+        ByteBuffer buf = ByteBuffer.allocateDirect(MAX_RECV_DATAGRAM);
         DemuxScratch scratch = new DemuxScratch();
         while (running) {
             try {
@@ -151,13 +173,13 @@ public final class Http3Listener implements AutoCloseable {
     private void onDatagram(ByteBuffer datagram, InetSocketAddress from,
                              DemuxScratch s) {
         int length = datagram.remaining();
-        byte[] pkt = new byte[length];
-        datagram.get(pkt);
         try {
             s.scidLenA[0] = Quiche.QUICHE_MAX_CONN_ID_LEN;
             s.dcidLenA[0] = Quiche.QUICHE_MAX_CONN_ID_LEN;
             s.tokenLenA[0] = MAX_TOKEN_LEN;
-            int rc = Quiche.headerInfo(pkt, length, LOCAL_CID_LEN,
+            // Parsed in place from the receive buffer; the datagram is
+            // copied out only if it is handed to a connection.
+            int rc = Quiche.headerInfo(datagram, length, LOCAL_CID_LEN,
                 s.versionOut, s.typeOut,
                 s.scidBuf, s.scidLenA,
                 s.dcidBuf, s.dcidLenA,
@@ -172,13 +194,22 @@ public final class Http3Listener implements AutoCloseable {
             // Look up existing connection via a view-based key first so
             // the common case (packet for an established conn) skips the
             // dcidBytes copy entirely.
-            Http3Connection existing = conns.get(CidKey.view(s.dcidBuf, dcidLen));
+            Http3Connection existing = conns.get(s.lookup.view(dcidLen));
             if (existing != null) {
-                existing.enqueue(pkt);
+                existing.enqueue(copyOut(datagram, length), from);
                 return;
             }
             // Miss → materialise the cid bytes for the accept path (we
             // hand them off to Http3Connection ctor + retryToken).
+            // Unknown connection ID: only a full-size client Initial may
+            // allocate state or get a reply. Short headers carry no
+            // version, so never trigger Version Negotiation (RFC 9000
+            // §5.2.2, §6.1); Handshake / 0-RTT / short packets for an
+            // unknown CID are dropped (no stateless reset sent).
+            int type = s.typeOut[0];
+            if (length < MIN_INITIAL_DATAGRAM || type == 5 /* short */ || type == 6 /* VN */) {
+                return;
+            }
             byte[] scidBytes = Arrays.copyOf(s.scidBuf, scidLen);
             byte[] dcidBytes = Arrays.copyOf(s.dcidBuf, dcidLen);
             int wireVersion = s.versionOut[0];
@@ -186,6 +217,7 @@ public final class Http3Listener implements AutoCloseable {
                 sendVersionNegotiation(scidBytes, dcidBytes, from);
                 return;
             }
+            if (type != TYPE_INITIAL) return;
             // Stateless retry (RFC 9000 §8.1.2). Force the client to prove
             // it can receive at its claimed source address before we
             // allocate connection state. Peers that don't echo a valid
@@ -201,18 +233,23 @@ public final class Http3Listener implements AutoCloseable {
             byte[] localCid;
             byte[] retryOdcid;
             if (retryToken != null) {
-                if (tokenLen == 0) {
-                    byte[] token = retryToken.mint(from, dcidBytes);
+                byte[] verifiedOdcid = tokenLen == 0 ? null
+                    : retryToken.verify(s.tokenBuf, 0, tokenLen, from, s.dcidBuf, dcidLen);
+                if (verifiedOdcid == null) {
+                    // No token, or one we can't validate (expired, minted
+                    // for another address, a NEW_TOKEN token from another
+                    // server): treated as absent (RFC 9000 §8.1.3), so the
+                    // client gets a Retry. Closing with INVALID_TOKEN
+                    // would need connection state, which Retry exists to
+                    // avoid allocating for unvalidated addresses.
                     byte[] newScid = new byte[LOCAL_CID_LEN];
                     rng.nextBytes(newScid);
+                    byte[] token = retryToken.mint(from, dcidBytes, newScid);
                     sendRetry(scidBytes, dcidBytes, newScid, token, wireVersion, from);
                     return;
                 }
-                byte[] token = Arrays.copyOf(s.tokenBuf, tokenLen);
-                byte[] verifiedOdcid = retryToken.verify(token, from);
-                if (verifiedOdcid == null) {
-                    return;
-                }
+                // The token binds the Retry SCID, so this DCID is the
+                // LOCAL_CID_LEN-byte id we generated.
                 localCid = dcidBytes;
                 retryOdcid = verifiedOdcid;
             } else {
@@ -220,10 +257,16 @@ public final class Http3Listener implements AutoCloseable {
                 rng.nextBytes(localCid);
                 retryOdcid = null;
             }
-            acceptNew(pkt, from, localCid, dcidBytes, retryOdcid);
+            acceptNew(copyOut(datagram, length), from, localCid, dcidBytes, retryOdcid);
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "h3 onDatagram failed", t);
         }
+    }
+
+    private static byte[] copyOut(ByteBuffer datagram, int length) {
+        byte[] pkt = new byte[length];
+        datagram.get(0, pkt);
+        return pkt;
     }
 
     private void sendRetry(byte[] scid, byte[] dcid, byte[] newScid,
@@ -251,9 +294,10 @@ public final class Http3Listener implements AutoCloseable {
 
     private void acceptNew(byte[] datagram, InetSocketAddress from,
                            byte[] localCid, byte[] clientDcid, byte[] retryOdcid) {
-        // First-line DoS gate — cheap and racy, real bound enforced below
-        // via putIfAbsent semantics on the connection map.
-        if (conns.size() >= MAX_CONNECTIONS) {
+        // DoS gate. Only the demux thread accepts, so this check and the
+        // increment below can't race each other past the bound; closing
+        // connections only lower the count.
+        if (!running || connCount.get() >= MAX_CONNECTIONS) {
             return;
         }
         byte[] localIp = localAddr.getAddress().getAddress();
@@ -269,18 +313,38 @@ public final class Http3Listener implements AutoCloseable {
         }
         CidKey key = new CidKey(localCid);
         CidKey odKey = new CidKey(clientDcid);
-        Http3Connection h3conn = new Http3Connection(
-            localCid, conn, channel, localAddr, from,
-            handler,
-            config,
-            connExecutor,
-            () -> { conns.remove(key); conns.remove(odKey); });
+        Http3Connection[] self = new Http3Connection[1];
+        Http3Connection h3conn;
+        connCount.incrementAndGet();
+        try {
+            h3conn = new Http3Connection(
+                localCid, conn, channel, localAddr, from,
+                handler,
+                errorHandler,
+                config,
+                connExecutor,
+                () -> {
+                    // Only this connection's entries: a key may have been
+                    // re-bound to another connection meanwhile.
+                    conns.remove(key, self[0]);
+                    conns.remove(odKey, self[0]);
+                    connCount.decrementAndGet();
+                });
+            self[0] = h3conn;
+        } catch (Throwable t) {
+            connCount.decrementAndGet();
+            // No owner thread will ever run (executor shut down / out of
+            // threads), so nobody else frees the quiche conn.
+            Quiche.connFree(conn);
+            LOG.log(Level.WARNING, "h3 connection start failed", t);
+            return;
+        }
         Http3Connection prev = conns.putIfAbsent(key, h3conn);
         if (prev != null) {
             // Extremely unlikely collision on 128-bit random CID; keep
             // existing and abandon this one.
             h3conn.close();
-            prev.enqueue(datagram);
+            prev.enqueue(datagram, from);
             return;
         }
         // Also route packets whose DCID is still the client's original
@@ -295,7 +359,7 @@ public final class Http3Listener implements AutoCloseable {
         conns.putIfAbsent(odKey, h3conn);
         LOG.info("h3 accepted new connection cid="
             + HexFormat.of().formatHex(localCid) + " from " + from);
-        h3conn.enqueue(datagram);
+        h3conn.enqueue(datagram, from);
     }
 
     @Override
@@ -307,6 +371,13 @@ public final class Http3Listener implements AutoCloseable {
         // finally throws AsynchronousCloseException and peers never see
         // H3_NO_ERROR — task #133.
         running = false;
+        // Stop the demux before anything else: it is the only caller of
+        // quiche_accept / quiche_retry with the shared config. Interrupting
+        // it would close the channel (ClosedByInterruptException) the
+        // connections still need, so wake its blocking receive with an
+        // empty datagram to ourselves instead.
+        wakeDemux();
+        joinDemux(1000);
         // Signal all conns in parallel (non-blocking flag-flip + wake).
         // Serial c.close() at 3s each would take hours at 10k conns.
         // Bounded connExecutor.awaitTermination below caps total wait
@@ -334,8 +405,29 @@ public final class Http3Listener implements AutoCloseable {
         if (channel != null) {
             try { channel.close(); } catch (IOException ignored) {}
         }
+        // Closing the channel ends a demux the wake datagram didn't reach;
+        // only then is the config unreferenced.
+        joinDemux(5000);
         if (quicheConfig != null) {
             try { quicheConfig.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private void wakeDemux() {
+        if (channel == null || localAddr == null) return;
+        InetAddress to = localAddr.getAddress().isAnyLocalAddress()
+            ? InetAddress.getLoopbackAddress() : localAddr.getAddress();
+        try {
+            channel.send(ByteBuffer.allocate(0), new InetSocketAddress(to, localAddr.getPort()));
+        } catch (IOException ignored) {}
+    }
+
+    private void joinDemux(long millis) {
+        if (demux == null) return;
+        try {
+            demux.join(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -345,49 +437,51 @@ public final class Http3Listener implements AutoCloseable {
      * key without relying on identity semantics.
      */
     private static final class CidKey {
+        // Per-JVM secret so a peer choosing DCIDs (Initial DCIDs become
+        // alias keys) can't aim many keys at one hash bucket.
+        private static final long HASH_KEY = new SecureRandom().nextLong() | 1L;
+
         private final byte[] bytes;
-        private final int off;
-        private final int len;
-        private final int hash;
+        private int len;
+        private int hash;
 
         /** Owned-copy variant — used as the persisted map key. */
         CidKey(byte[] bytes) {
-            this.bytes = bytes;
-            this.off = 0;
-            this.len = bytes.length;
-            this.hash = hashBytes(bytes, 0, bytes.length);
+            this(bytes, bytes.length);
         }
 
-        private CidKey(byte[] bytes, int off, int len, int hash) {
+        CidKey(byte[] bytes, int len) {
             this.bytes = bytes;
-            this.off = off;
             this.len = len;
-            this.hash = hash;
+            this.hash = hashBytes(bytes, len);
         }
 
         /**
-         * Lookup-only view over a scratch buffer prefix. Do NOT store this
-         * in the map — the backing array is reused across datagrams.
-         * Safe for {@code get}/{@code containsKey} which only invoke
+         * Re-point a lookup-only key at the first {@code len} bytes of its
+         * (scratch) array. Never store such a key in the map — the array
+         * is reused across datagrams; {@code get} only calls
          * hashCode/equals synchronously.
          */
-        static CidKey view(byte[] scratch, int len) {
-            return new CidKey(scratch, 0, len, hashBytes(scratch, 0, len));
+        CidKey view(int len) {
+            this.len = len;
+            this.hash = hashBytes(bytes, len);
+            return this;
         }
 
-        private static int hashBytes(byte[] a, int off, int len) {
-            int h = 1;
-            for (int i = 0; i < len; i++) h = 31 * h + a[off + i];
-            return h;
+        // Keyed multiply/rotate mix (not cryptographic).
+        private static int hashBytes(byte[] a, int len) {
+            long h = HASH_KEY ^ len;
+            for (int i = 0; i < len; i++) {
+                h = Long.rotateLeft((h ^ (a[i] & 0xFF)) * 0x9E3779B97F4A7C15L, 29);
+            }
+            h ^= h >>> 32;
+            return (int) h;
         }
 
         @Override public int hashCode() { return hash; }
         @Override public boolean equals(Object o) {
             if (!(o instanceof CidKey k) || k.len != this.len) return false;
-            for (int i = 0; i < len; i++) {
-                if (bytes[off + i] != k.bytes[k.off + i]) return false;
-            }
-            return true;
+            return Arrays.equals(bytes, 0, len, k.bytes, 0, len);
         }
     }
 }

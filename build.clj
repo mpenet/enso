@@ -22,7 +22,10 @@
 (defn- sh
   [& cmds]
   (doseq [cmd cmds]
-    (p/process {:command-args ["sh" "-c" cmd]})))
+    (let [{:keys [exit]} (p/process {:command-args ["sh" "-c" cmd]})]
+      (when-not (zero? exit)
+        (throw (ex-info (str "command failed (exit " exit "): " cmd)
+                        {:cmd cmd :exit exit}))))))
 
 (defn clean [_]
   (b/delete {:path "target"}))

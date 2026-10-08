@@ -2,8 +2,8 @@ package com.s_exp.enso.http3;
 
 /**
  * HTTP/3 frame types (RFC 9114 §7.2). Only server-relevant types have
- * dedicated constants; unknown/reserved types are silently ignored per
- * §9 when they are not one of the mandatory control-stream types.
+ * dedicated constants; unknown and grease types are ignored (§9), while
+ * HTTP/2-only types are errors ({@link #isReservedHttp2}).
  */
 public final class Http3FrameType {
 
@@ -23,4 +23,13 @@ public final class Http3FrameType {
     public static final long MAX_PUSH_ID = 0x0D;
 
     private Http3FrameType() {}
+
+    /**
+     * HTTP/2 frame types with no HTTP/3 equivalent (PRIORITY, PING,
+     * WINDOW_UPDATE, CONTINUATION). RFC 9114 §7.2.8: receiving one is a
+     * connection error of type H3_FRAME_UNEXPECTED.
+     */
+    public static boolean isReservedHttp2(long type) {
+        return type == 0x02 || type == 0x06 || type == 0x08 || type == 0x09;
+    }
 }

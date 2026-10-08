@@ -1,0 +1,10 @@
+/* Linux version script: the shim exports its JNI entry points only, so the
+   BoringSSL / quiche symbols linked in from libquiche.a can't interpose on
+   (or be interposed by) other copies loaded in the same JVM (netty-tcnative,
+   conscrypt, ...). */
+{
+  global:
+    Java_*;
+  local:
+    *;
+};

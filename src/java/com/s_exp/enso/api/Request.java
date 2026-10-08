@@ -1,13 +1,23 @@
 package com.s_exp.enso.api;
 
+import clojure.lang.AFn;
 import clojure.lang.APersistentMap;
+import clojure.lang.IDeref;
+import clojure.lang.IFn;
+import clojure.lang.IHashEq;
+import clojure.lang.IKVReduce;
 import clojure.lang.IMapEntry;
+import clojure.lang.IObj;
 import clojure.lang.IPersistentCollection;
 import clojure.lang.IPersistentMap;
 import clojure.lang.ISeq;
 import clojure.lang.Keyword;
 import clojure.lang.MapEntry;
+import clojure.lang.MapEquivalence;
+import clojure.lang.Murmur3;
 import clojure.lang.PersistentArrayMap;
+import clojure.lang.RT;
+import clojure.lang.Util;
 import java.io.InputStream;
 import java.net.InetAddress;
 import java.util.Iterator;
@@ -19,8 +29,12 @@ import java.util.Map;
  * Implements {@link IPersistentMap} directly so no Clojure wrapper is allocated
  * per request — handler code sees a fully-featured persistent map with
  * identity-checked keyword lookup and lazy caches for the derived Ring keys.
+ * Equality, hashing, invocation as a function, metadata and reduce-kv follow
+ * the persistent map contract, so a Request is interchangeable with the
+ * equivalent literal map.
  */
-public final class Request implements IPersistentMap, Map<Object, Object> {
+public final class Request extends AFn
+        implements IPersistentMap, Map<Object, Object>, MapEquivalence, IHashEq, IObj, IKVReduce {
 
     static final Keyword K_SERVER_PORT = Keyword.intern("server-port");
     static final Keyword K_SERVER_NAME = Keyword.intern("server-name");
@@ -32,7 +46,8 @@ public final class Request implements IPersistentMap, Map<Object, Object> {
     static final Keyword K_PROTOCOL = Keyword.intern("protocol");
     static final Keyword K_HEADERS = Keyword.intern("headers");
     static final Keyword K_BODY = Keyword.intern("body");
-    static final Keyword K_HTTP = Keyword.intern("http");
+    public static final Keyword K_HTTP = Keyword.intern("http");
+    public static final Keyword K_HTTPS = Keyword.intern("https");
 
     private static final Keyword M_GET = Keyword.intern("get");
     private static final Keyword M_POST = Keyword.intern("post");
@@ -56,14 +71,19 @@ public final class Request implements IPersistentMap, Map<Object, Object> {
     public final IPersistentMap headers;
     public final InputStream body;
     public final int serverPort;
+    /** Ring {@code :scheme} of the transport: {@link #K_HTTP} or {@link #K_HTTPS}. */
+    public final Keyword scheme;
 
     private final InetAddress remoteAddress;
+    private final IPersistentMap meta;
     private String remoteAddr;
     private Keyword methodKw;
     private String serverName;
+    private Long serverPortValue;
 
     public Request(String method, String uri, String queryString, String protocol,
-            IPersistentMap headers, InputStream body, InetAddress remoteAddress, int serverPort) {
+            IPersistentMap headers, InputStream body, InetAddress remoteAddress, int serverPort,
+            Keyword scheme) {
         this.method = method;
         this.uri = uri;
         this.queryString = queryString;
@@ -72,6 +92,25 @@ public final class Request implements IPersistentMap, Map<Object, Object> {
         this.body = body;
         this.remoteAddress = remoteAddress;
         this.serverPort = serverPort;
+        this.scheme = scheme;
+        this.meta = null;
+    }
+
+    private Request(Request r, IPersistentMap meta) {
+        this.method = r.method;
+        this.uri = r.uri;
+        this.queryString = r.queryString;
+        this.protocol = r.protocol;
+        this.headers = r.headers;
+        this.body = r.body;
+        this.remoteAddress = r.remoteAddress;
+        this.serverPort = r.serverPort;
+        this.scheme = r.scheme;
+        this.meta = meta;
+        this.remoteAddr = r.remoteAddr;
+        this.methodKw = r.methodKw;
+        this.serverName = r.serverName;
+        this.serverPortValue = r.serverPortValue;
     }
 
     public String header(String name) {
@@ -105,6 +144,17 @@ public final class Request implements IPersistentMap, Map<Object, Object> {
             methodKw = k;
         }
         return k;
+    }
+
+    // Boxed once, as a Long like any Clojure integer literal, so the
+    // request equals the equivalent map under Object.equals too.
+    private Long serverPortValue() {
+        Long v = serverPortValue;
+        if (v == null) {
+            v = (long) serverPort;
+            serverPortValue = v;
+        }
+        return v;
     }
 
     private String serverName() {
@@ -147,10 +197,10 @@ public final class Request implements IPersistentMap, Map<Object, Object> {
         if (key == K_HEADERS) return headers;
         if (key == K_BODY) return body;
         if (key == K_QUERY_STRING) return queryString;
-        if (key == K_SERVER_PORT) return serverPort;
+        if (key == K_SERVER_PORT) return serverPortValue();
         if (key == K_SERVER_NAME) return serverName();
         if (key == K_REMOTE_ADDR) return remoteAddr();
-        if (key == K_SCHEME) return K_HTTP;
+        if (key == K_SCHEME) return scheme;
         if (key == K_PROTOCOL) return protocol;
         return notFound;
     }
@@ -169,14 +219,65 @@ public final class Request implements IPersistentMap, Map<Object, Object> {
 
     @Override
     public IPersistentCollection empty() {
-        return PersistentArrayMap.EMPTY;
+        return PersistentArrayMap.EMPTY.withMeta(meta);
     }
 
     @Override
     public boolean equiv(Object o) {
         if (o == this) return true;
-        if (!(o instanceof Map<?, ?>)) return false;
-        return materialize().equiv(o);
+        // Same contract as APersistentMap.equiv: maps compare by entries,
+        // but a persistent map that isn't a MapEquivalence (e.g. a record)
+        // never equals a plain map.
+        if (!(o instanceof Map<?, ?> m)) return false;
+        if (o instanceof IPersistentMap && !(o instanceof MapEquivalence)) return false;
+        if (m.size() != KEYS.length) return false;
+        for (Keyword k : KEYS) {
+            if (!m.containsKey(k) || !Util.equiv(valAt(k), m.get(k))) return false;
+        }
+        return true;
+    }
+
+    // ---- IHashEq ----
+
+    @Override
+    public int hasheq() {
+        return Murmur3.hashUnordered(this);
+    }
+
+    // ---- IFn ----
+
+    @Override
+    public Object invoke(Object key) {
+        return valAt(key);
+    }
+
+    @Override
+    public Object invoke(Object key, Object notFound) {
+        return valAt(key, notFound);
+    }
+
+    // ---- IObj ----
+
+    @Override
+    public IPersistentMap meta() {
+        return meta;
+    }
+
+    @Override
+    public Request withMeta(IPersistentMap meta) {
+        if (meta == this.meta) return this;
+        return new Request(this, meta);
+    }
+
+    // ---- IKVReduce ----
+
+    @Override
+    public Object kvreduce(IFn f, Object init) {
+        for (Keyword k : KEYS) {
+            init = f.invoke(init, k, valAt(k));
+            if (RT.isReduced(init)) return ((IDeref) init).deref();
+        }
+        return init;
     }
 
     // ---- Associative ----
@@ -319,7 +420,7 @@ public final class Request implements IPersistentMap, Map<Object, Object> {
             arr[i++] = k;
             arr[i++] = valAt(k);
         }
-        return new PersistentArrayMap(arr);
+        return new PersistentArrayMap(meta, arr);
     }
 
     private Map<Object, Object> materializeMutable() {

@@ -13,11 +13,10 @@ import java.nio.file.StandardOpenOption;
  * turn dlopens the system {@code libquiche}. All methods are 1:1 with
  * the C entry points in {@code native/enso_quiche/enso_quiche.c}.
  *
- * <p>We use JNI instead of FFM because JDK 25 + macOS ARM64 FFM downcall
- * paths corrupt libmalloc's freelist under connection churn (task
- * #86/#79; see also JDK-8357145 / JDK-8357268 which Netty's own
- * CleanerJava25.java steers around by gating MemorySegment usage on
- * JDK ≥ 25).
+ * <p>Per-packet calls pass byte[] arguments the C side accesses through
+ * {@code GetPrimitiveArrayCritical} (no copies) and send datagrams through
+ * a direct {@link java.nio.ByteBuffer}; see the conventions at the top of
+ * {@code enso_quiche.c}.
  *
  * <p>Pointer discipline: every quiche resource crosses the boundary as
  * an opaque {@code long} address. Java code treats them as tokens — do
@@ -37,8 +36,11 @@ public final class Quiche {
     // lives in quiche.h — copy just the ones we branch on.
     public static final long QUICHE_ERR_STREAM_STOPPED = -15L;
     public static final long QUICHE_ERR_STREAM_RESET = -16L;
-    public static final long QUICHE_ERR_INVALID_STREAM_STATE = -6L;
+    public static final long QUICHE_ERR_INVALID_STATE = -6L;
+    public static final long QUICHE_ERR_INVALID_STREAM_STATE = -7L;
     public static final long QUICHE_ERR_FINAL_SIZE = -13L;
+    /** Returned by the shim itself for invalid arguments (bounds, address). */
+    public static final long SHIM_ERR_INVALID_ARGUMENT = -10000L;
 
     // enum quiche_shutdown
     public static final int QUICHE_SHUTDOWN_READ = 0;
@@ -204,6 +206,7 @@ public final class Quiche {
     public static native void configSetMaxAckDelay(long config, long v);
     public static native void configSetActiveConnectionIdLimit(long config, long v);
     public static native void configSetDisableActiveMigration(long config, boolean v);
+    public static native void configVerifyPeer(long config, boolean v);
 
     // -----------------------------------------------------------------
     // Accept / retry / negotiate / header info
@@ -212,6 +215,15 @@ public final class Quiche {
                                      byte[] localIp, int localPort,
                                      byte[] peerIp, int peerPort,
                                      long config);
+    /**
+     * Client-side connection (quiche_connect). The server never calls
+     * this; the test suite uses it to drive the server over real QUIC.
+     * Returns 0 on failure.
+     */
+    public static native long connect(String serverName, byte[] scid,
+                                      byte[] localIp, int localPort,
+                                      byte[] peerIp, int peerPort,
+                                      long config);
     /** Returns bytes written (>=0), QUICHE_ERR_DONE (-1), or < 0 on error. */
     public static native long retry(byte[] scid, byte[] dcid,
                                     byte[] newScid, byte[] token,
@@ -220,11 +232,12 @@ public final class Quiche {
     public static native long negotiateVersion(byte[] scid, byte[] dcid, byte[] out);
 
     /**
-     * Parses a QUIC packet header. Pre-fill scidLen[0]/dcidLen[0]/tokenLen[0]
-     * with the maximum buffer size; C writes back the actual lengths on
-     * success. Returns 0 on success or < 0 on error.
+     * Parses the QUIC packet header at the start of the direct buffer
+     * {@code buf[0, bufLen)}. Pre-fill scidLen[0]/dcidLen[0]/tokenLen[0]
+     * with the maximum sizes (CIDs ≤ 20, token ≤ 4096); C writes back the
+     * actual lengths on success. Returns 0 on success or < 0 on error.
      */
-    public static native int headerInfo(byte[] buf, int bufLen, int dcil,
+    public static native int headerInfo(java.nio.ByteBuffer buf, int bufLen, int dcil,
                                         int[] versionOut, byte[] typeOut,
                                         byte[] scid, long[] scidLen,
                                         byte[] dcid, long[] dcidLen,
@@ -240,11 +253,25 @@ public final class Quiche {
     /** Nanoseconds until next timeout, or -1 if no timeout is scheduled. */
     public static native long connTimeoutAsNanos(long conn);
     public static native void connOnTimeout(long conn);
+    /**
+     * When the peer closed the connection, fills {@code out[0]} with 1
+     * for an application close (0 for transport) and {@code out[1]} with
+     * its error code, and returns true.
+     */
+    public static native boolean connPeerError(long conn, long[] out);
 
     public static native long connRecv(long conn, byte[] buf, int bufLen,
                                        byte[] fromIp, int fromPort,
                                        byte[] toIp, int toPort);
-    public static native long connSend(long conn, byte[] out, int outLen);
+    /**
+     * Writes one packet into the direct buffer {@code out[0, outLen)}.
+     * Returns its length, QUICHE_ERR_DONE, or another error. On success
+     * the destination (quiche's send_info.to) is written to
+     * {@code toIpOut} (16 bytes, 4 used for IPv4) and
+     * {@code toMetaOut = {port, ipLength}}.
+     */
+    public static native long connSend(long conn, java.nio.ByteBuffer out, int outLen,
+                                       byte[] toIpOut, int[] toMetaOut);
     /**
      * Initiate graceful/error connection close. {@code app=true} sends an
      * application-level close (H3 error codes); {@code app=false} sends a

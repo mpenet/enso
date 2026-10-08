@@ -43,5 +43,6 @@ clojure -T:build javac-bench
 - tag push matching `v*`
 
 Builds native shims across 5 platforms (macOS arm64, Linux glibc x2, Linux
-musl x2), assembles per-classifier + fat + core jars, attaches to the
-release on tag push.
+musl x2), assembles per-classifier + fat + core jars and uploads them as
+workflow artifacts. On tag push, core + per-classifier jars are published
+to Clojars (the fat jar is too large for Clojars).

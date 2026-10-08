@@ -22,7 +22,7 @@
     (let [scratch (byte-array 10)
           n (.read in scratch 0 10)]
       (is (= 4 n) "queued bytes returned before poison")
-      (is (thrown-with-msg? IOException #"exceeded size cap"
+      (is (thrown-with-msg? IOException #"truncated"
                             (.read in scratch 0 10))
           "next read hits truncated marker → IOException"))))
 
@@ -89,6 +89,29 @@
     (.reset r)
     (is (not (.hasPartial r)) "reset clears buffered bytes")))
 
+(deftest frame-reader-data-chunk-larger-than-accum-cap
+  ;; The accumulation cap bounds buffered frame payloads (HEADERS), not
+  ;; the size of one feed: DATA bytes are streamed through.
+  (let [r (Http3FrameReader. 8192)
+        payload (byte-array 16384 (byte 7))
+        frame (byte-array (concat [0x00 (unchecked-byte 0x80) 0x00 0x40 0x00] payload))
+        total (atom 0)]
+    (feed-bytes! r frame)
+    (loop []
+      (when-let [^com.s_exp.enso.http3.Http3FrameReader$Frame f (.poll r)]
+        (swap! total + (alength ^bytes (.-dataChunk f)))
+        (recur)))
+    (is (= 16384 @total))
+    (is (not (.hasPartial r)))))
+
+(deftest frame-reader-headers-over-cap-still-oversized
+  ;; A HEADERS frame longer than the cap is reported, never buffered.
+  (let [r (Http3FrameReader. 8192)
+        frame (byte-array (concat [0x01 (unchecked-byte 0x80) 0x00 0x40 0x00] (repeat 16384 0)))]
+    (feed-bytes! r frame)
+    (is (.-oversized ^com.s_exp.enso.http3.Http3FrameReader$Frame (.poll r)))
+    (is (not (.hasPartial r)))))
+
 ;; ---- RetryToken issued-at + expiry ---------------------------------------
 
 (deftest retry-token-issued-at-tampered-rejected
@@ -97,9 +120,10 @@
   (let [tok (RetryToken.)
         peer (InetSocketAddress. "127.0.0.1" 55555)
         odcid (byte-array [(byte 1) (byte 2) (byte 3)])
-        ^bytes minted (.mint tok peer odcid)]
+        scid (byte-array 16 (byte 9))
+        ^bytes minted (.mint tok peer odcid scid)]
     ;; Sanity: intact token verifies.
-    (is (some? (.verify tok minted peer)))
+    (is (some? (.verify tok minted 0 (alength minted) peer scid 16)))
     ;; Locate issued-at start via reflection: layout is
     ;; HMAC(32) + MAGIC(4) + ISSUED_AT(8) + IP + port + odcid_len + odcid.
     ;; Flip MSB of issued-at: value jumps by 2^56 seconds → age check fails.
@@ -107,7 +131,7 @@
           copy (aclone minted)]
       (aset copy issued-at-off
             (byte (bit-xor (aget copy issued-at-off) 0x40)))
-      (is (nil? (.verify tok copy peer))
+      (is (nil? (.verify tok copy 0 (alength copy) peer scid 16))
           "tampered issued-at rejected (HMAC mismatch OR age out of window)"))))
 
 (deftest retry-token-max-age-seconds-constant
@@ -128,4 +152,58 @@
   (let [tok (RetryToken.)
         peer (InetSocketAddress. "127.0.0.1" 55555)
         too-short (byte-array (+ 32 4 8))]  ; missing odcid_len + odcid + peer
-    (is (nil? (.verify tok too-short peer)))))
+    (is (nil? (.verify tok too-short 0 (alength too-short) peer (byte-array 16) 16)))))
+
+(deftest retry-token-binds-retry-source-connection-id
+  ;; RFC 9000 §8.1.2/§17.2.5: the client's retried Initial must carry the
+  ;; Retry packet's SCID as its DCID; a token is only valid for that CID.
+  (let [tok (RetryToken.)
+        peer (InetSocketAddress. "127.0.0.1" 55555)
+        odcid (byte-array [(byte 1) (byte 2) (byte 3)])
+        scid (byte-array 16 (byte 9))
+        other (byte-array 16 (byte 8))
+        ^bytes minted (.mint tok peer odcid scid)
+        ;; token embedded at an offset in a larger buffer (slice verify)
+        buf (byte-array (+ 7 (alength minted)))]
+    (System/arraycopy minted 0 buf 7 (alength minted))
+    (is (= (seq odcid) (seq (.verify tok buf 7 (alength minted) peer scid 16))))
+    (is (nil? (.verify tok buf 7 (alength minted) peer other 16)) "different DCID")
+    (is (nil? (.verify tok buf 7 (alength minted) peer scid 15)) "different DCID length")))
+
+(deftest request-timeout-scheduler-drops-cancelled-tasks
+  ;; Each request schedules a timeout task that captures its connection;
+  ;; cancelled tasks must leave the queue at once, not at their deadline.
+  (let [f (doto (.getDeclaredField (Class/forName "com.s_exp.enso.http3.Http3Connection")
+                                   "TIMEOUT_SCHEDULER")
+            (.setAccessible true))
+        sched (.get f nil)]
+    (is (instance? java.util.concurrent.ScheduledThreadPoolExecutor sched))
+    (when (instance? java.util.concurrent.ScheduledThreadPoolExecutor sched)
+      (let [^java.util.concurrent.ScheduledThreadPoolExecutor s sched
+            before (.size (.getQueue s))
+            fut (.schedule s ^Runnable (fn []) 1 java.util.concurrent.TimeUnit/HOURS)]
+        (.cancel fut false)
+        (is (= before (.size (.getQueue s))))))))
+
+;; ---- Http3Session peer uni-stream bookkeeping ----------------------------
+
+(defn- peer-uni-types-size [^com.s_exp.enso.http3.Http3Session session]
+  (let [^Field f (doto (.getDeclaredField com.s_exp.enso.http3.Http3Session "peerUniTypes")
+                   (.setAccessible true))]
+    (.size ^com.s_exp.enso.util.Long2ObjectHashMap (.get f session))))
+
+(deftest session-forgets-finished-grease-uni-streams
+  ;; Grease / unknown peer uni streams are tracked only until they end, so
+  ;; a long-lived connection's bookkeeping doesn't grow with each one.
+  ;; Grease streams involve no quiche call, so no live connection is needed.
+  (let [cfg (.build (doto (com.s_exp.enso.api.Config/builder)
+                      (.http3 true) (.http3CertPath "c") (.http3KeyPath "k")))
+        session (com.s_exp.enso.http3.Http3Session. 0 cfg)]
+    (testing "type and FIN in one chunk"
+      (.onStreamData session 14 (byte-array [0x21 0x00]) true nil)
+      (is (zero? (peer-uni-types-size session))))
+    (testing "FIN after the type was identified"
+      (.onStreamData session 18 (byte-array [0x21]) false nil)
+      (is (= 1 (peer-uni-types-size session)))
+      (.onStreamData session 18 (byte-array [0x00]) true nil)
+      (is (zero? (peer-uni-types-size session))))))

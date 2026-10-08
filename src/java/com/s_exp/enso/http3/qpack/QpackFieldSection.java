@@ -29,15 +29,26 @@ public final class QpackFieldSection {
 
     private QpackFieldSection() {}
 
+    /** {@link #decode(byte[], long)} without a decoded-size cap. */
+    public static List<String[]> decode(byte[] payload) {
+        return decode(payload, 0);
+    }
+
     /**
      * Decode a field section into a list of {name, value} pairs. Throws
      * {@link QpackException} on any malformed or unsupported input; the
      * caller wraps into a stream reset (per-stream error) or connection
      * close (session error) depending on {@link QpackException#isStreamLevel()}.
-     * All dynamic-table references (indexed dyn, name-ref dyn, post-base)
-     * are stream-level errors under our advertised capacity=0.
+     * Malformed representations and dynamic-table references (indexed
+     * dyn, name-ref dyn, post-base) under our advertised capacity=0 are
+     * connection errors (RFC 9204 §2.2.3, §6).
+     *
+     * @param maxDecodedSize SETTINGS_MAX_FIELD_SECTION_SIZE we advertised
+     *   (RFC 9114 §4.2.2: name + value + 32 per field); {@code <= 0}
+     *   disables the cap. Decoding stops as soon as the running size
+     *   exceeds it, with a stream-level {@code H3_EXCESSIVE_LOAD}.
      */
-    public static List<String[]> decode(byte[] payload) {
+    public static List<String[]> decode(byte[] payload, long maxDecodedSize) {
         ByteBuffer buf = ByteBuffer.wrap(payload);
         // Prefix: Required Insert Count (8-bit NBit int) + S bit + Delta
         // Base (7-bit NBit int). Under capacity=0 both are zero.
@@ -50,7 +61,7 @@ public final class QpackFieldSection {
         decodeNbitSafe(buf, 7, b1 & 0x7F);
         if (requiredInsertCount != 0) {
             throw new QpackException(
-                QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                QpackException.QPACK_DECOMPRESSION_FAILED, false,
                 "peer used dynamic table (RIC=" + requiredInsertCount
                     + ") but advertised capacity is 0");
         }
@@ -59,6 +70,7 @@ public final class QpackFieldSection {
         // pseudo + regular). Skips the first ArrayList grow visible in
         // alloc profile.
         List<String[]> out = new ArrayList<>(24);
+        long decodedSize = 0;
         while (buf.hasRemaining()) {
             int b = buf.get() & 0xFF;
             if ((b & 0x80) != 0) {
@@ -67,34 +79,34 @@ public final class QpackFieldSection {
                 long idx = decodeNbitSafe(buf, 6, b & 0x3F);
                 if (!fromStatic) {
                     throw new QpackException(
-                        QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                        QpackException.QPACK_DECOMPRESSION_FAILED, false,
                         "dynamic indexed field line but capacity is 0");
                 }
                 if (idx >= QpackStaticTable.size()) {
                     throw new QpackException(
-                        QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                        QpackException.QPACK_DECOMPRESSION_FAILED, false,
                         "static index out of range: " + idx);
                 }
-                out.add(QpackStaticTable.get((int) idx));
+                decodedSize = add(out, QpackStaticTable.get((int) idx), decodedSize, maxDecodedSize);
             } else if ((b & 0xC0) == 0x40) {
                 // Literal Field Line with Name Reference: 0 1 N T XXXX
                 boolean fromStatic = (b & 0x10) != 0;
                 long nameIdx = decodeNbitSafe(buf, 4, b & 0x0F);
                 if (!fromStatic) {
                     throw new QpackException(
-                        QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                        QpackException.QPACK_DECOMPRESSION_FAILED, false,
                         "dynamic name reference but capacity is 0");
                 }
                 if (nameIdx >= QpackStaticTable.size()) {
                     throw new QpackException(
-                        QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                        QpackException.QPACK_DECOMPRESSION_FAILED, false,
                         "static name index out of range: " + nameIdx);
                 }
                 String name = QpackStaticTable.get((int) nameIdx)[0];
                 need(buf, 1);
                 int vb = buf.get() & 0xFF;
                 String value = decodeStringSafe(buf, 7, vb);
-                out.add(new String[]{name, value});
+                decodedSize = add(out, new String[]{name, value}, decodedSize, maxDecodedSize);
             } else if ((b & 0xE0) == 0x20) {
                 // Literal Field Line with Literal Name: 0 0 1 N H XXX
                 int prefixConsumed = b & 0x0F; // low 4 bits (H bit + 3 length bits)
@@ -102,28 +114,46 @@ public final class QpackFieldSection {
                 need(buf, 1);
                 int vb = buf.get() & 0xFF;
                 String value = decodeStringSafe(buf, 7, vb);
-                out.add(new String[]{name.toLowerCase(java.util.Locale.ROOT), value});
+                // Names are kept verbatim: an uppercase name makes the
+                // request malformed (RFC 9114 §4.2), checked by the caller.
+                decodedSize = add(out, new String[]{name, value}, decodedSize, maxDecodedSize);
             } else if ((b & 0xF0) == 0x10) {
                 throw new QpackException(
-                    QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                    QpackException.QPACK_DECOMPRESSION_FAILED, false,
                     "post-base indexed field line but capacity is 0");
             } else if ((b & 0xF0) == 0x00) {
                 throw new QpackException(
-                    QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                    QpackException.QPACK_DECOMPRESSION_FAILED, false,
                     "post-base literal field line but capacity is 0");
             } else {
                 throw new QpackException(
-                    QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                    QpackException.QPACK_DECOMPRESSION_FAILED, false,
                     "unknown QPACK field line prefix: 0x" + Integer.toHexString(b));
             }
         }
         return out;
     }
 
+    /**
+     * Appends {@code field} and returns the running decoded size, failing
+     * with a stream-level H3_EXCESSIVE_LOAD once it passes the cap.
+     */
+    private static long add(List<String[]> out, String[] field,
+                            long decodedSize, long maxDecodedSize) {
+        out.add(field);
+        if (maxDecodedSize <= 0) return decodedSize;
+        long size = decodedSize + field[0].length() + field[1].length() + 32L;
+        if (size > maxDecodedSize) {
+            throw new QpackException(QpackException.H3_EXCESSIVE_LOAD, true,
+                "field section exceeds SETTINGS_MAX_FIELD_SECTION_SIZE " + maxDecodedSize);
+        }
+        return size;
+    }
+
     private static void need(ByteBuffer buf, int bytes) {
         if (buf.remaining() < bytes) {
             throw new QpackException(
-                QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                QpackException.QPACK_DECOMPRESSION_FAILED, false,
                 "truncated QPACK field section (need " + bytes
                     + ", have " + buf.remaining() + ")");
         }
@@ -134,7 +164,7 @@ public final class QpackFieldSection {
             return NBitInteger.decode(buf, n, first);
         } catch (java.nio.BufferUnderflowException | IllegalStateException e) {
             throw new QpackException(
-                QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                QpackException.QPACK_DECOMPRESSION_FAILED, false,
                 "malformed N-bit int in QPACK field section", e);
         }
     }
@@ -145,7 +175,7 @@ public final class QpackFieldSection {
         } catch (java.nio.BufferUnderflowException | IllegalStateException
                  | java.io.UncheckedIOException e) {
             throw new QpackException(
-                QpackException.QPACK_DECOMPRESSION_FAILED, true,
+                QpackException.QPACK_DECOMPRESSION_FAILED, false,
                 "malformed string in QPACK field section", e);
         }
     }
@@ -195,11 +225,21 @@ public final class QpackFieldSection {
         int nameIdx = QpackStaticTable.findName(name);
         if (nameIdx >= 0) {
             NBitInteger.encode(out, 4, 0x50, nameIdx);
-            NBitString.encode(out, 7, 0, value, shouldHuffman(value));
+            NBitString.encode(out, 7, 0, value, true);
             return;
         }
-        NBitString.encode(out, 3, 0x20, name, shouldHuffman(name));
-        NBitString.encode(out, 7, 0, value, shouldHuffman(value));
+        NBitString.encode(out, 3, 0x20, name, true);
+        NBitString.encode(out, 7, 0, value, true);
+    }
+
+    /**
+     * Upper bound on the bytes {@link #encodeInto} writes for one field:
+     * representation prefix + both strings (see
+     * {@link NBitString#maxEncodedLength}).
+     */
+    public static int maxEncodedLength(String name, String value) {
+        return NBitString.maxEncodedLength(name)
+            + NBitString.maxEncodedLength(value == null ? "" : value);
     }
 
     /**
@@ -218,7 +258,7 @@ public final class QpackFieldSection {
         for (String[] hf : headers) {
             String name = hf[0].toLowerCase(java.util.Locale.ROOT);
             String value = hf[1] == null ? "" : hf[1];
-            out = ensureRoom(out, name.length() + value.length() + 8);
+            out = ensureRoom(out, maxEncodedLength(name, value));
             int exact = QpackStaticTable.findExact(name, value);
             if (exact >= 0) {
                 // Indexed static: 1 1 XXXXXX with NBit(6) index, prefix 0xC0.
@@ -230,16 +270,16 @@ public final class QpackFieldSection {
                 // Literal Name Ref static: 0 1 N T XXXX
                 // N=0 (allow indexing — doesn't matter, we never insert),
                 // T=1 (static), prefix bits = 0101 0000 = 0x50.
-                out = ensureRoom(out, value.length() + 4);
+                out = ensureRoom(out, maxEncodedLength(name, value));
                 NBitInteger.encode(out, 4, 0x50, nameIdx);
-                NBitString.encode(out, 7, 0, value, shouldHuffman(value));
+                NBitString.encode(out, 7, 0, value, true);
                 continue;
             }
             // Literal Literal: 0 0 1 N H XXX (H sits in NBitString prefix)
             // N=0, prefix bits = 0010 0000 = 0x20.
-            out = ensureRoom(out, name.length() + value.length() + 4);
-            NBitString.encode(out, 3, 0x20, name, shouldHuffman(name));
-            NBitString.encode(out, 7, 0, value, shouldHuffman(value));
+            out = ensureRoom(out, maxEncodedLength(name, value));
+            NBitString.encode(out, 3, 0x20, name, true);
+            NBitString.encode(out, 7, 0, value, true);
         }
         byte[] result = new byte[out.position()];
         out.flip();
@@ -256,9 +296,4 @@ public final class QpackFieldSection {
         return bigger;
     }
 
-    // Huffman-encode any string long enough that the compression is likely
-    // to save bytes; below ~4 bytes overhead usually outweighs savings.
-    private static boolean shouldHuffman(String s) {
-        return s.length() >= 5;
-    }
 }
