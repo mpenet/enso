@@ -1064,6 +1064,22 @@ public final class Http2Connection implements Runnable, Drainable {
         }
         readPayload();
         int frameLen = frameLength;
+        // Padding is checked first: a pad length past the payload is a
+        // connection error whatever the stream's state (§6.1), including
+        // a stream already closed or reset.
+        int off = 0;
+        int len = frameLen;
+        if ((frameFlags & Http2.FLAG_PADDED) != 0) {
+            if (len < 1) {
+                throw new Http2.ConnectionError(Http2.ERROR_PROTOCOL_ERROR, "DATA PADDED with no pad-length byte");
+            }
+            int padLen = payload[payloadOff] & 0xFF;
+            off = 1;
+            len = len - 1 - padLen;
+            if (len < 0) {
+                throw new Http2.ConnectionError(Http2.ERROR_PROTOCOL_ERROR, "DATA padding too large");
+            }
+        }
         // Every DATA frame counts against the connection window, whatever
         // becomes of it (§6.9).
         if (connRecvWindow.addAndGet(-frameLen) < 0) {
@@ -1101,19 +1117,6 @@ public final class Http2Connection implements Runnable, Drainable {
         }
         if (!body.charge(frameLen)) {
             throw new Http2.ConnectionError(Http2.ERROR_FLOW_CONTROL_ERROR, "peer overran stream window");
-        }
-        int off = 0;
-        int len = frameLen;
-        if ((frameFlags & Http2.FLAG_PADDED) != 0) {
-            if (len < 1) {
-                throw new Http2.ConnectionError(Http2.ERROR_PROTOCOL_ERROR, "DATA PADDED with no pad-length byte");
-            }
-            int padLen = payload[payloadOff] & 0xFF;
-            off = 1;
-            len = len - 1 - padLen;
-            if (len < 0) {
-                throw new Http2.ConnectionError(Http2.ERROR_PROTOCOL_ERROR, "DATA padding too large");
-            }
         }
         boolean endStream = (frameFlags & Http2.FLAG_END_STREAM) != 0;
         if (len == 0 && !endStream) {

@@ -3246,3 +3246,17 @@
                         (not= (mod i 251) (bit-and (aget body i) 0xFF)) false
                         :else (recur (inc i))))
                 "byte-for-byte")))))))
+
+(deftest h2-invalid-data-padding-is-a-connection-error-on-a-reset-stream
+  ;; §6.1: a pad length past the payload is a connection error whatever
+  ;; the stream's state. Here the handler answers and the server resets
+  ;; the stream (request body unfinished) before the bad DATA arrives.
+  (with-h2-server
+    (fn [_] {:status 200 :body "ok"})
+    (fn []
+      (with-conn [conn]
+        (send-request! conn 1 (request-headers "POST" "/") false)
+        (is (some? (read-until conn #(and (= frame-rst (:type %)) (= 1 (:sid %))))) "server reset stream 1")
+        ;; PADDED (0x8), pad length 10 with a 1-byte payload.
+        (write-frame! conn frame-data 0x8 1 (byte-array [10 97]))
+        (is (= 0x1 (some-> (read-until conn #(= frame-goaway (:type %))) goaway-code)) "PROTOCOL_ERROR")))))
