@@ -1,3 +1,5 @@
+// ABOUTME: HTTP/3 SETTINGS identifier constants the server reads or sends
+// ABOUTME: (RFC 9114 section 7.2.4.1, RFC 9204 section 5).
 package com.s_exp.enso.http3;
 
 /**

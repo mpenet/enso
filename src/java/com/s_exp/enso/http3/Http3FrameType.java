@@ -1,3 +1,5 @@
+// ABOUTME: HTTP/3 frame type constants (RFC 9114 section 7.2) and the check for reserved
+// ABOUTME: HTTP/2-only frame types.
 package com.s_exp.enso.http3;
 
 /**

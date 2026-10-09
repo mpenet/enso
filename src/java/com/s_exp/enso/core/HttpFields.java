@@ -93,10 +93,16 @@ public final class HttpFields {
                 }
             }
         }
-        return v instanceof String ct ? charsetParam(ct) : StandardCharsets.UTF_8;
+        return v instanceof String ct ? contentTypeCharset(ct) : StandardCharsets.UTF_8;
     }
 
-    private static Charset charsetParam(String ct) {
+    /**
+     * The charset parameter of Content-Type value {@code ct}, else UTF-8.
+     * Allocation-free unless a charset other than UTF-8 is named.
+     *
+     * @throws IllegalArgumentException when the named charset is unknown
+     */
+    public static Charset contentTypeCharset(String ct) {
         int n = ct.length();
         int semi = ct.indexOf(';');
         while (semi >= 0) {
@@ -129,6 +135,70 @@ public final class HttpFields {
             semi = ct.indexOf(';', p);
         }
         return StandardCharsets.UTF_8;
+    }
+
+    /**
+     * Parses RFC 9110 §8.6 {@code 1*DIGIT}. Returns -1 for anything else
+     * (sign, whitespace, list form, empty) or on long overflow, where
+     * {@link Long#parseLong} would accept a leading '+' or '-'.
+     */
+    public static long parseDigits(String s) {
+        int len = s.length();
+        if (len == 0) {
+            return -1;
+        }
+        long v = 0;
+        for (int i = 0; i < len; i++) {
+            int d = s.charAt(i) - '0';
+            if (d < 0 || d > 9 || v > (Long.MAX_VALUE - d) / 10) {
+                return -1;
+            }
+            v = v * 10 + d;
+        }
+        return v;
+    }
+
+    /** {@code s} with ASCII uppercase lowered; {@code s} itself when there is none. */
+    public static String toLowerAscii(String s) {
+        for (int i = 0, n = s.length(); i < n; i++) {
+            char c = s.charAt(i);
+            if (c >= 'A' && c <= 'Z') {
+                return s.toLowerCase(java.util.Locale.ROOT);
+            }
+        }
+        return s;
+    }
+
+    /**
+     * Whether comma-separated list {@code header} has an element equal to
+     * {@code token}, ignoring case and optional whitespace (RFC 9110 §5.6.1).
+     */
+    public static boolean containsToken(String header, String token) {
+        int i = 0;
+        int len = header.length();
+        while (i < len) {
+            while (i < len && (isOws(header.charAt(i)) || header.charAt(i) == ',')) {
+                i++;
+            }
+            int start = i;
+            while (i < len && header.charAt(i) != ',') {
+                i++;
+            }
+            int end = i;
+            while (end > start && isOws(header.charAt(end - 1))) {
+                end--;
+            }
+            if (end - start == token.length()
+                && header.regionMatches(true, start, token, 0, token.length())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** SP or HTAB. */
+    public static boolean isOws(char c) {
+        return c == ' ' || c == '\t';
     }
 
     /** Rejects a response field value outside RFC 9110 §5.5: VCHAR / obs-text / SP / HTAB. */

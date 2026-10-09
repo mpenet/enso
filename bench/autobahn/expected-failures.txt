@@ -1,0 +1,11 @@
+# ABOUTME: Autobahn TestSuite cases expected to fail plus the suite size; bench/autobahn/run.sh
+# ABOUTME: fails CI on any other failure, a listed case passing, or a different case count.
+# Autobahn cases enso is currently known to fail, one "<case> <behavior>/<behaviorClose>"
+# per line exactly as printed by bench/autobahn/run.sh. Any other failing case
+# fails CI, and so does a listed case that no longer fails: remove its line.
+# The run covers every case, 12.* and 13.* (permessage-deflate) included,
+# with the server options set in run.sh. None is expected to fail.
+#
+# Cases a full run must execute; a different count fails the run (truncated
+# run or changed suite).
+total-cases: 517

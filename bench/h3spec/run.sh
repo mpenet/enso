@@ -1,119 +1,80 @@
 #!/usr/bin/env bash
-# h3spec runner for the Enso h3 layer.
-#
-# Boots the h3 repro server (dev/h3_repro.clj) on 127.0.0.1:18443, runs the
-# h3spec binary (bench/h3spec/h3spec — pinned v0.1.13 from
-# https://github.com/kazu-yamamoto/h3spec/releases), and compares the raw
-# output against bench/h3spec/baseline.txt to detect regressions.
+# ABOUTME: Runs the h3spec HTTP/3 + QUIC conformance suite (pinned release, downloaded and
+# ABOUTME: checksum-verified) against enso; fails on a crash, a truncated run or expectation drift.
 #
 # Usage:
-#   bench/h3spec/run.sh                 # full run, diff vs baseline
-#   bench/h3spec/run.sh --update        # rewrite baseline (use after a fix)
-#   bench/h3spec/run.sh --match=REGEX   # forward -m flag to h3spec
+#   bench/h3spec/run.sh                 # boot the test server, run h3spec, diff vs expectations
+#   bench/h3spec/run.sh --match=REGEX   # forward -m to h3spec (subset run: no case-count
+#                                       # check, expected failures that pass still fail it)
 #
-# Exit codes:
-#   0 = matches baseline (or --update)
-#   1 = server failed to boot / h3spec crashed
-#   2 = pass/fail count regressed vs baseline (new failures)
+# Needs the JNI shim (clojure -T:build shim) and compiled classes.
+#
+# Environment:
+#   H3SPEC_BIN   use this h3spec binary instead of downloading the pinned one
+#   H3SPEC_PORT  UDP port for the test server (default 18443)
+#   ENSO_SERVER_OPTS EDN map of extra run-server options
+#
+# Outputs land in target/conformance/h3spec/.
+# Exit codes: 0 ok, 1 setup/run error (crash, case count other than the
+# expected total on a full run), 2 results differ from the expectations.
 
-set -euo pipefail
+set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$HERE/../.." && pwd)"
-BASELINE="$HERE/baseline.txt"
-BIN="$HERE/h3spec"
-PORT=18443
+# shellcheck source=../conformance-lib.sh
+. "$HERE/../conformance-lib.sh"
 
-UPDATE=0
-MATCH=""
+H3SPEC_VERSION=0.1.13
+PORT="${H3SPEC_PORT:-18443}"
+WORK_DIR="$ROOT/target/conformance/h3spec"
+mkdir -p "$WORK_DIR"
+
+MATCH=()
 for arg in "$@"; do
   case "$arg" in
-    --update) UPDATE=1 ;;
-    --match=*) MATCH="-m ${arg#*=}" ;;
-    -h|--help)
-      sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    --match=*) MATCH=(-m "${arg#*=}") ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $arg" >&2; exit 1 ;;
   esac
 done
 
-if [ ! -x "$BIN" ]; then
-  echo "h3spec binary missing at $BIN" >&2
-  echo "download: curl -sL -o $BIN https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.13/h3spec-mac-arm64 && chmod +x $BIN" >&2
+if [ -z "${H3SPEC_BIN:-}" ]; then
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64) asset=h3spec-linux-x86_64
+                  sha=b5f8eddd968cb195d1e3e7698d33fa141d6b2ad56153089d89928ac0fdee28bf ;;
+    Darwin-arm64) asset=h3spec-mac-arm64
+                  sha=850ee3317b767db1e5e41cf3b9f034a74feabf52672744920ba41f330b710253 ;;
+    *) echo "no pinned h3spec for $(uname -s)-$(uname -m); set H3SPEC_BIN" >&2; exit 1 ;;
+  esac
+  H3SPEC_BIN="$TOOLS_DIR/h3spec-$H3SPEC_VERSION"
+  fetch_pinned "https://github.com/kazu-yamamoto/h3spec/releases/download/v$H3SPEC_VERSION/$asset" \
+    "$sha" "$H3SPEC_BIN" || exit 1
+  chmod +x "$H3SPEC_BIN"
+fi
+
+start_test_server h3 "$PORT" ${ENSO_SERVER_OPTS:+opts "$ENSO_SERVER_OPTS"} || exit 1
+
+# -n: the test server's certificate is self-signed.
+OUT="$WORK_DIR/output.txt"
+"$H3SPEC_BIN" -n ${MATCH[@]+"${MATCH[@]}"} 127.0.0.1 "$PORT" > "$OUT" 2>&1
+status=$?
+tail -3 "$OUT"
+stop_test_server
+
+grep -aE '\[✘\]$' "$OUT" | sed -E 's/^[[:space:]]+//; s/[[:space:]]*\[✘\]$//' > "$WORK_DIR/failures.txt"
+grep -aE '\[✔\]$' "$OUT" | sed -E 's/^[[:space:]]+//; s/[[:space:]]*\[✔\]$//' > "$WORK_DIR/passes.txt"
+check_tool_exit h3spec "$status" "$WORK_DIR/failures.txt" || { tail -20 "$OUT" >&2; exit 1; }
+
+# hspec's own "N examples, M failures" line must agree with the marks
+# parsed above, so a format change cannot silently drop cases.
+reported="$(sed -n 's/^\([0-9][0-9]*\) examples*, [0-9][0-9]* failures*.*/\1/p' "$OUT" | tail -1)"
+parsed=$(( $(wc -l < "$WORK_DIR/failures.txt") + $(wc -l < "$WORK_DIR/passes.txt") ))
+if [ -z "$reported" ] || [ "$reported" -ne "$parsed" ]; then
+  echo "h3spec reported ${reported:-no} examples but $parsed results were parsed; output:" >&2
+  cat "$OUT" >&2
   exit 1
 fi
 
-# Clean up any prior server on our port.
-lsof -ti :$PORT 2>/dev/null | xargs -r kill -9 || true
-pgrep -f "h3-repro" | xargs -r kill -9 || true
-sleep 1
-
-# Boot the h3 repro server in the background.
-cd "$ROOT"
-nohup clj -Sdeps '{:paths ["src/clj" "target/classes" "dev"]}' \
-  -M -m h3-repro >/tmp/h3spec-server.out 2>/tmp/h3spec-server.err &
-SRV_PID=$!
-disown
-
-# Wait for the server to bind. Give it ~15s to warm up + JIT.
-for i in $(seq 1 30); do
-  if lsof -i :$PORT >/dev/null 2>&1; then break; fi
-  sleep 0.5
-done
-
-if ! lsof -i :$PORT >/dev/null 2>&1; then
-  echo "server never bound port $PORT — stderr tail:" >&2
-  tail -20 /tmp/h3spec-server.err >&2
-  kill -9 $SRV_PID 2>/dev/null || true
-  exit 1
-fi
-
-# Give quiche a moment past bind to fully warm up.
-sleep 2
-
-OUT="/tmp/h3spec-run-$$.txt"
-# shellcheck disable=SC2086
-$BIN -n $MATCH 127.0.0.1 $PORT 2>&1 > "$OUT" || true
-
-kill -9 $SRV_PID 2>/dev/null || true
-wait 2>/dev/null || true
-
-if [ "$UPDATE" -eq 1 ]; then
-  cp "$OUT" "$BASELINE"
-  echo "baseline updated: $BASELINE"
-  tail -3 "$OUT"
-  exit 0
-fi
-
-if [ ! -f "$BASELINE" ]; then
-  echo "no baseline found at $BASELINE — run with --update to create" >&2
-  cat "$OUT"
-  exit 1
-fi
-
-# Compare just the pass/fail counts — the raw output includes randomised
-# seeds + timings that would produce diff noise.
-BASE_SUMMARY=$(grep -E "^[0-9]+ examples, [0-9]+ failures" "$BASELINE" | tail -1)
-CUR_SUMMARY=$(grep -E "^[0-9]+ examples, [0-9]+ failures" "$OUT" | tail -1)
-
-echo "baseline: $BASE_SUMMARY"
-echo "current:  $CUR_SUMMARY"
-
-BASE_FAILS=$(echo "$BASE_SUMMARY" | grep -oE "[0-9]+ failures" | grep -oE "[0-9]+")
-CUR_FAILS=$(echo "$CUR_SUMMARY"  | grep -oE "[0-9]+ failures" | grep -oE "[0-9]+")
-
-if [ -z "$CUR_FAILS" ]; then
-  echo "h3spec run did not produce a summary line — check $OUT" >&2
-  exit 1
-fi
-
-if [ "$CUR_FAILS" -gt "$BASE_FAILS" ]; then
-  echo "REGRESSION: $CUR_FAILS failures vs baseline $BASE_FAILS" >&2
-  diff -u "$BASELINE" "$OUT" | head -80 >&2 || true
-  exit 2
-fi
-
-if [ "$CUR_FAILS" -lt "$BASE_FAILS" ]; then
-  echo "IMPROVEMENT: $CUR_FAILS failures vs baseline $BASE_FAILS — rerun with --update to lock in"
-fi
-
-echo "OK"
+compare_expectations "h3spec $H3SPEC_VERSION (QUIC + HTTP/3)" \
+  "$WORK_DIR/failures.txt" "$WORK_DIR/passes.txt" "$HERE/expected-failures.txt" \
+  ${MATCH[@]+subset}

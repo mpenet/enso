@@ -1,5 +1,7 @@
+;; ABOUTME: TLS integration tests: reloadable SSL contexts via sslContextProvider, handshake and idle
+;; ABOUTME: timeouts, stalled writers, renegotiation refusal and TLS socket adapter behaviour.
 (ns s-exp.enso-tls-test
-  "TLS integration tests focused on reloadable SSL context (#242).
+  "TLS integration tests focused on reloadable SSL context.
   Verifies the sslContextProvider path serves live-swapped contexts on
   new connections without restart."
   (:require [clojure.test :refer [deftest testing is]]
@@ -172,15 +174,15 @@
     (try (f (enso/port srv)) (finally (enso/stop srv)))))
 
 (deftest tls-silent-client-closed-after-idle-timeout
-  (with-tls-server {:idle-timeout 300 :request-timeout 5000}
+  (with-tls-server {:idle-timeout 300 :handshake-timeout 5000}
     (fn [port]
       (let [ms (ms-until-server-closes port 4000 (fn [_]))]
         (is (some? ms) "server never closed a silent TLS connection")))))
 
-(deftest tls-drip-fed-handshake-bounded-by-request-timeout
+(deftest tls-drip-fed-handshake-bounded-by-handshake-timeout
   ;; One byte every 100ms keeps every read under the idle timeout; only a
   ;; wall-clock handshake deadline stops it.
-  (with-tls-server {:idle-timeout 2000 :request-timeout 500}
+  (with-tls-server {:idle-timeout 2000 :handshake-timeout 500}
     (fn [port]
       (let [ms (ms-until-server-closes
                 port 1000
@@ -198,7 +200,7 @@
           (is (< ms 3000) (str "took " ms "ms")))))))
 
 (deftest tls-http1-stalled-request-times-out
-  (with-tls-server {:idle-timeout 300 :request-timeout 5000}
+  (with-tls-server {:header-timeout 300}
     (fn [port]
       (let [factory (.getSocketFactory (capturing-trust-context (atom [])))]
         (with-open [^javax.net.ssl.SSLSocket sock (.createSocket factory "127.0.0.1" (int port))]
@@ -219,6 +221,24 @@
                            (catch java.io.IOException _ true))]
               (is closed "stalled HTTPS/1 request never timed out")
               (is (< (/ (- (System/nanoTime) t0) 1e6) 3000)))))))))
+
+(deftest tls-socket-adapter-forwards-socket-options
+  ;; The adapter has no socket of its own: options must reach the
+  ;; accepted channel.
+  (with-open [server-ch (doto (java.nio.channels.ServerSocketChannel/open)
+                          (.bind (java.net.InetSocketAddress. "127.0.0.1" 0)))
+              client (java.nio.channels.SocketChannel/open (.getLocalAddress server-ch))
+              accepted (.accept server-ch)]
+    (let [engine (.createSSLEngine (SSLContext/getDefault))
+          adapter (.asSocket (com.s_exp.enso.core.TlsSocket. accepted engine))]
+      (.setTcpNoDelay adapter false)
+      (is (false? (.getOption accepted java.net.StandardSocketOptions/TCP_NODELAY)))
+      (.setTcpNoDelay adapter true)
+      (is (true? (.getOption accepted java.net.StandardSocketOptions/TCP_NODELAY)))
+      (.setSoLinger adapter true 3)
+      (is (= 3 (.getOption accepted java.net.StandardSocketOptions/SO_LINGER)))
+      (.setSoLinger adapter false 0)
+      (is (neg? (.getOption accepted java.net.StandardSocketOptions/SO_LINGER))))))
 
 (deftest tls-handshake-recovers-from-app-buffer-overflow
   ;; Scripted engine: the first handshake unwrap reports BUFFER_OVERFLOW,
@@ -278,8 +298,12 @@
 (deftest tls-stop-not-blocked-by-stalled-writer
   ;; The client never reads a large response, so the server's writer
   ;; blocks holding the TLS write lock. Forced shutdown must still finish.
-  (let [srv (enso/run-server
-             (fn [_] {:status 200 :body (byte-array (* 64 1024 1024))})
+  (let [writing (promise)
+        srv (enso/run-server
+             (fn [_] {:status 200
+                      :body (fn [w]
+                              (deliver writing true)
+                              (dotimes [_ 64] (enso/write! w (byte-array (* 1024 1024)))))})
              {:port 0 :http2 true :ssl-context (keytool-gen! "cert-stall")
               :shutdown-timeout 300})
         factory (.getSocketFactory (capturing-trust-context (atom [])))]
@@ -290,7 +314,9 @@
         (.write out (.getBytes "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
                                java.nio.charset.StandardCharsets/ISO_8859_1))
         (.flush out))
-      (Thread/sleep 500)
+      ;; The body is far larger than the socket buffers: once it is being
+      ;; written, the writer stalls (on stop or before it).
+      (is (deref writing 3000 false))
       (let [t0 (System/nanoTime)
             stopped (deref (future (enso/stop srv) :stopped) 5000 :timed-out)]
         (is (= :stopped stopped))
@@ -342,7 +368,7 @@
   ;; handler swallows the timeout and answers, and draining the unread
   ;; body must not see earlier decrypted plaintext (which would parse as
   ;; a phantom second request).
-  (with-tls-server {:idle-timeout 300 :request-timeout 5000
+  (with-tls-server {:read-timeout 300
                     :handler (fn [req]
                                (try (slurp (:body req)) (catch Exception _))
                                {:status 200 :body "ok"})}
@@ -398,17 +424,20 @@
   ;; TLS write lock. Closing the WebSocket must still drop the connection
   ;; in bounded time and report onClose.
   (let [sock-p (promise)
-        closed (promise)]
+        closed (promise)
+        ;; when the send in progress started
+        send-started (atom nil)]
     (with-tls-server {:idle-timeout 0
                       :handler (fn [_]
                                  {:ring.websocket/listener
-                                  {:on-open (fn [^com.s_exp.enso.websocket.WebSocketSocket s]
+                                  {:on-open (fn [^com.s_exp.enso.api.WebSocketSocket s]
                                               (deliver sock-p s)
                                               (Thread/startVirtualThread
                                                (fn []
                                                  (try
                                                    (let [chunk (java.nio.ByteBuffer/allocate (* 1024 1024))]
                                                      (while (.isOpen s)
+                                                       (reset! send-started (System/nanoTime))
                                                        (.sendBinary s (.duplicate chunk))))
                                                    (catch java.io.IOException _)))))
                                    :on-close (fn [_ code _] (deliver closed code))}})}
@@ -418,12 +447,129 @@
             (.setEnabledProtocols sock (into-array String ["TLSv1.3" "TLSv1.2"]))
             (.startHandshake sock)
             (tls-ws-handshake! sock)
-            (let [^com.s_exp.enso.websocket.WebSocketSocket s (deref sock-p 2000 nil)]
+            (let [^com.s_exp.enso.api.WebSocketSocket s (deref sock-p 2000 nil)]
               (is s)
-              ;; Let the writer fill the socket buffers and block.
-              (Thread/sleep 500)
+              ;; Wait until a send has been blocked for a while: the
+              ;; client reads nothing, so the socket buffers are full.
+              (let [deadline (+ (System/currentTimeMillis) 5000)]
+                (while (and (not (when-let [t @send-started] (> (- (System/nanoTime) t) 200000000)))
+                            (< (System/currentTimeMillis) deadline))
+                  (Thread/sleep 20)))
               (let [closer (future (.close s 1000 "") :returned)]
                 (is (= :returned (deref closer 10000 :timed-out))
                     "close returns despite the stalled TLS writer")
                 (is (number? (deref closed 10000 :timed-out))
                     "onClose fires")))))))))
+
+(deftest tls12-client-renegotiation-refused
+  ;; TLS 1.2 renegotiation started by the client after the handshake is
+  ;; refused: the connection closes (reported as a "renegotiation" TLS
+  ;; protocol error), serves nothing more, and the server keeps serving.
+  (let [errors (atom [])]
+    (with-tls-server {:server-events {:protocol-error (fn [p kind] (swap! errors conj [p kind]))}}
+      (fn [port]
+        (let [factory (.getSocketFactory (capturing-trust-context (atom [])))]
+          (with-open [^javax.net.ssl.SSLSocket sock (.createSocket factory "127.0.0.1" (int port))]
+            (.setEnabledProtocols sock (into-array String ["TLSv1.2"]))
+            (.setSoTimeout sock 4000)
+            (.startHandshake sock)
+            (let [out (.getOutputStream sock)
+                  in (.getInputStream sock)
+                  request (.getBytes "GET / HTTP/1.1\r\nHost: x\r\n\r\n" java.nio.charset.StandardCharsets/ISO_8859_1)
+                  read-head (fn []
+                              (let [sb (StringBuilder.)]
+                                (try
+                                  (loop []
+                                    (let [b (.read in)]
+                                      (when (>= b 0)
+                                        (.append sb (char b))
+                                        (when-not (.endsWith (str sb) "ok")
+                                          (recur)))))
+                                  (catch java.io.IOException _))
+                                (str sb)))]
+              (.write out request)
+              (.flush out)
+              (is (clojure.string/starts-with? (read-head) "HTTP/1.1 200"))
+              (let [renegotiated (try (.startHandshake sock) (.write out request) (.flush out) true
+                                      (catch java.io.IOException _ false))]
+                (is (not (and renegotiated (clojure.string/includes? (read-head) "HTTP/1.1")))
+                    "no response after a renegotiation")))))
+        (let [deadline (+ (System/currentTimeMillis) 3000)]
+          (while (and (empty? @errors) (< (System/currentTimeMillis) deadline))
+            (Thread/sleep 10)))
+        (is (= [["tls" "renegotiation"]] @errors))
+        (is (.startsWith ^String (String. ^bytes (do-tls-get! (capturing-trust-context (atom [])) port)
+                                          java.nio.charset.StandardCharsets/ISO_8859_1)
+                         "HTTP/1.1 200")
+            "server still serves new connections")))))
+
+(deftest tls-handshake-timeout-reported-as-its-own-kind
+  (let [errors (promise)]
+    (with-tls-server {:handshake-timeout 300
+                      :server-events {:protocol-error (fn [p kind] (deliver errors [p kind]))}}
+      (fn [port]
+        (with-open [sock (java.net.Socket. "127.0.0.1" (int port))]
+          (is (= ["tls" "handshake-timeout"] (deref errors 3000 :none))))))))
+
+(deftest tls-error-response-survives-an-unread-upload
+  ;; Lingering close over TLS: close_notify and FIN, then the refused
+  ;; upload is read and discarded, so the client finishes sending and
+  ;; reads the 413 instead of hitting a reset.
+  (with-tls-server {:max-request-body-bytes 1000}
+    (fn [port]
+      (let [factory (.getSocketFactory (capturing-trust-context (atom [])))]
+        (with-open [^javax.net.ssl.SSLSocket sock (.createSocket factory "127.0.0.1" (int port))]
+          (.startHandshake sock)
+          (let [out (.getOutputStream sock)
+                in (.getInputStream sock)
+                writer (future
+                         (try
+                           (.write out (.getBytes "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4000000\r\n\r\n"
+                                                  java.nio.charset.StandardCharsets/ISO_8859_1))
+                           (dotimes [_ 100] (.write out (byte-array 40000)))
+                           :uploaded
+                           (catch java.io.IOException e e)))
+                resp (StringBuilder.)]
+            (.setSoTimeout sock 4000)
+            (try
+              (loop []
+                (let [b (.read in)]
+                  (when (>= b 0)
+                    (.append resp (char b))
+                    (recur))))
+              (catch java.io.IOException _))
+            (is (.startsWith (str resp) "HTTP/1.1 413") (str resp))
+            (is (= :uploaded (deref writer 5000 :timed-out)))))))))
+
+(deftest tls-keep-alive-request-after-idle-buffer-release
+  ;; Idle past the buffer-release delay, the TLS record buffers were
+  ;; swapped for small ones; the next request (a multi-record one) grows
+  ;; them back.
+  (with-tls-server {:handler (fn [req] {:status 200 :body (str (count (slurp (:body req))))})}
+    (fn [port]
+      (let [factory (.getSocketFactory (capturing-trust-context (atom [])))]
+        (with-open [^javax.net.ssl.SSLSocket sock (.createSocket factory "127.0.0.1" (int port))]
+          (.startHandshake sock)
+          (.setSoTimeout sock 4000)
+          (let [out (.getOutputStream sock)
+                in (.getInputStream sock)
+                read-response (fn []
+                                (let [sb (StringBuilder.)]
+                                  (loop []
+                                    (let [b (.read in)]
+                                      (when (>= b 0)
+                                        (.append sb (char b))
+                                        (when-not (.endsWith (str sb) "\r\n\r\n")
+                                          (recur)))))
+                                  (let [n (Long/parseLong (second (re-find #"Content-Length: (\d+)" (str sb))))]
+                                    (dotimes [_ n] (.append sb (char (.read in)))))
+                                  (str sb)))
+                post (fn [n] (.write out (.getBytes (str "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: " n "\r\n\r\n"
+                                                         (apply str (repeat n "q")))
+                                                    java.nio.charset.StandardCharsets/ISO_8859_1))
+                       (.flush out))]
+            (post 10)
+            (is (.endsWith ^String (read-response) "\r\n\r\n10"))
+            (Thread/sleep 1300)
+            (post 50000)
+            (is (.endsWith ^String (read-response) "\r\n\r\n50000"))))))))

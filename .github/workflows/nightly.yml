@@ -1,0 +1,147 @@
+# ABOUTME: Nightly/manual non-gating CI: soak/leak test, deep property and frame fuzz run, Jazzer
+# ABOUTME: coverage-guided fuzzing, and the perf harness with its allocation-per-request gate.
+name: nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      soak-connections:
+        description: Connections churned by the soak test
+        default: '10000'
+      property-trials:
+        description: Trials per property in the deep fuzz run
+        default: '2000'
+      perf-duration-s:
+        description: Measured seconds per perf scenario
+        default: '20'
+      fuzz-seconds:
+        description: Seconds per Jazzer target
+        default: '900'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-clojure
+
+      - name: Build enso_quiche shim
+        uses: ./.github/actions/build-shim
+
+      - name: Compile Java sources
+        run: clojure -T:build javac
+
+      - name: Raise UDP receive buffer limit
+        run: sudo sysctl -w net.core.rmem_max=8388608
+
+      - name: Soak (h1 / h2 / h3 connection churn)
+        env:
+          ENSO_SOAK_CONNECTIONS: ${{ inputs.soak-connections || '10000' }}
+          ENSO_TEST_LOG_DIR: target/soak-logs
+        run: |
+          ulimit -n 65536
+          script/test.sh s-exp.enso-soak-test
+
+      - name: Deep property / fuzz run
+        env:
+          ENSO_PROPERTY_TRIALS: ${{ inputs.property-trials || '2000' }}
+          ENSO_TEST_LOG_DIR: target/soak-logs
+        run: |
+          script/test.sh s-exp.enso-codec-property-test s-exp.enso-wire-fuzz-test \
+            s-exp.enso-h2-frame-fuzz-test
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: soak-logs
+          path: target/soak-logs/
+          retention-days: 14
+
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [HpackDecoderFuzz, QpackDecoderFuzz, Http1RequestFuzz, WebSocketFrameFuzz]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-clojure
+
+      - name: Compile Java sources
+        run: clojure -T:build javac
+
+      # The corpus grows run after run: restore the latest, save a new one.
+      - name: Restore corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: target/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      # --keep_going: a known finding does not stop the run from looking
+      # for others; any finding still fails the job.
+      - name: Jazzer ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+          FUZZ_SECONDS: ${{ inputs.fuzz-seconds || '900' }}
+        run: script/fuzz.sh "$TARGET" "$FUZZ_SECONDS" --keep_going=20
+
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-findings-${{ matrix.target }}
+          path: target/fuzz/findings/${{ matrix.target }}/
+          retention-days: 30
+
+  perf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-clojure
+
+      - name: Build enso_quiche shim
+        uses: ./.github/actions/build-shim
+
+      - name: Install h2load
+        run: sudo apt-get install -y --no-install-recommends nghttp2-client
+
+      - name: Compile Java sources
+        run: clojure -T:build javac
+
+      # Shared CI runners are noisy neighbours: req/s and latency are a
+      # trend line, not a benchmark. Allocation per request is stable and
+      # gated against bench/perf/baseline.edn.
+      - name: Throughput / latency / allocation harness
+        env:
+          PERF_OPTS: '{:duration-s ${{ inputs.perf-duration-s || ''20'' }}}'
+        run: |
+          clojure -M:perf "$PERF_OPTS"
+          cat target/perf/latest.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Allocation-per-request gate
+        run: clojure -M:perf-gate
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: perf-results
+          path: target/perf/
+          retention-days: 90

@@ -1,3 +1,5 @@
+// ABOUTME: JNI entry points of the enso_quiche shim (libquiche plus UDP socket I/O): loading,
+// ABOUTME: the libquiche version check, and the package-private natives the handle wrappers use.
 package com.s_exp.enso.quiche;
 
 import java.io.IOException;
@@ -8,26 +10,30 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
 /**
- * JNI shim over libquiche. Loads {@code libenso_quiche.<so|dylib>}
- * bundled in the jar (extracted to a temp dir on first use), which in
- * turn dlopens the system {@code libquiche}. All methods are 1:1 with
- * the C entry points in {@code native/enso_quiche/enso_quiche.c}.
+ * The shim {@code libenso_quiche.<so|dylib>} bundled in the jar (extracted
+ * to a temp dir on first use), statically linking libquiche in release
+ * builds and dynamically in development builds. Natives map 1:1 to the C
+ * entry points in {@code native/enso_quiche/enso_quiche.c}.
  *
- * <p>Per-packet calls pass byte[] arguments the C side accesses through
- * {@code GetPrimitiveArrayCritical} (no copies) and send datagrams through
- * a direct {@link java.nio.ByteBuffer}; see the conventions at the top of
- * {@code enso_quiche.c}.
+ * <p>The natives are package-private: raw quiche pointers and socket file
+ * descriptors never leave this package. {@link QuicheConfig},
+ * {@link QuicheConnection} and {@link UdpSocket} own them, check their
+ * state on every call and refuse to touch a freed handle.
  *
- * <p>Pointer discipline: every quiche resource crosses the boundary as
- * an opaque {@code long} address. Java code treats them as tokens — do
- * not dereference. Use the {@code *Free} methods to release.
+ * <p>Packets, socket addresses and per-call results travel in
+ * {@link NativeBuffer}s, passed as (address, capacity) and range-checked by
+ * the shim (record layouts in {@link Records}); stream payloads in byte[]
+ * accessed through one-call critical regions.
  *
- * <p>Sockaddr passing: instead of shipping {@code sockaddr_storage}
- * bytes (whose layout differs by OS), the shim takes {@code (byte[] ip,
- * int port)}. IPv4 addresses are 4-byte arrays; IPv6 addresses are
- * 16-byte arrays. The C side builds the real struct on the JNI stack.
+ * <p>Loading checks {@link #version()} against {@link #QUICHE_VERSION}: the
+ * shim is compiled against that release's header, whose struct layouts
+ * change between releases, so a dynamically linked libquiche of another
+ * version is refused rather than misread.
  */
 public final class Quiche {
+
+    /** The libquiche release the shim is built against. */
+    public static final String QUICHE_VERSION = "0.29.3";
 
     public static final int QUICHE_MAX_CONN_ID_LEN = 20;
     public static final int QUICHE_PROTOCOL_VERSION = 0x00000001;
@@ -39,6 +45,7 @@ public final class Quiche {
     public static final long QUICHE_ERR_INVALID_STATE = -6L;
     public static final long QUICHE_ERR_INVALID_STREAM_STATE = -7L;
     public static final long QUICHE_ERR_FINAL_SIZE = -13L;
+    public static final long QUICHE_ERR_STREAM_LIMIT = -12L;
     /** Returned by the shim itself for invalid arguments (bounds, address). */
     public static final long SHIM_ERR_INVALID_ARGUMENT = -10000L;
 
@@ -46,70 +53,153 @@ public final class Quiche {
     public static final int QUICHE_SHUTDOWN_READ = 0;
     public static final int QUICHE_SHUTDOWN_WRITE = 1;
 
+    /**
+     * The JNI contract this class and the shim were built for: the shim's
+     * {@code ENSO_SHIM_ABI}, bumped whenever a native's name, signature or
+     * record layout changes. A stale shim (a development build left in
+     * {@code target/native}, a classifier jar of another release) is
+     * refused at load instead of failing on the first changed call.
+     */
+    public static final int SHIM_ABI = 1;
+
+    /** System property naming the shim to load, bypassing every lookup. */
+    static final String SHIM_PROPERTY = "enso.quiche.shim";
+    /** System property, then environment variable, naming where the bundled shim is extracted. */
+    static final String TMPDIR_PROPERTY = "enso.quiche.tmpdir";
+    static final String TMPDIR_ENV = "ENSO_QUICHE_TMPDIR";
+
     static {
         loadLibrary();
+        requireShimAbi(loadedShimAbi());
+        requireVersion(version());
+    }
+
+    /**
+     * Refuses a libquiche other than {@link #QUICHE_VERSION}.
+     *
+     * @throws UnsatisfiedLinkError naming both versions
+     */
+    static void requireVersion(String actual) {
+        if (!QUICHE_VERSION.equals(actual)) {
+            throw new UnsatisfiedLinkError("libquiche " + actual + " loaded, but the enso_quiche shim"
+                + " is built against " + QUICHE_VERSION + " (struct layouts differ between"
+                + " releases). Install libquiche " + QUICHE_VERSION + " or use the statically"
+                + " linked shim from the release jars.");
+        }
+    }
+
+    /**
+     * Refuses a shim built for another {@link #SHIM_ABI}.
+     *
+     * @throws UnsatisfiedLinkError naming both
+     */
+    static void requireShimAbi(int actual) {
+        if (actual != SHIM_ABI) {
+            throw new UnsatisfiedLinkError("enso_quiche shim ABI " + actual + " loaded, but this enso"
+                + " expects ABI " + SHIM_ABI + ": rebuild the shim (make -C native/enso_quiche) or use"
+                + " the classifier jar of the same release.");
+        }
+    }
+
+    /** The loaded shim's ABI; 0 for a shim that predates the check (no shimAbi entry point). */
+    private static int loadedShimAbi() {
+        try {
+            return shimAbi();
+        } catch (UnsatisfiedLinkError e) {
+            return 0;
+        }
     }
 
     private Quiche() {}
 
+    /**
+     * Loads the shim from the first candidate that works, in order: the
+     * {@value #SHIM_PROPERTY} override (alone: an explicit choice is never
+     * second-guessed); the classpath resource of each OS classifier
+     * (extracted, see {@link #extractResource}); in a development checkout
+     * only, {@code target/native/} next to the class directory this class
+     * was loaded from; the library path. A candidate that fails to load is
+     * recorded and the next one tried; when none loads, the error lists
+     * every candidate and why it failed.
+     */
     private static void loadLibrary() {
-        // Explicit override wins: user pointed us at a specific dylib
-        // (typically for a locally-built shim during development).
-        String override = System.getProperty("enso.quiche.shim");
+        String override = System.getProperty(SHIM_PROPERTY);
         if (override != null && !override.isBlank()) {
             System.load(Path.of(override).toAbsolutePath().toString());
             return;
         }
         String arch = detectArch();
         String libName = System.mapLibraryName("enso_quiche");
-        // Ordered list of classifier prefixes to try. On Linux+musl we
-        // prefer the musl-built shim; if that isn't shipped, fall back
-        // to the glibc build — libquiche links against libc which may
-        // fail at runtime, but we bubble up a clear error rather than
-        // silently misload.
         String[] osClassifiers = detectOsClassifiers();
-        // 1) Try each candidate classpath resource in order.
+        StringBuilder tried = new StringBuilder();
         for (String os : osClassifiers) {
             String resPath = "/META-INF/native/" + os + "-" + arch + "/" + libName;
+            if (Quiche.class.getResource(resPath) == null) {
+                tried.append("\n  classpath ").append(resPath).append(": absent");
+                continue;
+            }
             try {
-                if (Quiche.class.getResource(resPath) != null) {
-                    Path extracted = extractResource(resPath, libName);
-                    System.load(extracted.toAbsolutePath().toString());
-                    return;
-                }
-            } catch (IOException e) {
-                // fall through to the next candidate / filesystem probe
-            }
-        }
-        // 2) Development / repl: probe local build output (same
-        //    classifier list, first match wins).
-        for (String os : osClassifiers) {
-            Path devPath = Path.of("target/native/" + os + "-" + arch + "/" + libName);
-            if (Files.exists(devPath)) {
-                System.load(devPath.toAbsolutePath().toString());
+                Path extracted = extractResource(resPath, libName);
+                System.load(extracted.toAbsolutePath().toString());
                 return;
+            } catch (IOException | UnsatisfiedLinkError e) {
+                tried.append("\n  classpath ").append(resPath).append(": ").append(e);
             }
         }
-        // 3) Standard library-path lookup (respects LD_LIBRARY_PATH,
-        //    java.library.path, DYLD_LIBRARY_PATH).
+        Path dev = developmentDirectory();
+        if (dev != null) {
+            for (String os : osClassifiers) {
+                Path devPath = dev.resolve(os + "-" + arch).resolve(libName);
+                if (!Files.exists(devPath)) {
+                    tried.append("\n  ").append(devPath).append(": absent");
+                    continue;
+                }
+                try {
+                    System.load(devPath.toAbsolutePath().toString());
+                    return;
+                } catch (UnsatisfiedLinkError e) {
+                    tried.append("\n  ").append(devPath).append(": ").append(e.getMessage());
+                }
+            }
+        }
         try {
             System.loadLibrary("enso_quiche");
+            return;
         } catch (UnsatisfiedLinkError e) {
-            throw new UnsatisfiedLinkError(
-                "libenso_quiche not found for classifier(s) "
-                + java.util.Arrays.toString(osClassifiers) + "-" + arch
-                + ". Build with `make -C native/enso_quiche` or set"
-                + " -Denso.quiche.shim=/abs/path/to/" + libName
-                + ". Underlying error: " + e.getMessage());
+            tried.append("\n  java.library.path: ").append(e.getMessage());
+        }
+        String hint = osClassifiers[0].equals("linux-musl")
+            ? " musl libc detected: add the linux-musl-" + arch + " classifier jar (a glibc shim"
+                + " doesn't load on musl)."
+            : " Add the " + osClassifiers[0] + "-" + arch + " classifier jar, build with"
+                + " `make -C native/enso_quiche`, or set -D" + SHIM_PROPERTY + "=/abs/path/to/" + libName + ".";
+        throw new UnsatisfiedLinkError("libenso_quiche could not be loaded." + hint + " Tried:" + tried);
+    }
+
+    /**
+     * {@code target/native} of a development checkout: only when this class
+     * was loaded from a directory ({@code target/classes}), never from a
+     * jar, and never relative to the working directory (which could load a
+     * library planted wherever the application happens to run). Null
+     * otherwise.
+     */
+    static Path developmentDirectory() {
+        try {
+            java.security.CodeSource cs = Quiche.class.getProtectionDomain().getCodeSource();
+            if (cs == null || cs.getLocation() == null) return null;
+            Path classes = Path.of(cs.getLocation().toURI());
+            if (!Files.isDirectory(classes) || classes.getParent() == null) return null;
+            return classes.getParent().resolve("native");
+        } catch (RuntimeException | java.net.URISyntaxException e) {
+            return null;
         }
     }
 
     /**
-     * OS classifiers in load-preference order. Standard `darwin` /
-     * `linux` first; Alpine / musl systems get `linux-musl` prepended
-     * so we prefer the musl-built shim over the glibc one. Detection
-     * looks for {@code /lib/ld-musl-*.so.1} which is present on every
-     * musl libc install (Alpine, Wolfi, Chimera).
+     * OS classifiers in load-preference order. Linux with musl libc (Alpine,
+     * Wolfi, Chimera) loads only the musl build: the glibc one can't run
+     * there, so it is never tried as a fallback. Detection looks for
+     * {@code /lib/ld-musl-*.so.1}, which every musl install has.
      */
     private static String[] detectOsClassifiers() {
         String n = System.getProperty("os.name").toLowerCase();
@@ -117,10 +207,7 @@ public final class Quiche {
             return new String[]{"darwin"};
         }
         if (n.contains("linux")) {
-            if (isMusl()) {
-                return new String[]{"linux-musl", "linux"};
-            }
-            return new String[]{"linux"};
+            return new String[]{isMusl() ? "linux-musl" : "linux"};
         }
         return new String[]{n.replace(' ', '_')};
     }
@@ -147,18 +234,31 @@ public final class Quiche {
     }
 
     /**
-     * Extract the classpath resource into a per-JVM tempdir with a
-     * random name, then return the path to the shim inside. Mirrors
-     * Netty's netty_jni_util pattern (each JVM instance gets its own
-     * filename so concurrent JVMs on the same host don't share a
-     * dlopen'd file — some libc / kernel combinations refuse to
-     * overwrite an in-use shared object). A shutdown hook removes the
-     * dir + file on clean exit; {@link File#deleteOnExit} covers the
-     * shutdown-hook-skipped paths (SIGKILL still leaks the tempdir,
-     * which is expected).
+     * Where the bundled shim is extracted: the {@value #TMPDIR_PROPERTY}
+     * system property, else the {@value #TMPDIR_ENV} environment variable,
+     * else {@code java.io.tmpdir}. Set it when the default temp directory is
+     * mounted noexec.
+     */
+    static Path extractionDirectory() {
+        String dir = System.getProperty(TMPDIR_PROPERTY);
+        if (dir == null || dir.isBlank()) dir = System.getenv(TMPDIR_ENV);
+        if (dir == null || dir.isBlank()) dir = System.getProperty("java.io.tmpdir");
+        return Path.of(dir);
+    }
+
+    /**
+     * Extract the classpath resource into a per-JVM directory with a random
+     * name under {@link #extractionDirectory}, then return the path to the
+     * shim inside. Mirrors Netty's netty_jni_util pattern (each JVM instance
+     * gets its own filename so concurrent JVMs on the same host don't share
+     * a dlopen'd file — some libc / kernel combinations refuse to overwrite
+     * an in-use shared object). A shutdown hook removes the dir + file on
+     * clean exit; {@link java.io.File#deleteOnExit} covers the
+     * shutdown-hook-skipped paths (SIGKILL still leaks the directory, which
+     * is expected).
      */
     private static Path extractResource(String resPath, String libName) throws IOException {
-        Path dir = Files.createTempDirectory("enso-quiche-");
+        Path dir = Files.createTempDirectory(extractionDirectory(), "enso-quiche-");
         Path lib = dir.resolve(libName);
         try (InputStream in = Quiche.class.getResourceAsStream(resPath);
              OutputStream out = Files.newOutputStream(lib,
@@ -183,122 +283,114 @@ public final class Quiche {
     // -----------------------------------------------------------------
     // Version
     // -----------------------------------------------------------------
-    public static native String version();
+    /** The loaded libquiche's version string. */
+    public static String libraryVersion() {
+        return version();
+    }
+
+    static native String version();
+
+    /** The shim's ENSO_SHIM_ABI; see {@link #SHIM_ABI}. */
+    static native int shimAbi();
+
+    /** Address of a direct buffer's memory (0 for heap buffers); see {@link NativeBuffer}. */
+    static native long bufferAddress(java.nio.ByteBuffer buf);
 
     // -----------------------------------------------------------------
     // Config
     // -----------------------------------------------------------------
-    public static native long configNew(int version);
-    public static native void configFree(long config);
-    public static native int configLoadCertChainFromPemFile(long config, String path);
-    public static native int configLoadPrivKeyFromPemFile(long config, String path);
-    public static native int configSetApplicationProtos(long config, byte[] protos);
-    public static native void configSetMaxIdleTimeout(long config, long v);
-    public static native void configSetMaxRecvUdpPayloadSize(long config, long v);
-    public static native void configSetMaxSendUdpPayloadSize(long config, long v);
-    public static native void configSetInitialMaxData(long config, long v);
-    public static native void configSetInitialMaxStreamDataBidiLocal(long config, long v);
-    public static native void configSetInitialMaxStreamDataBidiRemote(long config, long v);
-    public static native void configSetInitialMaxStreamDataUni(long config, long v);
-    public static native void configSetInitialMaxStreamsBidi(long config, long v);
-    public static native void configSetInitialMaxStreamsUni(long config, long v);
-    public static native void configSetAckDelayExponent(long config, long v);
-    public static native void configSetMaxAckDelay(long config, long v);
-    public static native void configSetActiveConnectionIdLimit(long config, long v);
-    public static native void configSetDisableActiveMigration(long config, boolean v);
-    public static native void configVerifyPeer(long config, boolean v);
+    static native long configNew(int version);
+    static native void configFree(long config);
+    static native int configLoadCertChainFromPemFile(long config, String path);
+    static native int configLoadPrivKeyFromPemFile(long config, String path);
+    static native int configSetApplicationProtos(long config, byte[] protos);
+    static native void configSetMaxIdleTimeout(long config, long v);
+    static native void configSetMaxRecvUdpPayloadSize(long config, long v);
+    static native void configSetMaxSendUdpPayloadSize(long config, long v);
+    static native void configSetInitialMaxData(long config, long v);
+    static native void configSetInitialMaxStreamDataBidiLocal(long config, long v);
+    static native void configSetInitialMaxStreamDataBidiRemote(long config, long v);
+    static native void configSetInitialMaxStreamDataUni(long config, long v);
+    static native void configSetInitialMaxStreamsBidi(long config, long v);
+    static native void configSetInitialMaxStreamsUni(long config, long v);
+    static native void configSetAckDelayExponent(long config, long v);
+    static native void configSetMaxAckDelay(long config, long v);
+    static native void configSetActiveConnectionIdLimit(long config, long v);
+    static native void configSetMaxConnectionWindow(long config, long v);
+    static native void configSetMaxStreamWindow(long config, long v);
+    static native void configSetDisableActiveMigration(long config, boolean v);
+    static native void configVerifyPeer(long config, boolean v);
 
     // -----------------------------------------------------------------
-    // Accept / retry / negotiate / header info
+    // Accept / connect / retry / negotiate / header info
     // -----------------------------------------------------------------
-    public static native long accept(byte[] scid, byte[] odcid,
-                                     byte[] localIp, int localPort,
-                                     byte[] peerIp, int peerPort,
-                                     long config);
-    /**
-     * Client-side connection (quiche_connect). The server never calls
-     * this; the test suite uses it to drive the server over real QUIC.
-     * Returns 0 on failure.
-     */
-    public static native long connect(String serverName, byte[] scid,
-                                      byte[] localIp, int localPort,
-                                      byte[] peerIp, int peerPort,
-                                      long config);
-    /** Returns bytes written (>=0), QUICHE_ERR_DONE (-1), or < 0 on error. */
-    public static native long retry(byte[] scid, byte[] dcid,
-                                    byte[] newScid, byte[] token,
-                                    int version, byte[] out);
-    /** Returns bytes written, or < 0 on error. */
-    public static native long negotiateVersion(byte[] scid, byte[] dcid, byte[] out);
-
-    /**
-     * Parses the QUIC packet header at the start of the direct buffer
-     * {@code buf[0, bufLen)}. Pre-fill scidLen[0]/dcidLen[0]/tokenLen[0]
-     * with the maximum sizes (CIDs ≤ 20, token ≤ 4096); C writes back the
-     * actual lengths on success. Returns 0 on success or < 0 on error.
-     */
-    public static native int headerInfo(java.nio.ByteBuffer buf, int bufLen, int dcil,
-                                        int[] versionOut, byte[] typeOut,
-                                        byte[] scid, long[] scidLen,
-                                        byte[] dcid, long[] dcidLen,
-                                        byte[] token, long[] tokenLen);
-    public static native boolean versionIsSupported(int version);
+    /** Addresses are ADDR records in {@code addrs}; {@code odcid} null without a Retry. 0 on failure. */
+    static native long accept(byte[] scid, byte[] odcid, long addrs, int addrsCap,
+                              int localOff, int peerOff, long config);
+    static native long connect(String serverName, byte[] scid, long addrs, int addrsCap,
+                               int localOff, int peerOff, long config);
+    /** Writes a Retry packet into {@code out[off, off + cap)}; its length, or < 0. */
+    static native long retry(byte[] scid, byte[] dcid, byte[] newScid, byte[] token,
+                             int version, long out, int outCap, int off, int cap);
+    /** Writes a Version Negotiation packet into {@code out[off, off + cap)}; its length, or < 0. */
+    static native long negotiateVersion(byte[] scid, byte[] dcid, long out, int outCap,
+                                        int off, int cap);
+    /** Parses the header of {@code buf[off, off + len)} into the HDR record at {@code out[outOff]}. */
+    static native int headerInfo(long buf, int bufCap, int off, int len, int dcil,
+                                 long out, int outCap, int outOff);
+    static native boolean versionIsSupported(int version);
 
     // -----------------------------------------------------------------
-    // Conn lifecycle + state
+    // Connection
     // -----------------------------------------------------------------
-    public static native void connFree(long conn);
-    public static native boolean connIsClosed(long conn);
-    public static native boolean connIsEstablished(long conn);
-    /** Nanoseconds until next timeout, or -1 if no timeout is scheduled. */
-    public static native long connTimeoutAsNanos(long conn);
-    public static native void connOnTimeout(long conn);
-    /**
-     * When the peer closed the connection, fills {@code out[0]} with 1
-     * for an application close (0 for transport) and {@code out[1]} with
-     * its error code, and returns true.
-     */
-    public static native boolean connPeerError(long conn, long[] out);
-
-    public static native long connRecv(long conn, byte[] buf, int bufLen,
-                                       byte[] fromIp, int fromPort,
-                                       byte[] toIp, int toPort);
-    /**
-     * Writes one packet into the direct buffer {@code out[0, outLen)}.
-     * Returns its length, QUICHE_ERR_DONE, or another error. On success
-     * the destination (quiche's send_info.to) is written to
-     * {@code toIpOut} (16 bytes, 4 used for IPv4) and
-     * {@code toMetaOut = {port, ipLength}}.
-     */
-    public static native long connSend(long conn, java.nio.ByteBuffer out, int outLen,
-                                       byte[] toIpOut, int[] toMetaOut);
-    /**
-     * Initiate graceful/error connection close. {@code app=true} sends an
-     * application-level close (H3 error codes); {@code app=false} sends a
-     * transport-level QUIC close. {@code reason} may be null / empty.
-     * Returns 0 on success or a quiche error code.
-     */
-    public static native int connClose(long conn, boolean app, long err,
-                                       byte[] reason);
+    static native void connFree(long conn);
+    static native boolean connIsClosed(long conn);
+    static native boolean connIsEstablished(long conn);
+    static native boolean connIsDraining(long conn);
+    static native long connTimeoutAsNanos(long conn);
+    /** {@link #connTimeoutAsNanos}, or -2 once the connection is closed: one call where both are asked. */
+    static native long connTimeoutAsNanosOrClosed(long conn);
+    static native void connOnTimeout(long conn);
+    static native boolean connPeerError(long conn, long[] out);
+    static native boolean connLocalError(long conn, long[] out);
+    static native long connRecv(long conn, long buf, int bufCap, int off, int len,
+                                long meta, int metaCap, int peerOff, int localOff);
+    static native long connSend(long conn, long out, int outCap, int off, int cap,
+                                long meta, int metaCap, int metaOff);
+    static native int connClose(long conn, boolean app, long err, byte[] reason);
+    static native long connSendAckEliciting(long conn);
+    /** DER bytes of the peer's certificate, or null when it presented none. */
+    static native byte[] connPeerCert(long conn);
+    /** The path's smoothed round-trip time estimate, nanoseconds; -1 when unknown. */
+    static native long connRttNanos(long conn);
 
     // -----------------------------------------------------------------
     // Streams
     // -----------------------------------------------------------------
-    /**
-     * Bytes the stream can currently accept from stream_send (peer flow
-     * control window minus in-flight). Negative on error. Zero means we
-     * must defer sending and retry once the peer's window opens.
-     */
-    public static native long connStreamCapacity(long conn, long streamId);
-    public static native long connStreamRecv(long conn, long streamId,
-                                             byte[] out, int outLen,
-                                             boolean[] finOut, long[] errOut);
-    public static native long connStreamSend(long conn, long streamId,
-                                             byte[] buf, int off, int len,
-                                             boolean fin);
-    public static native int connStreamShutdown(long conn, long streamId,
-                                                int direction, long err);
-    public static native long connReadable(long conn);
-    public static native boolean streamIterNext(long iter, long[] streamIdOut);
-    public static native void streamIterFree(long iter);
+    static native long connStreamCapacity(long conn, long streamId);
+    /** {@code (bytes << 1) | fin}, or a negative quiche error. */
+    static native long connStreamRecv(long conn, long streamId, byte[] out, int off, int len);
+    static native long connStreamSend(long conn, long streamId, byte[] buf, int off, int len,
+                                      boolean fin);
+    static native int connStreamShutdown(long conn, long streamId, int direction, long err);
+    static native long connStreamReadableNext(long conn);
+    static native long connStreamWritableNext(long conn);
+
+    // -----------------------------------------------------------------
+    // UDP sockets, wake-ups, poll
+    // -----------------------------------------------------------------
+    static native int udpOpen(byte[] ip, int port, int flags, int rcvBuf, int sndBuf);
+    static native int udpLocalAddress(int fd, long out, int outCap, int off);
+    static native int udpBufferSize(int fd, boolean send);
+    static native int udpClose(int fd);
+    static native int udpAttachSteering(int fd, int n);
+    static native int udpRecvBatch(int fd, long slab, int slabCap, int slotSize, int maxSlots,
+                                   long meta, int metaCap);
+    static native int udpSendBatch(int fd, long slab, int slabCap, long meta, int metaCap,
+                                   int count, int flags);
+    static native boolean udpGsoSupported(int fd);
+    static native long wakeOpen();
+    static native void wakeSignal(int writeFd);
+    static native void wakeClose(long handle);
+    static native int poll(int recvFd, int sendFd, int wakeFd, boolean wantWrite, long timeoutNanos);
 }

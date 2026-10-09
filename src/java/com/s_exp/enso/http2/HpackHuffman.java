@@ -1,3 +1,5 @@
+// ABOUTME: HPACK Huffman codec (RFC 7541 Appendix B), shared with QPACK: bit-packing encoder
+// ABOUTME: and a nibble-table-driven decoder that validates padding and rejects EOS.
 package com.s_exp.enso.http2;
 
 import java.io.IOException;
@@ -9,9 +11,10 @@ import java.io.IOException;
  * <p>Encoding: iterate each byte, look up its (code, bit-length), pack into
  * the output buffer.
  *
- * <p>Decoding: walk a canonical binary tree bit-by-bit. Simple, correct;
- * table-driven acceleration can come later if profiling shows Huffman decode
- * as a hotspot.
+ * <p>Decoding: table-driven, one lookup per input nibble. The tables are
+ * derived from the canonical code tree at class load: each entry gives the
+ * symbols (zero to two) a nibble completes from a tree state, and the next
+ * state.
  */
 public final class HpackHuffman {
 

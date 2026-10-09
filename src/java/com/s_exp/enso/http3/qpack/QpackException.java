@@ -1,3 +1,5 @@
+// ABOUTME: QPACK decoding/encoding failure carrying the HTTP/3 error code that decides whether
+// ABOUTME: the stream is reset or the whole connection closed.
 package com.s_exp.enso.http3.qpack;
 
 /**

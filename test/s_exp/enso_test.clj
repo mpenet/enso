@@ -1,9 +1,12 @@
+;; ABOUTME: Broad end-to-end tests of the server: HTTP/1.1 request/response handling, TLS, streaming
+;; ABOUTME: and file bodies, error handlers, WebSocket basics, HTTP/3 retry tokens, config and smoke tests.
 (ns s-exp.enso-test
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
             [clojure.string :as str]
             [ring.core.protocols]
+            [ring.websocket.protocols]
             [s-exp.enso :as enso])
-  (:import (com.s_exp.enso.websocket WebSocketSocket)
+  (:import (com.s_exp.enso.api WebSocketSocket)
            (java.io ByteArrayInputStream IOException)
            (java.net Socket SocketException URI)
            (java.net.http HttpClient WebSocket WebSocket$Builder WebSocket$Listener)
@@ -438,19 +441,19 @@
       (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
         (let [in (.getInputStream sock)
               out (.getOutputStream sock)
-              got-431 (atom false)
-              closed (atom false)
+              outcome (promise)
               reader (Thread/ofVirtual)
               _ (.start (.unstarted reader
                                     (fn []
                                       (try
                                         (let [buf (byte-array 8192)
                                               n (.read in buf)]
-                                          (when (pos? n)
-                                            (when (str/includes? (String. buf 0 n StandardCharsets/ISO_8859_1) "431")
-                                              (reset! got-431 true))))
-                                        (reset! closed true)
-                                        (catch IOException _ (reset! closed true))))))
+                                          (deliver outcome
+                                                   (if (and (pos? n)
+                                                            (str/includes? (String. buf 0 n StandardCharsets/ISO_8859_1) "431"))
+                                                     :431
+                                                     :closed)))
+                                        (catch IOException _ (deliver outcome :closed))))))
               big (.getBytes (apply str (repeat 70000 "a")) StandardCharsets/ISO_8859_1)]
           (try
             (.write out (.getBytes "GET / HTTP/1.1\r\nHost: x\r\nX-Big: " StandardCharsets/ISO_8859_1))
@@ -458,8 +461,7 @@
             (.write out (.getBytes "\r\n\r\n" StandardCharsets/ISO_8859_1))
             (.flush out)
             (catch IOException _))
-          (Thread/sleep 200)
-          (is (or @got-431 @closed)))))))
+          (is (contains? #{:431 :closed} (deref outcome 3000 :timed-out))))))))
 
 (deftest fragmented-header-read
   (with-server
@@ -501,7 +503,7 @@
                {:status 200 :body "done"})
              {:port 0 :shutdown-timeout 3000})
         port (enso/port srv)
-        result (atom nil)
+        result (promise)
         client (Thread/ofVirtual)]
     (.start (.unstarted client
                         (fn []
@@ -511,34 +513,32 @@
                               (.write out (.getBytes "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
                                                      StandardCharsets/ISO_8859_1))
                               (.flush out)
-                              (reset! result (String. (.readAllBytes in) StandardCharsets/ISO_8859_1)))))))
+                              (deliver result (String. (.readAllBytes in) StandardCharsets/ISO_8859_1)))))))
     (.await start-latch 2 java.util.concurrent.TimeUnit/SECONDS)
     ;; handler is blocked; stop() must wait for it to finish
     (let [stop-thread (Thread/ofVirtual)
-          stopped (atom false)]
+          stopped (CountDownLatch. 1)]
       (.start (.unstarted stop-thread
                           (fn []
                             (enso/stop srv)
-                            (reset! stopped true))))
-      (Thread/sleep 100)
-      (is (not @stopped) "stop should be waiting for in-flight request")
+                            (.countDown stopped))))
+      (is (not (.await stopped 100 TimeUnit/MILLISECONDS)) "stop should be waiting for in-flight request")
       (.countDown release-latch)
-      (Thread/sleep 500)
-      (is @stopped "stop should complete after handler returned")
-      (is (some-> @result (str/includes? "done")) "in-flight request should get its response"))))
+      (is (.await stopped 3 TimeUnit/SECONDS) "stop should complete after handler returned")
+      (is (some-> (deref result 3000 nil) (str/includes? "done")) "in-flight request should get its response"))))
 
-(deftest request-timeout-slowloris
+(deftest header-timeout-slowloris
   ;; Drip-feeds 1 byte at a time. Server should time out via 408 before headers complete.
   ;; Concurrent reader avoids losing the 408 to a TCP RST when the server closes mid-write.
   (let [srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0 :idle-timeout 5000 :request-timeout 500})]
+             {:port 0 :idle-timeout 5000 :header-timeout 500})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (let [out (.getOutputStream sock)
               in (.getInputStream sock)
               got-408 (atom false)
-              closed (atom false)
+              closed (promise)
               t0 (System/nanoTime)
               reader (Thread/ofVirtual)]
           (.start (.unstarted reader
@@ -552,16 +552,17 @@
                                                  (String. buf 0 n StandardCharsets/ISO_8859_1) "408")
                                             (reset! got-408 true))
                                           (recur)))))
-                                  (reset! closed true)
-                                  (catch IOException _ (reset! closed true))))))
+                                  (deliver closed true)
+                                  (catch IOException _ (deliver closed true))))))
           (try
+            ;; Drip-feed pacing (not synchronisation): one byte per 30 ms.
             (doseq [b (.getBytes "GET / HTTP/1.1\r\nHost: x\r\nX-Foo: bar\r\n\r\n"
                                  StandardCharsets/ISO_8859_1)]
               (.write out (byte-array [b]))
               (.flush out)
               (Thread/sleep 30))
             (catch IOException _))
-          (Thread/sleep 200)
+          (is (deref closed 3000 false) "server closed the connection")
           (let [elapsed-ms (/ (- (System/nanoTime) t0) 1e6)]
             (is @got-408)
             (is (< elapsed-ms 2000) (str "should time out ~500ms, took " elapsed-ms "ms")))))
@@ -817,6 +818,47 @@
             (is (= 500 (:status r))))))
       (finally (enso/stop srv)))))
 
+(defn- capture-logs
+  "Runs `f` with records of `logger-name` at every level collected; returns them."
+  [logger-name f]
+  (let [logger (java.util.logging.Logger/getLogger logger-name)
+        records (atom [])
+        handler (proxy [java.util.logging.Handler] []
+                  (publish [^java.util.logging.LogRecord r] (swap! records conj r))
+                  (flush [])
+                  (close []))
+        level (.getLevel logger)]
+    (.setLevel logger java.util.logging.Level/ALL)
+    (.addHandler logger handler)
+    (try
+      (f)
+      @records
+      (finally
+        (.removeHandler logger handler)
+        (.setLevel logger level)))))
+
+(deftest unhandled-handler-exceptions-log-by-cause
+  (testing "I/O-caused failures (client went away mid-body) are FINE"
+    (let [records (capture-logs "com.s_exp.enso.api.RingErrorHandler"
+                                #(with-server
+                                   (fn [_] (throw (RuntimeException. (java.io.EOFException. "client gone"))))
+                                   nil
+                                   (fn [] (get! "/"))))]
+      (is (seq records))
+      (is (every? #(= java.util.logging.Level/FINE (.getLevel ^java.util.logging.LogRecord %)) records))))
+  (testing "handler bugs are WARNING, rate-limited"
+    ;; The limiter is per call site and JVM-wide: let the one-second window
+    ;; opened by earlier tests' failures pass first (a wait on the clock the
+    ;; limiter itself uses, not synchronisation).
+    (Thread/sleep 1100)
+    (let [records (capture-logs "com.s_exp.enso.api.RingErrorHandler"
+                                #(with-server
+                                   (fn [_] (throw (IllegalStateException. "bug")))
+                                   nil
+                                   (fn [] (dotimes [_ 20] (get! "/")))))
+          warnings (filter #(= java.util.logging.Level/WARNING (.getLevel ^java.util.logging.LogRecord %)) records)]
+      (is (<= 1 (count warnings) 2) (str (count warnings) " warnings for 20 failures")))))
+
 (deftest inputstream-body-exact-content-length
   (with-server
     (fn [_] {:status 200
@@ -895,6 +937,44 @@
             (is (str/includes? raw "413")))))
       (finally (enso/stop srv)))))
 
+;; Extended only inside protocols-extended-after-start-are-honored, after
+;; the server is running.
+(deftype LateBody [^String text])
+(deftype LateListener [opened])
+
+(deftest protocols-extended-after-start-are-honored
+  ;; Protocol values are read when used, not captured when s-exp.enso
+  ;; loads: types extended later still work.
+  (let [opened (promise)]
+    (with-server
+      (fn [req]
+        (if (= "/ws" (:uri req))
+          {:ring.websocket/listener (LateListener. opened)}
+          {:status 200 :body (LateBody. "late body")}))
+      nil
+      (fn []
+        (extend-protocol ring.core.protocols/StreamableResponseBody
+          LateBody
+          (write-body-to-stream [b _ ^java.io.OutputStream out]
+            (.write out (.getBytes (.-text ^LateBody b) StandardCharsets/UTF_8))
+            (.close out)))
+        (extend-protocol ring.websocket.protocols/Listener
+          LateListener
+          (on-open [l _] (deliver (.-opened ^LateListener l) :opened))
+          (on-message [_ _ _])
+          (on-pong [_ _ _])
+          (on-error [_ _ _])
+          (on-close [_ _ _ _]))
+        (is (str/includes? (:body (get! "/")) "late body"))
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (let [out (.getOutputStream sock)]
+            (.write out (.getBytes (str "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+                                        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                                        "Sec-WebSocket-Version: 13\r\n\r\n")
+                                   StandardCharsets/ISO_8859_1))
+            (.flush out)
+            (is (= :opened (deref opened 3000 :not-opened)))))))))
+
 (defrecord CountingBody [n]
   ring.core.protocols/StreamableResponseBody
   (write-body-to-stream [_ _ out]
@@ -924,8 +1004,8 @@
   ;; Seq bodies are streamed by enso directly, ahead of the
   ;; StreamableResponseBody check (whose satisfies? is slow on misses),
   ;; even though ring.core.protocols also extends ISeq.
-  (with-redefs-fn {#'enso/write-body-to-stream-fn
-                   (fn [& _] (throw (AssertionError. "protocol path taken")))}
+  (with-redefs-fn {#'enso/write-body-to-stream-var
+                   (clojure.lang.Var/create (fn [& _] (throw (AssertionError. "protocol path taken"))))}
     (fn []
       (with-server
         (fn [_] {:status 200 :body (list "a" "b" 3)}) nil
@@ -951,11 +1031,13 @@
                       (.countDown closed))}}) nil
       (fn []
         (let [seen (atom [])
+              echoed (CountDownLatch. 1)
               listener (reify WebSocket$Listener
                          (onOpen [_ ws]
                            (.request ws 1))
                          (onText [_ ws data last?]
                            (swap! seen conj (str data))
+                           (.countDown echoed)
                            (.request ws 1)
                            nil)
                          (onClose [_ _ _ _]
@@ -967,7 +1049,7 @@
                          (.get 2 TimeUnit/SECONDS))]
           (.await opened 2 TimeUnit/SECONDS)
           (-> (.sendText ^WebSocket client "hello" true) (.get 2 TimeUnit/SECONDS))
-          (Thread/sleep 100)
+          (is (.await echoed 2 TimeUnit/SECONDS))
           (-> (.sendClose ^WebSocket client WebSocket/NORMAL_CLOSURE "bye") (.get 2 TimeUnit/SECONDS))
           (is (.await closed 2 TimeUnit/SECONDS))
           (is (= ["hello"] @received))
@@ -1081,27 +1163,24 @@
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (let [out (.getOutputStream sock)
               in (.getInputStream sock)
-              got-431 (atom false)
-              done (atom false)
+              outcome (promise)
               _ (.start (.unstarted (Thread/ofVirtual)
                                     (fn []
                                       (try
                                         (let [buf (byte-array 4096)
                                               n (.read in buf)]
-                                          (when (pos? n)
-                                            (when (str/includes?
-                                                   (String. buf 0 n StandardCharsets/ISO_8859_1) "431")
-                                              (reset! got-431 true))))
-                                        (reset! done true)
-                                        (catch IOException _ (reset! done true))))))]
+                                          (deliver outcome
+                                                   (and (pos? n)
+                                                        (str/includes?
+                                                         (String. buf 0 n StandardCharsets/ISO_8859_1) "431"))))
+                                        (catch IOException _ (deliver outcome false))))))]
           (try
             (.write out (.getBytes (str "GET / HTTP/1.1\r\nHost: x\r\nX-Big: "
                                         (apply str (repeat 2000 "a"))
                                         "\r\n\r\n") StandardCharsets/ISO_8859_1))
             (.flush out)
             (catch IOException _))
-          (Thread/sleep 200)
-          (is @got-431)))
+          (is (true? (deref outcome 3000 :timed-out)))))
       (finally (enso/stop srv)))))
 
 (deftest graceful-stop-closes-idle-keepalive
@@ -1242,32 +1321,32 @@
 (deftest h3-config-requires-cert-and-key
   ;; Config.build() throws directly — no server startup involved so no
   ;; risk of a shutdown hang.
-  (is (thrown-with-msg? IllegalArgumentException #"http3CertPath"
+  (is (thrown-with-msg? IllegalArgumentException #":http3-cert-path"
                         (-> (com.s_exp.enso.api.Config/builder)
                             (.http3 true)
                             (.build)))
       "http3 without cert path throws"))
 
 (deftest h3-config-validates-udp-payload-size
-  (is (thrown-with-msg? IllegalArgumentException #"http3MaxUdpPayloadSize"
+  (is (thrown-with-msg? IllegalArgumentException #":http3-max-udp-payload-bytes"
                         (-> (com.s_exp.enso.api.Config/builder)
-                            (.http3MaxUdpPayloadSize 500)
+                            (.http3MaxUdpPayloadBytes 500)
                             (.build)))
       "below 1200 rejected")
-  (is (thrown-with-msg? IllegalArgumentException #"http3MaxUdpPayloadSize"
+  (is (thrown-with-msg? IllegalArgumentException #":http3-max-udp-payload-bytes"
                         (-> (com.s_exp.enso.api.Config/builder)
-                            (.http3MaxUdpPayloadSize 70000)
+                            (.http3MaxUdpPayloadBytes 70000)
                             (.build)))
       "above 65527 rejected"))
 
 (deftest h3-config-alt-svc-max-age-negative-rejected
-  (is (thrown-with-msg? IllegalArgumentException #"altSvcMaxAge"
+  (is (thrown-with-msg? IllegalArgumentException #":alt-svc-max-age"
                         (-> (com.s_exp.enso.api.Config/builder)
                             (.altSvcMaxAge -1)
                             (.build)))))
 
 (deftest h3-config-initial-max-streams-bidi-positive
-  (is (thrown-with-msg? IllegalArgumentException #"http3InitialMaxStreamsBidi"
+  (is (thrown-with-msg? IllegalArgumentException #":http3-initial-max-streams-bidi"
                         (-> (com.s_exp.enso.api.Config/builder)
                             (.http3InitialMaxStreamsBidi 0)
                             (.build)))))
@@ -1280,6 +1359,9 @@
 
 (deftest alt-svc-computed-when-explicitly-enabled
   (let [cfg (-> (com.s_exp.enso.api.Config/builder)
+                (.http3 true)
+                (.http3CertPath "c")
+                (.http3KeyPath "k")
                 (.advertiseAltSvc true)
                 (.port 9999)
                 (.build))]
@@ -1294,9 +1376,10 @@
 
 (deftest alt-svc-explicit-false-overrides-http3-auto
   ;; When http3 is on, Alt-Svc defaults to true; explicit false disables.
-  ;; Skip the real http3 flag here (needs cert paths for validation), just
-  ;; exercise the advertiseAltSvcExplicit override branch.
   (let [cfg (-> (com.s_exp.enso.api.Config/builder)
+                (.http3 true)
+                (.http3CertPath "c")
+                (.http3KeyPath "k")
                 (.advertiseAltSvc false)
                 (.build))]
     (is (false? (.-advertiseAltSvc cfg)))
@@ -1304,6 +1387,9 @@
 
 (deftest alt-svc-custom-max-age
   (let [cfg (-> (com.s_exp.enso.api.Config/builder)
+                (.http3 true)
+                (.http3CertPath "c")
+                (.http3KeyPath "k")
                 (.advertiseAltSvc true)
                 (.altSvcMaxAge 300)
                 (.port 8443)
@@ -1312,6 +1398,9 @@
 
 (deftest alt-svc-uses-http3-port-when-set
   (let [cfg (-> (com.s_exp.enso.api.Config/builder)
+                (.http3 true)
+                (.http3CertPath "c")
+                (.http3KeyPath "k")
                 (.advertiseAltSvc true)
                 (.port 8080)
                 (.http3Port 4433)
@@ -1393,7 +1482,6 @@
                                 :http3-cert-path cert-path
                                 :http3-key-path key-path})]
       (try
-        (Thread/sleep 200)
         (let [body (quiche-client-get h3-port)]
           (is (= "h3-hello" body) "GET body round-trips over h3"))
         (finally (enso/stop srv))))
@@ -1414,7 +1502,6 @@
                                 :http3-key-path key-path
                                 :http3-stateless-retry true})]
       (try
-        (Thread/sleep 200)
         (let [body (quiche-client-get h3-port)]
           (is (= "h3-retry-ok" body)
               "retry-challenged handshake completes + response round-trips"))
@@ -1423,7 +1510,7 @@
         (is true))))
 
 (deftest h3-smoke-streaming-file-body
-  ;; Verifies task #200: File bodies stream via multi-chunk DATA instead
+  ;; File bodies stream via multi-chunk DATA instead
   ;; of materialising into a single byte[]. Payload sized to force >=2
   ;; DATA chunks (chunk size is 256 KiB, payload is 600 KiB). Smoke
   ;; check only asserts the client received some body — quiche-client's
@@ -1449,7 +1536,6 @@
                                 :http3-cert-path cert-path
                                 :http3-key-path key-path})]
       (try
-        (Thread/sleep 200)
         (let [body (quiche-client-get h3-port)]
           (is (some? body) "streamed body reached the client")
           (when body
@@ -1459,7 +1545,7 @@
     (do (println "SKIP h3-smoke-streaming-file-body: opt-in with -J-Denso.h3.integration=true")
         (is true))))
 
-;; --- #171 config-surface tests ---------------------------------------------
+;; --- config-surface tests --------------------------------------------------
 
 (deftest server-header-emitted
   (with-server
@@ -1479,41 +1565,34 @@
 
 (deftest max-keep-alive-requests-caps-reuse
   ;; Cap at 2 → third request over the same socket should not be served
-  ;; because the server closed the socket after the second response.
+  ;; because the server closed the socket after the second response. The
+  ;; client already sent more (a third request and a large body behind
+  ;; it), still unread when the server ends the connection: closing then
+  ;; would make the kernel answer with a reset that destroys the two
+  ;; responses before the client reads them, so the server must close
+  ;; lingering. The client reads only after the close happened, which
+  ;; makes the reset certain without lingering.
   (with-server
     (fn [_] {:status 200 :body "ok"})
     {:max-keep-alive-requests 2}
     (fn []
-      (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
-        (let [out (.getOutputStream sock)
-              in (.getInputStream sock)
-              req "GET / HTTP/1.1\r\nHost: x\r\n\r\n"]
-          (dotimes [_ 3]
-            (.write out (.getBytes ^String req StandardCharsets/ISO_8859_1)))
-          (.flush out)
-          (let [full (String. (.readAllBytes in) StandardCharsets/ISO_8859_1)
-                ;; count response start lines
-                n (count (re-seq #"HTTP/1\.1 200" full))]
-            (is (= 2 n) "server served exactly 2 responses before closing")))))))
-
-(deftest worker-executor-override-used
-  ;; Handlers should run on the user-supplied executor's threads.
-  (let [seen (atom nil)
-        tf (reify java.util.concurrent.ThreadFactory
-             (newThread [_ r]
-               (doto (Thread. r "custom-worker")
-                 (.setDaemon true))))
-        pool (java.util.concurrent.Executors/newSingleThreadExecutor tf)]
-    (try
-      (with-server
-        (fn [_]
-          (reset! seen (.getName (Thread/currentThread)))
-          {:status 200 :body "ok"})
-        {:worker-executor pool}
-        (fn []
-          (get! "/")
-          (is (= "custom-worker" @seen))))
-      (finally (.shutdown pool)))))
+      (dotimes [_ 3]
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (let [out (.getOutputStream sock)
+                in (.getInputStream sock)
+                req "GET / HTTP/1.1\r\nHost: x\r\n\r\n"]
+            (dotimes [_ 2]
+              (.write out (.getBytes ^String req StandardCharsets/ISO_8859_1)))
+            (.write out (.getBytes "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 65536\r\n\r\n"
+                                   StandardCharsets/ISO_8859_1))
+            (.write out (byte-array 65536 (byte 97)))
+            (.flush out)
+            (Thread/sleep 300)
+            (let [full (try (String. (.readAllBytes in) StandardCharsets/ISO_8859_1)
+                            (catch java.net.SocketException e (str "reset: " (.getMessage e))))
+                  ;; count response start lines
+                  n (count (re-seq #"HTTP/1\.1 200" full))]
+              (is (= 2 n) (str "server served exactly 2 responses before closing: " full)))))))))
 
 (deftest so-nodelay-honored-on-accepted-socket
   ;; TCP_NODELAY defaults to true; verify explicit false also propagates
@@ -1527,12 +1606,197 @@
     (fn []
       (is (= 200 (:status (get! "/")))))))
 
-(deftest keep-alive-timeout-falls-back-to-idle-timeout
-  ;; :keep-alive-timeout 0 means use :idle-timeout. Server should still
-  ;; serve at least one request within idle-timeout window.
+(deftest idle-timeout-serves-within-its-window
   (with-server
     (fn [_] {:status 200 :body "ok"})
-    {:keep-alive-timeout 0 :idle-timeout 5000}
+    {:idle-timeout 5000}
     (fn []
       (is (= 200 (:status (get! "/")))))))
 
+;; ---- Ring contract -----------------------------------------------------------
+
+(defn- keystore-context
+  "SSLContext with a fresh self-signed certificate for `cn`; trusts any peer
+  certificate when `trust-all` (for client-certificate tests)."
+  ^SSLContext [^String cn trust-all]
+  (let [pass "changeit"
+        ks-file (java.io.File/createTempFile "enso-ring" ".p12")
+        _ (.delete ks-file)
+        proc (-> (ProcessBuilder. ^java.util.List
+                  ["keytool" "-genkeypair" "-alias" cn "-keyalg" "RSA" "-keysize" "2048"
+                   "-storetype" "PKCS12" "-keystore" (.getPath ks-file)
+                   "-storepass" pass "-validity" "365"
+                   "-dname" (str "CN=" cn ", O=enso, C=US")
+                   "-ext" "SAN=DNS:localhost,IP:127.0.0.1"])
+                 (.redirectErrorStream true)
+                 (.start))]
+    (.waitFor proc)
+    (let [ks (KeyStore/getInstance "PKCS12")
+          _ (with-open [in (java.io.FileInputStream. ks-file)]
+              (.load ks in (.toCharArray pass)))
+          kmf (doto (KeyManagerFactory/getInstance (KeyManagerFactory/getDefaultAlgorithm))
+                (.init ks (.toCharArray pass)))
+          tm (reify X509TrustManager
+               (checkClientTrusted [_ _ _])
+               (checkServerTrusted [_ _ _])
+               (getAcceptedIssuers [_] (make-array java.security.cert.X509Certificate 0)))
+          ctx (SSLContext/getInstance "TLS")]
+      (.init ctx (.getKeyManagers kmf) (when trust-all (into-array TrustManager [tm])) nil)
+      (.delete ks-file)
+      ctx)))
+
+(defn- cert-subject-handler [req]
+  {:status 200
+   :body (if-let [^java.security.cert.X509Certificate c (:ssl-client-cert req)]
+           (str (.getSubjectX500Principal c))
+           "none")})
+
+(defn- tls-get-body
+  "GET / over HTTP/1.1 + TLS with `client-ctx`; the response body."
+  [port ^SSLContext client-ctx]
+  (with-open [sock (.createSocket (.getSocketFactory client-ctx) "127.0.0.1" (int port))]
+    (let [out (.getOutputStream sock)]
+      (.write out (.getBytes "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                             StandardCharsets/ISO_8859_1))
+      (.flush out)
+      (:body (parse-response (String. (.readAllBytes (.getInputStream sock)) StandardCharsets/ISO_8859_1))))))
+
+(defn- h2-get
+  "GET `path` over HTTP/2 with `client-ctx`; {:status :body :version}."
+  [port ^SSLContext client-ctx path]
+  (let [client (-> (HttpClient/newBuilder)
+                   (.sslContext client-ctx)
+                   (.version java.net.http.HttpClient$Version/HTTP_2)
+                   (.build))
+        resp (.send client
+                    (.build (java.net.http.HttpRequest/newBuilder (URI. (str "https://localhost:" port path))))
+                    (java.net.http.HttpResponse$BodyHandlers/ofString))]
+    {:status (.statusCode resp) :body (.body resp) :version (str (.version resp))}))
+
+(deftest ssl-client-cert-is-the-verified-peer-certificate
+  (let [server-ctx (keystore-context "server" true)
+        client-with-cert (keystore-context "client-a" true)
+        client-without (trust-all-context)]
+    (with-server cert-subject-handler
+      {:ssl-context server-ctx :ssl-want-client-auth true :http2 true}
+      (fn []
+        (let [port (:port *server*)]
+          (testing "HTTP/1.1"
+            (is (re-find #"CN=client-a" (tls-get-body port client-with-cert)))
+            (is (= "none" (tls-get-body port client-without))))
+          (testing "HTTP/2"
+            (let [r (h2-get port client-with-cert "/")]
+              (is (= "HTTP_2" (:version r)))
+              (is (re-find #"CN=client-a" (:body r))))
+            (is (= "none" (:body (h2-get port client-without "/"))))))))
+    (testing "plain HTTP"
+      (with-server cert-subject-handler nil
+        (fn [] (is (= "none" (:body (get! "/")))))))))
+
+(deftest bodiless-requests-have-nil-body
+  ;; Ring SPEC: :body is the request body "if present". A request without
+  ;; one gets nil on HTTP/1.1 and HTTP/2 (HTTP/3 hands an empty stream).
+  (let [handler (fn [req] {:status 200 :body (if (:body req) (str "body:" (slurp (:body req))) "nil")})]
+    (with-server handler {:ssl-context (keystore-context "server" false) :http2 true}
+      (fn []
+        (is (= "nil" (:body (h2-get (:port *server*) (trust-all-context) "/"))))
+        (let [client (-> (HttpClient/newBuilder) (.sslContext (trust-all-context))
+                         (.version java.net.http.HttpClient$Version/HTTP_2) (.build))
+              resp (.send client
+                          (-> (java.net.http.HttpRequest/newBuilder (URI. (str "https://localhost:" (:port *server*) "/")))
+                              (.POST (java.net.http.HttpRequest$BodyPublishers/ofString "x"))
+                              (.build))
+                          (java.net.http.HttpResponse$BodyHandlers/ofString))]
+          (is (= "body:x" (.body resp))))))
+    (with-server handler nil
+      (fn []
+        (is (= "nil" (:body (get! "/"))))))))
+
+(deftest nil-header-values-are-skipped
+  ;; HTTP/1.1 (ResponseHead). HTTP/2 and HTTP/3 serialise headers
+  ;; themselves and send a nil value as an empty field.
+  (with-server (fn [_] {:status 200 :headers {"x-present" "1" "x-absent" nil} :body "ok"}) nil
+    (fn []
+      (let [r (get! "/")]
+        (is (= 200 (:status r)))
+        (is (= "1" (get-in r [:headers "x-present"])))
+        (is (not (contains? (:headers r) "x-absent")))))))
+
+(deftest response-status-rules
+  (testing "missing :status defaults to 200"
+    (with-server (fn [_] {:body "no status"}) nil
+      (fn [] (is (= 200 (:status (get! "/")))))))
+  (testing "nil or non-integer :status is a handler error naming the key"
+    (doseq [status [nil "200" 2.5]]
+      (with-server (fn [_] {:status status :body "x"})
+        {:error-handler (fn [_ t] {:status 500 :body (str (ex-message t))})}
+        (fn []
+          (let [r (get! "/")]
+            (is (= 500 (:status r)) (pr-str status))
+            (is (str/includes? (:body r) ":status must be an integer") (pr-str status))))))))
+
+(deftest write!-encodes-with-the-response-charset
+  (with-server (fn [_] {:status 200
+                        :headers {"content-type" "text/plain; charset=ISO-8859-1"}
+                        :body (fn [w] (enso/write! w "é") (enso/flush! w))})
+    nil
+    (fn []
+      (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+        (let [out (.getOutputStream sock)]
+          (.write out (.getBytes "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                                 StandardCharsets/ISO_8859_1))
+          (.flush out)
+          (let [raw (.readAllBytes (.getInputStream sock))
+                text (String. raw StandardCharsets/ISO_8859_1)]
+            ;; the body is the single byte 0xE9, not the two UTF-8 bytes
+            (is (str/ends-with? text "\r\n\r\né") (pr-str text))))))))
+
+(defrecord ProbeBody [seen]
+  ring.core.protocols/StreamableResponseBody
+  (write-body-to-stream [_ _ out]
+    (reset! seen (class out))
+    (.write ^java.io.OutputStream out (int \a))
+    (.write ^java.io.OutputStream out (.getBytes "bc" StandardCharsets/UTF_8))
+    (.close ^java.io.OutputStream out)))
+
+(deftest streamable-body-gets-a-plain-output-stream
+  (let [seen (atom nil)]
+    (with-server (fn [_] {:status 200 :body (->ProbeBody seen)}) nil
+      (fn []
+        (is (str/includes? (:body (get! "/")) "abc"))
+        (is (= "com.s_exp.enso.api.ChunkedOutputStream" (.getName ^Class @seen)))))))
+
+(defrecord LaterBody [^String text]
+  ring.core.protocols/StreamableResponseBody
+  (write-body-to-stream [_ _ out]
+    ;; Returns at once; another thread writes, then closes the stream.
+    (future
+      (Thread/sleep 100)
+      (.write ^java.io.OutputStream out (.getBytes text StandardCharsets/UTF_8))
+      (.close ^java.io.OutputStream out))))
+
+(deftest async-handlers
+  (testing "a streamable body written asynchronously ends when its stream is closed"
+    ;; Ring: "The stream may be written asynchronously from asynchronous
+    ;; handlers"; closing it completes the response.
+    (with-server (fn [_ respond _] (respond {:status 200 :body (->LaterBody "written later")}))
+      {:async true}
+      (fn []
+        (let [r (get! "/")]
+          (is (= 200 (:status r)))
+          (is (str/includes? (:body r) "written later") (pr-str r))))))
+  (testing "respond from another thread"
+    (with-server (fn [_ respond _]
+                   (future (respond {:status 201 :body "later"})))
+      {:async true}
+      (fn []
+        (let [r (get! "/")]
+          (is (= 201 (:status r)))
+          (is (= "later" (:body r)))))))
+  (testing "raise goes to the error handler"
+    (with-server (fn [_ _ raise] (raise (ex-info "boom" {})))
+      {:async true :error-handler (fn [_ t] {:status 502 :body (ex-message t)})}
+      (fn []
+        (let [r (get! "/")]
+          (is (= 502 (:status r)))
+          (is (= "boom" (:body r))))))))

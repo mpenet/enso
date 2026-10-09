@@ -1,5 +1,8 @@
+// ABOUTME: HPACK (RFC 7541) header compression: one encoder and one decoder per HTTP/2
+// ABOUTME: connection, with decoded-size limits and an allocation-free streaming encoder.
 package com.s_exp.enso.http2;
 
+import com.s_exp.enso.core.RequestHead;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -9,8 +12,9 @@ import java.util.Map;
 
 /**
  * HPACK (RFC 7541) — one encoder and one decoder per connection. Not
- * thread-safe: each direction has its own instance owned by the connection's
- * framer thread.
+ * thread-safe: the decoder is confined to the connection's framer thread,
+ * the encoder is used under the connection writer's lock (blocks are
+ * encoded while output is packed, so they reach the wire in encoding order).
  *
  * <p>Encoder emission priority:
  * <ol>
@@ -25,6 +29,12 @@ import java.util.Map;
  * </ol>
  * Values are sent as raw octets (no Huffman on egress) — decoders parse both
  * forms; Huffman would trade CPU for a few percent of wire bytes.
+ *
+ * <p>The connection drives both directions without intermediate lists:
+ * {@link Decoder#decode(byte[], int, int, FieldSink, long, long)} hands each
+ * field to a sink and enforces the decoded-size limits as it goes, and the
+ * encoder writes a block field by field into its own reusable buffer
+ * ({@link Encoder#beginBlock}, {@link Encoder#field}, ...).
  */
 public final class Hpack {
 
@@ -114,7 +124,8 @@ public final class Hpack {
 
     static {
         for (int i = 1; i <= STATIC_TABLE_SIZE; i++) {
-            STATIC_ENTRIES[i] = new Entry(STATIC_NAMES[i], STATIC_VALUES[i]);
+            STATIC_ENTRIES[i] = new Entry(STATIC_NAMES[i], STATIC_VALUES[i],
+                                          RequestHead.hasValidChars(STATIC_NAMES[i], STATIC_VALUES[i]));
         }
     }
 
@@ -135,17 +146,29 @@ public final class Hpack {
 
     // ---- Dynamic table --------------------------------------------------
 
-    static final class Entry {
-        final String name;
-        final String value;
+    /**
+     * A table entry is also the decoded field handed out for an indexed
+     * representation, so decoding an indexed field allocates nothing.
+     */
+    static final class Entry extends HeaderField {
         final int size; // per RFC 7541 §4.1: 32 + len(name) + len(value)
+        // The name's hash, compared before the name itself on encoder lookups.
+        final int nameHash;
+        // Decoder entries: the field passed RequestHead.hasValidChars when
+        // inserted, so referencing it again needs no character scan.
+        final boolean validChars;
 
         Entry(String name, String value) {
-            this.name = name;
-            this.value = value;
+            this(name, value, false);
+        }
+
+        Entry(String name, String value, boolean validChars) {
+            super(name, value, false);
             // Field strings are octets carried one per char (ISO-8859-1),
             // so char count is the octet length.
             this.size = 32 + name.length() + value.length();
+            this.nameHash = name.hashCode();
+            this.validChars = validChars;
         }
     }
 
@@ -153,7 +176,8 @@ public final class Hpack {
      * Circular-buffer dynamic table. Indexes are RFC 7541 §2.3.3 style — 0 is
      * the newest entry. Both {@link #at} and {@link #insert} are O(1) amortised.
      * The buffer grows on demand up to whatever count fits inside {@code maxSize},
-     * so pathological entry mixes don't cause repeated reallocations.
+     * so pathological entry mixes don't cause repeated reallocations. Its
+     * length is a power of two, so positions wrap with a mask.
      */
     static final class DynamicTable {
         Entry[] buf = new Entry[16];
@@ -170,7 +194,7 @@ public final class Hpack {
             if (i < 0 || i >= size) {
                 return null;
             }
-            return buf[(head + i) % buf.length];
+            return buf[(head + i) & (buf.length - 1)];
         }
 
         void insert(Entry e) {
@@ -188,7 +212,7 @@ public final class Hpack {
             if (size == buf.length) {
                 grow();
             }
-            head = (head - 1 + buf.length) % buf.length;
+            head = (head - 1) & (buf.length - 1);
             buf[head] = e;
             size++;
             currentSize += e.size;
@@ -202,7 +226,7 @@ public final class Hpack {
         }
 
         private void dropOldest() {
-            int idx = (head + size - 1) % buf.length;
+            int idx = (head + size - 1) & (buf.length - 1);
             Entry removed = buf[idx];
             buf[idx] = null;
             size--;
@@ -213,7 +237,7 @@ public final class Hpack {
             int newCap = buf.length * 2;
             Entry[] fresh = new Entry[newCap];
             for (int i = 0; i < size; i++) {
-                fresh[i] = buf[(head + i) % buf.length];
+                fresh[i] = buf[(head + i) & (buf.length - 1)];
             }
             buf = fresh;
             head = 0;
@@ -222,7 +246,7 @@ public final class Hpack {
 
     // ---- HeaderField (name/value pair, sensitive flag for §6.2.3) -----
 
-    public static final class HeaderField {
+    public static class HeaderField {
         public final String name;
         public final String value;
         public final boolean sensitive;
@@ -240,32 +264,95 @@ public final class Hpack {
 
     // ---- Decoder --------------------------------------------------------
 
+    /** Receives decoded fields in block order. */
+    public interface FieldSink {
+        void field(String name, String value);
+
+        /**
+         * {@link #field}; {@code validChars}: the field is known to pass
+         * {@link RequestHead#hasValidChars} (checked when its table entry
+         * was inserted). Defaults to {@link #field}.
+         */
+        default void field(String name, String value, boolean validChars) {
+            field(name, value);
+        }
+
+        /**
+         * A Literal Never Indexed field (§6.2.3): an intermediary must
+         * re-encode it the same way. Defaults to {@link #field}.
+         */
+        default void sensitiveField(String name, String value) {
+            field(name, value);
+        }
+    }
+
+    /**
+     * The decoded field section passed the decoder's hard limit: decoding
+     * stopped mid-block, so the dynamic table is out of step and the
+     * connection must end.
+     */
+    public static final class HeaderListTooLarge extends IOException {
+        HeaderListTooLarge(long limit) {
+            super("HPACK: decoded header list exceeds " + limit + " bytes");
+        }
+    }
+
+    private static final int HUFFMAN_SCRATCH_INITIAL = 128;
+    private static final int ENCODER_BUFFER_INITIAL = 256;
+
     public static final class Decoder {
         final DynamicTable table;
-        int maxTableSizeSetting; // last value we advertised in SETTINGS
+        // The table size our SETTINGS allow: a size update may not exceed it.
+        final int maxTableSizeSetting;
         // Scratch for Huffman decode output. Reused across every string
         // decoded on this connection; grows on demand. Decoder is thread-
         // confined (owned by the framer vthread), so no locking needed.
-        private byte[] huffmanScratch = new byte[128];
+        private byte[] huffmanScratch = new byte[HUFFMAN_SCRATCH_INITIAL];
+        private final Cursor cursor = new Cursor(null, 0, 0);
 
         public Decoder(int maxTableSize) {
             this.table = new DynamicTable(maxTableSize);
             this.maxTableSizeSetting = maxTableSize;
         }
 
-        void setMaxTableSizeSetting(int newMax) {
-            this.maxTableSizeSetting = newMax;
-            // If the peer never sends a Dynamic Table Size Update, we still
-            // reflect it locally — but a strict spec impl would wait for the
-            // update. Passing the setting is enough for now.
-            if (table.maxSize > newMax) {
-                table.resize(newMax);
+        /** Gives back a Huffman scratch grown by a long string (connection idle). */
+        void releaseScratch() {
+            if (huffmanScratch.length > HUFFMAN_SCRATCH_INITIAL) {
+                huffmanScratch = new byte[HUFFMAN_SCRATCH_INITIAL];
             }
         }
 
+        /** Decodes a whole block into a fresh list, without size limits. */
         public List<HeaderField> decode(byte[] block, int off, int len) throws IOException {
             List<HeaderField> out = new ArrayList<>(16);
-            Cursor c = new Cursor(block, off, len);
+            decode(block, off, len, new FieldSink() {
+                @Override
+                public void field(String name, String value) {
+                    out.add(new HeaderField(name, value));
+                }
+
+                @Override
+                public void sensitiveField(String name, String value) {
+                    out.add(new HeaderField(name, value, true));
+                }
+            }, Long.MAX_VALUE, Long.MAX_VALUE);
+            return out;
+        }
+
+        /**
+         * Decodes a block, handing each field to {@code sink} while the
+         * decoded size (RFC 9113 §6.5.2: 32 + name + value octets per field)
+         * stays within {@code softLimit}. Past it decoding goes on, keeping
+         * the dynamic table in step, but fields are no longer handed out;
+         * past {@code hardLimit} it stops with {@link HeaderListTooLarge}.
+         * Returns the decoded size: above {@code softLimit} means the sink
+         * saw only a prefix of the section.
+         */
+        public long decode(byte[] block, int off, int len, FieldSink sink,
+                           long softLimit, long hardLimit) throws IOException {
+            Cursor c = cursor;
+            c.reset(block, off, len);
+            long size = 0;
             // Per RFC 7541 §4.2: any dynamic table size update representations
             // MUST appear at the very beginning of the header block, before any
             // header field. Once we've seen a non-size-update, further size
@@ -274,7 +361,10 @@ public final class Hpack {
 
             while (c.remaining() > 0) {
                 int first = c.peek();
-
+                String name;
+                String value;
+                boolean sensitive = false;
+                boolean validChars = false;
                 if ((first & 0x80) != 0) {
                     // 1xxxxxxx — Indexed Header Field (§6.1)
                     int idx = decodeInteger(c, 7);
@@ -285,25 +375,15 @@ public final class Hpack {
                     if (e == null) {
                         throw new IOException("HPACK: index " + idx + " out of range");
                     }
-                    out.add(new HeaderField(e.name, e.value));
-                    sawHeaderField = true;
+                    name = e.name;
+                    value = e.value;
+                    validChars = e.validChars;
                 } else if ((first & 0xC0) == 0x40) {
                     // 01xxxxxx — Literal with Incremental Indexing (§6.2.1)
-                    int idx = decodeInteger(c, 6);
-                    String name;
-                    if (idx == 0) {
-                        name = decodeString(c);
-                    } else {
-                        Entry e = lookup(idx);
-                        if (e == null) {
-                            throw new IOException("HPACK: name-index " + idx + " out of range");
-                        }
-                        name = e.name;
-                    }
-                    String value = decodeString(c);
-                    out.add(new HeaderField(name, value));
-                    table.insert(new Entry(name, value));
-                    sawHeaderField = true;
+                    name = literalName(c, decodeInteger(c, 6));
+                    value = decodeString(c);
+                    validChars = RequestHead.hasValidChars(name, value);
+                    table.insert(new Entry(name, value, validChars));
                 } else if ((first & 0xE0) == 0x20) {
                     // 001xxxxx — Dynamic Table Size Update (§6.3). Must precede
                     // all header fields per §4.2.
@@ -316,41 +396,41 @@ public final class Hpack {
                         throw new IOException("HPACK: size update exceeds SETTINGS advertisement");
                     }
                     table.resize(newMax);
-                } else if ((first & 0xF0) == 0x10) {
-                    // 0001xxxx — Literal Never Indexed (§6.2.3)
-                    int idx = decodeInteger(c, 4);
-                    String name;
-                    if (idx == 0) {
-                        name = decodeString(c);
-                    } else {
-                        Entry e = lookup(idx);
-                        if (e == null) {
-                            throw new IOException("HPACK: name-index " + idx + " out of range");
-                        }
-                        name = e.name;
-                    }
-                    String value = decodeString(c);
-                    out.add(new HeaderField(name, value, true));
-                    sawHeaderField = true;
+                    continue;
                 } else {
-                    // 0000xxxx — Literal without Indexing (§6.2.2)
-                    int idx = decodeInteger(c, 4);
-                    String name;
-                    if (idx == 0) {
-                        name = decodeString(c);
+                    // 0001xxxx — Literal Never Indexed (§6.2.3), or
+                    // 0000xxxx — Literal without Indexing (§6.2.2). Neither
+                    // touches the table.
+                    sensitive = (first & 0xF0) == 0x10;
+                    name = literalName(c, decodeInteger(c, 4));
+                    value = decodeString(c);
+                }
+                sawHeaderField = true;
+                // Field strings are octets, one per char.
+                size += 32L + name.length() + value.length();
+                if (size > hardLimit) {
+                    throw new HeaderListTooLarge(hardLimit);
+                }
+                if (size <= softLimit) {
+                    if (sensitive) {
+                        sink.sensitiveField(name, value);
                     } else {
-                        Entry e = lookup(idx);
-                        if (e == null) {
-                            throw new IOException("HPACK: name-index " + idx + " out of range");
-                        }
-                        name = e.name;
+                        sink.field(name, value, validChars);
                     }
-                    String value = decodeString(c);
-                    out.add(new HeaderField(name, value));
-                    sawHeaderField = true;
                 }
             }
-            return out;
+            return size;
+        }
+
+        private String literalName(Cursor c, int idx) throws IOException {
+            if (idx == 0) {
+                return decodeString(c);
+            }
+            Entry e = lookup(idx);
+            if (e == null) {
+                throw new IOException("HPACK: name-index " + idx + " out of range");
+            }
+            return e.name;
         }
 
         /**
@@ -405,6 +485,9 @@ public final class Hpack {
         private int pendingSizeUpdate = -1;
         // Smallest size set since the last block (§4.2); -1 = none.
         private int pendingMinSize = -1;
+        // The block being encoded, reused for every block: [0, len).
+        private byte[] buf = new byte[ENCODER_BUFFER_INITIAL];
+        private int len;
 
         public Encoder(int maxTableSize) {
             this.table = new DynamicTable(maxTableSize);
@@ -426,59 +509,184 @@ public final class Hpack {
 
         /** Encode a list of header fields into a fresh byte[]. */
         public byte[] encode(List<HeaderField> fields) {
-            // Exact upper bound: strings are one octet per char, plus at
-            // most 5 octets for each of the three prefixed integers (index,
-            // name length, value length) and 5 for each of two size updates.
-            int cap = 10;
+            beginBlock();
             for (HeaderField hf : fields) {
-                cap += 15 + hf.name.length() + hf.value.length();
+                field(hf.name, hf.value, hf.sensitive);
             }
-            byte[] buf = new byte[cap];
-            int p = 0;
+            return java.util.Arrays.copyOf(buf, len);
+        }
+
+        /** Gives back a buffer grown by a large block, between blocks (connection idle). */
+        void releaseBuffer() {
+            if (buf.length > ENCODER_BUFFER_INITIAL) {
+                buf = new byte[ENCODER_BUFFER_INITIAL];
+                len = 0;
+            }
+        }
+
+        /** The block encoded since {@link #beginBlock}: {@code buffer()[0, length())}. */
+        public byte[] buffer() {
+            return buf;
+        }
+
+        public int length() {
+            return len;
+        }
+
+        /**
+         * Starts a block in the reused buffer, beginning with any pending
+         * Dynamic Table Size Update. Every block started must reach the peer
+         * in order: the table changes as fields are encoded.
+         */
+        public void beginBlock() {
+            len = 0;
             if (pendingSizeUpdate >= 0) {
+                ensure(10);
                 // §6.3: 001xxxxx pattern, 5-bit prefix. When the size dipped
                 // below the final value since the last block, signal the
                 // minimum first (§4.2) so the peer evicts as we did.
                 if (pendingMinSize < pendingSizeUpdate) {
-                    p = encodeInteger(buf, p, 5, 0x20, pendingMinSize);
+                    len = encodeInteger(buf, len, 5, 0x20, pendingMinSize);
                 }
-                p = encodeInteger(buf, p, 5, 0x20, pendingSizeUpdate);
+                len = encodeInteger(buf, len, 5, 0x20, pendingSizeUpdate);
                 pendingSizeUpdate = -1;
                 pendingMinSize = -1;
             }
-            for (HeaderField hf : fields) {
-                String name = hf.name;
-                String value = hf.value;
-                int policy = hf.sensitive ? NEVER_INDEXED : indexingPolicy(name);
-                int fullIdx = policy == NEVER_INDEXED ? 0 : staticFullIndex(name, value);
-                Integer staticName = STATIC_NAME_INDEX.get(name);
-                int nameIdx = staticName == null ? 0 : staticName;
-                // One pass over the dynamic table: exact (name, value) match,
-                // else the newest entry with this name.
-                for (int i = 0; fullIdx == 0 && i < table.size; i++) {
-                    Entry e = table.at(i);
-                    if (e.name.equals(name)) {
+        }
+
+        /** Most octets {@link #field} can emit for this field. */
+        public static int maxFieldLength(String name, String value) {
+            // Strings are one octet per char, plus at most 5 octets for each
+            // of the three prefixed integers (index, name length, value length).
+            return 15 + name.length() + value.length();
+        }
+
+        /** Appends {@code :status}. */
+        public void status(int status) {
+            int idx = switch (status) {
+                case 200 -> 8;
+                case 204 -> 9;
+                case 206 -> 10;
+                case 304 -> 11;
+                case 400 -> 12;
+                case 404 -> 13;
+                case 500 -> 14;
+                default -> 0;
+            };
+            if (idx > 0) {
+                ensure(1);
+                buf[len++] = (byte) (0x80 | idx);
+            } else {
+                field(":status", statusString(status), false);
+            }
+        }
+
+        public void field(String name, String value) {
+            field(name, value, false);
+        }
+
+        /**
+         * Appends a field whose value is a number, written as decimal
+         * digits without building a String unless the policy indexes it.
+         */
+        public void field(String name, long value) {
+            if (value < 0 || indexingPolicy(name) == INCREMENTAL) {
+                field(name, Long.toString(value), false);
+                return;
+            }
+            Integer staticName = STATIC_NAME_INDEX.get(name);
+            int nameIdx = staticName == null ? dynamicNameIndex(name) : staticName;
+            int pattern = indexingPolicy(name) == NEVER_INDEXED ? 0x10 : 0x00;
+            ensure(15 + name.length() + 20);
+            if (nameIdx > 0) {
+                len = encodeInteger(buf, len, 4, pattern, nameIdx);
+            } else {
+                buf[len++] = (byte) pattern;
+                len = writeString(buf, len, name);
+            }
+            int digits = digits(value);
+            buf[len++] = (byte) digits;
+            for (int i = len + digits - 1; i >= len; i--) {
+                buf[i] = (byte) ('0' + (int) (value % 10));
+                value /= 10;
+            }
+            len += digits;
+        }
+
+        private static int digits(long v) {
+            int n = 1;
+            while (v >= 10) {
+                v /= 10;
+                n++;
+            }
+            return n;
+        }
+
+        private void field(String name, String value, boolean sensitive) {
+            ensure(maxFieldLength(name, value));
+            int policy = sensitive ? NEVER_INDEXED : indexingPolicy(name);
+            if (policy == INCREMENTAL && 32 + name.length() + value.length() > table.maxSize / 4 * 3) {
+                // An entry this large would evict most of the table (and an
+                // entry over the whole table empties it): as nghttp2 does,
+                // it isn't indexed.
+                policy = WITHOUT_INDEXING;
+            }
+            int fullIdx = policy == NEVER_INDEXED ? 0 : staticFullIndex(name, value);
+            Integer staticName = STATIC_NAME_INDEX.get(name);
+            int nameIdx = staticName == null ? 0 : staticName;
+            // One pass over the dynamic table (at most 128 entries, a few
+            // dozen in practice), comparing cached name hashes first: exact
+            // (name, value) match, else the newest entry with this name. A
+            // hash index would cost a value hash per field and upkeep per
+            // insert and eviction, more than this scan at these sizes.
+            if (fullIdx == 0 && table.size > 0) {
+                int h = name.hashCode();
+                Entry[] entries = table.buf;
+                int mask = entries.length - 1;
+                int head = table.head;
+                for (int i = 0; i < table.size; i++) {
+                    Entry e = entries[(head + i) & mask];
+                    if (e.nameHash == h && e.name.equals(name)) {
                         if (policy != NEVER_INDEXED && e.value.equals(value)) {
                             fullIdx = STATIC_TABLE_SIZE + 1 + i;
+                            break;
                         } else if (nameIdx == 0) {
                             nameIdx = STATIC_TABLE_SIZE + 1 + i;
                         }
                     }
                 }
-                if (fullIdx > 0) {
-                    // §6.1 Indexed Header Field — 1-byte emit for small
-                    // indexes, no dynamic-table mutation.
-                    p = encodeInteger(buf, p, 7, 0x80, fullIdx);
-                } else if (policy == INCREMENTAL) {
-                    p = writeLiteral(buf, p, 6, 0x40, nameIdx, name, value);
-                    table.insert(new Entry(name, value));
-                } else if (policy == WITHOUT_INDEXING) {
-                    p = writeLiteral(buf, p, 4, 0x00, nameIdx, name, value);
-                } else {
-                    p = writeLiteral(buf, p, 4, 0x10, nameIdx, name, value);
+            }
+            if (fullIdx > 0) {
+                // §6.1 Indexed Header Field — 1-byte emit for small
+                // indexes, no dynamic-table mutation.
+                len = encodeInteger(buf, len, 7, 0x80, fullIdx);
+            } else if (policy == INCREMENTAL) {
+                len = writeLiteral(buf, len, 6, 0x40, nameIdx, name, value);
+                table.insert(new Entry(name, value));
+            } else if (policy == WITHOUT_INDEXING) {
+                len = writeLiteral(buf, len, 4, 0x00, nameIdx, name, value);
+            } else {
+                len = writeLiteral(buf, len, 4, 0x10, nameIdx, name, value);
+            }
+        }
+
+        private int dynamicNameIndex(String name) {
+            int h = name.hashCode();
+            Entry[] entries = table.buf;
+            int mask = entries.length - 1;
+            for (int i = 0; i < table.size; i++) {
+                Entry e = entries[(table.head + i) & mask];
+                if (e.nameHash == h && e.name.equals(name)) {
+                    return STATIC_TABLE_SIZE + 1 + i;
                 }
             }
-            return java.util.Arrays.copyOf(buf, p);
+            return 0;
+        }
+
+        private void ensure(int n) {
+            if (len + n > buf.length) {
+                buf = java.util.Arrays.copyOf(buf, Math.max(len + n, buf.length * 2));
+            }
         }
 
         private static final int INCREMENTAL = 0;
@@ -487,13 +695,17 @@ public final class Hpack {
 
         // Credentials are never indexed (§7.1.3: low-entropy secrets in a
         // shared table invite compression-based guessing); per-response
-        // values would only churn the dynamic table, evicting entries that
-        // do repeat. Close to nghttp2's policy.
+        // values (lengths, validators, request and trace ids) would only
+        // churn the dynamic table, evicting entries that do repeat. Close
+        // to nghttp2's policy.
         private static int indexingPolicy(String name) {
             return switch (name) {
                 case "authorization", "proxy-authorization", "cookie", "set-cookie" ->
                     NEVER_INDEXED;
-                case "content-length", "content-range", "etag", "location" ->
+                case "content-length", "content-range", "etag", "location",
+                     "x-request-id", "request-id", "x-correlation-id", "x-trace-id",
+                     "traceparent", "tracestate", "x-amzn-trace-id",
+                     "x-b3-traceid", "x-b3-spanid", "x-b3-parentspanid" ->
                     WITHOUT_INDEXING;
                 default -> INCREMENTAL;
             };
@@ -540,7 +752,7 @@ public final class Hpack {
         // Field strings are octets, one per char (ISO-8859-1) as on the
         // decode side. Chars above U+00FF have no octet form and become
         // '?' — truncating them could forge CR/LF/NUL octets.
-        private int writeString(byte[] buf, int p, String s) {
+        private static int writeString(byte[] buf, int p, String s) {
             int n = s.length();
             // High bit = 0 → raw literal; length uses 7-bit prefix.
             p = encodeInteger(buf, p, 7, 0x00, n);
@@ -550,6 +762,23 @@ public final class Hpack {
             }
             return p;
         }
+    }
+
+    // Codes 100..599 pre-formatted so a :status outside the static table
+    // skips Integer.toString per response.
+    private static final int STATUS_MIN = 100;
+    private static final String[] STATUS_STRINGS = buildStatusStrings();
+
+    private static String[] buildStatusStrings() {
+        String[] s = new String[500];
+        for (int i = 0; i < s.length; i++) s[i] = Integer.toString(STATUS_MIN + i);
+        return s;
+    }
+
+    static String statusString(int code) {
+        int idx = code - STATUS_MIN;
+        if (idx >= 0 && idx < STATUS_STRINGS.length) return STATUS_STRINGS[idx];
+        return Integer.toString(code);
     }
 
     // ---- Integer codec (RFC 7541 §5.1) ---------------------------------
@@ -609,12 +838,16 @@ public final class Hpack {
     // ---- Cursor helper --------------------------------------------------
 
     public static final class Cursor {
-        final byte[] buf;
-        final int off;
-        final int limit;
+        byte[] buf;
+        int off;
+        int limit;
         int pos;
 
         public Cursor(byte[] buf, int off, int len) {
+            reset(buf, off, len);
+        }
+
+        void reset(byte[] buf, int off, int len) {
             this.buf = buf;
             this.off = off;
             this.limit = len;

@@ -1,0 +1,6 @@
+GET / HTTP/1.1
+Host: x
+Connection: close
+Cookie: a=b; c=d
+Accept-Encoding: gzip
+

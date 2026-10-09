@@ -1,3 +1,5 @@
+// ABOUTME: QPACK field sections under a dynamic table capacity of 0: the response encoders the loop
+// ABOUTME: uses, plus list-based encode/decode used by the test client and as the reference decoder.
 package com.s_exp.enso.http3.qpack;
 
 import java.nio.ByteBuffer;
@@ -192,9 +194,7 @@ public final class QpackFieldSection {
     /**
      * Encode QPACK bytes directly into {@code out} at its current position
      * without allocating an intermediate byte[]. Returns the number of
-     * bytes written. Used by {@link com.s_exp.enso.http3.Http3FrameWriter}
-     * to fold header encoding into the outbound frame envelope (task
-     * #123).
+     * bytes written.
      */
     public static int encodeInto(ByteBuffer out, Iterable<String[]> headers) {
         int start = out.position();
@@ -202,7 +202,7 @@ public final class QpackFieldSection {
         out.put((byte) 0x00);
         out.put((byte) 0x00);
         // Take the indexed fast path when caller supplies a List (avoids
-        // Iterator alloc — task #129).
+        // Iterator alloc).
         if (headers instanceof java.util.List<?>) {
             @SuppressWarnings("unchecked")
             java.util.List<String[]> list = (java.util.List<String[]>) headers;
@@ -215,8 +215,15 @@ public final class QpackFieldSection {
     }
 
     private static void encodeOne(ByteBuffer out, String[] hf) {
-        String name = hf[0].toLowerCase(java.util.Locale.ROOT);
-        String value = hf[1] == null ? "" : hf[1];
+        encodeField(out, hf[0].toLowerCase(java.util.Locale.ROOT), hf[1] == null ? "" : hf[1]);
+    }
+
+    /**
+     * Appends one field line for a lowercase {@code name}: an indexed static
+     * entry, a literal with a static name reference, or a literal with a
+     * literal name. Writes at most {@link #maxEncodedLength} bytes.
+     */
+    public static void encodeField(ByteBuffer out, String name, String value) {
         int exact = QpackStaticTable.findExact(name, value);
         if (exact >= 0) {
             NBitInteger.encode(out, 6, 0xC0, exact);
@@ -230,6 +237,57 @@ public final class QpackFieldSection {
         }
         NBitString.encode(out, 3, 0x20, name, true);
         NBitString.encode(out, 7, 0, value, true);
+    }
+
+    // ":status" static entries by code, else -1.
+    private static final int[] STATUS_INDEX = new int[600];
+    private static final int STATUS_NAME_INDEX = QpackStaticTable.findName(":status");
+
+    static {
+        java.util.Arrays.fill(STATUS_INDEX, -1);
+        for (int i = 0; i < QpackStaticTable.size(); i++) {
+            String[] e = QpackStaticTable.get(i);
+            if (e[0].equals(":status")) STATUS_INDEX[Integer.parseInt(e[1])] = i;
+        }
+    }
+
+    /** Appends the :status field line for a 3-digit {@code status}: at most 5 bytes, no allocation. */
+    public static void encodeStatus(ByteBuffer out, int status) {
+        int idx = status >= 0 && status < STATUS_INDEX.length ? STATUS_INDEX[status] : -1;
+        if (idx >= 0) {
+            NBitInteger.encode(out, 6, 0xC0, idx);
+            return;
+        }
+        NBitInteger.encode(out, 4, 0x50, STATUS_NAME_INDEX);
+        out.put((byte) 3);
+        out.put((byte) ('0' + status / 100 % 10));
+        out.put((byte) ('0' + status / 10 % 10));
+        out.put((byte) ('0' + status % 10));
+    }
+
+    /**
+     * Appends a field whose value is the decimal form of {@code value >= 0}
+     * (content-length), without building a String: a static name reference
+     * when the name has one. Writes at most {@link #maxEncodedLength}
+     * of the name plus 26 bytes.
+     */
+    public static void encodeDecimal(ByteBuffer out, String name, long value) {
+        int digits = 1;
+        for (long v = value; v >= 10; v /= 10) digits++;
+        int nameIdx = QpackStaticTable.findName(name);
+        if (nameIdx >= 0) {
+            NBitInteger.encode(out, 4, 0x50, nameIdx);
+        } else {
+            NBitString.encode(out, 3, 0x20, name, true);
+        }
+        NBitInteger.encode(out, 7, 0, digits);
+        int at = out.position() + digits;
+        long v = value;
+        for (int i = 1; i <= digits; i++) {
+            out.put(at - i, (byte) ('0' + (int) (v % 10)));
+            v /= 10;
+        }
+        out.position(at);
     }
 
     /**

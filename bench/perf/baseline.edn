@@ -1,0 +1,14 @@
+;; ABOUTME: Per-platform allocation-per-request baselines for the perf gate (s-exp.enso-perf-gate).
+;; ABOUTME: Written by `clojure -M:perf-gate update`; see doc/testing.md before raising a number.
+{:tolerance {:ratio 1.2, :slack-bytes 48},
+ :platforms
+ {"Mac OS X aarch64"
+  {:java "25.0.4+7-LTS-jvmci-b01",
+   :git "cac93f4",
+   :alloc-bytes-per-request
+   {:h1-get 394,
+    :h1-get-rate 400,
+    :h1-pipelined 235,
+    :h2-get 1125,
+    :h3-get 791,
+    :ws-echo 332}}}}

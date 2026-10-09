@@ -1,3 +1,5 @@
+// ABOUTME: QPACK static table (RFC 9204 Appendix A) with name and name/value lookups
+// ABOUTME: used by the QPACK encoder and decoder.
 package com.s_exp.enso.http3.qpack;
 
 import java.util.HashMap;

@@ -1,3 +1,5 @@
+// ABOUTME: HTTP/3 unidirectional stream type constants (RFC 9114 section 6.2):
+// ABOUTME: control, push and the QPACK encoder/decoder streams.
 package com.s_exp.enso.http3;
 
 /**

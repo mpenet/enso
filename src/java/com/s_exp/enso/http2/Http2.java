@@ -1,3 +1,5 @@
+// ABOUTME: RFC 9113 vocabulary shared by the HTTP/2 driver: frame types, flags, error codes,
+// ABOUTME: SETTINGS identifiers, protocol defaults, the preface and the connection-error type.
 package com.s_exp.enso.http2;
 
 /**

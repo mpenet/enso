@@ -1,3 +1,5 @@
+// ABOUTME: Mints and verifies stateless Retry tokens: HMAC-bound to the client address and family,
+// ABOUTME: the original and Retry connection ids, and a 10 s lifetime.
 package com.s_exp.enso.quiche;
 
 import java.net.InetSocketAddress;
@@ -11,11 +13,12 @@ import javax.crypto.spec.SecretKeySpec;
  * §8.1.2). The listener uses these to force a round-trip before allocating
  * connection state, defeating handshake floods.
  *
- * <p>Layout: {@code HMAC(32) || magic(4) || issuedAt(8) || peerIp(4|16)
- * || peerPort(2) || odcid_len(1) || odcid(≤20) || scid_len(1) ||
- * scid(≤20)}. The keyed-HMAC(SHA-256) tag covers everything after it, so
+ * <p>Layout: {@code HMAC(32) || magic(4) || issuedAt(8) || ipLen(1) ||
+ * peerIp(4|16) || peerPort(2) || odcid_len(1) || odcid(≤20) || scid_len(1)
+ * || scid(≤20)}. The keyed-HMAC(SHA-256) tag covers everything after it, so
  * an attacker who can see one valid token can't fabricate another for a
- * different peer. {@code scid} is the Source Connection ID of our Retry
+ * different peer. The address length binds the family: the bytes of an
+ * IPv6 token can't be read as a valid IPv4 layout. {@code scid} is the Source Connection ID of our Retry
  * packet: the client's retried Initial MUST use it as its Destination
  * Connection ID (RFC 9000 §17.2.5.2), and the server adopts that DCID as
  * the connection's ID, so binding it stops a client from choosing its
@@ -59,12 +62,11 @@ public final class RetryToken {
      * retried Initial; {@link #verify} then checks all three.
      */
     public byte[] mint(InetSocketAddress peer, byte[] odcid, byte[] retryScid) {
-        // Build body directly into `out[HMAC_LEN..]`, then HMAC over that
-        // region, then write tag into `out[0..HMAC_LEN]`. Task #145
-        // dropped the alloc from verify; this drops mint from 4 allocs
-        // to 1 (the returned array).
+        // Body built directly into `out[HMAC_LEN..]`, HMAC over that
+        // region, tag into `out[0..HMAC_LEN]`: one allocation, the
+        // returned array.
         byte[] ip = peer.getAddress().getAddress();
-        int addrLen = ip.length + 2; // ip + 2-byte port (matches verify layout)
+        int addrLen = 1 + ip.length + 2; // length, ip, 2-byte port (matches verify layout)
         int bodyLen = MAGIC.length + ISSUED_AT_LEN + addrLen + 1 + odcid.length
             + 1 + retryScid.length;
         byte[] out = new byte[HMAC_LEN + bodyLen];
@@ -74,6 +76,7 @@ public final class RetryToken {
         for (int i = 7; i >= 0; i--) {
             out[p++] = (byte) ((issuedAt >>> (i * 8)) & 0xFF);
         }
+        out[p++] = (byte) ip.length;
         System.arraycopy(ip, 0, out, p, ip.length); p += ip.length;
         int port = peer.getPort();
         out[p++] = (byte) ((port >>> 8) & 0xFF);
@@ -130,8 +133,9 @@ public final class RetryToken {
         long nowSec = System.currentTimeMillis() / 1000L;
         long age = nowSec - issuedAt;
         if (age < -1 || age > TOKEN_MAX_AGE_SECONDS) return null;
-        // Peer IP: 4 bytes v4 or 16 bytes v6.
+        // Peer IP: its length (4 for v4, 16 for v6), then its bytes.
         byte[] ip = peer.getAddress().getAddress();
+        if (p >= end || (buf[p++] & 0xFF) != ip.length) return null;
         for (int i = 0; i < ip.length; i++) {
             if (p >= end || buf[p++] != ip[i]) return null;
         }
@@ -153,6 +157,19 @@ public final class RetryToken {
         byte[] odcid = new byte[odcidLen];
         System.arraycopy(buf, odcidOff, odcid, 0, odcidLen);
         return odcid;
+    }
+
+    /**
+     * True when {@code token} has the shape of a token this class mints
+     * (length and magic), whether or not it verifies. Distinguishes a
+     * stale or misdirected Retry token of ours from a foreign one.
+     */
+    public static boolean looksMinted(byte[] token) {
+        if (token.length < HMAC_LEN + MAGIC.length + ISSUED_AT_LEN + 2) return false;
+        for (int i = 0; i < MAGIC.length; i++) {
+            if (token[HMAC_LEN + i] != MAGIC[i]) return false;
+        }
+        return true;
     }
 
     private static boolean constantTimeEquals(byte[] a, int aOff,

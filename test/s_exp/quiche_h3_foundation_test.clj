@@ -1,3 +1,5 @@
+;; ABOUTME: Unit tests of the H3 and QPACK primitives: varints, prefixed integers and strings,
+;; ABOUTME: Huffman, the static table, frame reading and the field-section decoders.
 (ns s-exp.quiche-h3-foundation-test
   "Unit tests for the low-level H3 + QPACK primitives: varint, N-bit
   integer/string codecs, static table lookups. These have no dependency on
@@ -108,6 +110,15 @@
   (is (= -1 (QpackStaticTable/findExact ":method" "TRACE")))
   (is (= -1 (QpackStaticTable/findName "x-custom"))))
 
+(defn- frame-bytes
+  "An HTTP/3 frame: type varint, length varint, payload."
+  ^bytes [type ^bytes payload]
+  (let [out (byte-array (+ 16 (alength payload)))
+        at (Http3Varint/encode out 0 (long type))
+        at (Http3Varint/encode out at (long (alength payload)))]
+    (System/arraycopy payload 0 out at (alength payload))
+    (java.util.Arrays/copyOf out (+ at (alength payload)))))
+
 (deftest h3-frame-writer-basic
   ;; SETTINGS frame with one id/value pair.
   (let [bb (Http3FrameWriter/settings (long-array [0x06 4096]))
@@ -118,7 +129,7 @@
 
 (deftest h3-frame-reader-single-headers
   (let [payload (byte-array [0x01 0x02 0x03])
-        wire (to-bytes (Http3FrameWriter/headers payload))
+        wire (frame-bytes Http3FrameType/HEADERS payload)
         reader (Http3FrameReader.)]
     (.feed reader (ByteBuffer/wrap wire))
     (let [f (.poll reader)]
@@ -130,7 +141,7 @@
   ;; Feed the frame in one-byte chunks — parser must survive partial
   ;; input for both header AND payload.
   (let [payload (byte-array [10 20 30 40 50])
-        wire (to-bytes (Http3FrameWriter/headers payload))
+        wire (frame-bytes Http3FrameType/HEADERS payload)
         reader (Http3FrameReader.)]
     (doseq [b wire]
       (.feed reader (ByteBuffer/wrap (byte-array [b]))))
@@ -142,7 +153,7 @@
   ;; Large DATA frame arriving in three chunks. Reader must stream them
   ;; without buffering the full payload.
   (let [body (byte-array (repeat 1500 42))
-        wire (to-bytes (Http3FrameWriter/data body))
+        wire (frame-bytes Http3FrameType/DATA body)
         reader (Http3FrameReader.)
         halves [(java.util.Arrays/copyOfRange wire (int 0) (int 700))
                 (java.util.Arrays/copyOfRange wire (int 700) (alength wire))]]
@@ -244,6 +255,19 @@
   ;; Name ref :authority (static 0), plain value claiming 10 bytes, 2 present.
   (let [fs (byte-array (map unchecked-byte [0x00 0x00 0x50 0x0A 0x61 0x62]))]
     (is (= 0x200 (decode-error-code fs)))))
+
+(deftest qpack-overlong-integer-rejected-by-both-decoders
+  ;; Delta Base 127 followed by nine zero continuation bytes and a tenth
+  ;; zero chunk at bit 63: an overlong encoding of 127. The list decoder
+  ;; and the production decoder must both refuse it with the same code.
+  (let [fs (byte-array (map unchecked-byte [0x00 0x7F 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x00]))
+        production (try (.decode (com.s_exp.enso.http3.qpack.QpackDecoder.) fs 0 (alength fs) 0
+                                 (reify com.s_exp.enso.http3.qpack.QpackDecoder$FieldSink
+                                   (field [_ _ _])))
+                        :no-error
+                        (catch com.s_exp.enso.http3.qpack.QpackException e (.errorCode e)))]
+    (is (= 0x200 production) "QpackDecoder: QPACK_DECOMPRESSION_FAILED")
+    (is (= 0x200 (decode-error-code fs)) "QpackFieldSection.decode: QPACK_DECOMPRESSION_FAILED")))
 
 (deftest qpack-decoded-field-section-size-capped
   ;; 2000 × indexed static 62 (x-xss-protection: 1; mode=block) = 2 KB

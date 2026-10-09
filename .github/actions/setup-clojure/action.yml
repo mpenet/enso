@@ -1,0 +1,31 @@
+# ABOUTME: Composite action installing a Temurin JDK (25 unless asked otherwise) + the Clojure CLI and
+# ABOUTME: restoring the Maven/gitlibs cache; shared by the test, nightly and release workflows.
+name: Set up JDK and Clojure
+description: Temurin JDK, Clojure CLI and dependency cache
+inputs:
+  java-version:
+    description: Temurin JDK feature release
+    default: '25'
+runs:
+  using: composite
+  steps:
+    - name: Set up JDK ${{ inputs.java-version }}
+      uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+      with:
+        distribution: temurin
+        java-version: ${{ inputs.java-version }}
+
+    - name: Set up Clojure
+      uses: DeLaGuardo/setup-clojure@3fe9b3ae632c6758d0b7757b0838606ef4287b08 # 13.4
+      with:
+        cli: 1.12.5.1654
+
+    - name: Cache Maven / Gitlibs
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          ~/.m2/repository
+          ~/.gitlibs
+          ~/.deps.clj
+        key: ${{ runner.os }}-clj-${{ hashFiles('deps.edn') }}
+        restore-keys: ${{ runner.os }}-clj-

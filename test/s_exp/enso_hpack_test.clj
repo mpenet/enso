@@ -1,7 +1,9 @@
+;; ABOUTME: Unit tests for the HPACK encoder/decoder and Huffman codec: dynamic table size updates,
+;; ABOUTME: RFC 7541 vectors, integer overflow rejection and indexing policy for sensitive fields.
 (ns s-exp.enso-hpack-test
-  "HPACK encoder + Huffman table decoder tests. Covers session changes
-  #209 (peer table size → Dynamic Table Size Update emission) and #238
-  (nibble table-driven Huffman decoder round-trip fuzz)."
+  "HPACK encoder + Huffman table decoder tests: Dynamic Table Size Update
+  emission after a peer table size change, and round-trip fuzz of the
+  nibble table-driven Huffman decoder."
   (:require [clojure.test :refer [deftest testing is]])
   (:import (com.s_exp.enso.http2 Hpack Hpack$Encoder Hpack$Decoder Hpack$HeaderField HpackHuffman)
            (java.util ArrayList Random)))
@@ -222,3 +224,16 @@
             out (.decode dec block 0 (alength block))]
         (is (= [["set-cookie" "a=b"] ["content-length" "5"] ["content-type" "text/html"]]
                (mapv (fn [^Hpack$HeaderField hf] [(.name hf) (.value hf)]) out)))))))
+
+(deftest encoder-keeps-unique-and-oversized-values-out-of-the-table
+  ;; Values unique to a response (request / trace ids) or large enough to
+  ;; evict most of the table would only churn it: they go out as Literal
+  ;; without Indexing, leaving the entries that repeat in place.
+  (let [enc (Hpack$Encoder. 4096)
+        first-byte (fn [k v] (bit-and 0xFF (aget ^bytes (.encode enc (fields [[k v]])) 0)))]
+    (doseq [n ["x-request-id" "x-correlation-id" "traceparent" "tracestate" "x-trace-id" "request-id"]]
+      (is (= 0x00 (bit-and 0xF0 (first-byte n "4bf92f3577b34da6a3ce929d0e0e4736"))) n))
+    (is (= 0x00 (bit-and 0xF0 (first-byte "x-big" (apply str (repeat 3500 "v")))))
+        "an entry over 3/4 of the table")
+    (is (= 0x40 (bit-and 0xC0 (first-byte "x-medium" (apply str (repeat 1000 "v")))))
+        "smaller ones are still indexed")))

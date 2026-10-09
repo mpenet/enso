@@ -1,40 +1,217 @@
+# ABOUTME: Gating CI: every test namespace in its own JVM on JDK 21 and 25 (HTTP/3 via the JNI shim), the
+# ABOUTME: HTTP/3 namespaces against an ASan/UBSan shim, and the h2spec, Autobahn and h3spec suites.
 name: test
+
+# Each conformance job checks the suite ran its full case count and
+# compares the failures with bench/<suite>/expected-failures.txt: any
+# other failure, or a listed case that passes, fails the job.
+#
+# Also invoked by release.yml (workflow_call) so nothing is published
+# unless this whole workflow passes.
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Called from release.yml this runs under the caller's event and ref,
+  # which keeps release runs out of the push/PR groups.
+  group: test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
+  shim:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up JDK 25
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: '25'
 
-      - name: Set up Clojure
-        uses: DeLaGuardo/setup-clojure@13.4
-        with:
-          cli: 1.12.5.1654
+      - name: Build enso_quiche shim
+        uses: ./.github/actions/build-shim
 
-      - name: Cache Maven / Gitlibs
-        uses: actions/cache@v4
+      # The notices list every crate the lockfile links into the shim:
+      # regenerate them whenever the lockfile or the quiche pin changes.
+      - name: THIRD-PARTY-NOTICES matches the locked crates
+        run: |
+          python3 native/enso_quiche/third_party_notices.py quiche-src > /tmp/THIRD-PARTY-NOTICES
+          diff -u THIRD-PARTY-NOTICES /tmp/THIRD-PARTY-NOTICES
+
+      - name: Upload shim
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          path: |
-            ~/.m2/repository
-            ~/.gitlibs
-            ~/.deps.clj
-          key: ${{ runner.os }}-clj-${{ hashFiles('deps.edn') }}
-          restore-keys: ${{ runner.os }}-clj-
+          name: test-libenso_quiche-linux-amd64
+          path: target/native/linux-amd64/libenso_quiche.so
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    needs: shim
+    name: test (JDK ${{ matrix.java }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 21 is the oldest supported release (javac --release 21), 25 the
+        # current LTS; both run every namespace.
+        java: ['21', '25']
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-clojure
+        with:
+          java-version: ${{ matrix.java }}
+
+      - name: Download shim
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: test-libenso_quiche-linux-amd64
+          path: target/native/linux-amd64
 
       - name: Compile Java sources
         run: clojure -T:build javac
 
-      - name: Run tests
-        run: clojure -X:test
+      # Linux caps SO_RCVBUF at rmem_max (~208 KiB by default); the HTTP/3
+      # test client asks for 8 MiB to absorb unpaced loopback bursts.
+      - name: Raise UDP receive buffer limit
+        run: sudo sysctl -w net.core.rmem_max=8388608
+
+      - name: Run tests (one JVM per namespace)
+        env:
+          ENSO_PROPERTY_TRIALS: '200'
+        run: script/test.sh
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-logs-jdk${{ matrix.java }}
+          path: target/test-logs/
+          retention-days: 7
+
+  sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-clojure
+
+      - name: Build enso_quiche shim (ASan + UBSan)
+        uses: ./.github/actions/build-shim
+        with:
+          make-args: SANITIZE=1
+
+      - name: Compile Java sources
+        run: clojure -T:build javac
+
+      - name: Raise UDP receive buffer limit
+        run: sudo sysctl -w net.core.rmem_max=8388608
+
+      - name: HTTP/3 namespaces under the sanitizers
+        run: script/sanitizer-test.sh
+
+      - name: Upload sanitizer reports and logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sanitizer-reports
+          path: target/sanitizer/
+          retention-days: 14
+
+  h2spec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Conformance verdict logic self-test
+        run: bench/conformance-lib-test.sh
+
+      - uses: ./.github/actions/setup-clojure
+
+      - name: Compile Java sources
+        run: clojure -T:build javac
+
+      - name: h2spec (HTTP/2 over TLS)
+        run: bench/h2spec/run.sh
+
+      - name: h2spec (cleartext HTTP/2, prior knowledge)
+        if: always()
+        run: bench/h2spec/run.sh h2c
+
+      - name: Upload h2spec report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: h2spec-report
+          path: |
+            target/conformance/h2spec/
+            target/conformance/h2spec-h2c/
+          retention-days: 14
+
+  autobahn:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-clojure
+
+      - name: Compile Java sources
+        run: clojure -T:build javac
+
+      - name: Autobahn TestSuite (WebSocket)
+        run: bench/autobahn/run.sh
+
+      - name: Upload Autobahn report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: autobahn-report
+          path: target/conformance/autobahn/
+          retention-days: 14
+
+  h3spec:
+    needs: shim
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-clojure
+
+      - name: Download shim
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: test-libenso_quiche-linux-amd64
+          path: target/native/linux-amd64
+
+      # h3spec is a dynamically linked GHC binary.
+      - name: Install h3spec runtime deps
+        run: sudo apt-get install -y --no-install-recommends libgmp10 zlib1g
+
+      - name: Compile Java sources
+        run: clojure -T:build javac
+
+      - name: h3spec (QUIC + HTTP/3)
+        run: bench/h3spec/run.sh
+
+      - name: Upload h3spec report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: h3spec-report
+          path: target/conformance/h3spec/
+          retention-days: 14

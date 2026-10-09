@@ -1,3 +1,5 @@
+;; ABOUTME: Unit tests for helpers that need no running server: header merging, Long2ObjectHashMap edge
+;; ABOUTME: cases, and the Ring map contract of com.s_exp.enso.api.Request.
 (ns s-exp.enso-util-test
   "Direct tests against `com.s_exp.enso.util` helpers that don't need a
   running server. Covers header merge semantics + primitive-key map
@@ -8,7 +10,7 @@
            (com.s_exp.enso.core HttpFields)
            (com.s_exp.enso.util Long2ObjectHashMap RingHeaders)
            (java.nio.charset StandardCharsets)
-           (java.net InetAddress)))
+           (java.net Inet6Address InetAddress InetSocketAddress ServerSocket Socket)))
 
 (deftest merge-duplicates-no-dup-returns-fit-array
   (let [in (object-array ["a" "1" "b" "2"])
@@ -105,8 +107,8 @@
     (is (not (.containsKey m 0)))))
 
 (deftest long2obj-contains-key-null-value-not-mistaken-for-absent
-  ;; Regression for #233: earlier containsKey delegated to `get() != null`
-  ;; and reported false when the value was a legit null. Now a direct probe.
+  ;; containsKey probes for the key itself: a key mapped to null is
+  ;; present, which `get() != null` would report as absent.
   (let [m (Long2ObjectHashMap.)]
     (.put m 5 nil)
     (is (.containsKey m 5) "key present with null value")
@@ -137,7 +139,8 @@
 (def ^:private expected-request
   {:server-port 8080 :server-name "example.com" :remote-addr "127.0.0.1"
    :uri "/p" :query-string "a=1" :scheme :http :request-method :get
-   :protocol "HTTP/1.1" :headers {"host" "example.com:80"} :body nil})
+   :protocol "HTTP/1.1" :headers {"host" "example.com:80"} :body nil
+   :ssl-client-cert nil})
 
 (deftest request-scheme
   (is (= :http (:scheme (request Request/K_HTTP))))
@@ -200,3 +203,93 @@
       (HttpFields/responseCharset lower))
     (let [allocated (- (.getCurrentThreadAllocatedBytes mx) before)]
       (is (< allocated (* 64 1024)) (str "allocated " allocated " bytes")))))
+
+;; ---- Request: assoc / dissoc keep the request lazy ------------------------
+
+(deftest request-assoc-adds-keys-without-materializing
+  ;; Middleware assoc'ing keys gets a Request back (the lazy fields are not
+  ;; computed into a plain map), and it behaves as the equivalent map.
+  (let [req (request)
+        r2 (assoc req :params {:a 1})
+        expected (assoc expected-request :params {:a 1})]
+    (is (instance? Request r2))
+    (is (= expected r2))
+    (is (= r2 expected))
+    (is (= (hash expected) (hash r2)))
+    (is (= {:a 1} (:params r2)))
+    (is (= "/p" (:uri r2)))
+    (is (= (count expected) (count r2)))
+    (is (contains? r2 :params))
+    (is (= expected (reduce-kv assoc {} r2)))
+    (is (= (set (keys expected)) (set (keys r2))))
+    (is (= expected (into {} r2)))))
+
+(deftest request-assoc-overrides-and-dissoc
+  (let [req (request)
+        over (assoc req :uri "/q")
+        gone (dissoc req :body)
+        back (assoc gone :body "b")]
+    (is (instance? Request over))
+    (is (= "/q" (:uri over)))
+    (is (= "/q" (over :uri)))
+    (is (= (assoc expected-request :uri "/q") over))
+    (is (= (count expected-request) (count over)))
+    (is (instance? Request gone))
+    (is (not (contains? gone :body)))
+    (is (= ::nf (get gone :body ::nf)))
+    (is (= (dissoc expected-request :body) gone))
+    (is (= (dec (count expected-request)) (count gone)))
+    (is (= (assoc expected-request :body "b") back))
+    (is (identical? req (dissoc req :absent)) "dissoc of an absent key returns the request itself")
+    (is (= expected-request (dissoc (assoc req :x 1) :x)))
+    (is (= {:m 1} (meta (assoc (with-meta req {:m 1}) :x 1))))
+    (is (= {:m 1} (meta (dissoc (with-meta req {:m 1}) :uri))))
+    (is (= (merge expected-request {:a 1 :b 2}) (conj req [:a 1] {:b 2})))
+    (is (= (assoc expected-request :a 1) (into req {:a 1})))
+    (is (thrown? RuntimeException (.assocEx req :uri "/x")))
+    (is (= (assoc expected-request :y 2) (.assocEx req :y 2)))))
+
+(deftest request-java-map-views-are-read-only
+  (let [req (assoc (request) :x 1)]
+    (is (= (set (keys (assoc expected-request :x 1))) (set (.keySet req))))
+    (is (thrown? UnsupportedOperationException (.add (.keySet req) :y)))
+    (is (thrown? UnsupportedOperationException (.clear (.values req))))
+    (is (thrown? UnsupportedOperationException (.clear (.entrySet req))))
+    (is (.containsValue req "/p"))
+    (is (.containsValue req 1))))
+
+(deftest request-extension-methods
+  (doseq [[m kw] [["PROPFIND" :propfind] ["MKCOL" :mkcol] ["GET" :get] ["QUERY" :query]]]
+    (is (= kw (:request-method (Request. m "/" nil "HTTP/1.1" {} nil
+                                         (InetAddress/getLoopbackAddress) (int 80) Request/K_HTTP))))))
+
+(defn- remote-addr-of [^InetAddress addr]
+  (:remote-addr (Request. "GET" "/" nil "HTTP/1.1" {"host" "h"} nil addr (int 80) Request/K_HTTP)))
+
+(deftest request-remote-addr-ipv6-is-rfc-5952
+  ;; Shortest form: lowercase, longest run of zero groups as "::"
+  ;; (leftmost on a tie, never a single group), no zone index.
+  (doseq [[in expected] [["::1" "::1"]
+                         ["0:0:0:0:0:0:0:0" "::"]
+                         ["2001:db8:0:0:1:0:0:1" "2001:db8::1:0:0:1"]
+                         ["2001:0:0:1:0:0:0:1" "2001:0:0:1::1"]
+                         ["2001:db8:0:1:1:1:1:1" "2001:db8:0:1:1:1:1:1"]
+                         ["2001:DB8:0:0:0:0:0:ABCD" "2001:db8::abcd"]
+                         ["1:0:0:0:2:0:0:0" "1::2:0:0:0"]
+                         ["0:0:1:0:0:0:0:0" "0:0:1::"]]]
+    (is (= expected (remote-addr-of (InetAddress/getByName in))) in))
+  (let [scoped (Inet6Address/getByAddress nil (.getAddress (InetAddress/getByName "fe80::1")) (int 3))]
+    (is (= "fe80::1" (remote-addr-of scoped)) "zone index dropped"))
+  (is (= "10.1.2.3" (remote-addr-of (InetAddress/getByName "10.1.2.3")))))
+
+(deftest request-server-name-without-host-is-the-local-address
+  (with-open [ss (ServerSocket. 0 1 (InetAddress/getLoopbackAddress))
+              client (Socket. (InetAddress/getLoopbackAddress) (.getLocalPort ss))
+              accepted (.accept ss)]
+    (let [req (Request. "GET" "/" nil "HTTP/1.0" {} nil (.getInetAddress accepted)
+                        (int (.getLocalPort accepted)) Request/K_HTTP accepted)]
+      (is (= "127.0.0.1" (:server-name req))))))
+
+(deftest request-ssl-client-cert-is-nil-without-tls
+  (is (contains? (request) :ssl-client-cert))
+  (is (nil? (:ssl-client-cert (request)))))

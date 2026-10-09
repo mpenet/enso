@@ -1,66 +1,57 @@
 # HTTP/3 conformance
 
-Ensō ships an h3spec suite run against libquiche 0.29.3 + our JNI shim +
-our pure-Java HTTP/3 layer. Current status: **39/49 pass, 10 failures**.
-All 10 failures are transport-layer, listed below as libquiche 0.29.3
-limitations — fixable only by upstream. The HTTP/3-layer and QPACK
-layers pass 100%.
+Ensō runs the external h3spec suite (`bench/h3spec/run.sh`) against
+libquiche 0.29.3 + our JNI shim + our pure-Java HTTP/3 layer. Current status: **47/49 pass, 2 failures**.
+Both failures are reserved-bit checks inside libquiche 0.29.3, listed
+below. The HTTP/3-layer and QPACK layers pass 100%.
 
-Run: `bench/h3spec/run.sh`
-Baseline snapshot: [`bench/h3spec/baseline.txt`](../bench/h3spec/baseline.txt)
+Run: `bench/h3spec/run.sh` (downloads the pinned h3spec 0.1.13 release and
+verifies its checksum; see [testing.md](testing.md#conformance-suites)).
+Expected failures: [`bench/h3spec/expected-failures.txt`](../bench/h3spec/expected-failures.txt);
+any other failing case, a listed case that passes, or a run of other than
+49 cases fails CI.
 
 ## Transport-layer failures — libquiche 0.29.3 limitations
 
-These 10 tests exercise QUIC transport-parameter validation and
-short/handshake-packet reserved-bit checks. All happen strictly at the
-QUIC transport layer inside libquiche — well below our JNI boundary
-and pure-Java HTTP/3 code. We can't fix them without patching libquiche
-itself. Cloudflare's 0.29.3 release is currently the pinned version
-across our release CI + shim static links.
-
 | # | h3spec test | Category |
 |---|-------------|----------|
-| 1 | MUST send TRANSPORT_PARAMETER_ERROR if `initial_source_connection_id` is missing (RFC 9000 §7.3) | Transport param validation |
-| 2 | MUST send TRANSPORT_PARAMETER_ERROR if `original_destination_connection_id` is received (§18.2) | Transport param validation |
-| 3 | MUST send TRANSPORT_PARAMETER_ERROR if `preferred_address` is received (§18.2) | Transport param validation |
-| 4 | MUST send TRANSPORT_PARAMETER_ERROR if `retry_source_connection_id` is received (§18.2) | Transport param validation |
-| 5 | MUST send TRANSPORT_PARAMETER_ERROR if `stateless_reset_token` is received (§18.2) | Transport param validation |
-| 6 | MUST send TRANSPORT_PARAMETER_ERROR if `max_udp_payload_size < 1200` (§7.4, §18.2) | Transport param validation |
-| 7 | MUST send TRANSPORT_PARAMETER_ERROR if `ack_delay_exponent > 20` (§7.4, §18.2) | Transport param validation |
-| 8 | MUST send TRANSPORT_PARAMETER_ERROR if `max_ack_delay >= 2^14` (§7.4, §18.2) | Transport param validation |
-| 9 | MUST send PROTOCOL_VIOLATION if reserved bits in Handshake packet are non-zero (§17.2) | Reserved-bit validation |
-| 10 | MUST send PROTOCOL_VIOLATION if reserved bits in Short header are non-zero (§17.2) | Reserved-bit validation |
+| 1 | MUST send PROTOCOL_VIOLATION if reserved bits in Handshake are non-zero [Transport 17.2] | Reserved-bit validation |
+| 2 | MUST send PROTOCOL_VIOLATION if reserved bits in Short are non-zero [Transport 17.2] | Reserved-bit validation |
+
+The reserved bits sit under header protection, which quiche removes
+internally; the shim never sees them, so only libquiche can check them.
 
 ### Practical impact
 
-Low. All ten failures cover peers sending malformed transport
-parameters or malformed header bits — behavior only reachable from a
-buggy or hostile client. The typical peer never triggers them. quiche
-accepts and ignores the values (or the bits), then continues the
-handshake — same behavior we'd see from a strict-check libquiche
-version after the peer is disconnected.
+Low: only a buggy or hostile peer sets reserved bits. quiche ignores
+them and processes the packet.
 
-### Fix path
+## Invalid transport parameters
 
-- Upstream (Cloudflare quiche): the checks land as validation in
-  `crypto/tls13_server.c` and `frame.rs` on the quiche side. We
-  auto-pick up new releases via the pinned `QUICHE_VERSION` env var
-  in `.github/workflows/release.yml`.
-- Local: nothing we can do without carrying a fork of libquiche.
-
-Cloudflare tracks these gaps in their h3spec compliance dashboard;
-several were fixed in later master builds but not yet in 0.29.x.
+libquiche validates the client's transport parameters (RFC 9000 §7.3,
+§7.4, §18.2) while processing its first flight and closes with
+TRANSPORT_PARAMETER_ERROR, but queues that CONNECTION_CLOSE at the
+Handshake level. The client hasn't received a ServerHello then, so it
+can't decrypt it. When quiche refuses a client's first flight before the
+server sent anything, Ensō also sends the close as a server Initial,
+built statelessly from the Initial keys (RFC 9000 §10.2.3), and frees the
+connection. All eight transport-parameter cases pass.
 
 ## Fully passing categories
 
-- QPACK protocol errors — all 4 pass (dynamic-capacity, insert-count,
-  decoder-stream, static-table-index).
-- HTTP/3 frame-type errors — all pass (DATA-before-HEADERS, duplicate
-  SETTINGS, CANCEL_PUSH on request stream, control-stream misuse).
+- QPACK — all 4 pass (static-table index, dynamic-table capacity, Insert
+  Count Increment 0 on the decoder stream, closing a critical stream).
+- HTTP/3 frame and control-stream errors — all 7 pass (DATA before
+  HEADERS, first control frame not SETTINGS, DATA or HEADERS on the
+  control stream, second SETTINGS, HTTP/2 settings, CANCEL_PUSH on a
+  request stream).
 - HTTP/3 pseudo-header validation — all 4 pass (duplicate, missing
   mandatory including `:authority` for http/https, prohibited, after
   regular).
-- TLS-layer errors — all 6 pass (KeyUpdate, ALPN, missing extension,
-  EndOfEarlyData, CRYPTO in 0-RTT).
-- QUIC frame-encoding errors — all pass (STREAM state, MAX_STREAMS,
-  NEW_CONNECTION_ID, HANDSHAKE_DONE, NEW_TOKEN).
+- TLS-layer errors — all 7 pass (KeyUpdate in Handshake and in 1-RTT,
+  ALPN, missing transport-parameters extension twice, EndOfEarlyData,
+  CRYPTO in 0-RTT; h3spec skips the 0-RTT case, since the server offers
+  no 0-RTT, and counts it as passing).
+- Other QUIC transport errors — all 17 pass (flow control, stream limits,
+  stream state, frame encoding, unexpected frames: NEW_TOKEN,
+  HANDSHAKE_DONE, PATH_CHALLENGE in Handshake).

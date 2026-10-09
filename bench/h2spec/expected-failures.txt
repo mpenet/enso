@@ -1,0 +1,11 @@
+# ABOUTME: h2spec cases expected to fail plus the suite size; bench/h2spec/run.sh fails CI on
+# ABOUTME: any other failure, a listed case passing, or a different case count.
+# h2spec cases enso is currently known to fail, one "<section>/<n>: <description>"
+# per line exactly as printed by bench/h2spec/run.sh. Any other failing case
+# fails CI, and so does a listed case that no longer fails: remove its line.
+#
+# None: all 146 cases pass with the default server options.
+#
+# Cases a full run must execute; a different count fails the run (truncated
+# run or changed suite).
+total-cases: 146

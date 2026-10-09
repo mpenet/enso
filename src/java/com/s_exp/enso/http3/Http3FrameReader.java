@@ -1,3 +1,5 @@
+// ABOUTME: Incremental HTTP/3 frame parser for whole-frame consumers (the peer control stream, the
+// ABOUTME: test client): buffers partial frames, streams DATA, skips unknown types.
 package com.s_exp.enso.http3;
 
 import java.nio.ByteBuffer;
@@ -69,8 +71,9 @@ public final class Http3FrameReader {
 
     // Max bytes we buffer for a single non-DATA frame. Prevents an
     // adversary from OOMing us with a giant SETTINGS/HEADERS payload;
-    // legitimate values are ~KB. Request-stream readers are built with
-    // the field-section limit instead (see Http3Session).
+    // legitimate values are ~KB. The server reads only the peer's control
+    // stream with this class (request streams are parsed in place by
+    // Http3RequestReader); the test client reads responses with it.
     private static final int DEFAULT_MAX_ACCUM = 64 * 1024;
     // Largest array the JVM reliably allocates.
     private static final long MAX_BUFFER = Integer.MAX_VALUE - 8;
@@ -78,8 +81,12 @@ public final class Http3FrameReader {
 
     private final int maxAccum;
     // Rolling input buffer. Retains bytes across feed() calls when a frame
-    // is only partially available.
-    private ByteBuffer buf = ByteBuffer.allocate(4096);
+    // is only partially available. Starts small (a peer control stream
+    // carries a few small frames for the connection's whole life), grows
+    // with the input and is given back once a large frame was consumed.
+    private static final int SMALL_BUFFER = 64;
+    private static final int KEEP_BUFFER = 4096;
+    private ByteBuffer buf = ByteBuffer.allocate(SMALL_BUFFER);
     // Set when we've decoded a frame header but the payload hasn't fully
     // arrived. -1 = not-yet-parsed.
     private long pendingType = -1;
@@ -87,6 +94,8 @@ public final class Http3FrameReader {
     private long pendingConsumed = 0;   // bytes of payload already emitted (DATA path)
     // Current frame's payload is being discarded (oversized HEADERS).
     private boolean skipping;
+    // Type of the stream's first frame, skipped types included; -1 before.
+    private long firstType = -1;
 
     private final Deque<Frame> ready = new ArrayDeque<>();
 
@@ -108,9 +117,7 @@ public final class Http3FrameReader {
 
     /**
      * byte[]-input overload that avoids the {@link ByteBuffer#wrap} the
-     * {@link ByteBuffer} variant would need — task #125 alloc profile
-     * showed HeapByteBuffer wrappers accumulating on the hot per-recv
-     * path.
+     * {@link ByteBuffer} variant would need.
      */
     public void feed(byte[] data, int off, int len) {
         appendTo(data, off, len);
@@ -119,6 +126,13 @@ public final class Http3FrameReader {
 
     /** Poll the next complete frame or DATA chunk, or {@code null}. */
     public Frame poll() { return ready.pollFirst(); }
+
+    /**
+     * Type of the first frame header read since construction or
+     * {@link #reset}, including types that are skipped and never polled;
+     * -1 before one was complete.
+     */
+    public long firstFrameType() { return firstType; }
 
     /**
      * True if the reader is mid-frame — either a partial header varint is
@@ -137,7 +151,7 @@ public final class Http3FrameReader {
      * Clear all reader state so the instance can be reused for a fresh
      * stream. Keeps the rolling {@link #buf} allocation to amortise it
      * across pooled reuse; the buffer's position is reset. Pooled by
-     * {@link Http3Session} to avoid per-stream reader allocations.
+     * callers that parse many streams one after another.
      */
     public void reset() {
         buf.clear();
@@ -145,6 +159,7 @@ public final class Http3FrameReader {
         pendingLength = -1;
         pendingConsumed = 0;
         skipping = false;
+        firstType = -1;
         ready.clear();
     }
 
@@ -194,6 +209,7 @@ public final class Http3FrameReader {
         } finally {
             // Compact any unread bytes to the front, restore write mode.
             buf.compact();
+            if (buf.position() == 0 && buf.capacity() > KEEP_BUFFER) buf = ByteBuffer.allocate(SMALL_BUFFER);
         }
     }
 
@@ -211,6 +227,7 @@ public final class Http3FrameReader {
         }
         long length = Http3Varint.decode(buf);
         if (length < 0) throw new IllegalStateException("frame length overflow");
+        if (firstType < 0) firstType = type;
         pendingType = type;
         pendingLength = length;
         pendingConsumed = 0;

@@ -1,3 +1,5 @@
+// ABOUTME: Response body that writes to the client over time through a ChunkedWriter (SSE,
+// ABOUTME: long-poll); the server ends the body when write returns.
 package com.s_exp.enso.api;
 
 import java.io.IOException;

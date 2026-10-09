@@ -1,3 +1,5 @@
+// ABOUTME: Formats and caches the HTTP Date header value (IMF-fixdate) for the current second,
+// ABOUTME: shared lock-free by all connections.
 package com.s_exp.enso.core;
 
 import java.nio.charset.StandardCharsets;
@@ -26,7 +28,8 @@ public final class HttpDates {
     private HttpDates() {
     }
 
-    static String now() {
+    /** The current IMF-fixdate, e.g. "Sun, 06 Nov 1994 08:49:37 GMT". */
+    public static String now() {
         return refresh().value;
     }
 

@@ -1,3 +1,5 @@
+;; ABOUTME: Benchmark harness comparing enso, http-kit and Jetty in one JVM: drives wrk against each server
+;; ABOUTME: and reports throughput, latency percentiles and allocation profiles.
 (ns enso.bench
   "Side-by-side bench harness for Enso, http-kit, Jetty (ring-jetty-adapter).
   Boots all servers in one JVM, drives wrk against each, aggregates throughput
@@ -16,9 +18,8 @@
 ;; --- Handlers ---------------------------------------------------------------
 
 (defn plaintext-handler
-  "TechEmpower-style plaintext: fixed 404 body 'nf'. Same shape as our previous
-  wrk baseline. Keeps the response tight so we're measuring adapter overhead
-  rather than user code."
+  "TechEmpower-style plaintext: fixed 404 body 'nf'. Keeps the response
+  tight so we're measuring adapter overhead rather than user code."
   [_]
   {:status 404
    :headers {"content-type" "text/plain"}
@@ -202,7 +203,7 @@
                ;; Match Netty h3 example defaults so cross-server bench
                ;; isn't biased by config drift.
                :http3-stateless-retry false
-               :http3-max-idle-timeout 30000
+               :idle-timeout 30000
                :http3-initial-max-streams-bidi 100})]
      (reset! h3-state {:srv srv :h3-port h3-port :cert cert :key key})
      {:h3-url (str "https://127.0.0.1:" h3-port "/nope")})))
@@ -246,7 +247,7 @@
      :wall-ms wall-ms
      :rps-est (double (/ (* clients per-client) (/ wall-ms 1000.0)))}))
 
-;; --- Cross-server h3 bench (task #95) --------------------------------------
+;; --- Cross-server h3 bench ------------------------------------------------
 
 (defn- gen-p12!
   "Wraps a PEM cert + key into a PKCS12 keystore for Jetty. Returns
@@ -369,8 +370,8 @@
 (defn profile-alloc-h3-jfr!
   "JFR-based allocation profiler for h3. Uses the JVM's built-in
   jdk.ObjectAllocationSample event stream (JEP 331, always enabled at low
-  overhead on JDK 16+). Sidesteps async-profiler's SIGABRT-in-GC-thread
-  crashes we hit at task #76 on JDK 25 + FFM.
+  overhead on JDK 16+). Avoids async-profiler, which can crash with
+  SIGABRT in a GC thread on JDK 25 when native code is loaded.
 
   Returns {jfr-path, top-classes, load} — a small aggregated report over
   the recording plus the raw .jfr for deeper drill-down via `jfr print`."

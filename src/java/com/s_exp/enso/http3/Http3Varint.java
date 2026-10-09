@@ -1,3 +1,5 @@
+// ABOUTME: QUIC variable-length integer encoder/decoder (RFC 9000 section 16) used by
+// ABOUTME: HTTP/3 framing and stream-type prefixes.
 package com.s_exp.enso.http3;
 
 import java.nio.ByteBuffer;
@@ -51,9 +53,48 @@ public final class Http3Varint {
         }
     }
 
+    /** Encodes {@code v} into {@code b} at {@code off}; returns the offset after it. */
+    public static int encode(byte[] b, int off, long v) {
+        int n = size(v);
+        switch (n) {
+            case 1 -> b[off] = (byte) v;
+            case 2 -> {
+                b[off] = (byte) ((v >>> 8) | 0x40);
+                b[off + 1] = (byte) v;
+            }
+            case 4 -> {
+                b[off] = (byte) ((v >>> 24) | 0x80);
+                b[off + 1] = (byte) (v >>> 16);
+                b[off + 2] = (byte) (v >>> 8);
+                b[off + 3] = (byte) v;
+            }
+            default -> {
+                b[off] = (byte) ((v >>> 56) | 0xC0);
+                for (int i = 1; i < 8; i++) b[off + i] = (byte) (v >>> (56 - 8 * i));
+            }
+        }
+        return off + n;
+    }
+
+    /**
+     * Length of the varint whose first byte is {@code first} (1, 2, 4 or 8).
+     */
+    public static int length(int first) {
+        return 1 << ((first & 0xFF) >>> 6);
+    }
+
+    /** Decodes the varint at {@code b[off]}; the caller checked {@link #length} bytes are there. */
+    public static long decode(byte[] b, int off) {
+        int first = b[off] & 0xFF;
+        long v = first & 0x3F;
+        int n = 1 << (first >>> 6);
+        for (int i = 1; i < n; i++) v = (v << 8) | (b[off + i] & 0xFF);
+        return v;
+    }
+
     /**
      * Decode a varint from {@code buf} at the current position, advancing.
-     * @throws BufferUnderflowException if fewer than the required 1/2/4/8
+     * @throws java.nio.BufferUnderflowException if fewer than the required 1/2/4/8
      *   bytes remain.
      */
     public static long decode(ByteBuffer buf) {

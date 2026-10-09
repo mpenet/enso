@@ -1,3 +1,5 @@
+;; ABOUTME: HTTP/3 protocol-level unit tests: QPACK round trips, frame reader interop, varints and
+;; ABOUTME: quiche error constants, without a live connection.
 (ns s-exp.enso-http3-test
   "HTTP/3 protocol-level unit tests: QPACK codec round-trip, H3 frame
   writer/reader interop, varint boundaries. Java-only — no live UDP
@@ -124,6 +126,15 @@
 
 ;; ---- H3 frame writer + reader interop ------------------------------------
 
+(defn- frame-bytes
+  "An HTTP/3 frame: type varint, length varint, payload."
+  ^bytes [type ^bytes payload]
+  (let [out (byte-array (+ 16 (alength payload)))
+        at (Http3Varint/encode out 0 (long type))
+        at (Http3Varint/encode out at (long (alength payload)))]
+    (System/arraycopy payload 0 out at (alength payload))
+    (java.util.Arrays/copyOf out (+ at (alength payload)))))
+
 (defn- feed-and-drain
   "Feed `bytes` into a fresh reader, drain all frames, return the list."
   [^bytes bytes]
@@ -137,11 +148,9 @@
           (recur))))
     acc))
 
-(deftest frame-writer-data-round-trip
+(deftest frame-reader-data-frame
   (let [payload (.getBytes "hello, h3" "UTF-8")
-        bb (Http3FrameWriter/data payload)
-        raw (byte-array (.remaining bb))
-        _ (.get bb raw)
+        raw (frame-bytes Http3FrameType/DATA payload)
         frames (feed-and-drain raw)]
     (is (= 1 (.size frames)))
     (let [f (.get frames 0)]
@@ -149,11 +158,9 @@
       ;; DATA frames are emitted as chunks with dataChunk set.
       (is (= (seq payload) (seq (.dataChunk f)))))))
 
-(deftest frame-writer-headers-round-trip
+(deftest frame-reader-headers-frame
   (let [encoded (byte-array [(byte 0) (byte 0) (unchecked-byte 0xC0)]) ;; QPACK :authority static idx
-        bb (Http3FrameWriter/headers encoded)
-        raw (byte-array (.remaining bb))
-        _ (.get bb raw)
+        raw (frame-bytes Http3FrameType/HEADERS encoded)
         frames (feed-and-drain raw)]
     (is (= 1 (.size frames)))
     (is (= Http3FrameType/HEADERS (.type (.get frames 0))))))
@@ -179,12 +186,9 @@
 
 (deftest frame-reader-multi-frame-in-one-feed
   ;; Concat HEADERS + DATA in a single feed — reader should emit both.
-  (let [hb (Http3FrameWriter/headers (byte-array [(byte 0) (byte 0)]))
-        db (Http3FrameWriter/data (.getBytes "abc" "UTF-8"))
-        joined (byte-array (+ (.remaining hb) (.remaining db)))
-        _ (.get hb joined 0 (.remaining hb))
-        h-off (- (alength joined) (.remaining db))
-        _ (.get db joined h-off (.remaining db))
+  (let [hb (frame-bytes Http3FrameType/HEADERS (byte-array [(byte 0) (byte 0)]))
+        db (frame-bytes Http3FrameType/DATA (.getBytes "abc" "UTF-8"))
+        joined (byte-array (concat hb db))
         frames (feed-and-drain joined)]
     (is (<= 2 (.size frames)) "at least HEADERS + DATA emitted")
     (is (some #(= Http3FrameType/HEADERS (.type %)) frames))
@@ -193,9 +197,7 @@
 (deftest frame-reader-drip-fed-bytes-still-parses
   ;; Feed a HEADERS frame one byte at a time. Reader must accumulate
   ;; without losing data.
-  (let [bb (Http3FrameWriter/headers (byte-array [(byte 0) (byte 0)]))
-        raw (byte-array (.remaining bb))
-        _ (.get bb raw)
+  (let [raw (frame-bytes Http3FrameType/HEADERS (byte-array [(byte 0) (byte 0)]))
         r (Http3FrameReader. 65536)]
     (dotimes [i (alength raw)]
       (.feed r raw i 1))
@@ -207,14 +209,3 @@
   ;; quiche.h enum quiche_error.
   (is (= -6 com.s_exp.enso.quiche.Quiche/QUICHE_ERR_INVALID_STATE))
   (is (= -7 com.s_exp.enso.quiche.Quiche/QUICHE_ERR_INVALID_STREAM_STATE)))
-
-(deftest config-rejects-qpack-dynamic-table
-  ;; The QPACK decoder only supports the static table (capacity 0);
-  ;; advertising more would invite encoder instructions we reject.
-  (is (thrown-with-msg? IllegalArgumentException #"http3QpackMaxTableCapacity"
-                        (-> (com.s_exp.enso.api.Config/builder)
-                            (.http3QpackMaxTableCapacity 4096)
-                            (.build))))
-  (is (some? (-> (com.s_exp.enso.api.Config/builder)
-                 (.http3QpackMaxTableCapacity 0)
-                 (.build)))))

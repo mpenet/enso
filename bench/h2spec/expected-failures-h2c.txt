@@ -1,0 +1,13 @@
+# ABOUTME: h2spec cases expected to fail over cleartext HTTP/2 (bench/h2spec/run.sh h2c) plus the
+# ABOUTME: suite size; the run fails on any other failure, a listed case passing, or a different count.
+# One "<section>/<n>: <description>" per line exactly as printed by bench/h2spec/run.sh.
+#
+# The :http2c listener serves HTTP/1.1 and HTTP/2 with prior knowledge on
+# one port: bytes that aren't the HTTP/2 preface are an HTTP/1.1 request,
+# so an invalid preface is answered as a malformed HTTP/1.1 request (400,
+# then close) rather than with a GOAWAY, which h2spec reads as a frame.
+http2/3.5/2: Sends invalid connection preface
+#
+# Cases a full run must execute; a different count fails the run (truncated
+# run or changed suite).
+total-cases: 146

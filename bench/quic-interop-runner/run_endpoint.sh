@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# ABOUTME: quic-interop-runner endpoint entry script: accepts only the http3 test case and
+# ABOUTME: launches the enso HTTP/3 file server with the runner's certs and /www root.
 # quic-interop-runner endpoint entry.
 #
 # Contract (see repo/quic.md):

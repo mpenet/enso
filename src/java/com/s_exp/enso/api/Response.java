@@ -1,6 +1,7 @@
+// ABOUTME: A handler's response as the drivers consume it: status, headers, body, or a WebSocket
+// ABOUTME: listener (with an optional subprotocol) for an upgrade.
 package com.s_exp.enso.api;
 
-import com.s_exp.enso.websocket.WebSocketListener;
 import java.util.Map;
 
 public final class Response {

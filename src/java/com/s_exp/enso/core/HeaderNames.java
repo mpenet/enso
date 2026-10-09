@@ -1,3 +1,5 @@
+// ABOUTME: Interning table of common request header names, matched case-insensitively against
+// ABOUTME: raw request bytes so well-known names cost no String allocation.
 package com.s_exp.enso.core;
 
 /**
@@ -20,8 +22,12 @@ public final class HeaderNames {
         "x-forwarded-proto", "x-real-ip"
     };
 
+    /** Number of names in the table; {@link #index} returns values below it. */
+    public static final int COUNT = NAMES.length;
+
     private static final String[][] BY_LENGTH;
     private static final byte[][][] BYTES_BY_LENGTH;
+    private static final int[][] INDEX_BY_LENGTH;
 
     static {
         int max = 0;
@@ -34,20 +40,25 @@ public final class HeaderNames {
         }
         String[][] groups = new String[max + 1][];
         byte[][][] byteGroups = new byte[max + 1][][];
+        int[][] indexGroups = new int[max + 1][];
         for (int len = 0; len <= max; len++) {
             if (counts[len] > 0) {
                 groups[len] = new String[counts[len]];
                 byteGroups[len] = new byte[counts[len]][];
+                indexGroups[len] = new int[counts[len]];
             }
         }
         int[] fill = new int[max + 1];
-        for (String n : NAMES) {
+        for (int i = 0; i < NAMES.length; i++) {
+            String n = NAMES[i];
             int len = n.length();
             groups[len][fill[len]] = n;
+            indexGroups[len][fill[len]] = i;
             byteGroups[len][fill[len]++] = n.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
         }
         BY_LENGTH = groups;
         BYTES_BY_LENGTH = byteGroups;
+        INDEX_BY_LENGTH = indexGroups;
     }
 
     private HeaderNames() {
@@ -55,13 +66,28 @@ public final class HeaderNames {
 
     /** Returns the interned lowercase name, or null if not a known header. */
     public static String lookup(byte[] buf, int from, int to) {
+        int i = index(buf, from, to);
+        return i < 0 ? null : NAMES[i];
+    }
+
+    /** The interned lowercase name with index {@code i} (from {@link #index}). */
+    public static String name(int i) {
+        return NAMES[i];
+    }
+
+    /**
+     * Index of the known name in {@code buf[from, to)} (ASCII case
+     * ignored), in [0, {@link #COUNT}); -1 if not a known header. Lets a
+     * caller keep per-name state in a plain array.
+     */
+    public static int index(byte[] buf, int from, int to) {
         int len = to - from;
         if (len >= BY_LENGTH.length) {
-            return null;
+            return -1;
         }
         byte[][] byteGroup = BYTES_BY_LENGTH[len];
         if (byteGroup == null) {
-            return null;
+            return -1;
         }
         // | 0x20 lowercases ASCII letters, leaves '-' and digits alone
         int first = buf[from] | 0x20;
@@ -76,8 +102,8 @@ public final class HeaderNames {
                     continue outer;
                 }
             }
-            return BY_LENGTH[len][g];
+            return INDEX_BY_LENGTH[len][g];
         }
-        return null;
+        return -1;
     }
 }

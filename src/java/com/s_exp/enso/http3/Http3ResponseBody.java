@@ -1,47 +1,55 @@
 // ABOUTME: Zero-copy handoff of a streamed HTTP/3 response body from the
-// ABOUTME: handler's virtual thread to the connection's owner thread.
+// ABOUTME: handler's virtual thread to the connection's event loop.
 package com.s_exp.enso.http3;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
-import java.nio.ByteBuffer;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Hands a streamed response body from the handler's virtual thread (the
  * producer: it reads the File / InputStream or runs the StreamingBody)
- * to the connection's owner thread, which only ever sends. Nothing
- * blocking runs on the owner, so one slow body source can't stall the
- * other streams of the connection.
+ * to the event loop, which only ever sends. Nothing blocking runs on the
+ * loop, so one slow body source can't stall other streams.
  *
  * <p>Zero-copy rendezvous: {@link #write} offers a slice of the
- * producer's buffer and blocks until the owner has handed all of it to
+ * producer's buffer and blocks until the loop has handed all of it to
  * quiche (bounded by QUIC flow control), so the producer can then reuse
  * its buffer. Memory per streamed response is the producer's buffer;
- * backpressure comes for free. The owner frames each slice as one DATA
- * frame (header, then payload straight from the producer's array).
+ * backpressure comes for free. The loop frames each slice as one DATA
+ * frame (header, then payload straight from the producer's array); a
+ * slice offered as the last one carries the stream's FIN.
  *
- * <p>The lock is held by the owner while it reads the slice, so a
- * producer can never return (and overwrite its buffer) mid-send — even
- * when interrupted.
+ * <p>The lock is held by the loop while it reads the slice, so a producer
+ * can never return (and overwrite its buffer) mid-send, even when
+ * interrupted. A handler Content-Length ({@code declaredLength}) is
+ * enforced: more bytes, or fewer at the end, fail the body.
  */
 final class Http3ResponseBody {
 
     /** {@link #pump} results. */
-    static final int SENDING = 0;
-    static final int COMPLETE = 1;
-    static final int ABORTED = 2;
+    static final int IDLE = 0;
+    static final int SENDING = 1;
+    static final int COMPLETE = 2;
+    static final int ABORTED = 3;
+
+    /** The loop's direct path into quiche for this stream. */
+    interface Sender {
+        /** Bytes accepted (possibly 0), or -1 once the stream can't take data. */
+        int send(byte[] b, int off, int len, boolean fin);
+    }
 
     private static final byte[] EMPTY = new byte[0];
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition consumed = lock.newCondition();
-    private final Runnable wakeOwner;
+    private final Http3Exchange exchange;
+    private final long declaredLength;
     private final OutputStream outputStream = new BodyOutputStream();
 
-    // Offered slice, guarded by lock. `offered` is volatile so the owner
+    // Offered slice, guarded by lock. `offered` is volatile so the loop
     // can skip the lock when nothing is pending.
     private volatile boolean offered;
     private byte[] buf;
@@ -50,31 +58,47 @@ final class Http3ResponseBody {
     private boolean fin;
     private volatile boolean failed;
     private volatile boolean cancelled;
+    // Producer only.
+    private long produced;
 
-    // Owner-only: DATA frame header of the current slice, sent first.
-    private final ByteBuffer frameHeader = ByteBuffer.allocate(16);
+    // Loop only: DATA frame header of the current slice, sent first.
+    private final byte[] frameHeader = new byte[16];
+    private int headerOff;
+    private int headerEnd;
     private boolean headerPending;
 
-    Http3ResponseBody(Runnable wakeOwner) {
-        this.wakeOwner = wakeOwner;
+    Http3ResponseBody(Http3Exchange exchange, long declaredLength) {
+        this.exchange = exchange;
+        this.declaredLength = declaredLength;
+    }
+
+    long declaredLength() {
+        return declaredLength;
     }
 
     // ---- producer side (handler virtual thread) -----------------------
 
-    /** Send {@code b[off, off+len)} as one DATA frame; blocks until sent. */
-    void write(byte[] b, int off, int len) throws IOException {
-        if (len > 0) offer(b, off, len, false);
+    /** Sends {@code b[off, off+len)} as one DATA frame, the last one when {@code last}; blocks until sent. */
+    void write(byte[] b, int off, int len, boolean last) throws IOException {
+        produced += len;
+        if (declaredLength >= 0 && (produced > declaredLength || (last && produced != declaredLength))) {
+            throw new IOException("response body length differs from its Content-Length " + declaredLength);
+        }
+        if (len > 0 || last) offer(b, off, len, last);
     }
 
-    /** End the body (FIN); blocks until handed to quiche. */
+    /** Ends the body (FIN); blocks until handed to quiche. */
     void finish() throws IOException {
+        if (declaredLength >= 0 && produced != declaredLength) {
+            throw new IOException("response body shorter than its Content-Length " + declaredLength);
+        }
         offer(EMPTY, 0, 0, true);
     }
 
-    /** The producer failed: the owner resets the stream (no clean FIN). */
+    /** The producer failed: the loop resets the stream (no clean FIN). */
     void fail() {
         failed = true;
-        wakeOwner.run();
+        exchange.signal(Http3Exchange.EV_BODY);
     }
 
     /** OutputStream view for StreamingBody / ChunkedWriter. */
@@ -91,13 +115,13 @@ final class Http3ResponseBody {
             len = l;
             fin = f;
             offered = true;
-            wakeOwner.run();
+            exchange.signal(Http3Exchange.EV_BODY);
             while (offered) {
                 if (cancelled) throw closed();
                 try {
                     consumed.await();
                 } catch (InterruptedException e) {
-                    // We hold the lock again, so the owner isn't reading
+                    // We hold the lock again, so the loop isn't reading
                     // the slice: safe to abandon it.
                     offered = false;
                     cancelled = true;
@@ -115,77 +139,75 @@ final class Http3ResponseBody {
         return new IOException("HTTP/3 response stream closed");
     }
 
-    // ---- owner side ---------------------------------------------------
+    // ---- loop side ------------------------------------------------------
+
+    /** True while a slice waits for the loop. */
+    boolean hasOffer() {
+        return offered;
+    }
+
+    boolean failed() {
+        return failed || cancelled;
+    }
 
     /**
-     * Push as much of the offered slice as quiche accepts. Owner thread
-     * only; called every loop iteration while the body is registered.
-     * With {@code checkStopped} (packets arrived), a body with nothing to
-     * send asks quiche whether the peer stopped the stream: no send would
-     * reveal it while the producer is idle.
+     * Pushes as much of the offered slice as quiche accepts. Loop only;
+     * called on {@link Http3Exchange#EV_BODY} and when the stream's send
+     * capacity grows.
      *
-     * @return {@link #SENDING}, {@link #COMPLETE} once FIN went out, or
-     *   {@link #ABORTED} when the stream is gone or the producer failed
-     *   (the caller resets the stream).
+     * @return {@link #IDLE} (nothing offered), {@link #SENDING} (a slice
+     *   is waiting on flow control), {@link #COMPLETE} once the FIN went
+     *   out, or {@link #ABORTED} when the stream is gone or the producer
+     *   failed (the caller resets the stream)
      */
-    int pump(Http3Session session, long streamId, boolean checkStopped) {
+    int pump(Sender sender) {
         if (failed || cancelled) {
             cancel();
             return ABORTED;
         }
-        // Earlier bytes (HEADERS) still deferred: keep stream order.
-        if (!offered || session.hasPendingWrites(streamId)) {
-            if (checkStopped && session.sendStopped(streamId)) {
-                cancel();
-                return ABORTED;
-            }
-            return SENDING;
-        }
+        if (!offered) return IDLE;
         lock.lock();
         try {
-            if (!offered) return cancelled ? ABORTED : SENDING;
-            if (fin) {
-                if (session.sendStreamBytes(streamId, EMPTY, 0, 0, true) < 0) {
+            if (!offered) return cancelled ? ABORTED : IDLE;
+            if (len == 0) {
+                if (sender.send(EMPTY, 0, 0, fin) < 0) {
                     cancelLocked();
                     return ABORTED;
                 }
-                release();
-                return COMPLETE;
+                return release(fin);
             }
             if (!headerPending) {
-                frameHeader.clear();
-                Http3Varint.encode(frameHeader, Http3FrameType.DATA);
-                Http3Varint.encode(frameHeader, len);
-                frameHeader.flip();
+                headerOff = 0;
+                headerEnd = Http3Varint.encode(frameHeader, 0, Http3FrameType.DATA);
+                headerEnd = Http3Varint.encode(frameHeader, headerEnd, len);
                 headerPending = true;
             }
-            if (frameHeader.hasRemaining()) {
-                int n = session.sendStreamBytes(streamId, frameHeader.array(),
-                    frameHeader.position(), frameHeader.remaining(), false);
+            if (headerOff < headerEnd) {
+                int n = sender.send(frameHeader, headerOff, headerEnd - headerOff, false);
                 if (n < 0) {
                     cancelLocked();
                     return ABORTED;
                 }
-                frameHeader.position(frameHeader.position() + n);
-                if (frameHeader.hasRemaining()) return SENDING;
+                headerOff += n;
+                if (headerOff < headerEnd) return SENDING;
             }
-            int n = session.sendStreamBytes(streamId, buf, off, len, false);
+            int n = sender.send(buf, off, len, fin);
             if (n < 0) {
                 cancelLocked();
                 return ABORTED;
             }
             off += n;
             len -= n;
-            if (len == 0) release();
-            return SENDING;
+            if (len > 0) return SENDING;
+            return release(fin);
         } finally {
             lock.unlock();
         }
     }
 
     /**
-     * Abandon the body (stream reset by the peer, connection closing):
-     * a blocked or later {@link #write} throws.
+     * Abandons the body (stream reset, connection closing): a blocked or
+     * later {@link #write} throws.
      */
     void cancel() {
         lock.lock();
@@ -203,11 +225,12 @@ final class Http3ResponseBody {
         consumed.signalAll();
     }
 
-    private void release() {
+    private int release(boolean last) {
         offered = false;
         headerPending = false;
         buf = null;
         consumed.signal();
+        return last ? COMPLETE : IDLE;
     }
 
     private final class BodyOutputStream extends OutputStream {
@@ -216,12 +239,12 @@ final class Http3ResponseBody {
         @Override
         public void write(int b) throws IOException {
             one[0] = (byte) b;
-            Http3ResponseBody.this.write(one, 0, 1);
+            Http3ResponseBody.this.write(one, 0, 1, false);
         }
 
         @Override
         public void write(byte[] b, int off, int len) throws IOException {
-            Http3ResponseBody.this.write(b, off, len);
+            Http3ResponseBody.this.write(b, off, len, false);
         }
     }
 }

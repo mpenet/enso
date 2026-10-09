@@ -1,0 +1,14 @@
+# ABOUTME: h3spec cases expected to fail plus the suite size; bench/h3spec/run.sh fails CI on
+# ABOUTME: any other failure, a listed case passing, or a different case count.
+# h3spec cases enso is currently known to fail, one case description per line
+# exactly as printed by h3spec (without the trailing [✘]). Any other failing
+# case fails CI, and so does a listed case that no longer fails: remove its line.
+#
+# Both are reserved-bit checks done inside libquiche 0.29.3, below the JNI
+# shim (the bits are under header protection); see doc/h3-conformance.md.
+#
+# Cases a full run must execute; a different count fails the run (truncated
+# run or changed suite).
+total-cases: 49
+MUST send PROTOCOL_VIOLATION if reserved bits in Handshake are non-zero [Transport 17.2]
+MUST send PROTOCOL_VIOLATION if reserved bits in Short are non-zero [Transport 17.2]

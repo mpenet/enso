@@ -1,19 +1,37 @@
+// ABOUTME: Buffered writer for streamed response bodies (SSE, long-poll): HTTP/1.1 chunked
+// ABOUTME: framing, or raw bytes for drivers that frame themselves (HTTP/2 DATA, HTTP/3).
 package com.s_exp.enso.api;
 
+import com.s_exp.enso.core.ChunkedWriters;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
 /**
- * Writer that emits HTTP/1.1 chunked-transfer-encoded chunks to the client.
- * Buffers small writes and emits them as a chunk whenever the buffer fills,
- * so memory stays bounded by the buffer size; {@link #flush()} forces the
- * accumulated bytes out as a single chunk. Do not touch a writer after the
- * handler returns — the server emits the terminating zero-length chunk
- * itself.
+ * Writer for a streamed response body. On HTTP/1.1 it emits
+ * chunked-transfer-encoded chunks (or raw bytes for a close-delimited or
+ * fixed-length body); on HTTP/2 and HTTP/3 it writes raw bytes that the
+ * driver frames as DATA. Buffers small writes and emits them whenever the
+ * buffer fills, so memory stays bounded by the buffer size; {@link #flush()}
+ * forces the accumulated bytes out. Do not touch a writer after the body
+ * fn ({@link StreamingBody#write}) returns — the server then ends the body
+ * itself (the terminating zero-length chunk on HTTP/1.1).
  */
 public final class ChunkedWriter {
+
+    static {
+        ChunkedWriters.register(ChunkedWriter::finish);
+    }
+
+    /** Pending-chunk buffer size the drivers use for streamed bodies. */
+    public static final int DEFAULT_BUFFER_BYTES = 8192;
+    /**
+     * Room kept in front of chunk data for its size line: up to 8 hex
+     * digits for an int, then CRLF. See {@link #frame}.
+     */
+    public static final int SIZE_LINE_ROOM = 10;
 
     private static final byte[] CRLF = {'\r', '\n'};
     private static final byte[] CHUNK_END = "0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
@@ -21,16 +39,62 @@ public final class ChunkedWriter {
 
     private final OutputStream out;
     private final boolean framed;
+    // Pending chunk data sits at [dataStart, dataStart + len); when framed,
+    // the size line is written in place in front of it and CRLF behind it,
+    // so a chunk leaves in one write.
     private final byte[] buf;
-    // Chunk-size line scratch: up to 8 hex digits for an int, then CRLF.
-    private final byte[] sizeLine = new byte[10];
+    private final int dataStart;
+    private final int capacity;
+    // Chunk-size line scratch for chunks written without copying.
+    private byte[] sizeLine;
     private int len;
     private boolean closed;
+    private Charset charset = StandardCharsets.UTF_8;
+    private long bytesWritten;
 
     public ChunkedWriter(OutputStream out, int bufferSize, boolean framed) {
+        this(out, new byte[Math.max(bufferSize, 512)], framed);
+    }
+
+    /**
+     * A writer over a caller-owned buffer (a connection reuses one for every
+     * streamed response): used until the driver ends the body
+     * ({@code ChunkedWriters.finish}), never after. At least 512 bytes.
+     */
+    public ChunkedWriter(OutputStream out, byte[] buffer, boolean framed) {
+        if (buffer.length < 512) {
+            throw new IllegalArgumentException("ChunkedWriter buffer below 512 bytes");
+        }
         this.out = out;
         this.framed = framed;
-        this.buf = new byte[Math.max(bufferSize, 512)];
+        this.buf = buffer;
+        this.dataStart = framed ? SIZE_LINE_ROOM : 0;
+        this.capacity = buffer.length - (framed ? SIZE_LINE_ROOM + 2 : 0);
+    }
+
+    /**
+     * Frames {@code len} bytes of chunk data at {@code buf[dataStart..]} in
+     * place: the size line right before it (needs {@link #SIZE_LINE_ROOM}
+     * bytes there) and CRLF right after it (2 bytes). Returns where the
+     * framed chunk starts; it ends at {@code dataStart + len + 2}.
+     */
+    public static int frame(byte[] buf, int dataStart, int len) {
+        buf[dataStart + len] = '\r';
+        buf[dataStart + len + 1] = '\n';
+        return sizeLine(buf, dataStart, len);
+    }
+
+    /** Writes the size line of a {@code len}-byte chunk ending at {@code end}; returns its start. */
+    private static int sizeLine(byte[] buf, int end, int len) {
+        int i = end - 2;
+        buf[i] = '\r';
+        buf[i + 1] = '\n';
+        int v = len;
+        do {
+            buf[--i] = HEX[v & 0xF];
+            v >>>= 4;
+        } while (v != 0);
+        return i;
     }
 
     /** Writes bytes into the pending chunk buffer. */
@@ -45,10 +109,10 @@ public final class ChunkedWriter {
      */
     public void write(int b) throws IOException {
         ensureOpen();
-        if (len == buf.length) {
+        if (len == capacity) {
             flushPending();
         }
-        buf[len++] = (byte) b;
+        buf[dataStart + len++] = (byte) b;
     }
 
     /**
@@ -59,20 +123,32 @@ public final class ChunkedWriter {
     public void write(byte[] data, int off, int length) throws IOException {
         ensureOpen();
         Objects.checkFromIndexSize(off, length, data.length);
-        if (length > buf.length - len) {
+        if (length > capacity - len) {
             flushPending();
-            if (length >= buf.length) {
+            if (length >= capacity) {
                 emitChunk(data, off, length);
                 return;
             }
         }
-        System.arraycopy(data, off, buf, len, length);
+        System.arraycopy(data, off, buf, dataStart + len, length);
         len += length;
     }
 
-    /** Writes a UTF-8 encoded string into the pending chunk buffer. */
+    /**
+     * Writes a string, encoded with {@link #charset(Charset)} (UTF-8 unless
+     * set), into the pending chunk buffer.
+     */
     public void write(String s) throws IOException {
-        write(s.getBytes(StandardCharsets.UTF_8));
+        write(s.getBytes(charset));
+    }
+
+    /**
+     * Sets the charset {@link #write(String)} encodes with. The Clojure
+     * adapter sets the response's ({@code Content-Type}) charset before the
+     * body runs, as for String and seq bodies.
+     */
+    public void charset(Charset charset) {
+        this.charset = Objects.requireNonNull(charset);
     }
 
     /**
@@ -95,12 +171,13 @@ public final class ChunkedWriter {
         }
         int i = 0;
         while (i < n) {
-            if (len == buf.length) {
+            if (len == capacity) {
                 flushPending();
             }
-            int m = Math.min(n - i, buf.length - len);
+            int m = Math.min(n - i, capacity - len);
+            int at = dataStart + len;
             for (int j = 0; j < m; j++) {
-                buf[len + j] = (byte) s.charAt(i + j);
+                buf[at + j] = (byte) s.charAt(i + j);
             }
             len += m;
             i += m;
@@ -123,7 +200,13 @@ public final class ChunkedWriter {
         return len;
     }
 
-    public void closeInternal() throws IOException {
+    /** Body bytes handed to the output so far, framing excluded. */
+    public long bytesWritten() {
+        return bytesWritten;
+    }
+
+    // Ends the body; reached by drivers through ChunkedWriters.finish.
+    private void finish() throws IOException {
         if (closed) {
             return;
         }
@@ -139,33 +222,32 @@ public final class ChunkedWriter {
         if (len == 0) {
             return;
         }
-        emitChunk(buf, 0, len);
+        bytesWritten += len;
+        if (framed) {
+            int start = frame(buf, dataStart, len);
+            out.write(buf, start, dataStart + len + 2 - start);
+        } else {
+            out.write(buf, 0, len);
+        }
         len = 0;
     }
 
+    /** A chunk at least as large as the buffer, written from the caller's array. */
     private void emitChunk(byte[] data, int off, int length) throws IOException {
-        if (length == 0) {
-            return;
-        }
+        bytesWritten += length;
         if (framed) {
-            writeSizeLine(length);
+            byte[] line = sizeLine;
+            if (line == null) {
+                line = new byte[SIZE_LINE_ROOM];
+                sizeLine = line;
+            }
+            int start = sizeLine(line, SIZE_LINE_ROOM, length);
+            out.write(line, start, SIZE_LINE_ROOM - start);
             out.write(data, off, length);
             out.write(CRLF);
         } else {
             out.write(data, off, length);
         }
-    }
-
-    private void writeSizeLine(int v) throws IOException {
-        // 4-byte int in hex is at most 8 digits, followed by CRLF
-        int i = 8;
-        do {
-            sizeLine[--i] = HEX[v & 0xF];
-            v >>>= 4;
-        } while (v != 0);
-        sizeLine[8] = '\r';
-        sizeLine[9] = '\n';
-        out.write(sizeLine, i, 10 - i);
     }
 
     private void ensureOpen() {

@@ -1,3 +1,5 @@
+// ABOUTME: Blocking TLS over a SocketChannel with an SSLEngine: handshake deadline, record I/O,
+// ABOUTME: close_notify / half-close, abortable close, idle buffer release, renegotiation refusal.
 package com.s_exp.enso.core;
 
 import java.io.EOFException;
@@ -14,13 +16,15 @@ import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLEngineResult.HandshakeStatus;
 import javax.net.ssl.SSLEngineResult.Status;
+import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLSession;
 
 /**
- * Thin blocking TLS wrapper: {@link SocketChannel} + {@link SSLEngine}. Used
- * in place of {@code SSLSocket} when the HTTP/2 path wants direct control of
- * the record boundary (gathering writes, clean {@code close_notify}
- * shutdown).
+ * Thin blocking TLS wrapper: {@link SocketChannel} + {@link SSLEngine}. Every
+ * TLS connection (HTTP/1.1 and HTTP/2) goes through it rather than
+ * {@code SSLSocket}, for direct control of the record boundary (gathering
+ * writes, clean {@code close_notify} shutdown), an abortable close, and a
+ * wall-clock handshake deadline.
  *
  * <p>The underlying channel stays in blocking mode; Loom parks virtual
  * threads that block on its reads (through the socket adaptor stream, so
@@ -36,6 +40,10 @@ import javax.net.ssl.SSLSession;
 public final class TlsSocket implements AutoCloseable {
 
     private static final ByteBuffer EMPTY = ByteBuffer.allocate(0);
+    // Record buffers of an idle connection (releaseIdleBuffers): enough
+    // for a record header and a close_notify; they grow back to the
+    // session's sizes through the BUFFER_UNDERFLOW / BUFFER_OVERFLOW paths.
+    private static final int IDLE_BUFFER_BYTES = 512;
 
     private final SocketChannel channel;
     private final SSLEngine engine;
@@ -62,7 +70,11 @@ public final class TlsSocket implements AutoCloseable {
     private final ReentrantLock handshakeLock = new ReentrantLock();
 
     private volatile boolean handshakeDone = false;
+    // Set when the peer tried to renegotiate after the initial handshake.
+    private volatile boolean renegotiationRefused;
     private final java.util.concurrent.atomic.AtomicBoolean closed =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final java.util.concurrent.atomic.AtomicBoolean outputShut =
         new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private final InputStream in;
@@ -75,6 +87,9 @@ public final class TlsSocket implements AutoCloseable {
     // whole handshake, so a peer dripping bytes under SO_TIMEOUT can't
     // hold it open indefinitely.
     private long handshakeDeadlineNanos;
+    // The session's packet size, fixed once the handshake is done (TLS 1.3
+    // has no renegotiation; earlier versions' is refused); 0 before.
+    private volatile int packetSize;
 
     public TlsSocket(SocketChannel channel, SSLEngine engine) throws IOException {
         this.channel = channel;
@@ -115,6 +130,7 @@ public final class TlsSocket implements AutoCloseable {
             while (hs != HandshakeStatus.FINISHED && hs != HandshakeStatus.NOT_HANDSHAKING) {
                 hs = stepHandshake(hs);
             }
+            packetSize = engine.getSession().getPacketBufferSize();
             handshakeDone = true;
         } finally {
             if (handshakeDeadlineNanos != 0) {
@@ -125,6 +141,12 @@ public final class TlsSocket implements AutoCloseable {
         }
     }
 
+    /**
+     * One handshake step. Buffer modes, on entry and on return: peerNetData
+     * in write mode (ciphertext not yet unwrapped sits in [0, position)),
+     * peerAppData in read mode (plaintext not yet consumed sits in
+     * [position, limit)).
+     */
     private HandshakeStatus stepHandshake(HandshakeStatus hs) throws IOException {
         switch (hs) {
             case NEED_UNWRAP -> {
@@ -162,6 +184,11 @@ public final class TlsSocket implements AutoCloseable {
                 SSLEngineResult r = engine.wrap(EMPTY, myNetData);
                 myNetData.flip();
                 writeFully(myNetData);
+                if (r.getStatus() == Status.BUFFER_OVERFLOW) {
+                    myNetData = ByteBuffer.allocate(Math.max(myNetData.capacity() * 2,
+                                                             engine.getSession().getPacketBufferSize()));
+                    return hs;
+                }
                 return r.getHandshakeStatus();
             }
             case NEED_TASK -> {
@@ -223,6 +250,62 @@ public final class TlsSocket implements AutoCloseable {
         return bigger;
     }
 
+    /**
+     * Swaps the record buffers (about 16 KiB each) for small ones while the
+     * connection is idle, when they hold nothing: no ciphertext pending,
+     * no plaintext unread. Called by the reading thread between requests.
+     */
+    public void releaseIdleBuffers() {
+        releaseIdleInputBuffers();
+        releaseOutputBuffer();
+    }
+
+    /**
+     * The input half of {@link #releaseIdleBuffers}, for a reader that must
+     * not wait for a writer (the HTTP/2 framer): only takes the read lock.
+     */
+    public void releaseIdleInputBuffers() {
+        readLock.lock();
+        try {
+            if (peerNetData.position() == 0 && !peerAppData.hasRemaining()
+                && peerNetData.capacity() > IDLE_BUFFER_BYTES) {
+                peerNetData = ByteBuffer.allocate(IDLE_BUFFER_BYTES);
+                peerAppData = ByteBuffer.allocate(IDLE_BUFFER_BYTES);
+                peerAppData.flip();
+            }
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    /**
+     * The output half of {@link #releaseIdleBuffers}: the output record
+     * buffer becomes a small one (it grows back on the next write). A
+     * driver writing through {@link #writeRecords} with its own buffers
+     * calls it once, so the connection only keeps room for a close_notify.
+     */
+    public void releaseOutputBuffer() {
+        writeLock.lock();
+        try {
+            if (myNetData.capacity() > IDLE_BUFFER_BYTES) {
+                myNetData = ByteBuffer.allocate(IDLE_BUFFER_BYTES);
+            }
+            ((RecordOutputStream) out).forgetWrapped();
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /** Whether the peer tried to renegotiate after the initial handshake (refused, connection failed). */
+    public boolean renegotiationRefused() {
+        return renegotiationRefused;
+    }
+
+    /** The TLS session, for the peer's certificates. */
+    public SSLSession session() {
+        return engine.getSession();
+    }
+
     public String getApplicationProtocol() {
         return engine.getApplicationProtocol();
     }
@@ -253,39 +336,103 @@ public final class TlsSocket implements AutoCloseable {
         // §7.2.1 — send close_notify then FIN. Ordering matters here: if we
         // close the socket before the close_notify record hits the wire the
         // peer sees a bare TCP RST/FIN and can't tell our clean GOAWAY apart
-        // from an abrupt drop (h2spec §6.9.1). writeLock must also be held —
-        // myNetData is shared with the regular write path and racing wrap()
-        // calls corrupt its buffer state.
+        // from an abrupt drop (h2spec §6.9.1).
         try {
-            writeLock.lock();
-            try {
-                handshakeLock.lock();
-                try {
-                    engine.closeOutbound();
-                    while (!engine.isOutboundDone()) {
-                        myNetData.clear();
-                        SSLEngineResult r = engine.wrap(EMPTY, myNetData);
-                        myNetData.flip();
-                        writeFully(myNetData);
-                        if (r.getStatus() == Status.CLOSED) break;
-                    }
-                    // Half-close outbound (send FIN) after the close_notify
-                    // record is on the wire. Reads may still drain any
-                    // trailing bytes from the peer.
-                    try {
-                        channel.shutdownOutput();
-                    } catch (IOException ignored) {
-                    }
-                } finally {
-                    handshakeLock.unlock();
-                }
-            } finally {
-                writeLock.unlock();
-            }
+            shutdownOutput();
         } catch (IOException ignored) {
             // socket may be already dead — the finally block still closes it
         } finally {
             channel.close();
+        }
+    }
+
+    /**
+     * Sends close_notify, then FIN; the input side stays open, so the
+     * peer's remaining bytes can still be read (a lingering close) rather
+     * than answered with a TCP reset that could discard data the peer hasn't
+     * read yet (a final response or GOAWAY). Idempotent; {@link #close}
+     * afterwards closes the channel.
+     */
+    public void shutdownOutput() throws IOException {
+        if (!outputShut.compareAndSet(false, true)) return;
+        // writeLock must be held — myNetData is shared with the regular
+        // write path and racing wrap() calls corrupt its buffer state.
+        writeLock.lock();
+        try {
+            handshakeLock.lock();
+            try {
+                engine.closeOutbound();
+                while (!engine.isOutboundDone()) {
+                    myNetData.clear();
+                    SSLEngineResult r = engine.wrap(EMPTY, myNetData);
+                    myNetData.flip();
+                    writeFully(myNetData);
+                    if (r.getStatus() == Status.CLOSED) break;
+                    if (r.getStatus() == Status.BUFFER_OVERFLOW) {
+                        myNetData = ByteBuffer.allocate(engine.getSession().getPacketBufferSize());
+                    }
+                }
+                // Half-close outbound (send FIN) after the close_notify
+                // record is on the wire. Reads may still drain any
+                // trailing bytes from the peer.
+                try {
+                    channel.shutdownOutput();
+                } catch (IOException ignored) {
+                }
+            } finally {
+                handshakeLock.unlock();
+            }
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /**
+     * Writes {@code src[off, off+len)} as TLS records encrypted into
+     * {@code net}, a caller-owned buffer of at least one packet
+     * ({@code getPacketBufferSize}), with as many records per channel write
+     * as {@code net} holds: one syscall per several records, where the
+     * output stream makes one per record. Callers can pool {@code net}
+     * across connections; it holds nothing once this returns.
+     */
+    public void writeRecords(byte[] src, int off, int len, ByteBuffer net) throws IOException {
+        if (len == 0) return;
+        writeRecords(ByteBuffer.wrap(src, off, len), net);
+    }
+
+    /**
+     * {@link #writeRecords(byte[], int, int, ByteBuffer)} of {@code app}'s
+     * remaining bytes, consumed: a caller that keeps a wrapper per buffer
+     * allocates nothing per call.
+     */
+    public void writeRecords(ByteBuffer app, ByteBuffer net) throws IOException {
+        if (!app.hasRemaining()) return;
+        writeLock.lock();
+        try {
+            int packet = packetSize;
+            if (packet == 0) {
+                packet = engine.getSession().getPacketBufferSize();
+            }
+            if (net.capacity() < packet) {
+                throw new IllegalArgumentException("net buffer smaller than a TLS packet");
+            }
+            net.clear();
+            while (app.hasRemaining()) {
+                if (net.remaining() < packet) {
+                    net.flip();
+                    writeFully(net);
+                    net.clear();
+                }
+                SSLEngineResult r = engine.wrap(app, net);
+                if (r.getStatus() == Status.CLOSED) {
+                    throw new IOException("SSL engine outbound closed");
+                }
+            }
+            net.flip();
+            writeFully(net);
+        } finally {
+            net.clear();
+            writeLock.unlock();
         }
     }
 
@@ -317,7 +464,7 @@ public final class TlsSocket implements AutoCloseable {
      * Wrap this TlsSocket in a {@link java.net.Socket} shim so it can be
      * passed to callers that expect the classic API. Only the accessors and
      * lifecycle methods the connection drivers actually use are overridden;
-     * the underlying {@link Socket} instance is unconnected and inert.
+     * the underlying {@link java.net.Socket} instance is unconnected and inert.
      */
     public java.net.Socket asSocket() {
         return new AdapterSocket(this);
@@ -341,6 +488,7 @@ public final class TlsSocket implements AutoCloseable {
         @Override public InputStream getInputStream() { return tls.getInputStream(); }
         @Override public OutputStream getOutputStream() { return tls.getOutputStream(); }
         @Override public void close() throws IOException { tls.close(); }
+        @Override public void shutdownOutput() throws IOException { tls.shutdownOutput(); }
         @Override public InetAddress getInetAddress() { return tls.getInetAddress(); }
         @Override public int getLocalPort() { return tls.getLocalPort(); }
         @Override public SocketAddress getLocalSocketAddress() {
@@ -350,12 +498,14 @@ public final class TlsSocket implements AutoCloseable {
                 return null;
             }
         }
-        // close_notify replaces SO_LINGER as the way to make sure a final
-        // GOAWAY reaches the peer, so keep this a no-op.
-        @Override public void setSoLinger(boolean on, int linger) { }
-        // TCP_NODELAY was set on the underlying SocketChannel at accept time.
-        // The AdapterSocket has no SocketImpl to forward to; no-op.
-        @Override public void setTcpNoDelay(boolean on) { }
+        // The adapter has no SocketImpl of its own: socket options go to
+        // the socket underneath the SocketChannel.
+        @Override public void setSoLinger(boolean on, int linger) throws java.net.SocketException {
+            tls.channel.socket().setSoLinger(on, linger);
+        }
+        @Override public void setTcpNoDelay(boolean on) throws java.net.SocketException {
+            tls.channel.socket().setTcpNoDelay(on);
+        }
         // Per-request slowloris deadline from HttpConnection. Forward to the
         // SocketChannel's underlying Socket — ciphertext is read through its
         // adaptor stream, which honours SO_TIMEOUT and unparks the vthread
@@ -440,13 +590,14 @@ public final class TlsSocket implements AutoCloseable {
                 peerNetData.compact();
                 switch (r.getStatus()) {
                     case OK -> {
+                        HandshakeStatus hs = r.getHandshakeStatus();
+                        if (hs != HandshakeStatus.NOT_HANDSHAKING && hs != HandshakeStatus.FINISHED) {
+                            peerAppData.flip();
+                            postHandshake(hs);
+                            peerAppData.compact();
+                        }
                         if (peerAppData.position() > 0) {
                             peerAppData.flip();
-                            HandshakeStatus hs = r.getHandshakeStatus();
-                            if (hs != HandshakeStatus.NOT_HANDSHAKING
-                                && hs != HandshakeStatus.FINISHED) {
-                                driveHandshake(hs);
-                            }
                             return true;
                         }
                     }
@@ -470,23 +621,32 @@ public final class TlsSocket implements AutoCloseable {
                         return false;
                     }
                 }
-                HandshakeStatus hs = r.getHandshakeStatus();
-                if (hs != HandshakeStatus.NOT_HANDSHAKING
-                    && hs != HandshakeStatus.FINISHED
-                    && r.getStatus() == Status.OK) {
-                    driveHandshake(hs);
-                }
             }
         }
 
+        /**
+         * Handshake messages after the initial handshake. TLS 1.3 has no
+         * renegotiation: what arrives is a KeyUpdate (answered by a
+         * NEED_WRAP) and is driven through. Below 1.3 it is a
+         * client-initiated renegotiation, which is refused: it costs the
+         * server a full handshake per request a client chooses to send
+         * (a CPU amplification) and has a history of attacks. Called with
+         * peerAppData in read mode.
+         */
+        private void postHandshake(HandshakeStatus hs) throws IOException {
+            if (!"TLSv1.3".equals(engine.getSession().getProtocol())) {
+                renegotiationRefused = true;
+                throw new SSLHandshakeException("TLS renegotiation refused");
+            }
+            driveHandshake(hs);
+        }
+
         private void driveHandshake(HandshakeStatus start) throws IOException {
-            // Renegotiation triggered from the read path can transition to
+            // A TLS 1.3 KeyUpdate received on the read path transitions to
             // NEED_WRAP, which mutates myNetData — the same buffer the writer
             // vthread uses under writeLock. Grab writeLock first (matching
             // close()'s order) so a concurrent RecordOutputStream.write can
-            // never race with stepHandshake's wrap(). TLS 1.3 never
-            // renegotiates so this is dormant in practice, but the ordering
-            // must be right for older peers.
+            // never race with stepHandshake's wrap().
             writeLock.lock();
             try {
                 handshakeLock.lock();
@@ -519,9 +679,18 @@ public final class TlsSocket implements AutoCloseable {
         private byte[] wrappedArray;
         private ByteBuffer wrapped;
 
+        // write(int) scratch, used under writeLock.
+        private final byte[] one = new byte[1];
+
         @Override
         public void write(int b) throws IOException {
-            write(new byte[] { (byte) b }, 0, 1);
+            writeLock.lock();
+            try {
+                one[0] = (byte) b;
+                write(one, 0, 1);
+            } finally {
+                writeLock.unlock();
+            }
         }
 
         @Override
@@ -563,6 +732,12 @@ public final class TlsSocket implements AutoCloseable {
         public void flush() {
             // SSLEngine emits per wrap(); channel writes are synchronous.
             // Nothing else buffers past this point.
+        }
+
+        /** Drops the cached wrapper (and the caller's array it pins). Under writeLock. */
+        void forgetWrapped() {
+            wrapped = null;
+            wrappedArray = null;
         }
     }
 }

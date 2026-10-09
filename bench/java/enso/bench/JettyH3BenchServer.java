@@ -1,3 +1,5 @@
+// ABOUTME: Jetty HTTP/3 server used as a comparison point in enso's HTTP/3 benchmarks,
+// ABOUTME: answering every request with the same 200 "nf" response as the enso bench handler.
 package enso.bench;
 
 import org.eclipse.jetty.http.HttpHeader;
@@ -16,8 +18,9 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 
 /**
- * Jetty h3 server for bench comparisons against enso (task #95). Same
- * plaintext handler shape as enso + Netty benches: 200 OK, body "nf".
+ * Jetty h3 server for bench comparisons against enso. Answers every
+ * request 200 with the body "nf", as the Netty bench server does (enso's
+ * bench handler sends the same body with status 404).
  */
 public final class JettyH3BenchServer {
 

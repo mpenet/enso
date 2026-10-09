@@ -1,3 +1,5 @@
+;; ABOUTME: Dev entry point that starts enso with HTTP/3 on UDP port 18443 using a throwaway self-signed cert,
+;; ABOUTME: for reproducing HTTP/3 issues against a live server.
 (ns h3-repro
   (:require [s-exp.enso :as enso])
   (:import (java.nio.file Files)

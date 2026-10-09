@@ -1,3 +1,5 @@
+// ABOUTME: Open-addressing hash map keyed by primitive long, avoiding Long boxing;
+// ABOUTME: used for QUIC stream-id lookups on the HTTP/3 hot path.
 package com.s_exp.enso.util;
 
 import java.util.function.LongFunction;
@@ -9,8 +11,7 @@ import java.util.function.LongFunction;
  * <p>Motivation: {@code HashMap<Long, V>} autoboxes {@code long} keys on
  * every {@code put/get/remove}. Stream IDs grow past {@link Long}'s
  * value-cache (-128..127) very quickly under load, so each operation
- * allocates a fresh {@code Long}. Task #122 alloc profile showed this
- * as the top boxed primitive. This class stores keys in a
+ * allocates a fresh {@code Long}. This class stores keys in a
  * {@code long[]} and values in an {@code Object[]}, avoiding all
  * autoboxing on the hot path.
  *

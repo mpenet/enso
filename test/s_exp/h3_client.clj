@@ -10,11 +10,12 @@
                                  Http3FrameType Http3FrameWriter Http3Listener
                                  Http3Varint)
            (com.s_exp.enso.http3.qpack QpackFieldSection)
-           (com.s_exp.enso.quiche Quiche)
+           (com.s_exp.enso.quiche NativeBuffer Quiche QuicheConfig QuicheConnection Records)
            (java.io ByteArrayOutputStream)
-           (java.net DatagramPacket DatagramSocket InetAddress InetSocketAddress
-                     SocketTimeoutException)
+           (java.net DatagramPacket InetSocketAddress SocketTimeoutException
+                     StandardProtocolFamily StandardSocketOptions)
            (java.nio ByteBuffer)
+           (java.nio.channels DatagramChannel)
            (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)
            (java.security SecureRandom)
@@ -33,13 +34,19 @@
           key (str (.resolve dir "key.pem"))
           proc (.start (ProcessBuilder.
                         ^List (list "openssl" "req" "-x509" "-newkey" "rsa:2048"
-                               "-keyout" key "-out" cert "-sha256" "-days" "1"
-                               "-nodes" "-subj" "/CN=localhost")))]
+                                    "-keyout" key "-out" cert "-sha256" "-days" "1"
+                                    "-nodes" "-subj" "/CN=localhost")))]
       (.waitFor proc)
       [cert key])))
 
+(def ^:private event-loops
+  "ENSO_H3_EVENT_LOOPS runs every test listener with that many event
+  loops (exercising cross-loop forwarding where sockets are shared)."
+  (some-> (System/getenv "ENSO_H3_EVENT_LOOPS") parse-long))
+
 (defn server-config
-  "Config for an h3 listener on an ephemeral 127.0.0.1 UDP port.
+  "Config for an h3 listener on an ephemeral 127.0.0.1 UDP port (no
+  Alt-Svc: nothing could advertise an ephemeral port).
   `configure` receives the Config$Builder for extra knobs."
   ^Config [configure]
   (let [[cert key] @cert-pair
@@ -47,8 +54,10 @@
             (.host "127.0.0.1")
             (.port 0)
             (.http3 true)
+            (.advertiseAltSvc false)
             (.http3CertPath cert)
             (.http3KeyPath key))]
+    (when event-loops (.http3EventLoops b (int event-loops)))
     (configure b)
     (.build b)))
 
@@ -75,22 +84,41 @@
 
 ;; ---- client ---------------------------------------------------------------
 
-(defn- client-config ^long [idle-timeout-ms]
-  (let [c (Quiche/configNew Quiche/QUICHE_PROTOCOL_VERSION)]
-    (Quiche/configSetApplicationProtos c (byte-array [2 (int \h) (int \3)]))
-    (Quiche/configVerifyPeer c false)
-    (Quiche/configSetMaxIdleTimeout c idle-timeout-ms)
-    (Quiche/configSetMaxRecvUdpPayloadSize c 65527)
-    (Quiche/configSetMaxSendUdpPayloadSize c 1350)
-    (Quiche/configSetInitialMaxData c 100000000)
-    (Quiche/configSetInitialMaxStreamDataBidiLocal c 10000000)
-    (Quiche/configSetInitialMaxStreamDataBidiRemote c 10000000)
-    (Quiche/configSetInitialMaxStreamDataUni c 10000000)
-    (Quiche/configSetInitialMaxStreamsBidi c 100)
-    (Quiche/configSetInitialMaxStreamsUni c 100)
+(defn- client-config
+  "Client QuicheConfig; `configure` may adjust it (e.g. a small stream window)."
+  ^QuicheConfig [idle-timeout-ms configure]
+  (let [c (QuicheConfig/client (long idle-timeout-ms))]
+    (when configure (configure c))
     c))
 
+(defn- address-records
+  "ADDR records for `local` (offset 0) and `peer` (offset Records/ADDR_LEN)."
+  ^NativeBuffer [^InetSocketAddress local ^InetSocketAddress peer]
+  (let [b (NativeBuffer/allocate (* 2 Records/ADDR_LEN))]
+    (Records/putAddress (.-buffer b) 0 local)
+    (Records/putAddress (.-buffer b) Records/ADDR_LEN peer)
+    b))
+
 (defn- now-ms ^long [] (System/currentTimeMillis))
+
+;; The server sends multi-MiB responses as unpaced bursts on loopback;
+;; with the OS default receive buffer the tail of a burst (often the lone
+;; FIN packet) is dropped and only repaired by the server's PTO.
+(def ^:private recv-buffer-bytes (* 8 1024 1024))
+
+(defn- open-socket
+  "Blocking UDP channel on an ephemeral 127.0.0.1 port with the largest
+  receive buffer up to `recv-buffer-bytes` the OS grants (macOS refuses
+  sizes above kern.ipc.maxsockbuf; Linux clamps to net.core.rmem_max)."
+  ^DatagramChannel []
+  (let [ch (DatagramChannel/open StandardProtocolFamily/INET)]
+    (loop [size recv-buffer-bytes]
+      (when (and (>= size 65536)
+                 (not (try (.setOption ch StandardSocketOptions/SO_RCVBUF (Integer/valueOf (int size)))
+                           true
+                           (catch java.io.IOException _ false))))
+        (recur (quot size 2))))
+    (.bind ch (InetSocketAddress. "127.0.0.1" 0))))
 
 (defn concat-bytes ^bytes [& arrays]
   (let [out (ByteArrayOutputStream.)]
@@ -197,82 +225,117 @@
 (defn- client-initial? [^bytes out]
   (= 0xc0 (bit-and (aget out 0) 0xf0)))
 
-(defn- flush-out! [{:keys [conn sock ^InetSocketAddress server ^ByteBuffer send-buf
-                           initial-size odcid]}]
-  (let [out (byte-array 1350)
-        to-ip (byte-array 16)
-        to-meta (int-array 2)]
+(defn- flush-out! [{:keys [^QuicheConnection conn sock ^InetSocketAddress server ^NativeBuffer send-buf
+                           ^NativeBuffer send-meta initial-size odcid]}]
+  (let [out (byte-array 1350)]
     (loop []
-      (let [n (Quiche/connSend conn send-buf 1350 to-ip to-meta)]
+      (let [n (.send conn send-buf 0 1350 send-meta 0)]
         (when (pos? n)
-          (.get send-buf 0 out 0 (int n))
+          (.get (.-buffer send-buf) 0 out 0 (int n))
           (let [pkt (Arrays/copyOf out (int n))
                 ^bytes dgram (if (and initial-size (client-initial? pkt))
                                (pad-initial pkt initial-size
                                             (or @odcid (reset! odcid (initial-dcid pkt))))
                                pkt)]
-            (.send ^DatagramSocket @sock (DatagramPacket. dgram (alength dgram) ^InetSocketAddress server)))
+            (.send ^DatagramChannel @sock (ByteBuffer/wrap dgram) server))
           (recur))))))
 
-(defn- send-pending! [{:keys [conn pending]}]
+(defn- send-pending! [{:keys [^QuicheConnection conn pending]}]
   (doseq [[sid [^bytes bs off fin]] @pending]
     (let [off (long off)
           len (- (alength bs) off)
-          n (Quiche/connStreamSend conn sid bs (int off) (int len) (boolean fin))]
+          n (.streamSend conn sid bs (int off) (int len) (boolean fin))]
       (cond
         (= n len) (swap! pending dissoc sid)
         (>= n 0) (swap! pending assoc sid [bs (+ off n) fin])
         (= n Quiche/QUICHE_ERR_DONE) nil
         :else (swap! pending dissoc sid)))))
 
-(defn- read-streams! [{:keys [conn streams ^bytes recv-buf]}]
-  (let [it (Quiche/connReadable conn)]
-    (when-not (zero? it)
-      (try
-        (let [sid-out (long-array 1)
-              fin-out (boolean-array 1)
-              err-out (long-array 1)]
-          (while (Quiche/streamIterNext it sid-out)
-            (let [sid (aget sid-out 0)]
-              (loop []
-                (let [n (Quiche/connStreamRecv conn sid recv-buf (alength recv-buf)
-                                               fin-out err-out)]
-                  (cond
-                    (>= n 0)
-                    (do (swap! streams update sid
-                               (fn [s]
-                                 (let [s (or s {:out (ByteArrayOutputStream.)})]
-                                   (.write ^ByteArrayOutputStream (:out s) recv-buf 0 (int n))
-                                   (cond-> s (aget fin-out 0) (assoc :fin true)))))
-                        (when-not (aget fin-out 0) (recur)))
+(defn- read-stream!
+  "Reads everything stream `sid` holds; unless `sid` is paused."
+  [{:keys [^QuicheConnection conn streams ^bytes recv-buf paused]} sid]
+  (when-not (contains? @paused sid)
+    (loop []
+      (let [rc (.streamRecv conn sid recv-buf 0 (alength recv-buf))]
+        (cond
+          (>= rc 0)
+          (let [n (int (bit-shift-right rc 1))
+                fin (odd? rc)]
+            (swap! streams update sid
+                   (fn [s]
+                     (let [s (or s {:out (ByteArrayOutputStream.)})]
+                       (.write ^ByteArrayOutputStream (:out s) recv-buf 0 n)
+                       (cond-> s fin (assoc :fin true)))))
+            (when-not fin (recur)))
 
-                    (= n Quiche/QUICHE_ERR_DONE) nil
+          (= rc Quiche/QUICHE_ERR_DONE) nil
 
-                    :else
-                    (swap! streams update sid
-                           (fn [s]
-                             (assoc (or s {:out (ByteArrayOutputStream.)})
-                                    :reset (aget err-out 0))))))))))
-        (finally (Quiche/streamIterFree it))))))
+          :else
+          (swap! streams update sid
+                 (fn [s]
+                   (assoc (or s {:out (ByteArrayOutputStream.)})
+                          :reset (QuicheConnection/resetCode rc)))))))))
+
+(defn- read-streams! [{:keys [^QuicheConnection conn] :as c}]
+  (loop []
+    (let [sid (.readableNext conn)]
+      (when (>= sid 0)
+        (read-stream! c sid)
+        (recur)))))
+
+(defn resume-stream!
+  "Reads stream `sid` again after `pause-stream!`."
+  [c sid]
+  (swap! (:paused c) disj sid)
+  (read-stream! c sid))
+
+(defn pause-stream!
+  "Stops reading stream `sid` (its flow-control window then fills up)."
+  [c sid]
+  (swap! (:paused c) conj sid))
+
+(defn- feed-datagram! [{:keys [^QuicheConnection conn ^InetSocketAddress local ^NativeBuffer recv-direct
+                               ^NativeBuffer recv-meta datagrams]}
+                       ^bytes buf len ^InetSocketAddress from]
+  (swap! datagrams inc)
+  (.put (.-buffer recv-direct) 0 buf 0 (int len))
+  (Records/putAddress (.-buffer recv-meta) 0 from)
+  (Records/putAddress (.-buffer recv-meta) Records/ADDR_LEN local)
+  (.recv conn recv-direct 0 (int len) recv-meta 0 Records/ADDR_LEN))
+
+(defn- receive-all!
+  "Waits up to `wait-ms` for a datagram, then feeds it and every datagram
+  already queued behind it, so a burst never sits in the socket buffer
+  for more than one round. Returns the number of datagrams fed."
+  ^long [{:keys [sock ^bytes dgram-buf] :as c} ^long wait-ms]
+  (let [^DatagramChannel ch @sock
+        pkt (DatagramPacket. dgram-buf (alength dgram-buf))]
+    (.setSoTimeout (.socket ch) (int (max 1 wait-ms)))
+    (if-not (try (.receive (.socket ch) pkt) true (catch SocketTimeoutException _ false))
+      0
+      (do (feed-datagram! c dgram-buf (.getLength pkt) (.getSocketAddress pkt))
+          (let [bb (ByteBuffer/wrap dgram-buf)]
+            (.configureBlocking ch false)
+            (try
+              (loop [n 1]
+                (.clear bb)
+                (if-let [from (.receive ch bb)]
+                  (do (feed-datagram! c dgram-buf (.position bb) from)
+                      (recur (inc n)))
+                  n))
+              (finally (.configureBlocking ch true))))))))
 
 (defn- service!
   "One I/O round: send pending stream bytes + datagrams, wait up to
-  `wait-ms` for one inbound datagram, feed it, run timers, read streams."
-  [{:keys [conn sock ^InetSocketAddress local ^bytes dgram-buf] :as c} ^long wait-ms]
+  `wait-ms` for inbound datagrams and feed every one that arrived (or
+  run timers when none did), read streams."
+  [{:keys [^QuicheConnection conn] :as c} ^long wait-ms]
   (send-pending! c)
   (flush-out! c)
-  (let [t (Quiche/connTimeoutAsNanos conn)
-        t-ms (if (neg? t) wait-ms (max 1 (min wait-ms (quot t 1000000))))
-        pkt (DatagramPacket. dgram-buf (alength dgram-buf))]
-    (.setSoTimeout ^DatagramSocket @sock (int (max 1 t-ms)))
-    (try
-      (.receive ^DatagramSocket @sock pkt)
-      (let [from ^InetSocketAddress (.getSocketAddress pkt)]
-        (Quiche/connRecv conn dgram-buf (.getLength pkt)
-                         (.getAddress (.getAddress from)) (.getPort from)
-                         (.getAddress (.getAddress local)) (.getPort local)))
-      (catch SocketTimeoutException _
-        (Quiche/connOnTimeout conn))))
+  (let [t (.timeoutNanos conn)
+        t-ms (if (neg? t) wait-ms (max 1 (min wait-ms (quot t 1000000))))]
+    (when (zero? (receive-all! c t-ms))
+      (.onTimeout conn)))
   (read-streams! c)
   (send-pending! c)
   (flush-out! c))
@@ -284,7 +347,7 @@
   (let [deadline (+ (now-ms) (long ms))]
     (loop []
       (let [v (pred)]
-        (if (or v (>= (now-ms) deadline) (Quiche/connIsClosed (:conn c)))
+        (if (or v (>= (now-ms) deadline) (.isClosed ^QuicheConnection (:conn c)))
           (or v (pred))
           (do (service! c 20)
               (recur)))))))
@@ -294,67 +357,64 @@
   [c ms]
   (pump-until! c (constantly false) ms))
 
+(defn- new-client
+  "Client state map around a fresh quiche connection to `port`."
+  [^long port idle-timeout-ms {:keys [initial-size configure server-ip] :or {server-ip "127.0.0.1"}}]
+  (let [cfg (client-config idle-timeout-ms configure)
+        sock (open-socket)
+        server (InetSocketAddress. ^String server-ip (int port))
+        scid (let [b (byte-array 16)] (.nextBytes (SecureRandom.) b) b)
+        local ^InetSocketAddress (.getLocalAddress sock)
+        conn (QuicheConnection/connect cfg "localhost" scid (address-records local server)
+                                       0 Records/ADDR_LEN)]
+    (when-not conn (throw (ex-info "quiche_connect failed" {})))
+    {:conn conn :cfg cfg :sock (atom sock) :local local :server server
+     :send-buf (NativeBuffer/allocate 1350) :send-meta (NativeBuffer/allocate Records/PKT_META_LEN)
+     :recv-buf (byte-array 65536) :dgram-buf (byte-array 65536)
+     :recv-direct (NativeBuffer/allocate 65536) :recv-meta (NativeBuffer/allocate (* 2 Records/ADDR_LEN))
+     :pending (atom (sorted-map)) :streams (atom {}) :paused (atom #{}) :datagrams (atom 0)
+     :initial-size initial-size :odcid (atom nil)}))
+
 (defn start-handshake
   "Creates a client connection to `port` and sends only its first
   Initial flight, without servicing the connection afterwards. The
-  client advertises no idle timeout."
-  [^long port]
-  (let [cfg (client-config 0)
-        sock (DatagramSocket. 0 (InetAddress/getByName "127.0.0.1"))
-        server (InetSocketAddress. "127.0.0.1" (int port))
-        scid (let [b (byte-array 16)] (.nextBytes (SecureRandom.) b) b)
-        local ^InetSocketAddress (.getLocalSocketAddress sock)
-        conn (Quiche/connect "localhost" scid
-                             (.getAddress (.getAddress local)) (.getPort local)
-                             (.getAddress (.getAddress server)) port cfg)
-        c {:conn conn :cfg cfg :sock (atom sock) :local local :server server
-           :send-buf (ByteBuffer/allocateDirect 1350) :recv-buf (byte-array 65536)
-           :dgram-buf (byte-array 65536)
-           :pending (atom (sorted-map)) :streams (atom {})}]
-    (flush-out! c)
-    c))
+  client advertises no idle timeout. `opts` as for `connect`."
+  ([port] (start-handshake port {}))
+  ([^long port opts]
+   (let [c (new-client port 0 opts)]
+     (flush-out! c)
+     c)))
 
 (defn connect
   "Opens a QUIC connection to `port` on 127.0.0.1 and completes the
   handshake. Throws when the handshake doesn't finish within 5s.
-  `:initial-size` pads every client Initial datagram to that size."
+  `:initial-size` pads every client Initial datagram to that size;
+  `:configure` receives the client QuicheConfig; `:idle-timeout` (ms,
+  default 10000)."
   ([port] (connect port {}))
-  ([^long port {:keys [initial-size]}]
-   (let [cfg (client-config 10000)
-         sock (doto (DatagramSocket. 0 (InetAddress/getByName "127.0.0.1")))
-         server (InetSocketAddress. "127.0.0.1" (int port))
-         scid (let [b (byte-array 16)] (.nextBytes (SecureRandom.) b) b)
-         local ^InetSocketAddress (.getLocalSocketAddress sock)
-         conn (Quiche/connect "localhost" scid
-                              (.getAddress (.getAddress local)) (.getPort local)
-                              (.getAddress (.getAddress server)) port cfg)
-         c {:conn conn :cfg cfg :sock (atom sock) :local local :server server
-            :send-buf (ByteBuffer/allocateDirect 1350) :recv-buf (byte-array 65536)
-            :dgram-buf (byte-array 65536)
-            :pending (atom (sorted-map)) :streams (atom {})
-           :initial-size initial-size :odcid (atom nil)}]
-     (when (zero? conn) (throw (ex-info "quiche_connect failed" {})))
-     (when-not (pump-until! c #(Quiche/connIsEstablished conn) 5000)
+  ([^long port {:keys [idle-timeout] :or {idle-timeout 10000} :as opts}]
+   (let [c (new-client port idle-timeout opts)]
+     (when-not (pump-until! c #(.isEstablished ^QuicheConnection (:conn c)) 5000)
        (throw (ex-info "h3 handshake did not complete" {:port port})))
      c)))
 
 (defn close!
   "Closes the client connection and frees native state."
-  [{:keys [conn cfg sock] :as c}]
-  (when-not (Quiche/connIsClosed conn)
-    (Quiche/connClose conn true 0x100 (byte-array 0))
+  [{:keys [^QuicheConnection conn ^QuicheConfig cfg sock] :as c}]
+  (when-not (.isClosed conn)
+    (.close conn true 0x100 (byte-array 0))
     (flush-out! c))
-  (Quiche/connFree conn)
-  (Quiche/configFree cfg)
-  (.close ^DatagramSocket @sock))
+  (.free conn)
+  (.close cfg)
+  (.close ^DatagramChannel @sock))
 
 (defn rebind!
   "Simulates a NAT rebinding: further datagrams leave from (and are
   received on) a fresh UDP port, while quiche still believes its local
   address is the original one."
   [c]
-  (let [old ^DatagramSocket @(:sock c)]
-    (reset! (:sock c) (DatagramSocket. 0 (InetAddress/getByName "127.0.0.1")))
+  (let [old ^DatagramChannel @(:sock c)]
+    (reset! (:sock c) (open-socket))
     (.close old)))
 
 (defmacro with-client
@@ -415,13 +475,19 @@
 (defn reset-stream!
   "Abruptly terminates the client's sending side of `sid` (RESET_STREAM)."
   [c sid code]
-  (Quiche/connStreamShutdown (:conn c) sid Quiche/QUICHE_SHUTDOWN_WRITE code)
+  (.streamShutdown ^QuicheConnection (:conn c) sid Quiche/QUICHE_SHUTDOWN_WRITE code)
   (flush-out! c))
 
 (defn stop-sending!
   "Asks the server to stop sending on `sid` (STOP_SENDING)."
   [c sid code]
-  (Quiche/connStreamShutdown (:conn c) sid Quiche/QUICHE_SHUTDOWN_READ code)
+  (.streamShutdown ^QuicheConnection (:conn c) sid Quiche/QUICHE_SHUTDOWN_READ code)
+  (flush-out! c))
+
+(defn ping!
+  "Sends an ack-eliciting PING (keeps the QUIC path alive)."
+  [c]
+  (.sendAckEliciting ^QuicheConnection (:conn c))
   (flush-out! c))
 
 (defn open-control!
@@ -443,8 +509,9 @@
 
 (defn response
   "Parses what the server sent on request stream `sid`:
-  {:status :headers :fields :body :fin :reset}; :fields keeps every
-  [name value] pair of the response header section in wire order."
+  {:status :interim :headers :fields :body :fin :reset}; :interim lists the
+  statuses of 1xx interim responses before the final one, :fields keeps
+  every [name value] pair of the final header section in wire order."
   [c sid]
   (let [s (stream-state c sid)
         raw (if s (.toByteArray ^ByteArrayOutputStream (:out s)) (byte-array 0))
@@ -460,13 +527,38 @@
             (= Http3FrameType/HEADERS (.-type f))
             (swap! headers conj (mapv vec (QpackFieldSection/decode ^bytes (.-payload f)))))
           (recur))))
-    (let [hs (first @headers)]
-      {:status (some (fn [[n v]] (when (= n ":status") (Long/parseLong v))) hs)
+    (let [status-of (fn [hs] (some (fn [[n v]] (when (= n ":status") (Long/parseLong v))) hs))
+          ;; 1xx sections are interim responses (RFC 9114 §4.1).
+          [interim final] (split-with #(when-let [st (status-of %)] (< st 200)) @headers)
+          hs (first final)]
+      {:status (status-of hs)
+       :interim (mapv status-of interim)
        :headers (into {} (remove #(.startsWith ^String (first %) ":")) hs)
        :fields hs
        :body (.toByteArray body)
        :fin (boolean (:fin s))
        :reset (:reset s)})))
+
+(def ^:private response-timeout-ms 5000)
+
+;; Once response bytes stop arriving the FIN may still be missing: a lost
+;; final packet is only resent after the server's PTO, which backs off.
+(def ^:private fin-timeout-ms 5000)
+
+(defn- received-bytes ^long [c sid]
+  (if-let [s (stream-state c sid)] (.size ^ByteArrayOutputStream (:out s)) 0))
+
+(defn- await-stream-done!
+  "Services `c` until stream `sid` is done. Past the response deadline,
+  waiting goes on while response bytes keep arriving, and the FIN gets
+  `fin-timeout-ms` of its own after the last byte."
+  [c sid]
+  (when-not (pump-until! c #(stream-done? c sid) response-timeout-ms)
+    (loop [n (received-bytes c sid)]
+      (when (pos? n)
+        (pump-until! c #(or (stream-done? c sid) (> (received-bytes c sid) n)) fin-timeout-ms)
+        (when (and (not (stream-done? c sid)) (> (received-bytes c sid) n))
+          (recur (received-bytes c sid)))))))
 
 (defn request!
   "Sends a request on `sid` and waits for the full response."
@@ -476,7 +568,7 @@
                   (concat-bytes (headers-frame pairs) (data-frame body))
                   (headers-frame pairs))
           true)
-   (pump-until! c #(stream-done? c sid) 5000)
+   (await-stream-done! c sid)
    (response c sid)))
 
 (defn peer-error
@@ -484,8 +576,18 @@
   closed the connection."
   [c]
   (let [out (long-array 2)]
-    (when (Quiche/connPeerError (:conn c) out)
+    (when (.peerError ^QuicheConnection (:conn c) out)
       [(= 1 (aget out 0)) (aget out 1)])))
+
+(defn datagrams-received
+  "Datagrams the client received from the server so far."
+  ^long [c]
+  @(:datagrams c))
+
+(defn peer-certificate
+  "DER bytes of the certificate the server presented, or nil."
+  ^bytes [c]
+  (.peerCertificate ^QuicheConnection (:conn c)))
 
 (defn await-peer-error
   "Pumps until the server closes the connection; returns `peer-error`."

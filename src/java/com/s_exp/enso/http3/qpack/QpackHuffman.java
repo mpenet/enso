@@ -1,3 +1,5 @@
+// ABOUTME: QPACK Huffman codec entry point; delegates to HpackHuffman since QPACK uses
+// ABOUTME: the HPACK static Huffman table (RFC 9204 section 4.1.2).
 package com.s_exp.enso.http3.qpack;
 
 import com.s_exp.enso.http2.HpackHuffman;
@@ -40,7 +42,7 @@ public final class QpackHuffman {
     /**
      * Decode into caller-supplied {@code dst}, returning bytes written.
      * {@code dst} must be at least {@link #decodedLength(byte[], int, int)}
-     * bytes. Zero-allocation path for hot QPACK decoders (task #128).
+     * bytes. Zero-allocation path for hot QPACK decoders.
      */
     public static int decodeInto(byte[] src, int off, int len, byte[] dst)
             throws IOException {

@@ -1,3 +1,5 @@
+// ABOUTME: QPACK string literal codec (RFC 9204 section 4.1.2): N-bit length-prefixed strings
+// ABOUTME: with optional Huffman encoding, used for field names and values.
 package com.s_exp.enso.http3.qpack;
 
 import java.io.IOException;
@@ -76,10 +78,9 @@ public final class NBitString {
     public static String decode(ByteBuffer buf, int n, int firstByte) {
         boolean huffman = (firstByte & (1 << n)) != 0;
         long len = NBitInteger.decode(buf, n, firstByte);
-        // Belt-and-suspenders: N-bit decode now guards against overflow
-        // (task #137), but if a future refactor loses that guard a
-        // negative len would silently produce NegativeArraySizeException
-        // that escapes the QPACK error path.
+        // Belt-and-suspenders: N-bit decode guards against overflow, but
+        // should that guard go a negative len would surface as a
+        // NegativeArraySizeException outside the QPACK error path.
         if (len < 0 || len > Integer.MAX_VALUE) {
             throw new IllegalStateException("string length out of range: " + len);
         }
@@ -107,7 +108,7 @@ public final class NBitString {
         }
         // Huffman path: read into a per-thread scratch, then decode into
         // a second per-thread scratch. Both grow monotonically to fit
-        // the largest header seen on this thread — task #128. String
+        // the largest header seen on this thread. String
         // ctor still copies out of scratch, so callers get their own
         // immutable String.
         byte[] rawScratch = ensureCap(RAW_TL.get(), l);

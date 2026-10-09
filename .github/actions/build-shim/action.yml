@@ -1,0 +1,56 @@
+# ABOUTME: Composite action building the static libquiche (pinned by native/enso_quiche/pins.env, cached)
+# ABOUTME: and the enso_quiche JNI shim on the runner into target/native/<os>-<arch>/. Expects JAVA_HOME.
+name: Build enso_quiche shim
+description: >-
+  Static libquiche + JNI shim built on the runner itself: the macOS release
+  shim, and Linux shims for tests (released Linux shims are built in
+  baseline containers by native/enso_quiche/build-linux.sh).
+inputs:
+  make-args:
+    description: Extra make variables, e.g. SANITIZE=1
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Read native pins
+      id: pins
+      shell: bash
+      run: grep -E '^[A-Z_]+=' native/enso_quiche/pins.env >> "$GITHUB_OUTPUT"
+
+    - name: Cache libquiche build
+      id: quiche-cache
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        # The whole checkout: build-libquiche.sh reuses it when its
+        # .enso-build-key matches, and the header lives in the source tree.
+        path: quiche-src
+        key: quiche-${{ steps.pins.outputs.QUICHE_COMMIT }}-${{ hashFiles('native/enso_quiche/quiche-Cargo.lock') }}-${{ steps.pins.outputs.RUST_TOOLCHAIN }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install Rust ${{ steps.pins.outputs.RUST_TOOLCHAIN }}
+      if: steps.quiche-cache.outputs.cache-hit != 'true'
+      uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      with:
+        toolchain: ${{ steps.pins.outputs.RUST_TOOLCHAIN }}
+
+    - name: Install Linux build deps
+      if: steps.quiche-cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential cmake clang libclang-dev llvm-dev pkg-config
+
+    - name: Build libquiche ${{ steps.pins.outputs.QUICHE_VERSION }} (static)
+      shell: bash
+      run: native/enso_quiche/build-libquiche.sh /tmp/quiche
+
+    - name: Build enso_quiche shim (static)
+      shell: bash
+      env:
+        MAKE_ARGS: ${{ inputs.make-args }}
+        MACOSX_DEPLOYMENT_TARGET: ${{ steps.pins.outputs.MACOSX_DEPLOYMENT_TARGET }}
+      run: |
+        # shellcheck disable=SC2086 # MAKE_ARGS is a list of make variables
+        make -C native/enso_quiche QUICHE_STATIC=1 \
+          QUICHE_INCLUDE_DIR=/tmp/quiche/include QUICHE_LIB_DIR=/tmp/quiche/lib $MAKE_ARGS
+        ls -la target/native/*/

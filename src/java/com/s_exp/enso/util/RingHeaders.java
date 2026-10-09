@@ -1,5 +1,10 @@
+// ABOUTME: Builds the Ring request header map from wire (name, value) pairs for every protocol:
+// ABOUTME: duplicates joined per RFC 9110 / RFC 9113, then an array or hash map by size.
 package com.s_exp.enso.util;
 
+import clojure.lang.IPersistentMap;
+import clojure.lang.PersistentArrayMap;
+import clojure.lang.PersistentHashMap;
 import java.util.HashMap;
 
 /**
@@ -9,6 +14,23 @@ import java.util.HashMap;
 public final class RingHeaders {
 
     private RingHeaders() {}
+
+    // Clojure's own threshold (PersistentArrayMap.HASHTABLE_THRESHOLD):
+    // array maps hold at most 8 entries.
+    private static final int ARRAY_MAP_MAX_LENGTH = 16;
+
+    /**
+     * The header map over {@code kv}, an exact-fit array of unique names
+     * and their values as {@link #mergeDuplicates} returns it (taken over,
+     * not copied). Up to 8 fields an array map over the array itself (no
+     * duplicate scan: the names are already unique), beyond a hash map,
+     * so building and looking up stay linear in the field count.
+     */
+    public static IPersistentMap toMap(Object[] kv) {
+        if (kv.length == 0) return PersistentArrayMap.EMPTY;
+        if (kv.length <= ARRAY_MAP_MAX_LENGTH) return new PersistentArrayMap(kv);
+        return PersistentHashMap.create(kv);
+    }
 
     // Up to this many fields, pairwise name comparison beats hashing.
     // Above it a hash index keeps merging linear: one HTTP/3 HEADERS

@@ -1,3 +1,5 @@
+// ABOUTME: Exception signalling an HTTP/3 connection-level error, carrying the RFC 9114 / RFC 9204
+// ABOUTME: error code the session closes the QUIC connection with.
 package com.s_exp.enso.http3;
 
 /**

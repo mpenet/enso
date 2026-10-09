@@ -9,8 +9,10 @@
 ;; the leading `v` stripped, so e.g. tag `v1.0.0-alpha29` publishes
 ;; `1.0.0-alpha29` on Clojars regardless of the local commit count.
 ;; Local dev falls back to a git-count-based auto version.
-(def version (or (System/getenv "ENSO_VERSION")
-                 (format "1.0.0-alpha%s" (b/git-count-revs nil))))
+(defn- current-version []
+  (or (System/getenv "ENSO_VERSION")
+      (format "1.0.0-alpha%s" (b/git-count-revs nil))))
+(def version (current-version))
 (def class-dir "target/classes")
 ;; Jar contents are staged separately from `class-dir`: target/classes
 ;; is on the dev/test/bench classpaths, and copying src/clj into it
@@ -37,8 +39,9 @@
             :javac-opts ["--release" "21"]}))
 
 (defn javac-bench
-  "Compile bench-only Java sources (Netty + Jetty h3 servers for task #95).
-  Uses the bench alias basis so Netty/Jetty deps are on the compile path."
+  "Compile bench-only Java sources (the Netty and Jetty HTTP/3 comparison
+  servers). Uses the bench alias basis so Netty/Jetty deps are on the
+  compile path."
   [_]
   (javac nil)
   (b/javac {:src-dirs ["bench/java"]
@@ -54,21 +57,23 @@
 
 ;; --- Jar assembly ----------------------------------------------------------
 ;;
-;; We publish four flavors of the artifact:
+;; Jar flavors:
 ;;
 ;;   enso-<v>.jar                — core (Java + Clojure, NO native shim).
-;;                                 Users bring their own libquiche (or add a
-;;                                 platform classifier jar).
+;;                                 Published. Users bring their own shim or
+;;                                 add a platform classifier jar.
 ;;   enso-<v>-<os>-<arch>.jar    — per-classifier native jar. Contains only
-;;                                 META-INF/native/<os>-<arch>/libenso_quiche.
-;;                                 Netty-style: pull the one you need.
-;;   enso-<v>-all.jar            — fat jar with the core + all four static
-;;                                 shims. Ships zero-install for anyone who
-;;                                 doesn't want to think about classifiers.
+;;                                 META-INF/native/<os>-<arch>/libenso_quiche
+;;                                 plus the notices. Published, Netty-style:
+;;                                 pull the one you need.
+;;   enso-<v>-all.jar            — core + every shim staged under
+;;                                 target/native/. Not published (it exceeds
+;;                                 the Clojars per-file size limit); the
+;;                                 release workflow keeps it as a run
+;;                                 artifact for uberjar-style deploys.
 ;;
-;; The `jar` task is the plain "whatever's under target/native/ gets bundled"
-;; behaviour we've always had — it's what dev use of `clj -T:build jar` will
-;; keep producing. `jar-all`, `jar-core`, and `jar-classifier` are the
+;; The `jar` task bundles whatever is under target/native/ (dev use of
+;; `clj -T:build jar`). `jar-all`, `jar-core`, and `jar-classifier` are the
 ;; release-time helpers.
 
 (def jar-core-file (format "target/%s-%s.jar" (name lib) version))
@@ -94,20 +99,29 @@
                             [:url "https://github.com/mpenet/enso"]
                             [:connection "scm:git:git://github.com/mpenet/enso.git"]
                             [:developerConnection "scm:git:ssh://git@github.com/mpenet/enso.git"]]]})
-  ;; NOTICE gets bundled at META-INF/NOTICE so downstream tools that
-  ;; aggregate ATTRIBUTION files pick up the quiche + BoringSSL notice.
-  (let [notice (java.io.File. "NOTICE")]
-    (when (.exists notice)
-      (let [dst (java.io.File. (str staging "/META-INF/NOTICE"))]
+  ;; License and attribution files go under META-INF/ so downstream tools
+  ;; that aggregate them pick up enso's license, the quiche + BoringSSL
+  ;; notice and the full texts for every crate linked into the shim.
+  (doseq [f ["LICENSE" "NOTICE" "THIRD-PARTY-NOTICES"]]
+    (let [src (java.io.File. ^String f)]
+      (when-not (.exists src)
+        (throw (ex-info (str "missing " f) {:file f})))
+      (let [dst (java.io.File. (str staging "/META-INF/" f))]
         (.mkdirs (.getParentFile dst))
         (java.nio.file.Files/copy
-         (.toPath notice) (.toPath dst)
+         (.toPath src) (.toPath dst)
          ^"[Ljava.nio.file.CopyOption;"
          (into-array java.nio.file.CopyOption
                      [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))))))
 
+(def ^:private module-manifest
+  "Stable module name for module-path users: the jars are automatic
+  modules (no module-info; HTTP/3's classifier jar must stay readable
+  from the core jar's classes)."
+  {"Automatic-Module-Name" "com.s_exp.enso"})
+
 (defn jar
-  "Legacy / dev jar. Contents mirror what's staged under target/native/ at
+  "Dev jar. Contents mirror what's staged under target/native/ at
   call time — dynamic-linked shim if you `make -C native/enso_quiche`,
   none if `target/native` is absent. For release flavors use
   `jar-core`, `jar-all`, `jar-classifier`."
@@ -123,7 +137,8 @@
   (b/copy-dir {:src-dirs ["src/clj"]
                :target-dir jar-class-dir})
   (b/jar {:class-dir jar-class-dir
-          :jar-file jar-core-file}))
+          :jar-file jar-core-file
+          :manifest module-manifest}))
 
 (defn- stage-core
   "Common jar staging: Java classes + Clojure sources + pom. Leaves
@@ -139,12 +154,13 @@
 
 (defn jar-core
   "Core artifact: no native shim inside. Consumers who want HTTP/3 add a
-  matching classifier jar (see `jar-classifier`) or the `-all` fat jar."
+  matching classifier jar (see `jar-classifier`)."
   [_]
   (let [staging "target/jar-core-classes"]
     (stage-core staging)
     (b/jar {:class-dir staging
-            :jar-file jar-core-file})
+            :jar-file jar-core-file
+            :manifest module-manifest})
     {:jar-file jar-core-file}))
 
 (defn jar-classifier
@@ -167,8 +183,9 @@
       {:jar-file out :classifier classifier})))
 
 (defn jar-all
-  "Fat jar with core + every shim present under target/native/. Assumes
-  the release CI has staged all four platform shims before calling."
+  "Fat jar with core + every shim present under target/native/ (the
+  release workflow stages all five platform shims first). Not published:
+  it exceeds the Clojars per-file size limit."
   [_]
   (let [staging "target/jar-all-classes"]
     (stage-core staging)
@@ -176,7 +193,8 @@
       (b/copy-dir {:src-dirs ["target/native"]
                    :target-dir (str staging "/META-INF/native")}))
     (b/jar {:class-dir staging
-            :jar-file jar-all-file})
+            :jar-file jar-all-file
+            :manifest module-manifest})
     {:jar-file jar-all-file}))
 
 (defn install [_]
@@ -191,13 +209,13 @@
 (def ^:private clojars-repo-id "clojars")
 
 (defn deploy-jars
-  "Publish core + every per-platform classifier + fat jar to Clojars in
-  a single atomic `mvn deploy:deploy-file` call. Clojars rejects any
+  "Publish core + every per-platform classifier jar to Clojars in a
+  single atomic `mvn deploy:deploy-file` call. Clojars rejects any
   redeploy against an existing version, so all sidecar artifacts have
   to be attached to the same upload as the main jar. `-Dfiles`,
   `-Dclassifiers`, `-Dtypes` are comma-separated parallel lists.
-  Assumes CI has already run `jar-core`, `jar-classifier` per platform,
-  and `jar-all`. POM comes from the core-jar staging dir. Credentials
+  Assumes CI has already run `jar-core` and `jar-classifier` per
+  platform. POM comes from the core-jar staging dir. Credentials
   read from ~/.m2/settings.xml — CI writes it from repo secrets before
   invoking."
   [opts]
@@ -258,15 +276,17 @@
   opts)
 
 (defn tag
-  "Create annotated tag matching the computed `version`, then push it. The
+  "Fast-forward to the upstream branch, then create an annotated tag on
+  that commit, its version derived after the pull, and push it. The
   release CI workflow (`.github/workflows/release.yml`) triggers on tag
-  push — it builds shims, assembles jars, and publishes core +
-  every classifier + fat jar to Clojars."
+  push — it builds shims, assembles jars, and publishes core + every
+  classifier jar to Clojars."
   [opts]
-  (sh
-   (format "git tag -a \"v%s\" --no-sign -m \"Release %s\"" version version)
-   "git pull"
-   "git push --follow-tags")
+  (sh "git pull --ff-only")
+  (let [v (current-version)]
+    (sh (format "git tag -a \"v%s\" --no-sign -m \"Release %s\"" v v)
+        (format "git push --atomic origin HEAD \"refs/tags/v%s\"" v))
+    (println "tagged and pushed" (str "v" v)))
   opts)
 
 #_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}

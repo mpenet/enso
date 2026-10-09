@@ -1,3 +1,5 @@
+;; ABOUTME: quic-interop-runner server endpoint: serves files from the www root over HTTP/3 on port 443
+;; ABOUTME: using the certificate and key supplied by the runner.
 ;; quic-interop-runner endpoint — serves files from /www over HTTP/3.
 ;;
 ;; Invoked from run_endpoint.sh with args: TESTCASE CERT KEY WWWROOT.

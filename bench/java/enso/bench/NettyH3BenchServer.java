@@ -1,3 +1,5 @@
+// ABOUTME: Netty HTTP/3 server used as a comparison point in enso's HTTP/3 benchmarks,
+// ABOUTME: answering every request with the same 200 "nf" response as the enso bench handler.
 package enso.bench;
 
 import io.netty.bootstrap.Bootstrap;
@@ -27,10 +29,9 @@ import java.net.InetSocketAddress;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Netty h3 server for bench comparisons against enso (task #95). Mirrors
- * enso's plaintext handler: 200 OK, body "nf". Only the response body
- * differs from enso's version (status is 200 vs enso's 404 — h3-repro
- * uses 200 too; the ring plaintext-handler uses 404).
+ * Netty h3 server for bench comparisons against enso. Answers every
+ * request 200 with the body "nf"; enso's bench handler
+ * (enso.bench/plaintext-handler) sends the same body with status 404.
  */
 public final class NettyH3BenchServer {
 

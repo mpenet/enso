@@ -4,7 +4,7 @@ package com.s_exp.enso.http3;
 
 /**
  * Stream-level HTTP/3 error (RFC 9114 §8), e.g. a malformed request
- * (H3_MESSAGE_ERROR, §4.1.2). {@link Http3Session} resets the request
+ * (H3_MESSAGE_ERROR, §4.1.2). {@link Http3Connection} resets the request
  * stream in both directions with {@link #errorCode()}; contrast with
  * {@link Http3ConnectionException}, which closes the whole connection.
  */

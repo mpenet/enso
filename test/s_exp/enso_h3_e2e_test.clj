@@ -5,6 +5,7 @@
   framing, backpressure, response streaming, stream/connection error
   codes."
   (:require [clojure.test :refer [deftest is testing]]
+            [s-exp.enso-test-support :as support]
             [s-exp.h3-client :as h3])
   (:import (com.s_exp.enso.api Request Response)))
 
@@ -39,18 +40,25 @@
       (is (= [0x02] (some-> (stream-bytes c 7) seq vec)) "QPACK encoder stream")
       (is (= [0x03] (some-> (stream-bytes c 11) seq vec)) "QPACK decoder stream"))))
 
-(deftest oversized-field-section-is-stream-error
-  ;; RFC 9114 §4.2.2: SETTINGS_MAX_FIELD_SECTION_SIZE bounds the decoded
-  ;; section (name + value + 32 per field). Exceeding it resets only
-  ;; the offending stream.
-  (h3/with-server [srv (fn [_] (ok "fine"))
-                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3MaxFieldSectionSize b 1024))]
-    (h3/with-client [c (.port srv)]
-      (h3/open-control! c)
-      (let [r (h3/request! c 0 (h3/request-headers "GET" "/" ["x-big" (apply str (repeat 2000 "a"))]))]
-        (is (= 0x107 (:reset r)) "H3_EXCESSIVE_LOAD stream reset"))
-      (is (nil? (h3/peer-error c)) "connection still open")
-      (is (= "fine" (h3/body-str (h3/request! c 4 (h3/request-headers "GET" "/"))))))))
+(deftest oversized-field-section-is-431
+  ;; RFC 9114 §4.2.2: :max-header-bytes is SETTINGS_MAX_FIELD_SECTION_SIZE,
+  ;; bounding the decoded section (name + value + 32 per field). Over it
+  ;; the request is answered 431 without the handler, as on HTTP/1.1 and
+  ;; HTTP/2; over the hard ceiling (4x, at least 64 KiB) the stream is
+  ;; reset with H3_EXCESSIVE_LOAD before anything is buffered.
+  (let [called (atom 0)]
+    (h3/with-server [srv (fn [_] (swap! called inc) (ok "fine"))
+                     (fn [^com.s_exp.enso.api.Config$Builder b] (.maxHeaderBytes b 1024))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (let [r (h3/request! c 0 (h3/request-headers "GET" "/" ["x-big" (apply str (repeat 2000 "a"))]))]
+          (is (= 431 (:status r)))
+          (is (= "Request Header Fields Too Large" (h3/body-str r))))
+        (is (zero? @called) "handler not run")
+        (let [r (h3/request! c 4 (h3/request-headers "GET" "/" ["x-huge" (apply str (repeat 70000 "a"))]))]
+          (is (= 0x107 (:reset r)) "H3_EXCESSIVE_LOAD stream reset"))
+        (is (nil? (h3/peer-error c)) "connection still open")
+        (is (= "fine" (h3/body-str (h3/request! c 8 (h3/request-headers "GET" "/")))))))))
 
 (defn- echo-handler [^Request req]
   (ok (.readAllBytes ^java.io.InputStream (.-body req))))
@@ -344,7 +352,9 @@
     (h3/with-server [srv (fn [^Request req]
                            (swap! seen conj [(.-method req) (.-uri req)
                                              (get (.-headers req) "host")
-                                             (alength (.readAllBytes ^java.io.InputStream (.-body req)))])
+                                             (if-let [^java.io.InputStream in (.-body req)]
+                                               (alength (.readAllBytes in))
+                                               0)])
                            (ok "ok"))]
       (h3/with-client [c (.port srv)]
         (h3/open-control! c)
@@ -440,6 +450,52 @@
   (testing "Stream Cancellation is fine"
     (is (nil? (conn-error-after #(h3/send! % 10 (byte-array [0x40]) false))))))
 
+(deftest control-stream-push-and-settings-rules
+  (testing "RFC 9114 §7.2.3: CANCEL_PUSH for a push never promised is H3_ID_ERROR"
+    (is (= [true 0x108] (conn-error-after #(h3/send! % 2 (h3/frame 0x03 (h3/varint 0)) false)))))
+  (testing "RFC 9114 §7.2.7: MAX_PUSH_ID may not decrease (H3_ID_ERROR)"
+    (is (nil? (conn-error-after #(h3/send! % 2 (h3/concat-bytes (h3/frame 0x0d (h3/varint 5))
+                                                                (h3/frame 0x0d (h3/varint 5))
+                                                                (h3/frame 0x0d (h3/varint 9)))
+                                           false))))
+    (is (= [true 0x108] (conn-error-after #(h3/send! % 2 (h3/concat-bytes (h3/frame 0x0d (h3/varint 9))
+                                                                         (h3/frame 0x0d (h3/varint 5)))
+                                                    false)))))
+  (testing "malformed MAX_PUSH_ID is H3_FRAME_ERROR"
+    (is (= [true 0x106] (conn-error-after #(h3/send! % 2 (h3/frame 0x0d (byte-array [0x01 0x02])) false)))))
+  (testing "RFC 9114 §6.2.1: any frame before SETTINGS, a reserved one included, is H3_MISSING_SETTINGS"
+    (is (= [true 0x10a]
+           (h3/with-server [srv (fn [_] (ok "ok"))]
+             (h3/with-client [c (.port srv)]
+               (h3/open-control! c (h3/concat-bytes (h3/frame 0x21 (byte-array 2)) (h3/settings-frame)))
+               (h3/await-peer-error c 1500))))))
+  (testing "RFC 9114 §6.2.1: STOP_SENDING on our control stream is H3_CLOSED_CRITICAL_STREAM"
+    (is (= [true 0x104] (conn-error-after #(h3/stop-sending! % 3 0x100)))))
+  (testing "... and on our QPACK decoder stream"
+    (is (= [true 0x104] (conn-error-after #(h3/stop-sending! % 11 0x100))))))
+
+(deftest response-header-section-over-the-peer-limit-is-not-sent
+  ;; RFC 9114 §4.2.2: a header section larger than the peer's
+  ;; SETTINGS_MAX_FIELD_SECTION_SIZE isn't sent: the response becomes a
+  ;; 500, or the stream is reset when even that doesn't fit.
+  (let [big (apply str (repeat 400 "a"))]
+    (h3/with-server [srv (fn [^Request req]
+                           (if (= "/big" (.-uri req)) (Response. 200 {"x-big" big} "ok") (ok "ok")))]
+      (testing "limit fits a 500"
+        (h3/with-client [c (.port srv)]
+          (h3/open-control! c (h3/settings-frame 0x06 300))
+          (h3/pump! c 100)
+          (is (= 200 (:status (h3/request! c 0 (h3/request-headers "GET" "/")))) "a small section is sent")
+          (is (= 500 (:status (h3/request! c 4 (h3/request-headers "GET" "/big")))))))
+      (testing "limit too small even for a 500"
+        (h3/with-client [c (.port srv)]
+          (h3/open-control! c (h3/settings-frame 0x06 50))
+          (h3/pump! c 100)
+          (let [r (h3/request! c 0 (h3/request-headers "GET" "/big"))]
+            (is (nil? (:status r)))
+            (is (= 0x102 (:reset r)) "H3_INTERNAL_ERROR"))
+          (is (nil? (h3/peer-error c))))))))
+
 (deftest response-header-encoded-size-budget
   ;; 3000 'ü' = 6000 UTF-8 bytes whose Huffman codes are 19-23 bits each:
   ;; the frame budget must follow the encoded size, not the char count.
@@ -465,20 +521,25 @@
 
 (defn- long-header-packet
   "QUIC long-header packet of `size` bytes: `type-bits` (0 Initial,
-  1 0-RTT, 2 Handshake), `version`, 16-byte random DCID, 8-byte SCID,
-  empty token (Initial), junk payload."
-  ^bytes [type-bits version size]
+  1 0-RTT, 2 Handshake), `version`, random DCID (16 bytes unless
+  `dcid-len`), 8-byte SCID, `token` (Initial; default empty), junk payload."
+  (^bytes [type-bits version size] (long-header-packet type-bits version size (byte-array 0)))
+  (^bytes [type-bits version size ^bytes token] (long-header-packet type-bits version size token 16))
+  (^bytes [type-bits version size ^bytes token dcid-len]
   (let [out (java.io.ByteArrayOutputStream.)
-        dcid (byte-array 16)
+        dcid (byte-array (int dcid-len))
         rnd (java.util.Random.)]
     (.nextBytes rnd dcid)
     (.write out (int (bit-or 0xC0 (bit-shift-left type-bits 4))))
     (.write out (.array (.putInt (java.nio.ByteBuffer/allocate 4) (unchecked-int version))) 0 4)
-    (.write out 16)
-    (.write out dcid 0 16)
+    (.write out (int dcid-len))
+    (.write out dcid 0 (int dcid-len))
     (.write out 8)
     (.write out (byte-array 8 (byte 1)) 0 8)
-    (when (zero? type-bits) (.write out 0))
+    (when (zero? type-bits)
+      (let [^bytes tl (h3/varint (alength token))]
+        (.write out tl 0 (alength tl))
+        (.write out token 0 (alength token))))
     (let [head (.toByteArray out)
           pkt (byte-array size)]
       (System/arraycopy head 0 pkt 0 (alength head))
@@ -486,7 +547,7 @@
       (let [rest-len (- size (alength head) 2)]
         (aset pkt (alength head) (unchecked-byte (bit-or 0x40 (bit-shift-right rest-len 8))))
         (aset pkt (inc (alength head)) (unchecked-byte rest-len)))
-      pkt)))
+      pkt))))
 
 (defn- short-header-packet ^bytes [size]
   (let [pkt (byte-array size)]
@@ -508,9 +569,19 @@
            (java.util.Arrays/copyOf buf (.getLength p))
            (catch java.net.SocketTimeoutException _ nil)))))
 
-(defn- connection-count [srv]
-  (let [f (doto (.getDeclaredField (class srv) "conns") (.setAccessible true))]
-    (count (distinct (vals (.get f srv))))))
+(defn- connection-count ^long [^com.s_exp.enso.http3.Http3Listener srv]
+  (.connectionCount srv))
+
+(defn- await-connection-count
+  "Polls until the listener holds `n` connections or `ms` pass; returns
+  the last count seen."
+  [srv n ms]
+  (let [deadline (+ (System/currentTimeMillis) (long ms))]
+    (loop []
+      (let [c (connection-count srv)]
+        (if (or (= c n) (> (System/currentTimeMillis) deadline))
+          c
+          (do (Thread/sleep 10) (recur)))))))
 
 (deftest unknown-cid-datagrams
   (h3/with-server [srv (fn [_] (ok "ok"))]
@@ -539,26 +610,124 @@
         (is (some? r))
         (when r (is (= 0xF0 (bit-and (aget r 0) 0xF0)) "long header, type Retry"))))))
 
+;; ---- admission: Retry above the half-open threshold, caps ---------------
+
+(deftest initials-with-short-destination-ids-are-dropped
+  ;; RFC 9000 §7.2: a client's first Destination Connection ID is at least
+  ;; 8 bytes; a shorter one gets nothing, not even a Retry.
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3StatelessRetry b true))]
+    (is (nil? (reply-to (.port srv) (long-header-packet 0 1 1200 (byte-array 0) 7))) "7 bytes: dropped")
+    (let [^bytes r (reply-to (.port srv) (long-header-packet 0 1 1200 (byte-array 0) 8))]
+      (is (some? r) "8 bytes: answered")
+      (when r (is (= 0xF0 (bit-and (aget r 0) 0xF0)) "with a Retry")))))
+
+(defn- retry? [^bytes r]
+  (and r (= 0xF0 (bit-and (aget r 0) 0xF0))))
+
+(deftest retry-required-above-half-open-threshold
+  ;; A spoofed Initial costs a quiche connection and a handshake; past
+  ;; :http3-retry-threshold handshaking connections, Initials without a
+  ;; valid token only get a stateless Retry (RFC 9000 §8.1.2).
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3RetryThreshold b 1))]
+    (is (not (retry? (reply-to (.port srv) (long-header-packet 0 1 1200)))) "below the threshold: no Retry")
+    (let [half-open (h3/start-handshake (.port srv))]
+      (try
+        (is (= 1 (await-connection-count srv 1 1000)) "a client that never completes its handshake")
+        (is (retry? (reply-to (.port srv) (long-header-packet 0 1 1200))) "at the threshold: Retry")
+        (is (= 1 (connection-count srv)) "no state for it")
+        (testing "a real client still gets in (with one Retry round trip)"
+          (h3/with-client [c (.port srv)]
+            (h3/open-control! c)
+            (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))))
+        (finally (h3/close! half-open))))))
+
+(deftest half-open-connections-are-capped
+  (let [refused (atom 0)
+        two-refused (promise)
+        events (reify com.s_exp.enso.api.ServerEvents
+                 (connectionOpened [_ _ _])
+                 (connectionClosed [_ _ _ _])
+                 (requestCompleted [_ _ _ _ _ _ _])
+                 (protocolError [_ _ kind]
+                   (when (and (= "handshake-limit" kind) (= 2 (swap! refused inc)))
+                     (deliver two-refused true))))]
+    (h3/with-server [srv (fn [_] (ok "ok"))
+                     (fn [^com.s_exp.enso.api.Config$Builder b]
+                       (.http3MaxHalfOpen b 2)
+                       (.serverEvents b events))]
+      (let [clients (vec (repeatedly 4 #(h3/start-handshake (.port srv))))]
+        (try
+          ;; Each of the last two clients' Initial was refused at least once.
+          (is (deref two-refused 3000 false))
+          (is (= 2 (connection-count srv)) "Initials past :http3-max-half-open are dropped")
+          (is (= 2 (.halfOpenCount srv)))
+          (finally (run! h3/close! clients)))))))
+
+(deftest quic-connections-count-against-max-connections
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.maxConnections b 1))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))
+      (is (thrown? clojure.lang.ExceptionInfo (h3/connect (.port srv))) "second connection refused")
+      (is (= 1 (connection-count srv))))
+    (is (zero? (await-connection-count srv 0 3000)) "slot released at close")
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/"))))))))
+
+(deftest quic-connections-count-against-max-connections-per-ip
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.maxConnectionsPerIp b 1))]
+    (h3/with-client [c (.port srv)]
+      (is (thrown? clojure.lang.ExceptionInfo (h3/connect (.port srv))) "same address refused")
+      (is (= 1 (connection-count srv))))))
+
+(defn- minted-looking-token
+  "A token with our Retry token's shape (length, magic) but a forged tag."
+  ^bytes []
+  (let [t (byte-array (+ 32 4 8 4 2 1 16 1 16))]
+    (System/arraycopy (.getBytes "en30" "US-ASCII") 0 t 32 4)
+    t))
+
+(deftest invalid-retry-token-closes-with-invalid-token
+  ;; RFC 9000 §8.1.2: an Initial whose Retry token doesn't validate gets
+  ;; CONNECTION_CLOSE(INVALID_TOKEN) in a small server Initial; no state.
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3StatelessRetry b true))]
+    (let [^bytes r (reply-to (.port srv) (long-header-packet 0 1 1200 (minted-looking-token)))]
+      (is (some? r))
+      (when r
+        (is (= 0xC0 (bit-and (aget r 0) 0xF0)) "long header, type Initial")
+        (is (< (alength r) 100) "far below the triggering datagram")))
+    (is (zero? (connection-count srv)))
+    (testing "a token of unknown shape counts as absent: Retry"
+      (is (retry? (reply-to (.port srv) (long-header-packet 0 1 1200 (byte-array 40 (byte 7)))))))))
+
 (deftest unestablished-connection-is-reaped
   ;; A client that sends its first Initial and vanishes: with the idle
   ;; timeout disabled quiche never gives up on the handshake, so the
-  ;; server must drop the connection at its handshake deadline (10s).
+  ;; server must drop the connection at its :handshake-timeout.
   (h3/with-server [srv (fn [_] (ok "ok"))
-                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3MaxIdleTimeoutMs b 0))]
-    (let [c (h3/start-handshake (.port srv))]
+                   (fn [^com.s_exp.enso.api.Config$Builder b]
+                     (.idleTimeoutMillis b 0)
+                     (.handshakeTimeoutMillis b 1500))]
+    (let [c (h3/start-handshake (.port srv))
+          t0 (System/nanoTime)]
       (try
-        (Thread/sleep 300)
-        (is (= 1 (connection-count srv)))
-        (Thread/sleep 11000)
-        (is (zero? (connection-count srv)))
+        (is (= 1 (await-connection-count srv 1 1000)) "half-open connection created")
+        (is (zero? (await-connection-count srv 0 4000)) "reaped")
+        (is (>= (- (System/nanoTime) t0) 1400000000) "not before the handshake timeout")
         (finally (h3/close! c))))))
 
 (deftest websocket-upgrade-response-is-501
   ;; HTTP/3 has no 101 / Upgrade (RFC 9114 §4.5): a handler answering with
-  ;; a WebSocket listener gets 501, empty headers, no body.
+  ;; a WebSocket listener gets the server's own 501, none of its headers.
   (h3/with-server [srv (fn [_]
                          (Response. 101 {"upgrade" "websocket" "x-a" "1"} "ignored"
-                                    (reify com.s_exp.enso.websocket.WebSocketListener
+                                    (reify com.s_exp.enso.api.WebSocketListener
                                       (onOpen [_ _])
                                       (onMessage [_ _ _])
                                       (onClose [_ _ _ _]))
@@ -567,22 +736,29 @@
       (h3/open-control! c)
       (let [r (h3/request! c 0 (h3/request-headers "GET" "/ws"))]
         (is (= 501 (:status r)))
-        (is (= {} (:headers r)))
-        (is (zero? (alength ^bytes (:body r))))
+        (is (= {"content-type" "text/plain; charset=utf-8" "content-length" "15"} (dissoc (:headers r) "date"))
+            "none of the handler's headers")
+        (is (= "Not Implemented" (h3/body-str r)))
         (is (:fin r))))))
 
-(deftest listener-close-stops-demux-before-freeing-config
-  ;; The demux thread calls quiche_accept/retry with the shared config:
-  ;; it must be gone before the config is freed, and a freed config must
+(defn- private-field [obj ^String name]
+  (.get (doto (.getDeclaredField (class obj) name) (.setAccessible true)) obj))
+
+(deftest listener-close-stops-loops-before-freeing-config
+  ;; The event loops call quiche_accept with the shared config: every loop
+  ;; must have exited before the config is freed, and a freed config must
   ;; never hand out its dangling pointer.
-  (let [srv (h3/start-server (fn [_] (ok "ok")))
-        demux-f (doto (.getDeclaredField (class srv) "demux") (.setAccessible true))
-        cfg-f (doto (.getDeclaredField (class srv) "quicheConfig") (.setAccessible true))
-        ^Thread demux (.get demux-f srv)
-        ^com.s_exp.enso.quiche.QuicheConfig cfg (.get cfg-f srv)]
+  (let [srv (h3/start-server (fn [_] (ok "ok")) (fn [^com.s_exp.enso.api.Config$Builder b] (.http3EventLoops b 2)))
+        loops (vec (private-field srv "loops"))
+        threads (mapv #(private-field % "thread") loops)
+        ^com.s_exp.enso.quiche.QuicheConfig cfg (private-field srv "currentConfig")]
+    (is (= 2 (count threads)))
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/"))))))
     (.close srv)
-    (is (not (.isAlive demux)) "demux joined by close")
-    (is (thrown? IllegalStateException (.handle cfg)) "closed config refuses its handle")))
+    (is (not-any? #(.isAlive ^Thread %) threads) "loops joined by close")
+    (is (thrown? IllegalStateException (.setInitialMaxData cfg 1)) "closed config refuses use")))
 
 (deftest nat-rebinding
   ;; RFC 9000 §9: after the peer's address changes (NAT rebinding), the
@@ -604,14 +780,14 @@
           (is (:fin r))
           (is (java.util.Arrays/equals data ^bytes (:body r))))))))
 
-(deftest request-timeout-408
+(deftest handler-timeout-503
   (h3/with-server [srv (fn [_] (Thread/sleep 3000) (ok "too late"))
-                   (fn [^com.s_exp.enso.api.Config$Builder b] (.requestTimeoutMillis b 200))]
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.handlerTimeoutMillis b 200))]
     (h3/with-client [c (.port srv)]
       (h3/open-control! c)
       (let [r (h3/request! c 0 (h3/request-headers "GET" "/"))]
-        (is (= 408 (:status r)))
-        (is (= "408 request timeout" (h3/body-str r)))))))
+        (is (= 503 (:status r)))
+        (is (= "Service Unavailable" (h3/body-str r)) "the shared error body")))))
 
 (deftest client-initial-larger-than-advertised-payload-size
   ;; RFC 9000 §14.1: the client sizes its Initial datagrams before it has
@@ -619,7 +795,7 @@
   ;; max_udp_payload_size (Chrome pads to 1250+). Truncating them on
   ;; receive would fail the handshake.
   (h3/with-server [srv (fn [_] (ok "ok"))
-                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3MaxUdpPayloadSize b 1200))]
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3MaxUdpPayloadBytes b 1200))]
     (h3/with-client [c (.port srv) {:initial-size 1350}]
       (h3/open-control! c)
       (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/"))))))))
@@ -629,7 +805,7 @@
   ;; §4.2.2): body bytes arriving in 16 KiB reads must not count against it.
   (let [body (byte-array (* 64 1024) (byte 9))]
     (h3/with-server [srv echo-handler
-                     (fn [^com.s_exp.enso.api.Config$Builder b] (.http3MaxFieldSectionSize b 8192))]
+                     (fn [^com.s_exp.enso.api.Config$Builder b] (.maxHeaderBytes b 8192))]
       (h3/with-client [c (.port srv)]
         (h3/open-control! c)
         (let [r (h3/request! c 0 (h3/request-headers "POST" "/") body)]
@@ -637,12 +813,11 @@
           (is (java.util.Arrays/equals body ^bytes (:body r))))
         (is (nil? (h3/peer-error c)) "connection still open")))))
 
-(deftest unlimited-field-section-size-accepts-large-headers
-  ;; :http3-max-field-section-size 0 omits the setting: the peer may send
-  ;; field sections larger than the 64 KiB default.
+(deftest large-field-section-limit-accepts-large-headers
+  ;; A :max-header-bytes above the 64 KiB default admits larger sections.
   (let [v (apply str (repeat 150000 "a"))]
     (h3/with-server [srv (fn [^Request req] (ok (str (count (get (.-headers req) "x-big")))))
-                     (fn [^com.s_exp.enso.api.Config$Builder b] (.http3MaxFieldSectionSize b 0))]
+                     (fn [^com.s_exp.enso.api.Config$Builder b] (.maxHeaderBytes b 200000))]
       (h3/with-client [c (.port srv)]
         (h3/open-control! c)
         (let [r (h3/request! c 0 (h3/request-headers "GET" "/" ["x-big" v]))]
@@ -684,55 +859,52 @@
     (when-not (try @p true (catch InterruptedException _ false))
       (recur))))
 
-(defn- recording-body
-  "StreamingBody delivering true to `started` when the server runs it."
-  [started]
-  (reify com.s_exp.enso.api.StreamingBody
-    (write [_ w]
-      (deliver started true)
-      (.write w "x"))))
-
-(deftest body-cap-reset-drops-handler-response
-  ;; Once the stream was reset for exceeding :max-request-body-bytes, the
-  ;; handler's response is never produced (its streamed body never runs).
-  (let [gate (promise)
-        returned (promise)
-        started (promise)]
-    (h3/with-server [srv (fn [_]
-                           (await-ignoring-interrupts gate)
-                           (deliver returned true)
-                           (ok (recording-body started)))
+(deftest body-over-cap-is-413-whatever-the-handler-does
+  ;; A body growing past :max-request-body-bytes fails the handler's read
+  ;; with a 413, answered as such even when the handler swallows it, as on
+  ;; HTTP/1.1 and HTTP/2.
+  (let [seen (promise)]
+    (h3/with-server [srv (fn [^Request req]
+                           (deliver seen (try (.readAllBytes ^java.io.InputStream (.-body req)) :read
+                                              (catch java.io.IOException e (class e))))
+                           (ok "swallowed"))
                      (fn [^com.s_exp.enso.api.Config$Builder b] (.maxRequestBodyBytes b 10))]
       (h3/with-client [c (.port srv)]
         (h3/open-control! c)
         (h3/send! c 0 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
                                        (h3/data-frame (byte-array 100)))
                   false)
-        (h3/pump-until! c #(h3/stream-done? c 0) 2000)
-        (is (= 0x10e (:reset (h3/response c 0))))
-        (deliver gate true)
-        (is (deref returned 2000 false))
-        (h3/pump! c 300)
-        (is (not (realized? started)) "response body produced for a reset stream")))))
+        (h3/pump-until! c #(h3/stream-done? c 0) 3000)
+        (is (= com.s_exp.enso.core.RequestBodyException (deref seen 2000 :none)))
+        (is (= 413 (:status (h3/response c 0))))
+        (is (= "Content Too Large" (h3/body-str (h3/response c 0))))
+        (is (nil? (h3/peer-error c)) "connection kept")))))
 
-(defn- content-length-mismatch
-  "A request that the server resets (body longer than content-length)."
-  ^bytes []
-  (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/" ["content-length" "1"]))
-                   (h3/data-frame (.getBytes "abc"))))
+(defn- reset-once-started!
+  "Sends a request on `sid` the server will reset (body longer than its
+  content-length), the offending body only once `started?` is true or the
+  stream is done: a request reset before its handler starts never runs
+  the handler at all."
+  [c sid started?]
+  (h3/send! c sid (h3/headers-frame (h3/request-headers "POST" "/" ["content-length" "1"])) false)
+  (h3/pump-until! c #(or (started?) (h3/stream-done? c sid)) 2000)
+  (when-not (h3/stream-done? c sid)
+    (h3/send! c sid (h3/data-frame (.getBytes "abc")) true))
+  (h3/pump-until! c #(h3/stream-done? c sid) 2000))
 
 (deftest abandoned-request-interrupts-handler
   ;; A request the server resets is abandoned: its handler is interrupted
   ;; rather than left running until the request timeout.
-  (let [exited (promise)]
+  (let [exited (promise)
+        started (promise)]
     (h3/with-server [srv (fn [_]
+                           (deliver started true)
                            (try @(promise)
                                 (catch InterruptedException _ (deliver exited :interrupted)))
                            (ok "x"))]
       (h3/with-client [c (.port srv)]
         (h3/open-control! c)
-        (h3/send! c 0 (content-length-mismatch) true)
-        (h3/pump-until! c #(h3/stream-done? c 0) 2000)
+        (reset-once-started! c 0 #(realized? started))
         (is (= 0x10e (:reset (h3/response c 0))))
         (is (= :interrupted (deref exited 2000 :still-running)))))))
 
@@ -752,9 +924,9 @@
       (h3/with-client [c (.port srv)]
         (h3/open-control! c)
         (let [codes (vec (for [i (range 20)
-                               :let [sid (* 4 i)]]
-                           (do (h3/send! c sid (content-length-mismatch) true)
-                               (h3/pump-until! c #(h3/stream-done? c sid) 2000)
+                               :let [sid (* 4 i)
+                                     before @peak]]
+                           (do (reset-once-started! c sid #(> @peak before))
                                (:reset (h3/response c sid)))))]
           (is (<= @peak 6) (str "live handlers peaked at " @peak))
           (is (some #{0x10b} codes) (str "reset codes " codes)))
@@ -828,7 +1000,9 @@
 (deftest handler-outliving-connection-does-not-hang
   ;; A handler that ignores the teardown interrupt and returns afterwards
   ;; must not block forever handing a streamed body to a dead connection
-  ;; (leaking its thread and body source): its response is dropped.
+  ;; (leaking its thread and body source): its response is dropped. Until
+  ;; it returns the closed connection still counts (its limiter slot), so
+  ;; closing connections can't leave unbounded handlers running.
   (let [gate (promise)
         returned (promise)
         started (promise)
@@ -846,15 +1020,14 @@
         (h3/send! c 0 (h3/headers-frame (h3/request-headers "GET" "/")) true)
         (h3/pump! c 200)
         (h3/close! c))
-      (let [deadline (+ (System/currentTimeMillis) 3000)]
-        (while (and (pos? (connection-count srv)) (< (System/currentTimeMillis) deadline))
-          (Thread/sleep 20)))
-      (is (zero? (connection-count srv)))
+      (Thread/sleep 500)
+      (is (= 1 (.connectionCount srv)) "counted while its handler runs")
       (deliver gate true)
       (is (deref returned 2000 false))
-      (Thread/sleep 300)
-      (is (or (not (realized? started)) (realized? finished))
-          "streamed body blocked on a closed connection"))))
+      (is (zero? (await-connection-count srv 0 3000)) "released once the handler returned")
+      ;; If the body started, its write must fail promptly (not block).
+      (when (deref started 300 false)
+        (is (deref finished 2000 false) "streamed body blocked on a closed connection")))))
 
 (deftest unread-request-body-is-bounded-by-stream-window
   ;; While the handler doesn't read, QUIC flow control is what bounds the
@@ -891,3 +1064,944 @@
         (h3/stop-sending! c 0 0x10c)
         (h3/pump-until! c #(realized? outcome) 2000)
         (is (= :cancelled (deref outcome 0 :still-waiting)))))))
+
+;; ---- Shared response and request-head policy -------------------------------
+
+(deftest responses-carry-date
+  (h3/with-server [srv (fn [^Request req]
+                         (if (= "/own" (.-uri req))
+                           (Response. 200 {"Date" "Tue, 15 Nov 1994 08:12:31 GMT"} "x")
+                           (ok "x")))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (is (re-matches #"\w{3}, \d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} GMT"
+                      (str (get (:headers (h3/request! c 0 (h3/request-headers "GET" "/"))) "date"))))
+      (is (= [["date" "Tue, 15 Nov 1994 08:12:31 GMT"]]
+             (filterv #(= "date" (first %)) (:fields (h3/request! c 4 (h3/request-headers "GET" "/own")))))
+          "a handler Date wins"))))
+
+(deftest invalid-response-status-is-500
+  ;; 200-599 only: 1xx can't be a final response, and HTTP/3 has no 101.
+  (h3/with-server [srv (fn [^Request req] (Response. (int (parse-long (subs (.-uri req) 1))) {} "x"))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (doseq [[sid status] [[0 99] [4 101] [8 103] [12 600] [16 1000]]]
+        (is (= 500 (:status (h3/request! c sid (h3/request-headers "GET" (str "/" status))))) (str status)))
+      (is (= 599 (:status (h3/request! c 20 (h3/request-headers "GET" "/599"))))))))
+
+(deftest request-head-rules
+  ;; The shared request-head rules (RFC 9114 §4.2-4.3, RFC 9110 §5.5).
+  (let [called (atom [])]
+    (h3/with-server [srv (fn [^Request req] (swap! called conj (.-uri req)) (ok "ok"))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (testing "unsupported :scheme"
+          (is (message-error? c 0 (h3/headers-frame [[":method" "GET"] [":scheme" "ftp"]
+                                                      [":authority" "localhost"] [":path" "/0"]]))))
+        (testing "userinfo in :authority"
+          (is (message-error? c 4 (h3/headers-frame [[":method" "GET"] [":scheme" "https"]
+                                                      [":authority" "u@localhost"] [":path" "/4"]]))))
+        (testing "control char in value"
+          (is (message-error? c 8 (h3/headers-frame (h3/request-headers "GET" "/8" ["x-a" "a\u0001b"]))))) 
+        (testing "TE other than trailers"
+          (is (message-error? c 12 (h3/headers-frame (h3/request-headers "GET" "/12" ["te" "gzip"])))))
+        (testing "CONNECT is well-formed but not served"
+          (is (= 501 (:status (h3/request! c 16 [[":method" "CONNECT"] [":authority" "example.org:443"]])))))
+        (testing "a repeated content-length is malformed even when the values agree, as on HTTP/1.1"
+          (is (message-error? c 20 (h3/headers-frame (h3/request-headers "POST" "/20" ["content-length" "3"]
+                                                                          ["content-length" "3"])))))
+        (testing "host matches :authority ignoring case"
+          (let [seen (promise)]
+            (h3/with-server [srv2 (fn [^Request req] (deliver seen (.-headers req)) (ok "ok"))]
+              (h3/with-client [c2 (.port srv2)]
+                (h3/open-control! c2)
+                (is (= 200 (:status (h3/request! c2 0 (h3/request-headers "POST" "/" ["host" "LOCALHOST"]
+                                                                          ["content-length" "3"])
+                                                 (.getBytes "abc")))))
+                (is (= "3" (get (deref seen 1000 nil) "content-length")))))))
+        (is (empty? @called) "no invalid request reached the handler")))))
+
+;; ---- timeouts and peer-controlled resources --------------------------------
+
+(defn- partial-headers
+  "A HEADERS frame header announcing `announced` payload bytes followed by
+  only `sent` of them."
+  ^bytes [announced sent]
+  (h3/concat-bytes (h3/varint 0x01) (h3/varint announced) (byte-array sent (byte 0x41))))
+
+(deftest header-timeout-refuses-slow-header-sections
+  ;; :header-timeout: a request whose header section isn't complete in time
+  ;; is refused (H3_REQUEST_REJECTED); the connection lives on.
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.headerTimeoutMillis b 300))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (let [t0 (System/nanoTime)]
+        (h3/send! c 0 (partial-headers 200 20) false)
+        (is (h3/pump-until! c #(h3/stream-done? c 0) 3000))
+        (is (= 0x10b (:reset (h3/response c 0))))
+        (is (>= (- (System/nanoTime) t0) 250000000) "not before the timeout"))
+      (is (nil? (h3/peer-error c)))
+      (is (= "ok" (h3/body-str (h3/request! c 4 (h3/request-headers "GET" "/"))))))))
+
+(deftest partial-header-sections-share-a-connection-budget
+  ;; Header bytes buffered for incomplete sections are bounded per
+  ;; connection (the hard field-section ceiling: 4x :max-header-bytes, at
+  ;; least 64 KiB): past it, streams are refused instead of growing the
+  ;; buffer.
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.maxHeaderBytes b 1000))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      ;; 30000 bytes each arrive over many packets, interleaved: which
+      ;; stream crosses the budget first depends on delivery order, but two
+      ;; fit (60000 < 65536) and the three don't.
+      (doseq [sid [0 4 8]] (h3/send! c sid (partial-headers 60000 30000) false))
+      (h3/pump-until! c #(some (fn [sid] (h3/stream-done? c sid)) [0 4 8]) 2000)
+      (h3/pump! c 200)
+      (is (= [0x10b] (keep #(:reset (h3/response c %)) [0 4 8])) "exactly one refused: over budget")
+      (is (nil? (h3/peer-error c))))))
+
+(deftest read-timeout-ends-stalled-body-reads
+  ;; :read-timeout: a handler waiting for body bytes that don't come gets
+  ;; a SocketTimeoutException.
+  (let [outcome (promise)]
+    (h3/with-server [srv (fn [^Request req]
+                           (deliver outcome
+                                    (try (.readAllBytes ^java.io.InputStream (.-body req)) :read
+                                         (catch java.net.SocketTimeoutException _ :timed-out)
+                                         (catch java.io.IOException e e)))
+                           (Response. 408 {} "slow"))
+                     (fn [^com.s_exp.enso.api.Config$Builder b] (.readTimeoutMillis b 300))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (h3/send! c 0 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                       (h3/data-frame (.getBytes "partial")))
+                  false)
+        (h3/pump-until! c #(h3/stream-done? c 0) 3000)
+        (is (= :timed-out (deref outcome 0 :still-blocked)))
+        (is (= 408 (:status (h3/response c 0))))))))
+
+(deftest write-timeout-resets-stalled-streamed-responses
+  ;; :write-timeout: a client that stops reading a streamed response (its
+  ;; flow-control window stays full) gets the stream reset; the producer's
+  ;; blocked write fails instead of pinning the response forever.
+  (let [failed (promise)
+        chunk (byte-array 16384 (byte 1))]
+    (h3/with-server [srv (fn [_]
+                           (ok (reify com.s_exp.enso.api.StreamingBody
+                                 (write [_ w]
+                                   (try (dotimes [_ 1000] (.write w chunk) (.flush w))
+                                        (catch java.io.IOException e (deliver failed :io) (throw e)))))))
+                     (fn [^com.s_exp.enso.api.Config$Builder b] (.writeTimeoutMillis b 400))]
+      (h3/with-client [c (.port srv) {:configure #(.setInitialMaxStreamDataBidiLocal ^com.s_exp.enso.quiche.QuicheConfig % 65536)}]
+        (h3/open-control! c)
+        (h3/pause-stream! c 0)
+        (h3/send! c 0 (h3/headers-frame (h3/request-headers "GET" "/")) true)
+        (is (= :io (deref failed 5000 :still-blocked)) "producer released")
+        (h3/resume-stream! c 0)
+        (h3/pump-until! c #(h3/stream-done? c 0) 3000)
+        (is (= 0x10c (:reset (h3/response c 0))) "H3_REQUEST_CANCELLED")
+        (is (nil? (h3/peer-error c)))))))
+
+(deftest idle-connection-closes-despite-pings
+  ;; :idle-timeout with no request in flight closes the connection (GOAWAY,
+  ;; then H3_NO_ERROR) even while the client keeps the path alive.
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.idleTimeoutMillis b 600))]
+    (h3/with-client [c (.port srv) {:idle-timeout 0}]
+      (h3/open-control! c)
+      (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))
+      (let [deadline (+ (System/currentTimeMillis) 4000)]
+        (while (and (nil? (h3/peer-error c)) (< (System/currentTimeMillis) deadline))
+          (h3/ping! c)
+          (h3/pump! c 100)))
+      (is (= [true 0x100] (h3/peer-error c)) "closed with H3_NO_ERROR")
+      (let [ctrl ^bytes (some-> (h3/stream-state c 3) ^java.io.ByteArrayOutputStream (:out) .toByteArray)]
+        (is (some? ctrl))
+        (is (some #(= 0x07 %) (map #(bit-and % 0xff) ctrl)) "GOAWAY sent on the control stream")))))
+
+(deftest rapid-reset-closes-the-connection
+  ;; CVE-2023-44487 style: past :http3-stream-reset-limit peer resets per
+  ;; 30 s, the connection closes with H3_EXCESSIVE_LOAD.
+  (h3/with-server [srv (fn [_] @(promise))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3StreamResetLimit b 5))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (doseq [i (range 20)
+              :let [sid (* 4 i)]
+              :while (nil? (h3/peer-error c))]
+        (h3/send! c sid (h3/headers-frame (h3/request-headers "GET" "/")) false)
+        (h3/pump! c 10)
+        (h3/reset-stream! c sid 0x10c)
+        (h3/pump! c 10))
+      (is (= [true 0x107] (h3/await-peer-error c 2000))))))
+
+(deftest resets-answering-our-stop-sending-are-not-rapid-resets
+  ;; A request answered early (413) gets STOP_SENDING, and a client
+  ;; answers that with RESET_STREAM (RFC 9000 §3.5) after the exchange is
+  ;; over: quiche reports the stream readable again, which must neither
+  ;; start a new exchange nor count against the reset budget.
+  (let [called (atom 0)]
+    (h3/with-server [srv (fn [_] (swap! called inc) (ok "ok"))
+                     (fn [^com.s_exp.enso.api.Config$Builder b]
+                       (.http3StreamResetLimit b 2)
+                       (.maxRequestBodyBytes b 1000))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (doseq [i (range 6)
+                :let [sid (* 4 i)]]
+          (h3/send! c sid (h3/headers-frame (h3/request-headers "POST" "/" ["content-length" "5000"])) false)
+          (h3/pump-until! c #(h3/stream-done? c sid) 2000)
+          (is (= 413 (:status (h3/response c sid))) (str "stream " sid))
+          (h3/pump! c 50))
+        (is (nil? (h3/peer-error c)) "connection still open")
+        (is (= "ok" (h3/body-str (h3/request! c 24 (h3/request-headers "GET" "/")))))
+        (is (= 1 @called))))))
+
+(deftest stream-ending-without-request-is-reset
+  ;; RFC 9114 §4.1.2: a request stream that ends (or is reset) before its
+  ;; header section is complete gets its server side reset with
+  ;; H3_REQUEST_INCOMPLETE, so the stream and the client's credit are freed.
+  (h3/with-server [srv (fn [_] (ok "ok"))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (testing "FIN with no HEADERS"
+        (h3/send! c 0 (byte-array 0) true)
+        (h3/pump-until! c #(h3/stream-done? c 0) 2000)
+        (is (= 0x10d (:reset (h3/response c 0)))))
+      (testing "RESET_STREAM mid-header"
+        (h3/send! c 4 (partial-headers 100 10) false)
+        (h3/pump! c 50)
+        (h3/reset-stream! c 4 0x10c)
+        (h3/pump-until! c #(h3/stream-done? c 4) 2000)
+        (is (= 0x10d (:reset (h3/response c 4)))))
+      (is (nil? (h3/peer-error c)))
+      (is (= "ok" (h3/body-str (h3/request! c 8 (h3/request-headers "GET" "/"))))))))
+
+(deftest request-target-and-field-validation
+  ;; RFC 9114 §4.2-4.3 / RFC 9110 §5.5 / RFC 3986: what the shared request
+  ;; head rules and the h3 driver reject.
+  (let [called (atom [])
+        cases [["space in :path" (h3/request-headers "GET" "/a b")]
+               ["non-ASCII :path" (h3/request-headers "GET" "/\u00e9")]
+               ["control character in :path" (h3/request-headers "GET" "/a\u0001")]
+               [":method not a token" (h3/request-headers "GE T" "/")]
+               ["leading whitespace in a value" (h3/request-headers "GET" "/" ["x-a" " v"])]
+               ["trailing whitespace in a value" (h3/request-headers "GET" "/" ["x-a" "v\t"])]
+               ["empty :authority without host" [[":method" "GET"] [":scheme" "https"]
+                                                 [":authority" ""] [":path" "/"]]]
+               ["unsupported :scheme with a bad :path" [[":method" "GET"] [":scheme" "ws"]
+                                                        [":authority" "localhost"] [":path" "x"]]]]]
+    (h3/with-server [srv (fn [^Request req] (swap! called conj (.-uri req)) (ok "ok"))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (doseq [[i [what pairs]] (map-indexed vector cases)]
+          (testing what
+            (is (message-error? c (* 4 i) (h3/headers-frame pairs)))))
+        (is (empty? @called))
+        (is (= "ok" (h3/body-str (h3/request! c (* 4 (count cases)) (h3/request-headers "GET" "/ok")))))))))
+
+;; ---- graceful shutdown (RFC 9114 §5.2) -----------------------------------------
+
+(defn- goaway-ids
+  "Stream ids of the GOAWAY frames the server sent on its control stream."
+  [c]
+  (let [^bytes ctrl (or (some-> (h3/stream-state c 3) ^java.io.ByteArrayOutputStream (:out) .toByteArray)
+                        (byte-array 0))
+        r (com.s_exp.enso.http3.Http3FrameReader.)]
+    (when (pos? (alength ctrl))
+      (.feed r ctrl 1 (dec (alength ctrl))))
+    (loop [ids []]
+      (if-let [^com.s_exp.enso.http3.Http3FrameReader$Frame f (.poll r)]
+        (recur (if (= 0x07 (.-type f))
+                 (conj ids (com.s_exp.enso.http3.Http3Varint/decode (java.nio.ByteBuffer/wrap (.-payload f))))
+                 ids))
+        ids))))
+
+(deftest close-drains-in-flight-requests
+  ;; Closing the listener sends GOAWAY, refuses newer requests
+  ;; (H3_REQUEST_REJECTED), lets the in-flight one complete, then closes
+  ;; the connection with H3_NO_ERROR.
+  (let [gate (promise)
+        entered (promise)
+        srv (h3/start-server (fn [^Request req]
+                               (when (= "/slow" (.-uri req)) (deliver entered true) @gate)
+                               (ok (.-uri req))))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (h3/send! c 0 (h3/headers-frame (h3/request-headers "GET" "/slow")) true)
+      (h3/pump-until! c #(realized? entered) 2000)
+      (let [closing (future (.close srv))]
+        (is (h3/pump-until! c #(= 2 (count (goaway-ids c))) 2000) "two GOAWAYs")
+        (is (= [(- (bit-shift-left 1 62) 4) 4] (goaway-ids c))
+            "first the largest id (requests in flight still processed), then: from stream 4 on, not processed")
+        (h3/send! c 4 (h3/headers-frame (h3/request-headers "GET" "/late")) true)
+        (h3/pump-until! c #(h3/stream-done? c 4) 2000)
+        (is (= 0x10b (:reset (h3/response c 4))) "refused after GOAWAY")
+        (is (not (realized? closing)) "waits for the in-flight request")
+        (deliver gate true)
+        (h3/pump-until! c #(h3/stream-done? c 0) 2000)
+        (is (= "/slow" (h3/body-str (h3/response c 0))) (str "in-flight response completed " (dissoc (h3/response c 0) :body)))
+        (is (= [true 0x100] (h3/await-peer-error c 3000)) "then H3_NO_ERROR")
+        (is (not= ::timeout (deref closing 5000 ::timeout)) "close returned")))))
+
+(deftest drain-serves-requests-below-the-goaway-id-that-arrive-late
+  ;; Stream 4 arrived, stream 0 not yet (reordered, or lost and resent):
+  ;; the GOAWAY (id 8) promised stream 0 would be processed, so the
+  ;; connection waits for it instead of closing as soon as it is idle.
+  (let [srv (h3/start-server (fn [^Request req] (ok (.-uri req))))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (is (= "/four" (h3/body-str (h3/request! c 4 (h3/request-headers "GET" "/four")))))
+      (let [closing (future (.close srv))]
+        (is (h3/pump-until! c #(= 2 (count (goaway-ids c))) 2000) "both GOAWAYs")
+        (is (= 8 (last (goaway-ids c))))
+        (h3/pump! c 200)
+        (is (nil? (h3/peer-error c)) "still open: stream 0 is due")
+        (is (= "/zero" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/zero")))))
+        (is (= [true 0x100] (h3/await-peer-error c 3000)) "then H3_NO_ERROR")
+        (is (not= ::timeout (deref closing 5000 ::timeout)) "close returned")))))
+
+(deftest close-forces-connections-at-the-shutdown-timeout
+  (let [srv (h3/start-server (fn [_] @(promise) (ok "never"))
+                             (fn [^com.s_exp.enso.api.Config$Builder b] (.shutdownTimeoutMillis b 300)))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (h3/send! c 0 (h3/headers-frame (h3/request-headers "GET" "/")) true)
+      (h3/pump! c 100)
+      (let [t0 (System/nanoTime)
+            closing (future (.close srv))]
+        (is (some? (h3/await-peer-error c 3000)) "connection closed")
+        (is (not= ::timeout (deref closing 3000 ::timeout)))
+        (is (< (- (System/nanoTime) t0) 2500000000) "bounded by the shutdown timeout")
+        (is (zero? (.connectionCount srv)))))))
+
+(deftest close-returns-at-the-shutdown-timeout-even-with-a-stuck-loop
+  ;; A loop that can't stop (here: an event listener blocking it while it
+  ;; closes its connections) is left behind at the deadline instead of
+  ;; being waited for past :shutdown-timeout.
+  (let [release (promise)
+        events (reify com.s_exp.enso.api.ServerEvents
+                 (connectionOpened [_ _ _])
+                 (connectionClosed [_ _ _ _] (deref release 10000 nil))
+                 (requestCompleted [_ _ _ _ _ _ _])
+                 (protocolError [_ _ _]))
+        srv (h3/start-server (fn [_] (ok "ok"))
+                             (fn [^com.s_exp.enso.api.Config$Builder b]
+                               (.shutdownTimeoutMillis b 1000)
+                               (.serverEvents b events)))]
+    (try
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))
+        (let [t0 (System/nanoTime)]
+          (.close srv)
+          (is (< (- (System/nanoTime) t0) 2000000000)
+              (str "close took " (quot (- (System/nanoTime) t0) 1000000) " ms"))))
+      (finally (deliver release true)))))
+
+;; ---- observability ------------------------------------------------------------
+
+(deftest server-events-and-protocol-errors
+  (let [events (atom [])
+        listener (reify com.s_exp.enso.api.ServerEvents
+                   (connectionOpened [_ p _] (swap! events conj [:opened p]))
+                   (connectionClosed [_ p _ _] (swap! events conj [:closed p]))
+                   (requestCompleted [_ p method status _ bytes _] (swap! events conj [:request p method status bytes]))
+                   (protocolError [_ p kind] (swap! events conj [:error p kind])))]
+    (h3/with-server [srv (fn [_] (ok "hello"))
+                     (fn [^com.s_exp.enso.api.Config$Builder b] (.serverEvents b listener))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (is (= "hello" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))
+        (is (message-error? c 4 (h3/headers-frame (h3/request-headers "GET" "no-slash")))))
+      (await-connection-count srv 0 3000))
+    (is (= [[:opened "h3"] [:request "h3" "GET" 200 5] [:error "h3" "bad-request"] [:closed "h3"]]
+           @events))))
+
+;; ---- response details ------------------------------------------------------------
+
+(deftest file-bodies-carry-content-length
+  (let [f (doto (java.io.File/createTempFile "enso-h3" ".txt") (.deleteOnExit))]
+    (spit f "file body")
+    (h3/with-server [srv (fn [_] (ok f))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (let [r (h3/request! c 0 (h3/request-headers "GET" "/"))]
+          (is (= "file body" (h3/body-str r)))
+          (is (= "9" (get (:headers r) "content-length"))))))))
+
+(deftest unsent-response-bodies-are-closed
+  ;; A body that is never sent (501 for a WebSocket answer, HEAD) is closed.
+  (let [closed (atom 0)
+        body #(proxy [java.io.ByteArrayInputStream] [(.getBytes "x")]
+                (close [] (swap! closed inc)))]
+    (h3/with-server [srv (fn [^Request req]
+                           (if (= "/ws" (.-uri req))
+                             (Response. 101 {} (body)
+                                        (reify com.s_exp.enso.api.WebSocketListener
+                                          (onOpen [_ _]) (onMessage [_ _ _]) (onClose [_ _ _ _]))
+                                        nil)
+                             (ok (body))))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (is (= 501 (:status (h3/request! c 0 (h3/request-headers "GET" "/ws")))))
+        (is (= 200 (:status (h3/request! c 4 (h3/request-headers "HEAD" "/")))))
+        (is (= 2 @closed))))))
+
+(deftest nothing-is-dispatched-after-a-connection-error
+  ;; Frames read in the same pass after a connection error are dropped.
+  (let [called (atom 0)]
+    (h3/with-server [srv (fn [_] (swap! called inc) (ok "x"))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (h3/pump! c 50)
+        ;; Both streams leave in one flight: a SETTINGS frame on request
+        ;; stream 0 (H3_FRAME_UNEXPECTED) and a valid request on stream 4.
+        (swap! (:pending c) assoc
+               0 [(h3/settings-frame) 0 false]
+               4 [(h3/headers-frame (h3/request-headers "GET" "/")) 0 true])
+        (h3/pump! c 10)
+        (is (= [true 0x105] (h3/await-peer-error c 2000)))
+        (is (zero? @called))))))
+
+;; ---- sharding ----------------------------------------------------------------------
+
+(def ^:private linux? (.contains (.toLowerCase (System/getProperty "os.name")) "linux"))
+
+(deftest connections-spread-across-event-loops
+  ;; Each connection lives on the loop its connection id names. On Linux
+  ;; every loop has its own SO_REUSEPORT socket and the kernel steers each
+  ;; datagram to its loop by connection id (nothing is forwarded);
+  ;; elsewhere loop 0 receives for all and hands datagrams over.
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3EventLoops b 4))]
+    (is (= 4 (.eventLoops srv)))
+    (is (.steersByConnectionId srv))
+    (let [clients (vec (repeatedly 12 #(h3/connect (.port srv))))]
+      (try
+        (doseq [c clients]
+          (h3/open-control! c)
+          (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/"))))))
+        (let [per-loop (mapv #(.invoke (doto (.getDeclaredMethod (class %) "connectionCount" (make-array Class 0))
+                                         (.setAccessible true))
+                                       % (object-array 0))
+                             (private-field srv "loops"))]
+          (is (= 12 (reduce + per-loop)))
+          (is (<= 2 (count (filter pos? per-loop))) (str "connections per loop " per-loop))
+          (if linux?
+            (is (zero? (.forwardedDatagrams srv)) "steered by the kernel")
+            (is (pos? (.forwardedDatagrams srv)) "handed over by loop 0")))
+        (finally (run! h3/close! clients))))))
+
+(defn- bindable? [^String ip]
+  (try (with-open [_ (java.net.DatagramSocket. 0 (java.net.InetAddress/getByName ip))] true)
+       (catch java.io.IOException _ false)))
+
+(deftest wildcard-listener-answers-from-the-addressed-ip
+  ;; Bound to the wildcard address on a multi-homed host, replies must leave
+  ;; from the address the client used (IP_PKTINFO), or the client's QUIC
+  ;; stack sees them come from elsewhere. Needs a second loopback address
+  ;; (Linux has 127.0.0.0/8).
+  (when (and linux? (bindable? "127.0.0.2"))
+    (let [srv (h3/start-server (fn [_] (ok "ok"))
+                               (fn [^com.s_exp.enso.api.Config$Builder b] (.host b "0.0.0.0")))]
+      (try
+        (h3/with-client [c (.port srv) {:server-ip "127.0.0.2"}]
+          (h3/open-control! c)
+          (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/"))))))
+        (finally (.close srv))))))
+
+;; ---- allocation budget ------------------------------------------------------------
+
+(defn- compressed-oops? []
+  (= "true" (.getValue (.getVMOption ^com.sun.management.HotSpotDiagnosticMXBean
+                                     (java.lang.management.ManagementFactory/getPlatformMXBean
+                                      com.sun.management.HotSpotDiagnosticMXBean)
+                                     "UseCompressedOops"))))
+
+(defn- server-thread-allocated-bytes
+  "Bytes allocated so far by the server's threads: the event loops and the
+  carriers of the handlers' virtual threads (the test client allocates on
+  its own platform thread)."
+  ^long []
+  (let [mx ^com.sun.management.ThreadMXBean (java.lang.management.ManagementFactory/getThreadMXBean)
+        ids (->> (keys (Thread/getAllStackTraces))
+                 (filter (fn [^Thread t]
+                           (let [n (.getName t)]
+                             (or (.startsWith n "enso-h3-loop") (.startsWith n "ForkJoinPool")))))
+                 (map #(.threadId ^Thread %))
+                 long-array)]
+    (reduce + 0 (filter pos? (.getThreadAllocatedBytes mx ids)))))
+
+(defn- get-batch!
+  "Sends `n` GETs on fresh streams from `sid` and waits for all of them;
+  returns the next stream id."
+  [c ^long sid ^long n ^bytes frame]
+  (let [sids (range sid (+ sid (* 4 n)) 4)]
+    (doseq [s sids] (h3/send! c s frame true))
+    (h3/pump-until! c #(every? (fn [s] (h3/stream-done? c s)) sids) 10000)
+    (swap! (:streams c) #(apply dissoc % sids))
+    (+ sid (* 4 n))))
+
+(deftest a-quick-response-carries-the-ack-of-its-request
+  ;; quiche acknowledges a request at once; held back briefly, that ACK
+  ;; leaves with the response: one datagram per request, not two.
+  (h3/with-server [srv (fn [_] (ok "ok"))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (dotimes [i 20] (h3/request! c (* 4 i) (h3/request-headers "GET" "/")))
+      (h3/pump! c 50)
+      (let [n 100
+            before (h3/datagrams-received c)]
+        (dotimes [i n] (h3/request! c (* 4 (+ 20 i)) (h3/request-headers "GET" "/")))
+        (let [per-request (/ (double (- (h3/datagrams-received c) before)) n)]
+          (is (< per-request 1.6) (str per-request " datagrams per request")))))))
+
+(deftest h3-get-allocation-budget
+  ;; Server-side bytes per GET (4 request headers, String body), whole path:
+  ;; datagram, quiche, frame parsing, QPACK, the Ring request and handler
+  ;; thread, response encoding. Measured after warm-up on the server's own
+  ;; threads (exact, not sampled).
+  (h3/with-server [srv (fn [_] (ok "Hello, World!"))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (let [frame (h3/headers-frame (h3/request-headers "GET" "/" ["accept" "*/*"]
+                                                        ["user-agent" "enso-test"]
+                                                        ["accept-encoding" "gzip"]
+                                                        ["x-request-id" "abc"]))
+            sid (reduce (fn [sid _] (get-batch! c sid 50 frame)) 0 (range 40))
+            before (server-thread-allocated-bytes)
+            n 2000
+            _ (reduce (fn [sid _] (get-batch! c sid 50 frame)) sid (range (quot n 50)))
+            per-request (quot (- (server-thread-allocated-bytes) before) n)]
+        (println "h3 GET server allocation per request:" per-request "bytes")
+        ;; ~730 measured with compressed oops (~1050 without, e.g. ZGC):
+        ;; the per-request virtual thread (with its continuation and
+        ;; thread-container node), the Exchange, the Ring request and header
+        ;; map, the handler's Response.
+        (is (< per-request (if (compressed-oops?) 900 1300)) (str per-request " bytes per request"))))))
+
+(deftest large-text-bodies-are-not-copied-whole
+  ;; A 64 KiB ASCII String body is written to quiche in slices through the
+  ;; loop's frame buffer, not turned into a 64 KiB byte[] per response.
+  (let [body (apply str (repeat (* 64 1024) "a"))]
+    (h3/with-server [srv (fn [_] (ok body))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (is (= body (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))
+        (let [frame (h3/headers-frame (h3/request-headers "GET" "/"))
+              sid (reduce (fn [sid _] (get-batch! c sid 4 frame)) 4 (range 10))
+              before (server-thread-allocated-bytes)
+              n 80
+              _ (reduce (fn [sid _] (get-batch! c sid 4 frame)) sid (range (quot n 4)))
+              per-request (quot (- (server-thread-allocated-bytes) before) n)]
+          (is (< per-request (* 16 1024)) (str per-request " bytes per request")))))))
+
+(deftest enso-server-drains-h3-connections
+  ;; Through the server: QUIC connections count in its registry (and
+  ;; connectionCount), drain with GOAWAY on close, and a handshaking one
+  ;; is simply closed.
+  (let [gate (promise)
+        entered (promise)
+        cfg (h3/server-config (fn [^com.s_exp.enso.api.Config$Builder b]
+                                (.http3Port b (int (support/free-udp-port)))
+                                (.shutdownTimeoutMillis b 5000)))
+        server (doto (com.s_exp.enso.EnsoServer.
+                      (reify com.s_exp.enso.api.RingHandler
+                        (handle [_ req]
+                          (deliver entered true)
+                          @gate
+                          (ok "done")))
+                      cfg)
+                 (.start))
+        port (.-http3Port cfg)]
+    (try
+      (let [half-open (h3/start-handshake port)]
+        (h3/with-client [c port]
+          (h3/open-control! c)
+          (h3/send! c 0 (h3/headers-frame (h3/request-headers "GET" "/")) true)
+          (h3/pump-until! c #(realized? entered) 2000)
+          (is (= 2 (.connectionCount server)) "both QUIC connections registered")
+          (let [closing (future (.close server))]
+            (is (h3/pump-until! c #(seq (goaway-ids c)) 2000) "GOAWAY")
+            (deliver gate true)
+            (h3/pump-until! c #(h3/stream-done? c 0) 2000)
+            (is (= "done" (h3/body-str (h3/response c 0))))
+            (is (= [true 0x100] (h3/await-peer-error c 3000)))
+            (is (not= ::timeout (deref closing 5000 ::timeout)))
+            (is (zero? (.connectionCount server)))))
+        (h3/close! half-open))
+      (finally (.close server)))))
+
+(defn- open-fds ^long []
+  (.getOpenFileDescriptorCount ^com.sun.management.UnixOperatingSystemMXBean
+                               (java.lang.management.ManagementFactory/getOperatingSystemMXBean)))
+
+(deftest failed-start-releases-sockets-and-config
+  ;; A listener whose start fails (port taken, here) releases what it
+  ;; opened before failing: sockets, wake-up channels, the quiche config.
+  (with-open [taken (java.net.DatagramSocket. 0 (java.net.InetAddress/getByName "127.0.0.1"))]
+    (let [port (.getLocalPort taken)
+          attempt #(let [l (com.s_exp.enso.http3.Http3Listener.
+                            (h3/server-config (fn [^com.s_exp.enso.api.Config$Builder b]
+                                                (.http3Port b (int port))
+                                                (.http3EventLoops b 2)))
+                            (reify com.s_exp.enso.api.RingHandler (handle [_ _] (ok "x")))
+                            nil)]
+                     (try (.start l) :started
+                          (catch java.io.IOException _ :failed)
+                          (finally (.close l))))]
+      (attempt)
+      (let [before (open-fds)]
+        (is (every? #{:failed} (repeatedly 20 attempt)))
+        (is (<= (open-fds) (+ before 2)) "no descriptor leaked per failed start")))))
+
+(deftest small-socket-buffers-still-deliver-large-bodies
+  ;; A small UDP send buffer may fill (EAGAIN) or drop (ENOBUFS, treated as
+  ;; loss): either way a large body completes. Loopback rarely reports
+  ;; EAGAIN, so the resume-on-writable path itself is covered by reasoning,
+  ;; not asserted.
+  (let [data (byte-array (* 4 1024 1024))]
+    (.nextBytes (java.util.Random. 11) data)
+    (h3/with-server [srv (fn [_] (ok data))
+                     (fn [^com.s_exp.enso.api.Config$Builder b]
+                       (.http3SoSndBufBytes b 65536)
+                       (.http3EventLoops b 1))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (let [t0 (System/nanoTime)
+              r (h3/request! c 0 (h3/request-headers "GET" "/"))]
+          (is (java.util.Arrays/equals data ^bytes (:body r)))
+          (is (< (- (System/nanoTime) t0) 10000000000)))))))
+
+(deftest invalid-client-transport-parameters-close-the-handshake
+  ;; RFC 9000 §7.4 / §18.2: a max_udp_payload_size below 1200 is a
+  ;; TRANSPORT_PARAMETER_ERROR (0x08), sent before any state is kept.
+  (h3/with-server [srv (fn [_] (ok "ok"))]
+    (let [c (h3/start-handshake (.port srv) {:configure #(.setMaxRecvUdpPayloadSize ^com.s_exp.enso.quiche.QuicheConfig % 1199)})]
+      (try
+        (is (= [false 0x08] (h3/await-peer-error c 3000)) (str (h3/peer-error c)))
+        (is (zero? (await-connection-count srv 0 3000)))
+        (finally (h3/close! c))))))
+
+(deftest bodiless-request-has-nil-body
+  ;; Ring: :body is present only when the request has one, as on HTTP/1.1
+  ;; and HTTP/2.
+  (h3/with-server [srv (fn [^Request req]
+                         (ok (if-let [^java.io.InputStream in (.-body req)]
+                               (String. (.readAllBytes in) "UTF-8")
+                               "nil")))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (is (= "nil" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))
+      (is (= "abc" (h3/body-str (h3/request! c 4 (h3/request-headers "POST" "/") (.getBytes "abc" "UTF-8"))))))))
+
+;; ---- behaviour shared with the other protocols ---------------------------------
+
+(deftest declared-body-over-cap-is-413-without-the-handler
+  ;; As on HTTP/1.1 and HTTP/2: a Content-Length over
+  ;; :max-request-body-bytes is answered 413 before any handler runs.
+  (let [called (atom 0)]
+    (h3/with-server [srv (fn [_] (swap! called inc) (ok "ran"))
+                     (fn [^com.s_exp.enso.api.Config$Builder b] (.maxRequestBodyBytes b 10))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (let [r (h3/request! c 0 (h3/request-headers "POST" "/" ["content-length" "100"]) (byte-array 100))]
+          (is (= 413 (:status r)))
+          (is (= "Content Too Large" (h3/body-str r))))
+        (is (zero? @called) "handler not run")
+        (is (nil? (h3/peer-error c)))))))
+
+(deftest expect-100-continue-sent-on-first-body-read
+  ;; RFC 9114 §4.1 / RFC 9110 §10.1.1, as on HTTP/1.1: the interim 100
+  ;; goes out when the handler first reads the body.
+  (h3/with-server [srv (fn [^Request req]
+                         (if (= "/read" (.-uri req))
+                           (ok (String. (.readAllBytes ^java.io.InputStream (.-body req))))
+                           (ok "unread")))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (h3/send! c 0 (h3/headers-frame (h3/request-headers "POST" "/read" ["expect" "100-continue"])) false)
+      (h3/pump-until! c #(= [100] (:interim (h3/response c 0))) 2000)
+      (is (= [100] (:interim (h3/response c 0))) "100 before the body was sent")
+      (h3/send! c 0 (h3/data-frame (.getBytes "abc")) true)
+      (h3/pump-until! c #(h3/stream-done? c 0) 3000)
+      (let [r (h3/response c 0)]
+        (is (= 200 (:status r)))
+        (is (= "abc" (h3/body-str r))))
+      (let [r (h3/request! c 4 (h3/request-headers "POST" "/unread" ["expect" "100-continue"]) (.getBytes "x"))]
+        (is (= [] (:interim r)) "no 100 for a body never read")
+        (is (= 200 (:status r)))))))
+
+(deftest unknown-expectation-is-417
+  (let [called (atom 0)]
+    (h3/with-server [srv (fn [_] (swap! called inc) (ok "ran"))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (is (= 417 (:status (h3/request! c 0 (h3/request-headers "POST" "/" ["expect" "teapot"]) (.getBytes "x")))))
+        (is (zero? @called))))))
+
+(deftest header-field-count-is-capped
+  (let [called (atom 0)]
+    (h3/with-server [srv (fn [_] (swap! called inc) (ok "ok"))
+                     (fn [^com.s_exp.enso.api.Config$Builder b] (.maxHeaderFields b 5))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (is (= 200 (:status (h3/request! c 0 (apply h3/request-headers "GET" "/" (for [i (range 5)] [(str "x-h" i) "v"]))))))
+        (is (= 431 (:status (h3/request! c 4 (apply h3/request-headers "GET" "/" (for [i (range 6)] [(str "x-h" i) "v"]))))))
+        (is (= 1 @called))))))
+
+(deftest many-distinct-headers-build-a-hash-map-in-bounded-time
+  (let [seen (promise)]
+    (h3/with-server [srv (fn [^Request req]
+                           (let [h (.-headers req)]
+                             (deliver seen [(class h) (count h) (get h "x-h1999")]))
+                           (ok "ok"))
+                     (fn [^com.s_exp.enso.api.Config$Builder b]
+                       (.maxHeaderFields b 3000)
+                       (.maxHeaderBytes b (* 1024 1024)))]
+      (h3/with-client [c (.port srv)]
+        (h3/open-control! c)
+        (let [t0 (System/nanoTime)
+              r (h3/request! c 0 (apply h3/request-headers "GET" "/" (for [i (range 2000)] [(str "x-h" i) "v"])))]
+          (is (= 200 (:status r)))
+          (is (< (/ (- (System/nanoTime) t0) 1e6) 2000.0) "bounded time"))
+        (is (= [clojure.lang.PersistentHashMap 2001 "v"] (deref seen 1000 nil)))))))
+
+;; ---- failure containment ---------------------------------------------------------
+
+(defn- set-private-field! [obj ^String name v]
+  (.set (doto (.getDeclaredField (class obj) name) (.setAccessible true)) obj v))
+
+(defn- loop-connections
+  "The connections owned by `srv`'s event loops."
+  [srv]
+  (vec (mapcat (fn [l]
+                 (let [m (doto (.getDeclaredMethod (class l) "connections" (make-array Class 0))
+                           (.setAccessible true))]
+                   (seq (.invoke m l (object-array 0)))))
+               (private-field srv "loops"))))
+
+(defn- served? [c sid]
+  (= "ok" (h3/body-str (h3/request! c sid (h3/request-headers "GET" "/")))))
+
+(deftest a-failing-connection-closes-alone
+  ;; An exception while processing one connection closes that connection
+  ;; (H3_INTERNAL_ERROR); the loop and its other connections carry on.
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3EventLoops b 1))]
+    (h3/with-client [a (.port srv)]
+      (h3/with-client [b (.port srv)]
+        (h3/open-control! a)
+        (h3/open-control! b)
+        (is (served? a 0))
+        (is (served? b 0))
+        ;; Corrupt one connection: its next stream read throws.
+        (set-private-field! (first (loop-connections srv)) "reader" nil)
+        (h3/send! a 4 (h3/headers-frame (h3/request-headers "GET" "/")) true)
+        (h3/send! b 4 (h3/headers-frame (h3/request-headers "GET" "/")) true)
+        (h3/pump-until! a #(or (h3/peer-error a) (h3/stream-done? a 4)) 3000)
+        (h3/pump-until! b #(or (h3/peer-error b) (h3/stream-done? b 4)) 3000)
+        (let [[victim survivor] (if (h3/peer-error a) [a b] [b a])]
+          (is (= [true 0x102] (h3/peer-error victim)) "H3_INTERNAL_ERROR for the broken connection")
+          (is (nil? (h3/peer-error survivor)))
+          (is (served? survivor 8) "the loop still serves the others"))))))
+
+(deftest a-connection-whose-teardown-fails-is-still-freed
+  ;; Teardown that throws half-way (here: abandoning its requests) must
+  ;; still free the quiche connection and give back its configuration.
+  (h3/with-server [srv (fn [_] (ok "ok"))
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3EventLoops b 1))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (is (served? c 0))
+      (let [conn (first (loop-connections srv))
+            ^com.s_exp.enso.quiche.QuicheConnection q (private-field conn "quiche")]
+        (set-private-field! conn "writer" nil)
+        (h3/send! c 4 (h3/headers-frame (h3/request-headers "GET" "/")) true)
+        (is (support/await-condition #(do (h3/pump! c 20) (.isFreed q)) 3000 1)
+            "the quiche connection was freed")
+        (is (= 1 (.liveQuicheConfigs srv)) "its configuration reference was given back")
+        (is (empty? (loop-connections srv)))))))
+
+(deftest a-failing-event-loop-is-restarted
+  ;; A failure escaping the loop's own guards is reported, the loop's
+  ;; connections are closed and the loop restarts: new connections are
+  ;; served again.
+  (let [errors (atom [])
+        listener (reify com.s_exp.enso.api.ServerEvents
+                   (protocolError [_ _ kind] (swap! errors conj kind)))]
+    (h3/with-server [srv (fn [_] (ok "ok"))
+                     (fn [^com.s_exp.enso.api.Config$Builder b]
+                       (.http3EventLoops b 1)
+                       (.serverEvents b listener))]
+      (let [l (first (private-field srv "loops"))
+            ready (private-field l "ready")]
+        (h3/with-client [c (.port srv)]
+          (h3/open-control! c)
+          (is (served? c 0))
+          (set-private-field! l "ready" nil)
+          (h3/send! c 4 (h3/headers-frame (h3/request-headers "GET" "/")) true)
+          (is (h3/await-peer-error c 3000) "the failed loop's connections are closed"))
+        (is (some #{"event-loop-failure"} @errors) (str "events: " @errors))
+        (set-private-field! l "ready" ready)
+        (h3/with-client [c (.port srv)]
+          (h3/open-control! c)
+          (is (served? c 0) "the restarted loop serves new connections"))))))
+
+(deftest datagram-from-an-undecodable-address-is-dropped
+  ;; A source address in a family the shim doesn't decode is dropped at
+  ;; admission rather than crashing the loop with a null address.
+  (h3/with-server [srv (fn [_] (ok "ok"))]
+    (let [admit (doto (.getDeclaredMethod com.s_exp.enso.http3.Http3Listener "admit"
+                                          (into-array Class [java.nio.ByteBuffer Integer/TYPE java.nio.ByteBuffer
+                                                             Integer/TYPE (class (byte-array 0))]))
+                  (.setAccessible true))
+          meta (java.nio.ByteBuffer/allocate 256)
+          verdict (.invoke admit srv (object-array [(java.nio.ByteBuffer/allocate 64) (int 0) meta (int 0)
+                                                    (byte-array 8)]))]
+      (is (= 1 (private-field verdict "verdict")) "Admission/DROP"))))
+
+;; ---- certificate reloading -------------------------------------------------
+
+(defn- write-cert-pair!
+  "Generates an ECDSA P-256 certificate for `cn` and moves it over
+  `cert` / `key` (each replaced in one rename, as deploy tools do).
+  Returns the certificate's DER bytes."
+  ^bytes [^String cert ^String key ^String cn]
+  (let [dir (java.nio.file.Files/createTempDirectory "enso-h3-cert" (make-array java.nio.file.attribute.FileAttribute 0))
+        c (str (.resolve dir "c.pem"))
+        k (str (.resolve dir "k.pem"))
+        run (fn [& args] (let [p (.start (doto (ProcessBuilder. ^java.util.List (vec args)) (.redirectErrorStream true)))]
+                           (slurp (.getInputStream p))
+                           (assert (zero? (.waitFor p)) (str args))))]
+    (run "openssl" "ecparam" "-name" "prime256v1" "-genkey" "-noout" "-out" k)
+    (run "openssl" "req" "-new" "-x509" "-key" k "-out" c "-days" "1" "-subj" (str "/CN=" cn))
+    (java.nio.file.Files/move (java.nio.file.Path/of k (make-array String 0)) (java.nio.file.Path/of key (make-array String 0))
+                              (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+    (java.nio.file.Files/move (java.nio.file.Path/of c (make-array String 0)) (java.nio.file.Path/of cert (make-array String 0))
+                              (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+    (with-open [in (java.io.FileInputStream. cert)]
+      (.getEncoded (.generateCertificate (java.security.cert.CertificateFactory/getInstance "X.509") in)))))
+
+(defn- presented-certificate
+  "DER of the certificate a new connection to `port` is shown."
+  ^bytes [port]
+  (h3/with-client [c port]
+    (h3/peer-certificate c)))
+
+(deftest changed-certificate-files-are-loaded-for-new-connections
+  (let [dir (java.nio.file.Files/createTempDirectory "enso-h3-rotate" (make-array java.nio.file.attribute.FileAttribute 0))
+        cert (str (.resolve dir "cert.pem"))
+        key (str (.resolve dir "key.pem"))
+        first-der (write-cert-pair! cert key "first")]
+    (h3/with-server [srv (fn [_] (ok "ok"))
+                     (fn [^com.s_exp.enso.api.Config$Builder b]
+                       (.http3CertPath b cert)
+                       (.http3KeyPath b key)
+                       (.http3CertReloadIntervalMillis b 50))]
+      (let [old (h3/connect (.port srv))]
+        (try
+          (h3/open-control! old)
+          (is (java.util.Arrays/equals first-der (h3/peer-certificate old)))
+          (let [second-der (write-cert-pair! cert key "second")]
+            (is (support/await-condition #(java.util.Arrays/equals second-der (presented-certificate (.port srv))) 5000 50)
+                "new connections get the new certificate")
+            (is (= "ok" (h3/body-str (h3/request! old 0 (h3/request-headers "GET" "/"))))
+                "an existing connection keeps working on the configuration it was accepted with")
+            (is (= 2 (.liveQuicheConfigs srv)) "the old configuration lives while a connection uses it")
+            (testing "a broken pair is refused and the current one kept"
+              (spit cert "not a certificate")
+              (Thread/sleep 300)
+              (is (java.util.Arrays/equals second-der (presented-certificate (.port srv))))))
+          (finally (h3/close! old))))
+      (is (support/await-condition #(= 1 (.liveQuicheConfigs srv)) 5000 50)
+          "the old configuration is freed once its last connection is gone"))))
+
+;; ---- request-body memory -----------------------------------------------------
+
+(defn- start-with-service
+  "A listener on its own Service (so the test can watch its memory budget).
+  Returns [listener service timer]."
+  [handler configure]
+  (let [cfg (h3/server-config configure)
+        timer (com.s_exp.enso.core.Timer. "h3-test-timer" 10 512)
+        service (com.s_exp.enso.core.Service. (reify com.s_exp.enso.api.RingHandler (handle [_ req] (handler req)))
+                                              nil cfg timer)
+        l (com.s_exp.enso.http3.Http3Listener. service nil nil)]
+    (.start l)
+    [l service timer]))
+
+(defn- budget-used ^long [^com.s_exp.enso.core.Service service]
+  (.used ^com.s_exp.enso.core.MemoryBudget (.-budget service)))
+
+(deftest unread-body-bytes-are-released-when-the-connection-goes
+  ;; A handler that never reads its body (and ignores interrupts) can't
+  ;; give the buffered bytes back: closing the connection must.
+  (let [gate (promise)
+        [^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+        (start-with-service (fn [_] (while (not (realized? gate))
+                                      (try (deref gate) (catch InterruptedException _)))
+                              (ok "x"))
+                            (fn [_]))]
+    (try
+      (let [c (h3/connect (.port l))]
+        (h3/open-control! c)
+        (h3/send! c 0 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                       (h3/data-frame (byte-array (* 40 1024))))
+                  false)
+        (is (support/await-condition #(do (h3/pump! c 20) (pos? (budget-used service))) 5000 1)
+            "body bytes buffered for the handler")
+        (h3/close! c))
+      (is (support/await-condition #(zero? (budget-used service)) 5000 20)
+          (str "budget still charged: " (budget-used service)))
+      (finally
+        (deliver gate true)
+        (.close l)
+        (.close timer)))))
+
+(deftest unread-bodies-of-a-connection-are-bounded-by-its-window
+  ;; Body bytes the loop moves out of quiche into pipes return flow-control
+  ;; credit to the peer, so the pipes, not quiche, must bound what one
+  ;; connection's unread bodies hold: at most its connection window.
+  (let [gate (promise)
+        window (* 256 1024)
+        [^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+        (start-with-service (fn [_] @gate (ok "x"))
+                            (fn [^com.s_exp.enso.api.Config$Builder b]
+                              (.http3InitialMaxDataBytes b window)
+                              (.http3InitialMaxStreamsBidi b 8)))]
+    (try
+      (h3/with-client [c (.port l)]
+        (h3/open-control! c)
+        (doseq [sid (range 0 32 4)]
+          (h3/send! c sid (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                           (h3/data-frame (byte-array (* 96 1024))))
+                    true))
+        (let [peak (loop [deadline (+ (System/currentTimeMillis) 2000) peak 0]
+                     (if (> (System/currentTimeMillis) deadline)
+                       peak
+                       (do (h3/pump! c 20)
+                           (recur deadline (max peak (budget-used service))))))]
+          (is (pos? peak))
+          (is (<= peak window) (str "peak buffered " peak " bytes, window " window))))
+      (finally
+        (deliver gate true)
+        (.close l)
+        (.close timer)))))
+
+(deftest stream-body-longer-than-content-length-is-truncated
+  ;; As on HTTP/1.1 and HTTP/2: a declared Content-Length bounds what an
+  ;; InputStream body sends; the rest is dropped and the response ends
+  ;; cleanly.
+  (h3/with-server [srv (fn [_] (Response. 200 {"content-length" "3"}
+                                           (java.io.ByteArrayInputStream. (.getBytes "hello" "UTF-8"))))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (let [r (h3/request! c 0 (h3/request-headers "GET" "/"))]
+        (is (= 200 (:status r)))
+        (is (= "hel" (h3/body-str r)))
+        (is (:fin r))
+        (is (nil? (:reset r)))))))
