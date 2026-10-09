@@ -29,3 +29,15 @@ runs:
           ~/.deps.clj
         key: ${{ runner.os }}-clj-${{ hashFiles('deps.edn') }}
         restore-keys: ${{ runner.os }}-clj-
+
+    # tools.deps reads dependency descriptors on several threads, and the
+    # Maven model validator it calls isn't thread-safe (intermittent
+    # "HashMap$Node cannot be cast to HashMap$TreeNode"). Resolve every
+    # classpath the workflows use once, serially; later runs read the
+    # cached classpath and never resolve in parallel.
+    - name: Resolve classpaths
+      shell: bash
+      run: |
+        for aliases in -T:build -X:test -M:test-server -M:perf -M:perf-gate -A:fuzz; do
+          clojure -Sthreads 1 -P "$aliases"
+        done

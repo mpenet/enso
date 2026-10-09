@@ -58,6 +58,10 @@ start_test_server h3 "$PORT" ${ENSO_SERVER_OPTS:+opts "$ENSO_SERVER_OPTS"} || ex
 OUT="$WORK_DIR/output.txt"
 "$H3SPEC_BIN" -n ${MATCH[@]+"${MATCH[@]}"} 127.0.0.1 "$PORT" > "$OUT" 2>&1
 status=$?
+# hspec colours its marks and summary when it thinks it has a terminal
+# (CI does); strip the escapes so the parsing below sees plain text.
+esc=$'\033'
+sed "s/${esc}\[[0-9;]*m//g" "$OUT" > "$OUT.plain" && mv "$OUT.plain" "$OUT"
 tail -3 "$OUT"
 stop_test_server
 
