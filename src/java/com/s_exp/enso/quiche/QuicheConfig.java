@@ -169,11 +169,11 @@ public final class QuicheConfig implements AutoCloseable {
         Quiche.configSetInitialMaxData(p, cfg.http3InitialMaxDataBytes);
         Quiche.configSetMaxConnectionWindow(p, cfg.http3InitialMaxDataBytes);
         connectionWindow = cfg.http3InitialMaxDataBytes;
-        // Per-stream windows: explicit config when set, otherwise derived
-        // from the connection window and stream count, at least 1 MiB
-        // (never above the connection window).
-        long derived = Math.min(cfg.http3InitialMaxDataBytes, Math.max(1L << 20,
-            cfg.http3InitialMaxDataBytes / Math.max(1, cfg.http3InitialMaxStreamsBidi)));
+        // Per-stream windows: explicit config when set, otherwise a quarter
+        // of the connection window (as HTTP/2's 256 KiB to 1 MiB), so a
+        // stream whose handler doesn't read can't take the whole window
+        // and stall the connection's other requests.
+        long derived = cfg.http3InitialMaxDataBytes / 4;
         streamWindowBidiLocal = cfg.http3InitialMaxStreamDataBidiLocalBytes >= 0
             ? cfg.http3InitialMaxStreamDataBidiLocalBytes : derived;
         streamWindowBidiRemote = cfg.http3InitialMaxStreamDataBidiRemoteBytes >= 0

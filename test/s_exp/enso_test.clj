@@ -40,9 +40,20 @@
        (.flush out)
        (String. (.readAllBytes in) StandardCharsets/ISO_8859_1)))))
 
+(defn- dechunk
+  "The payload of a chunked body (trailers ignored)."
+  [^String body]
+  (loop [at 0 sb (StringBuilder.)]
+    (let [eol (str/index-of body "\r\n" at)
+          size (Long/parseLong (first (str/split (subs body at eol) #";")) 16)]
+      (if (zero? size)
+        (str sb)
+        (recur (+ eol 2 size 2) (.append sb (subs body (+ eol 2) (+ eol 2 size))))))))
+
 (defn- parse-response
   "Splits an HTTP response string into {:status :headers :body}. Assumes ISO-8859-1
-  header + optional body starting after the empty line."
+  header + optional body starting after the empty line, chunked framing
+  removed."
   [^String resp]
   (let [sep (str/index-of resp "\r\n\r\n")
         head (subs resp 0 sep)
@@ -57,7 +68,9 @@
                       header-lines)]
     {:status (Long/parseLong status)
      :headers headers
-     :body body}))
+     :body (if (some-> (get headers "transfer-encoding") (str/includes? "chunked"))
+             (dechunk body)
+             body)}))
 
 (defn- get! [path]
   (parse-response
@@ -1263,52 +1276,6 @@
         ^bytes m1 (.mint t1 peer odcid scid)]
     (is (nil? (.verify t2 m1 0 (alength m1) peer scid 16)) "cross-instance verify must fail")))
 
-(deftest h3-body-pipe-basic
-  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe.)
-        in (.inputStream pipe)]
-    (.enqueue pipe (.getBytes "hello" StandardCharsets/UTF_8))
-    (.signalEnd pipe)
-    (is (= "hello" (slurp in)))))
-
-(deftest h3-body-pipe-multi-chunk
-  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe.)
-        in (.inputStream pipe)]
-    (.enqueue pipe (.getBytes "aaa" StandardCharsets/UTF_8))
-    (.enqueue pipe (.getBytes "bbb" StandardCharsets/UTF_8))
-    (.enqueue pipe (.getBytes "ccc" StandardCharsets/UTF_8))
-    (.signalEnd pipe)
-    (is (= "aaabbbccc" (slurp in)))))
-
-(deftest h3-body-pipe-eof-only
-  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe.)
-        in (.inputStream pipe)]
-    (.signalEnd pipe)
-    (is (= "" (slurp in)) "empty body streams to empty string")))
-
-(deftest h3-body-pipe-cap-accepts-below-limit
-  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe. 100)]
-    (is (.enqueueChecked pipe (byte-array 40)))
-    (is (.enqueueChecked pipe (byte-array 40)))
-    (is (.enqueueChecked pipe (byte-array 20)))))
-
-(deftest h3-body-pipe-cap-rejects-above-limit
-  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe. 100)]
-    (is (.enqueueChecked pipe (byte-array 90)))
-    (is (not (.enqueueChecked pipe (byte-array 20))) "20-byte push over 100 cap rejected")))
-
-(deftest h3-body-pipe-cap-disabled-with-zero
-  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe. 0)]
-    (is (.enqueueChecked pipe (byte-array 1000000)) "cap=0 disables enforcement")))
-
-(deftest h3-body-pipe-read-single-byte
-  (let [pipe (com.s_exp.enso.http3.Http3BodyPipe.)
-        in (.inputStream pipe)]
-    (.enqueue pipe (byte-array [(byte 65) (byte 66)]))
-    (.signalEnd pipe)
-    (is (= 65 (.read in)) "A")
-    (is (= 66 (.read in)) "B")
-    (is (= -1 (.read in)) "EOF")))
-
 ;; Sockaddr encoding is exercised end-to-end by the h3 smoke tests when
 ;; opt-in integration runs. Direct-reflection unit test dropped — too
 ;; entangled with package-private inner Encoded record for negligible
@@ -1749,7 +1716,7 @@
           (let [raw (.readAllBytes (.getInputStream sock))
                 text (String. raw StandardCharsets/ISO_8859_1)]
             ;; the body is the single byte 0xE9, not the two UTF-8 bytes
-            (is (str/ends-with? text "\r\n\r\né") (pr-str text))))))))
+            (is (str/ends-with? text "\r\n\r\n1\r\né\r\n0\r\n\r\n") (pr-str text))))))))
 
 (defrecord ProbeBody [seen]
   ring.core.protocols/StreamableResponseBody

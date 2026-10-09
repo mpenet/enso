@@ -38,6 +38,8 @@ public final class Timer implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(Timer.class.getName());
     private static final LogLimiter CALLBACK_FAILURES = new LogLimiter(LOG, Level.WARNING);
+    private static final LogLimiter LOOP_FAILURES = new LogLimiter(LOG, Level.SEVERE);
+    private static final long RESTART_PAUSE_NANOS = 10_000_000L;
 
     public static final long DEFAULT_TICK_MILLIS = 10;
     public static final int DEFAULT_WHEEL_SIZE = 512;
@@ -154,6 +156,11 @@ public final class Timer implements AutoCloseable {
         return disarmed;
     }
 
+    /** Whether the timer thread is running (it is supervised: false after {@link #close} only). */
+    public boolean isAlive() {
+        return thread.isAlive();
+    }
+
     /** Stops the timer thread. Pending tasks never fire. */
     @Override
     public void close() {
@@ -180,7 +187,24 @@ public final class Timer implements AutoCloseable {
         }
     }
 
+    /**
+     * The supervisor: task failures are contained in {@link #fire}; anything
+     * else escaping the loop (an Error in the wheel's own bookkeeping) is
+     * logged and the loop restarted after a pause, so the server never runs
+     * without its timeouts.
+     */
     private void run() {
+        while (running) {
+            try {
+                loop();
+            } catch (Throwable t) {
+                LOOP_FAILURES.log("timer loop failed; restarting it", t);
+                LockSupport.parkNanos(this, RESTART_PAUSE_NANOS);
+            }
+        }
+    }
+
+    private void loop() {
         while (running) {
             long nowTick = (System.nanoTime() - origin) / tickNanos;
             if (linked == 0) {

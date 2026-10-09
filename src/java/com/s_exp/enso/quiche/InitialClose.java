@@ -47,6 +47,10 @@ public final class InitialClose {
     private static final byte[] INFO_IV = labelInfo("quic iv", 12);
     private static final byte[] INFO_HP = labelInfo("quic hp", 16);
     private static final SecretKeySpec SALT_KEY = new SecretKeySpec(INITIAL_SALT_V1, "HmacSHA256");
+    // A key and nonce no Initial derives in practice, to step the GCM
+    // cipher off the previous pair (see build).
+    private static final SecretKeySpec RESET_KEY = new SecretKeySpec(new byte[16], "AES");
+    private static final GCMParameterSpec RESET_NONCE = new GCMParameterSpec(128, new byte[12]);
 
     /**
      * The MAC and ciphers, looked up once per thread (an event loop): a
@@ -71,6 +75,9 @@ public final class InitialClose {
         int lastCode = -1;
         byte[] lastDcid;
         byte[] lastScid;
+        // The destination id whose key and nonce the GCM cipher was last
+        // initialised with.
+        byte[] gcmDcid;
 
         Crypto() throws GeneralSecurityException {}
 
@@ -166,8 +173,15 @@ public final class InitialClose {
         payload[3] = 0; // frame type: none
         payload[4] = 0; // reason length
 
-        // Nonce: the IV XORed with the packet number (0).
+        // Nonce: the IV XORed with the packet number (0). The JDK refuses
+        // to encrypt with the key and nonce it last encrypted with: an
+        // Initial to the same destination id (another source id or code)
+        // first steps the cipher onto a throwaway pair.
+        if (Arrays.equals(c.gcmDcid, clientDcid)) {
+            c.gcm.init(Cipher.ENCRYPT_MODE, RESET_KEY, RESET_NONCE);
+        }
         c.gcm.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(c.key, "AES"), new GCMParameterSpec(128, c.iv));
+        c.gcmDcid = clientDcid.clone();
         c.gcm.updateAAD(pkt, 0, headerLen);
         c.gcm.doFinal(payload, 0, payload.length, pkt, headerLen);
 

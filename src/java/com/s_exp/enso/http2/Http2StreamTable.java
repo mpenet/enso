@@ -21,10 +21,6 @@ final class Http2StreamTable {
         mask = 15;
     }
 
-    int size() {
-        return size;
-    }
-
     private static int hash(int id) {
         int h = id * 0x9E3779B9;
         return h ^ (h >>> 16);

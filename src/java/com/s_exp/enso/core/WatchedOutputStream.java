@@ -1,5 +1,5 @@
 // ABOUTME: OutputStream that brackets every write to the wrapped transport with a WriteWatchdog,
-// ABOUTME: in bounded slices, and counts bytes written for request accounting.
+// ABOUTME: in bounded slices, so a large write still reports progress.
 package com.s_exp.enso.core;
 
 import java.io.IOException;
@@ -20,16 +20,10 @@ public final class WatchedOutputStream extends OutputStream {
 
     private final OutputStream out;
     private final WriteWatchdog watchdog;
-    private long bytesWritten;
 
     public WatchedOutputStream(OutputStream out, WriteWatchdog watchdog) {
         this.out = out;
         this.watchdog = watchdog;
-    }
-
-    /** Total bytes handed to the transport so far. */
-    public long bytesWritten() {
-        return bytesWritten;
     }
 
     @Override
@@ -40,7 +34,6 @@ public final class WatchedOutputStream extends OutputStream {
         } finally {
             watchdog.exit();
         }
-        bytesWritten++;
     }
 
     @Override
@@ -53,7 +46,6 @@ public final class WatchedOutputStream extends OutputStream {
             } finally {
                 watchdog.exit();
             }
-            bytesWritten += n;
             off += n;
             len -= n;
         }

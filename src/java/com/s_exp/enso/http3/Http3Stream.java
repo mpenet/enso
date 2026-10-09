@@ -38,15 +38,39 @@ abstract class Http3Stream extends Exchange {
     Pending pendingTail;
     /** Deferred bytes, for diagnostics and the write timeout. */
     long pendingBytes;
-    /** System.nanoTime when quiche last took bytes while some were waiting. */
+    /**
+     * System.nanoTime of the last write progress while bytes were waiting:
+     * when the stream blocked, or since then each time quiche's taking
+     * bytes moved a byte count across a {@link #MIN_PROGRESS} boundary.
+     */
     long writeProgressNanos;
     /** The send side ended: FIN accepted, reset, or the peer stopped it. */
     boolean sendClosed;
     /** Waiting for send capacity (deferred bytes or a body slice); counted by the connection. */
     boolean blocked;
 
+    /**
+     * Bytes that count as write progress, as on HTTP/2: a peer granting
+     * credit a few bytes at a time makes none, so {@code :write-timeout}
+     * holds a waiting stream to at least this much per period.
+     */
+    static final int MIN_PROGRESS = 16 * 1024;
+
     Http3Stream(long id) {
         this.id = id;
+    }
+
+    /**
+     * quiche took bytes of this stream at {@code now}, moving a byte count
+     * the stream keeps anyway (response bytes sent, deferred bytes left)
+     * from {@code before} to {@code after}: progress whenever that crosses
+     * a {@link #MIN_PROGRESS} boundary, so after the first, every progress
+     * mark takes that many bytes (no field of its own per request).
+     */
+    final void sent(long before, long after, long now) {
+        if (before / MIN_PROGRESS != after / MIN_PROGRESS) {
+            writeProgressNanos = now;
+        }
     }
 
     final boolean hasPending() {

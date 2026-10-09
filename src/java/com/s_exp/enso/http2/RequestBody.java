@@ -2,7 +2,7 @@
 // ABOUTME: and the handler reads, bounded by the stream's receive window, returning credit as read.
 package com.s_exp.enso.http2;
 
-import com.s_exp.enso.core.MemoryBudget;
+import com.s_exp.enso.core.DataRate;
 import com.s_exp.enso.core.RequestBodyException;
 import com.s_exp.enso.core.RequestBodyTimeoutException;
 import java.io.IOException;
@@ -18,24 +18,30 @@ import java.util.concurrent.locks.ReentrantLock;
  * window lets the peer send: the framer charges every frame against
  * {@link #recvWindow} before copying it, and credit only goes back (a
  * WINDOW_UPDATE) once the handler has read the bytes. A ring grown large
- * is dropped once read empty, so a long upload keeps only what is buffered.
+ * is dropped once read empty, and halved while it is at most a quarter
+ * full, so a long upload keeps only what is buffered: past
+ * {@link #RETAINED_CAPACITY} a ring is never more than four times the bytes
+ * it holds, which are what the connection's memory account is charged.
  *
  * <p>One producer (the framer) and one consumer (the handler thread),
  * under a lock of their own; the consumer parks with
  * {@link LockSupport#park} (no allocation) until bytes, the end, or
  * {@code :read-timeout}.
  *
- * <p>Buffered bytes are charged to the server's {@link MemoryBudget}
- * ({@code :max-buffered-bytes}) until read or dropped. While the budget is
- * exhausted, read bytes earn no WINDOW_UPDATE: the credit is held back and
- * granted once the budget has room again, so peers are slowed down by
- * flow control rather than refused.
+ * <p>Memory is accounted per connection, not here: the connection pays
+ * for every DATA byte when it arrives (from the credit it reserved before
+ * granting it) and gets it back when the bytes leave this ring (read or
+ * dropped, through {@link Http2Connection#creditConnection}), where it
+ * decides whether to grant that credit again. The connection window
+ * bounds what all of a connection's bodies hold, so stream credit is
+ * granted as bytes are read.
  */
 final class RequestBody extends InputStream {
 
     private static final int INITIAL_CAPACITY = 1024;
     // A ring grown past this (a burst the handler fell behind on, up to the
-    // stream window) is dropped once read empty; the next DATA regrows it.
+    // stream window) is dropped once read empty, and shrunk as it is read;
+    // the next DATA regrows it.
     private static final int RETAINED_CAPACITY = 16 * 1024;
 
     private static final int OPEN = 0;
@@ -45,9 +51,11 @@ final class RequestBody extends InputStream {
 
     private final Http2Connection conn;
     private final Http2Stream stream;
-    private final MemoryBudget budget;
     private final ReentrantLock lock = new ReentrantLock();
     private final long readTimeoutNanos;
+    // :min-data-rate-bytes (0 = off) and its grace period.
+    private final long minDataRate;
+    private final long minDataRateGraceNanos;
     // Credit returned in one WINDOW_UPDATE once this much was read.
     private final int creditThreshold;
 
@@ -63,8 +71,11 @@ final class RequestBody extends InputStream {
     private long uncredited;
     // The stream is gone (reset, connection closed): nobody reads any more.
     private boolean abandoned;
-    // Grants held-back credit once the budget has room; allocated on first need.
-    private MemoryBudget.Waiter creditWaiter;
+
+    // Handler side, for :min-data-rate-bytes: bytes read and time spent
+    // waiting for them.
+    private long readBytes;
+    private long waitedNanos;
 
     // Consumer-side failure already reported: later reads fail the same way.
     private IOException failed;
@@ -75,9 +86,10 @@ final class RequestBody extends InputStream {
                 long readTimeoutMillis, int creditThreshold) {
         this.conn = conn;
         this.stream = stream;
-        this.budget = conn.service().budget;
         this.recvWindow = recvWindow;
         this.readTimeoutNanos = readTimeoutMillis * 1_000_000L;
+        this.minDataRate = conn.service().config.minDataRateBytes;
+        this.minDataRateGraceNanos = conn.service().config.minDataRateGraceMillis * 1_000_000L;
         this.creditThreshold = creditThreshold;
     }
 
@@ -118,8 +130,6 @@ final class RequestBody extends InputStream {
                 System.arraycopy(src, off + first, ring, 0, len - first);
             }
             count += len;
-            // The peer was entitled to send these: kept even over budget.
-            budget.charge(len);
             wake();
             return true;
         } finally {
@@ -139,6 +149,23 @@ final class RequestBody extends InputStream {
             System.arraycopy(ring, 0, bigger, first, count - first);
         }
         ring = bigger;
+        head = 0;
+    }
+
+    /**
+     * Halves the ring while it is at most a quarter full and larger than
+     * {@link #RETAINED_CAPACITY}: one copy, of the bytes it holds.
+     */
+    private void shrink() {
+        int cap = ring.length;
+        while (cap > RETAINED_CAPACITY && count <= cap / 4) {
+            cap >>= 1;
+        }
+        byte[] smaller = new byte[cap];
+        int first = Math.min(count, ring.length - head);
+        System.arraycopy(ring, head, smaller, 0, first);
+        System.arraycopy(ring, 0, smaller, first, count - first);
+        ring = smaller;
         head = 0;
     }
 
@@ -170,20 +197,15 @@ final class RequestBody extends InputStream {
      * many bytes were dropped, still charged to the connection window.
      */
     int abort() {
-        int dropped;
         lock.lock();
         try {
             if (end == OPEN || end == TOO_LARGE) {
                 end = ABORTED;
             }
-            dropped = dropLocked();
+            return dropLocked();
         } finally {
             lock.unlock();
         }
-        // Outside the lock: a release may run budget waiters, which take
-        // other bodies' locks.
-        budget.release(dropped);
-        return dropped;
     }
 
     private int dropLocked() {
@@ -237,25 +259,36 @@ final class RequestBody extends InputStream {
                 if (end == ABORTED || abandoned) {
                     throw fail(new IOException("HTTP/2 request body aborted before END_STREAM"));
                 }
+                long now = readTimeoutNanos > 0 || minDataRate > 0 ? System.nanoTime() : 0;
                 if (readTimeoutNanos > 0) {
-                    long now = System.nanoTime();
                     if (deadline == 0) {
                         deadline = now + readTimeoutNanos;
                     } else if (now - deadline >= 0) {
                         throw fail(new RequestBodyTimeoutException());
                     }
                 }
+                long wait = readTimeoutNanos > 0 ? deadline - now : Long.MAX_VALUE;
+                if (minDataRate > 0) {
+                    long allowance = DataRate.allowanceNanos(minDataRate, minDataRateGraceNanos, readBytes, waitedNanos);
+                    if (allowance <= 0) {
+                        throw fail(RequestBodyTimeoutException.minDataRate());
+                    }
+                    wait = Math.min(wait, allowance);
+                }
                 waiter = Thread.currentThread();
                 lock.unlock();
                 try {
-                    if (readTimeoutNanos > 0) {
-                        LockSupport.parkNanos(this, deadline - System.nanoTime());
+                    if (wait != Long.MAX_VALUE) {
+                        LockSupport.parkNanos(this, wait);
                     } else {
                         LockSupport.park(this);
                     }
                 } finally {
                     lock.lock();
                     waiter = null;
+                    if (minDataRate > 0) {
+                        waitedNanos += System.nanoTime() - now;
+                    }
                 }
                 if (Thread.interrupted()) {
                     Thread.currentThread().interrupt();
@@ -270,16 +303,20 @@ final class RequestBody extends InputStream {
             }
             head = (head + n) % ring.length;
             count -= n;
-            if (count == 0 && ring.length > RETAINED_CAPACITY) {
-                ring = null;
-                head = 0;
+            readBytes += n;
+            if (ring.length > RETAINED_CAPACITY) {
+                if (count == 0) {
+                    ring = null;
+                    head = 0;
+                } else if (count <= ring.length / 4) {
+                    shrink();
+                }
             }
         } finally {
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
             }
         }
-        budget.release(n);
         credit(n);
         return n;
     }
@@ -307,24 +344,20 @@ final class RequestBody extends InputStream {
     /**
      * {@code n} body octets left the server's hands (read by the handler,
      * or padding): hands their credit back, the stream's share only while
-     * the peer may still send on it. WINDOW_UPDATEs are batched, one per
-     * half window.
+     * the peer may still send on it, the connection's through
+     * {@link Http2Connection#creditConnection} (which pays for it again or
+     * holds it back). WINDOW_UPDATEs are batched, one per half window.
      */
     void credit(int n) {
         int increment = 0;
-        boolean held = false;
         lock.lock();
         try {
             if (!abandoned && !stream.remoteEnded()) {
                 uncredited += n;
                 if (uncredited >= creditThreshold) {
-                    if (budget.exhausted()) {
-                        held = true;
-                    } else {
-                        increment = (int) uncredited;
-                        uncredited = 0;
-                        recvWindow += increment;
-                    }
+                    increment = (int) uncredited;
+                    uncredited = 0;
+                    recvWindow += increment;
                 }
             }
         } finally {
@@ -333,46 +366,6 @@ final class RequestBody extends InputStream {
         if (increment > 0) {
             conn.sendWindowUpdate(stream.id, increment);
         }
-        if (held) {
-            budget.await(creditWaiter());
-        }
         conn.creditConnection(n);
-    }
-
-    private MemoryBudget.Waiter creditWaiter() {
-        lock.lock();
-        try {
-            MemoryBudget.Waiter w = creditWaiter;
-            if (w == null) {
-                w = new MemoryBudget.Waiter() {
-                    @Override
-                    protected void budgetAvailable() {
-                        grantHeldCredit();
-                    }
-                };
-                creditWaiter = w;
-            }
-            return w;
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /** The budget has room again: the credit held back goes out, whatever its size. */
-    private void grantHeldCredit() {
-        int increment = 0;
-        lock.lock();
-        try {
-            if (!abandoned && !stream.remoteEnded() && uncredited > 0) {
-                increment = (int) uncredited;
-                uncredited = 0;
-                recvWindow += increment;
-            }
-        } finally {
-            lock.unlock();
-        }
-        if (increment > 0) {
-            conn.sendWindowUpdate(stream.id, increment);
-        }
     }
 }

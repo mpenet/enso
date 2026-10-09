@@ -179,8 +179,11 @@
 (defn pad-initial
   "Re-protects the client Initial packet that starts datagram `pkt` with
   PADDING appended so the datagram is `size` bytes long. Initial keys
-  come from `odcid`, the DCID of the client's first Initial."
-  ^bytes [^bytes pkt ^long size ^bytes odcid]
+  come from `odcid`, the DCID of the client's first Initial. With
+  `new-dcid` (as long as the packet's), the packet is re-addressed to it
+  and protected with its keys, as if the client had chosen it."
+  (^bytes [^bytes pkt ^long size ^bytes odcid] (pad-initial pkt size odcid nil))
+  (^bytes [^bytes pkt ^long size ^bytes odcid ^bytes new-dcid]
   (let [dcid-len (aget pkt 5)
         scid-off (+ 6 dcid-len)
         token-off (+ scid-off 1 (aget pkt scid-off))
@@ -189,10 +192,12 @@
         [plen pl-size] (read-varint pkt len-off)
         plen (long plen)
         pn-off (+ len-off (long pl-size))
-        secret (hkdf-expand-label (hmac-sha256 initial-salt odcid) "client in" 32)
-        k (hkdf-expand-label secret "quic key" 16)
-        iv (hkdf-expand-label secret "quic iv" 12)
-        hp (hkdf-expand-label secret "quic hp" 16)
+        keys (fn [^bytes id]
+               (let [secret (hkdf-expand-label (hmac-sha256 initial-salt id) "client in" 32)]
+                 [(hkdf-expand-label secret "quic key" 16) (hkdf-expand-label secret "quic iv" 12)
+                  (hkdf-expand-label secret "quic hp" 16)]))
+        [k iv hp] (keys odcid)
+        [^bytes k2 ^bytes iv2 ^bytes hp2] (keys (or new-dcid odcid))
         ^bytes mask (aes-ecb hp pkt (+ pn-off 4))
         b0 (bit-xor (aget pkt 0) (bit-and (aget mask 0) 0x0f))
         pn-len (inc (bit-and b0 3))
@@ -214,19 +219,20 @@
                                         (unchecked-byte new-len)])
                            pn-bytes)
         _ (aset head 0 (unchecked-byte b0))
-        out (concat-bytes head (gcm Cipher/ENCRYPT_MODE k iv pn head padded 0 (alength padded)) tail)
-        ^bytes new-mask (aes-ecb hp out (+ new-pn-off 4))]
+        _ (when new-dcid (System/arraycopy new-dcid 0 head 6 (int dcid-len)))
+        out (concat-bytes head (gcm Cipher/ENCRYPT_MODE k2 iv2 pn head padded 0 (alength padded)) tail)
+        ^bytes new-mask (aes-ecb hp2 out (+ new-pn-off 4))]
     (aset out 0 (unchecked-byte (bit-xor b0 (bit-and (aget new-mask 0) 0x0f))))
     (dotimes [i pn-len]
       (let [j (+ new-pn-off i)]
         (aset out j (unchecked-byte (bit-xor (aget out j) (aget new-mask (inc i)))))))
-    out))
+    out)))
 
 (defn- client-initial? [^bytes out]
   (= 0xc0 (bit-and (aget out 0) 0xf0)))
 
 (defn- flush-out! [{:keys [^QuicheConnection conn sock ^InetSocketAddress server ^NativeBuffer send-buf
-                           ^NativeBuffer send-meta initial-size odcid]}]
+                           ^NativeBuffer send-meta initial-size odcid initial-dcid-fn]}]
   (let [out (byte-array 1350)]
     (loop []
       (let [n (.send conn send-buf 0 1350 send-meta 0)]
@@ -234,8 +240,9 @@
           (.get (.-buffer send-buf) 0 out 0 (int n))
           (let [pkt (Arrays/copyOf out (int n))
                 ^bytes dgram (if (and initial-size (client-initial? pkt))
-                               (pad-initial pkt initial-size
-                                            (or @odcid (reset! odcid (initial-dcid pkt))))
+                               (let [first-dcid (or @odcid (reset! odcid (initial-dcid pkt)))]
+                                 (pad-initial pkt initial-size first-dcid
+                                              (when initial-dcid-fn (initial-dcid-fn first-dcid))))
                                pkt)]
             (.send ^DatagramChannel @sock (ByteBuffer/wrap dgram) server))
           (recur))))))
@@ -359,7 +366,7 @@
 
 (defn- new-client
   "Client state map around a fresh quiche connection to `port`."
-  [^long port idle-timeout-ms {:keys [initial-size configure server-ip] :or {server-ip "127.0.0.1"}}]
+  [^long port idle-timeout-ms {:keys [initial-size configure server-ip initial-dcid-fn] :or {server-ip "127.0.0.1"}}]
   (let [cfg (client-config idle-timeout-ms configure)
         sock (open-socket)
         server (InetSocketAddress. ^String server-ip (int port))
@@ -373,7 +380,7 @@
      :recv-buf (byte-array 65536) :dgram-buf (byte-array 65536)
      :recv-direct (NativeBuffer/allocate 65536) :recv-meta (NativeBuffer/allocate (* 2 Records/ADDR_LEN))
      :pending (atom (sorted-map)) :streams (atom {}) :paused (atom #{}) :datagrams (atom 0)
-     :initial-size initial-size :odcid (atom nil)}))
+     :initial-size initial-size :odcid (atom nil) :initial-dcid-fn initial-dcid-fn}))
 
 (defn start-handshake
   "Creates a client connection to `port` and sends only its first

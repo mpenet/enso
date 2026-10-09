@@ -38,24 +38,28 @@ public final class LogLimiter {
         this(logger, level, 1000);
     }
 
-    /** Whether a record would be emitted at all, so callers skip building messages. */
-    public boolean isLoggable() {
-        return logger.isLoggable(level);
-    }
-
+    /**
+     * Never throws: callers report failures from server threads (timer,
+     * acceptor, event loops) that must outlive a broken logging setup, so
+     * whatever the logging framework throws is dropped with the record.
+     */
     public void log(String message, Throwable thrown) {
-        if (!logger.isLoggable(level)) return;
-        long now = System.nanoTime();
-        long next = nextAllowedNanos.get();
-        if (now - next < 0 || !nextAllowedNanos.compareAndSet(next, now + intervalNanos)) {
-            suppressed.incrementAndGet();
-            return;
+        try {
+            if (!logger.isLoggable(level)) return;
+            long now = System.nanoTime();
+            long next = nextAllowedNanos.get();
+            if (now - next < 0 || !nextAllowedNanos.compareAndSet(next, now + intervalNanos)) {
+                suppressed.incrementAndGet();
+                return;
+            }
+            long dropped = suppressed.getAndSet(0);
+            String text = dropped == 0 ? message
+                : message + " (" + dropped + " similar records suppressed)";
+            // Explicit source: inferred, it would always name this class.
+            logger.logp(level, logger.getName(), null, text, thrown);
+        } catch (Throwable ignored) {
+            // A handler that throws, or no memory left to build the record.
         }
-        long dropped = suppressed.getAndSet(0);
-        String text = dropped == 0 ? message
-            : message + " (" + dropped + " similar records suppressed)";
-        // Explicit source: inferred, it would always name this class.
-        logger.logp(level, logger.getName(), null, text, thrown);
     }
 
     public void log(String message) {

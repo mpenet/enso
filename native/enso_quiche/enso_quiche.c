@@ -65,7 +65,7 @@
 /* The JNI contract: bumped whenever a native's name, signature or a record
  * layout changes. Mirrored by Quiche.SHIM_ABI, checked when Java loads
  * the shim, so a stale build is refused instead of misread. */
-#define ENSO_SHIM_ABI 1
+#define ENSO_SHIM_ABI 2
 
 /* Shim-detected bad arguments (bounds, address). Distinct from every
  * quiche_error value; mirrored by Quiche.SHIM_ERR_INVALID_ARGUMENT. */
@@ -135,6 +135,30 @@
 #define MAX_TOKEN 1024
 #define MAX_GSO_SEGMENTS 64
 #define MAX_GSO_BYTES 65000
+
+/* The records nest as the code below assumes: each field inside its
+ * record, the connection id slots wide enough for quiche's longest. */
+_Static_assert(ADDR_IP + 16 <= ADDR_LEN, "ADDR address");
+_Static_assert(RECV_PEER + ADDR_LEN <= RECV_LOCAL && RECV_LOCAL + ADDR_LEN <= RECV_META_LEN, "RECV addresses");
+_Static_assert(SEND_TO + ADDR_LEN <= SEND_FROM && SEND_FROM + ADDR_LEN <= PKT_DELAY, "SEND addresses");
+_Static_assert(PKT_DELAY + 8 <= SEND_META_LEN && SEND_STATUS_FLAGS + 4 <= SEND_HEADER_LEN, "SEND record");
+_Static_assert(HDR_SCID + QUICHE_MAX_CONN_ID_LEN <= HDR_DCID && HDR_DCID + QUICHE_MAX_CONN_ID_LEN <= HDR_TOKEN,
+               "HDR connection ids");
+
+/* What Java must agree on, in the order of Quiche.LAYOUT_NAMES; compared
+ * when the shim is loaded (Quiche.requireLayout). */
+static const jint LAYOUT[] = {
+    ADDR_LEN, ADDR_FAMILY, ADDR_PORT, ADDR_SCOPE, ADDR_IP,
+    RECV_META_LEN, RECV_LEN, RECV_FLAGS, RECV_PEER, RECV_LOCAL, RECV_FLAG_TRUNCATED,
+    SEND_HEADER_LEN, SEND_STATUS_DROPPED, SEND_STATUS_ERRNO, SEND_STATUS_FLAGS,
+    SEND_STATUS_GSO_DISABLED, SEND_META_LEN, SEND_OFF, SEND_LEN, SEND_TO, SEND_FROM,
+    PKT_DELAY,
+    HDR_VERSION, HDR_TYPE, HDR_SCID_LEN, HDR_DCID_LEN, HDR_TOKEN_LEN, HDR_SCID, HDR_DCID,
+    HDR_TOKEN, HDR_MAX_TOKEN, HDR_LEN,
+    UDP_OPEN_REUSEPORT, UDP_OPEN_PKTINFO, UDP_SEND_GSO, UDP_SEND_PKTINFO,
+    POLL_READABLE, POLL_WAKE, POLL_WRITABLE,
+    QUICHE_MAX_CONN_ID_LEN, SHIM_ERR_INVALID_ARGUMENT,
+};
 
 #if defined(__linux__) && !defined(UDP_SEGMENT)
 #define UDP_SEGMENT 103
@@ -241,6 +265,17 @@ Java_com_s_1exp_enso_quiche_Quiche_shimAbi(JNIEnv *env, jclass cls) {
     return ENSO_SHIM_ABI;
 }
 
+/* The LAYOUT table as an int[], or null when it can't be allocated. */
+JNIEXPORT jintArray JNICALL
+Java_com_s_1exp_enso_quiche_Quiche_layout(JNIEnv *env, jclass cls) {
+    UNUSED(cls);
+    jsize n = (jsize)(sizeof LAYOUT / sizeof LAYOUT[0]);
+    jintArray a = (*env)->NewIntArray(env, n);
+    if (a == NULL) return NULL;
+    (*env)->SetIntArrayRegion(env, a, 0, n, LAYOUT);
+    return a;
+}
+
 /* Address of a direct buffer's memory, 0 for a heap buffer. Called once
  * per buffer by NativeBuffer. */
 JNIEXPORT jlong JNICALL
@@ -343,7 +378,7 @@ Java_com_s_1exp_enso_quiche_Quiche_configVerifyPeer(
 }
 
 /* ------------------------------------------------------------------ */
-/* Accept / connect / retry / version negotiation / header parsing      */
+/* Accept / connect / retry / header parsing                            */
 /* ------------------------------------------------------------------ */
 
 JNIEXPORT jlong JNICALL
@@ -420,22 +455,6 @@ Java_com_s_1exp_enso_quiche_Quiche_retry(
                                (uint32_t)version, dst, (size_t)cap);
 }
 
-JNIEXPORT jlong JNICALL
-Java_com_s_1exp_enso_quiche_Quiche_negotiateVersion(
-        JNIEnv *env, jclass cls, jbyteArray scidArr, jbyteArray dcidArr,
-        jlong out, jint outCap, jint off, jint cap) {
-    UNUSED(cls);
-    uint8_t scid[QUICHE_MAX_CONN_ID_LEN], dcid[QUICHE_MAX_CONN_ID_LEN];
-    jint scidLen = copy_bytes(env, scidArr, scid, QUICHE_MAX_CONN_ID_LEN);
-    if (scidLen < 0) return SHIM_ERR_INVALID_ARGUMENT;
-    jint dcidLen = copy_bytes(env, dcidArr, dcid, QUICHE_MAX_CONN_ID_LEN);
-    if (dcidLen < 0) return SHIM_ERR_INVALID_ARGUMENT;
-    uint8_t *dst = mem_range(out, outCap, off, cap);
-    if (dst == NULL) return SHIM_ERR_INVALID_ARGUMENT;
-    return (jlong)quiche_negotiate_version(scid, (size_t)scidLen, dcid, (size_t)dcidLen,
-                                           dst, (size_t)cap);
-}
-
 /* Parses the QUIC header of buf[off, off + len) into the HDR record at
  * out[outOff]. Returns 0, or a negative quiche / shim error. */
 JNIEXPORT jint JNICALL
@@ -492,12 +511,6 @@ JNIEXPORT jboolean JNICALL
 Java_com_s_1exp_enso_quiche_Quiche_connIsEstablished(JNIEnv *env, jclass cls, jlong conn) {
     UNUSED(env); UNUSED(cls);
     return quiche_conn_is_established(CONN(conn)) ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_s_1exp_enso_quiche_Quiche_connIsDraining(JNIEnv *env, jclass cls, jlong conn) {
-    UNUSED(env); UNUSED(cls);
-    return quiche_conn_is_draining(CONN(conn)) ? JNI_TRUE : JNI_FALSE;
 }
 
 /* Nanoseconds until quiche's next timeout, or -1 when none is armed. */
@@ -772,10 +785,19 @@ Java_com_s_1exp_enso_quiche_Quiche_udpOpen(
     jint ipLen = copy_bytes(env, ipArr, ip, 16);
     if ((ipLen != 4 && ipLen != 16) || port < 0 || port > 65535) return -EINVAL;
     int family = ipLen == 4 ? AF_INET : AF_INET6;
+#if defined(__linux__)
+    /* Atomically: a fork/exec on another JVM thread between socket() and
+     * fcntl() would otherwise inherit the descriptor. */
+    int fd = socket(family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -errno;
+#else
     int fd = socket(family, SOCK_DGRAM, 0);
     if (fd < 0) return -errno;
+#endif
     int one = 1, zero = 0;
+#if !defined(__linux__)
     if (set_nonblocking(fd) != 0) goto fail;
+#endif
     if (family == AF_INET6 && setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero) != 0) {
         goto fail;
     }
@@ -868,11 +890,18 @@ Java_com_s_1exp_enso_quiche_Quiche_udpAttachSteering(JNIEnv *env, jclass cls, ji
     UNUSED(env); UNUSED(cls);
 #if defined(__linux__) && defined(SO_ATTACH_REUSEPORT_CBPF)
     if (n < 1 || n > 256) return -EINVAL;
+    /* Socket index = first byte of the destination id (offset 1 in a short
+     * header, 6 in a long one) modulo n. Initial and 0-RTT packets (long
+     * header, type bit 0x20 clear) carry an id the client chose, which
+     * must not pick the loop: they return n, an index out of range, so
+     * the kernel falls back to its 4-tuple hash. */
     struct sock_filter code[] = {
         BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 0),
         BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x80, 2, 0),
         BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 1),
-        BPF_JUMP(BPF_JMP | BPF_JA, 1, 0, 0),
+        BPF_JUMP(BPF_JMP | BPF_JA, 3, 0, 0),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x20, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, (uint32_t)n),
         BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 6),
         BPF_STMT(BPF_ALU | BPF_MOD | BPF_K, (uint32_t)n),
         BPF_STMT(BPF_RET | BPF_A, 0),
@@ -1119,6 +1148,10 @@ Java_com_s_1exp_enso_quiche_Quiche_udpSendBatch(
     uint8_t *meta = mem_range(metaAddr, metaCap, 0, (jlong)SEND_HEADER_LEN + (jlong)SEND_META_LEN * count);
     uint8_t *slab = mem_range(slabAddr, slabCap, 0, slabCap);
     if (meta == NULL || slab == NULL) return SHIM_ERR_INVALID_ARGUMENT;
+    /* The status always describes this call, refused ones included. */
+    put_i32(meta + SEND_STATUS_DROPPED, 0);
+    put_i32(meta + SEND_STATUS_ERRNO, 0);
+    put_i32(meta + SEND_STATUS_FLAGS, 0);
     /* Validate every record before sending anything. */
     for (int i = 0; i < count; i++) {
         const uint8_t *r = meta + SEND_HEADER_LEN + (size_t)i * SEND_META_LEN;

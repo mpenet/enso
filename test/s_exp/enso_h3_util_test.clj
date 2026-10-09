@@ -14,13 +14,22 @@
            (java.nio ByteBuffer)
            (java.nio.charset StandardCharsets)))
 
-;; ---- Http3BodyPipe truncated marker --------------------------------------
+;; ---- Http3BodyPipe ---------------------------------------------------------
+
+(defn- pipe
+  "A body pipe with no content-length, no timeouts and no budgets; `max-bytes`
+  caps the body (0: no cap)."
+  (^Http3BodyPipe [] (pipe 0))
+  (^Http3BodyPipe [max-bytes] (Http3BodyPipe. (long max-bytes) -1 0 0 0 nil nil)))
+
+(defn- offer! [^Http3BodyPipe p ^bytes b]
+  (.offer p b 0 (alength b)))
 
 (deftest body-pipe-truncated-throws-ioexception-on-next-read
-  (let [pipe (Http3BodyPipe.)
-        in (.inputStream pipe)]
-    (.enqueue pipe (.getBytes "abcd" StandardCharsets/UTF_8))
-    (.signalTruncated pipe)
+  (let [p (pipe)
+        in (.inputStream p)]
+    (offer! p (.getBytes "abcd" StandardCharsets/UTF_8))
+    (.signalTruncated p)
     (let [scratch (byte-array 10)
           n (.read in scratch 0 10)]
       (is (= 4 n) "queued bytes returned before poison")
@@ -29,20 +38,65 @@
           "next read hits truncated marker → IOException"))))
 
 (deftest body-pipe-truncated-with-no-queued-bytes
-  (let [pipe (Http3BodyPipe.)
-        in (.inputStream pipe)]
-    (.signalTruncated pipe)
+  (let [p (pipe)
+        in (.inputStream p)]
+    (.signalTruncated p)
     (is (thrown? IOException (.read in)))))
 
 (deftest body-pipe-signalend-still-yields-clean-eof
   ;; Sanity: signalEnd (non-truncated) must remain -1 EOF, not IOException.
-  (let [pipe (Http3BodyPipe.)
-        in (.inputStream pipe)]
-    (.enqueue pipe (.getBytes "hi" StandardCharsets/UTF_8))
-    (.signalEnd pipe)
+  (let [p (pipe)
+        in (.inputStream p)]
+    (offer! p (.getBytes "hi" StandardCharsets/UTF_8))
+    (.signalEnd p)
     (let [scratch (byte-array 10)]
       (is (= 2 (.read in scratch 0 10)))
       (is (= -1 (.read in scratch 0 10)) "clean EOF after signalEnd"))))
+
+(deftest body-pipe-concatenates-offers
+  (let [p (pipe)]
+    (doseq [part ["aaa" "bbb" "ccc"]] (offer! p (.getBytes ^String part StandardCharsets/UTF_8)))
+    (.signalEnd p)
+    (is (= "aaabbbccc" (slurp (.inputStream p))))))
+
+(deftest body-pipe-empty-body
+  (let [p (pipe)]
+    (.signalEnd p)
+    (is (= "" (slurp (.inputStream p))) "empty body streams to empty string")))
+
+(deftest body-pipe-single-byte-reads
+  (let [p (pipe)
+        in (.inputStream p)]
+    (offer! p (byte-array [(byte 65) (byte 66)]))
+    (.signalEnd p)
+    (is (= 65 (.read in)) "A")
+    (is (= 66 (.read in)) "B")
+    (is (= -1 (.read in)) "EOF")))
+
+(deftest body-pipe-cap
+  (testing "below the cap"
+    (let [p (pipe 100)]
+      (is (= Http3BodyPipe/ACCEPTED (offer! p (byte-array 40))))
+      (is (= Http3BodyPipe/ACCEPTED (offer! p (byte-array 40))))
+      (is (= Http3BodyPipe/ACCEPTED (offer! p (byte-array 20))))))
+  (testing "over it: readers then fail with a 413"
+    (let [p (pipe 100)]
+      (is (= Http3BodyPipe/ACCEPTED (offer! p (byte-array 90))))
+      (is (= Http3BodyPipe/OVER_CAP (offer! p (byte-array 20))))
+      (is (.rejected p))
+      (let [in (.inputStream p)]
+        (is (= 90 (.read in (byte-array 100) 0 100)))
+        (is (thrown? com.s_exp.enso.core.RequestBodyException (.read in))))))
+  (testing "0 disables it"
+    (is (= Http3BodyPipe/ACCEPTED (offer! (pipe 0) (byte-array 1000000))))))
+
+(deftest body-pipe-content-length
+  (let [p (Http3BodyPipe. 0 5 0 0 0 nil nil)]
+    (is (= Http3BodyPipe/ACCEPTED (offer! p (byte-array 3))))
+    (is (not (.matchesDeclaredLength p)))
+    (is (= Http3BodyPipe/OVER_DECLARED_LENGTH (offer! p (byte-array 3))))
+    (is (= Http3BodyPipe/ACCEPTED (offer! p (byte-array 2))))
+    (is (.matchesDeclaredLength p))))
 
 ;; ---- Http3FrameReader partial detection ----------------------------------
 
@@ -156,6 +210,20 @@
         too-short (byte-array (+ 32 4 8))]  ; missing odcid_len + odcid + peer
     (is (nil? (.verify tok too-short 0 (alength too-short) peer (byte-array 16) 16)))))
 
+(deftest retry-token-is-shared-by-event-loops
+  ;; Every loop mints and verifies with the listener's one token key, at
+  ;; once (each thread has its own HMAC): tokens minted on one thread
+  ;; verify on another.
+  (let [tok (RetryToken.)
+        peer (InetSocketAddress. "127.0.0.1" 4433)
+        scid (byte-array 16 (byte 5))
+        minted (vec (pmap (fn [i] (.mint tok peer (byte-array 8 (byte i)) scid)) (range 64)))
+        results (->> (range 8)
+                     (mapv (fn [_] (future (every? (fn [^bytes t] (some? (.verify tok t 0 (alength t) peer scid 16)))
+                                                   minted))))
+                     (mapv deref))]
+    (is (every? true? results))))
+
 (deftest retry-token-binds-retry-source-connection-id
   ;; RFC 9000 §8.1.2/§17.2.5: the client's retried Initial must carry the
   ;; Retry packet's SCID as its DCID; a token is only valid for that CID.
@@ -225,6 +293,29 @@
       (feed-uni cs 18 (byte-array [0x00]) true)
       (is (zero? (tracked cs))))))
 
+(deftest control-streams-never-track-stopped-unknown-uni-streams
+  ;; An unknown (non-grease) type gets STOP_SENDING: quiche discards the
+  ;; stream's later bytes and never reports it again (no FIN, no reset),
+  ;; so recording it would leak an entry per stream for the connection's
+  ;; life.
+  (let [cs (control-streams)]
+    (doseq [sid (range 14 (+ 14 (* 4 50)) 4)]
+      (feed-uni cs sid (byte-array [0x54 0x01 0x02]) false))
+    (is (zero? (tracked cs)))))
+
+(deftest control-frames-too-large-to-buffer-are-excessive-load
+  ;; RFC 9114 §7.1 / §10.5: a control frame declaring more than we buffer
+  ;; is refused before any of it arrives (H3_EXCESSIVE_LOAD); a small one
+  ;; with extra bytes is malformed (H3_FRAME_ERROR).
+  (let [code (fn [^bytes b]
+               (try (feed-uni (control-streams) 2 b false) nil
+                    (catch java.lang.reflect.InvocationTargetException e
+                      (.errorCode ^com.s_exp.enso.http3.Http3ConnectionException (.getCause e)))))
+        settings [0x00 0x04 0x00]]
+    (is (= 0x107 (code (byte-array (map unchecked-byte (concat settings [0x07 0xc0 0x00 0x00 0x00 0x40 0x00 0x00 0x00]))))))
+    (is (= 0x106 (code (byte-array (map unchecked-byte (concat settings [0x07 0x02 0x00 0x00])))))
+        "GOAWAY with a byte after its id")))
+
 ;; ---- JNI shim: handles, version, sockets ---------------------------------
 
 (deftest quiche-natives-are-package-private
@@ -261,6 +352,39 @@
   (is (thrown-with-msg? UnsatisfiedLinkError #"ABI 0 loaded"
                         (invoke-static "requireShimAbi" [Integer/TYPE] [(int 0)]))
       "a shim predating the check (no shimAbi entry point) reads as ABI 0"))
+
+(deftest shim-record-layout-is-checked-at-load
+  ;; The shim reports the record sizes, offsets and flag values it was
+  ;; compiled with; loading compares them with Records / UdpSocket, so a
+  ;; layout edited on one side only is refused by name, not misread.
+  (let [shim (vec (invoke-static "layout" [] []))
+        expected (vec (invoke-static "expectedLayout" [] []))
+        names (vec (invoke-static "layoutNames" [] []))]
+    (is (= (count names) (count expected)))
+    (is (= expected shim) "the loaded shim agrees with the Java side")
+    (is (nil? (invoke-static "requireLayout" [(Class/forName "[I")] [(int-array shim)])))
+    (let [i (.indexOf ^java.util.List names "RECV_PEER")
+          off (assoc shim i (+ 8 (nth shim i)))]
+      (is (nat-int? i))
+      (is (thrown-with-msg? UnsatisfiedLinkError #"RECV_PEER: shim 16, Java 8"
+                            (invoke-static "requireLayout" [(Class/forName "[I")] [(int-array off)]))))
+    (is (thrown-with-msg? UnsatisfiedLinkError #"layout"
+                          (invoke-static "requireLayout" [(Class/forName "[I")] [(int-array (pop shim))]))
+        "a shorter table (an entry added on one side)")
+    (is (thrown-with-msg? UnsatisfiedLinkError #"layout"
+                          (invoke-static "requireLayout" [(Class/forName "[I")] [nil]))
+        "a shim without the table")))
+
+(deftest libc-is-the-one-the-jvm-runs-on
+  ;; musl is detected from the libc mapped into this JVM, not from a musl
+  ;; loader merely installed (a glibc host with the musl package has
+  ;; /lib/ld-musl-*.so.1 too).
+  (let [libc #(invoke-static "libcFromMaps" [java.io.BufferedReader] [(java.io.BufferedReader. (java.io.StringReader. %))])]
+    (is (= "musl" (libc "7f00-7f01 r-xp 00000000 08:01 123 /lib/ld-musl-x86_64.so.1\n")))
+    (is (= "glibc" (libc (str "55d0-55d1 r--p 00000000 08:01 1 /usr/lib/jvm/bin/java\n"
+                              "7f00-7f01 r-xp 00000000 08:01 2 /usr/lib/x86_64-linux-gnu/libc.so.6\n"))))
+    (is (= "glibc" (libc "7f00-7f01 r-xp 00000000 08:01 2 /lib64/libc-2.28.so\n")) "older glibc names")
+    (is (nil? (libc "7f00-7f01 r-xp 00000000 08:01 2 /usr/lib/libSystem.B.dylib\n")) "neither: fall back")))
 
 (deftest development-shim-is-found-next-to-the-class-directory
   ;; Never relative to the working directory: only target/native beside
@@ -442,13 +566,28 @@
       (is (= 1 (.getInt (view meta) (int com.s_exp.enso.quiche.Records/SEND_STATUS_DROPPED))) "one dropped as lost")
       (is (= 2 (count (receive-datagrams b 2))) "the others arrived"))))
 
+(deftest refused-send-batch-leaves-no-stale-status
+  ;; A batch the shim refuses (a malformed record) sent nothing: its status
+  ;; header must say so, not repeat the previous batch's drops.
+  (with-open [a (com.s_exp.enso.quiche.UdpSocket/open (java.net.InetAddress/getByName "127.0.0.1") 0 0 0 0)]
+    (let [slab (native-buffer 4096)
+          meta (native-buffer (+ com.s_exp.enso.quiche.Records/SEND_HEADER_LEN com.s_exp.enso.quiche.Records/SEND_META_LEN))
+          rec com.s_exp.enso.quiche.Records/SEND_HEADER_LEN]
+      (.putInt (view meta) (int com.s_exp.enso.quiche.Records/SEND_STATUS_DROPPED) (int 7))
+      (.putInt (view meta) (int com.s_exp.enso.quiche.Records/SEND_STATUS_FLAGS) (int 1))
+      (.putInt (view meta) (int (+ rec com.s_exp.enso.quiche.Records/SEND_OFF)) (int 0))
+      (.putInt (view meta) (int (+ rec com.s_exp.enso.quiche.Records/SEND_LEN)) (int 0))
+      (is (= com.s_exp.enso.quiche.Quiche/SHIM_ERR_INVALID_ARGUMENT (long (.sendBatch a slab meta 1 0))))
+      (is (zero? (.getInt (view meta) (int com.s_exp.enso.quiche.Records/SEND_STATUS_DROPPED))))
+      (is (zero? (.getInt (view meta) (int com.s_exp.enso.quiche.Records/SEND_STATUS_FLAGS)))))))
+
 (deftest quiche-config-pins-flow-control-windows
   ;; Autotuning can't grow windows past what is configured: a handler
   ;; that doesn't read bounds quiche's buffering at the configured windows.
   (let [build (fn [f] (.build (doto (com.s_exp.enso.api.Config/builder)
                                 (.http3 true) (.http3CertPath "c") (.http3KeyPath "k") f)))]
-    (is (= (* 4 1024 1024) (.-http3InitialMaxDataBytes ^com.s_exp.enso.api.Config (build identity)))
-        "default connection window 4 MiB")
+    (is (= (* 1024 1024) (.-http3InitialMaxDataBytes ^com.s_exp.enso.api.Config (build identity)))
+        "default connection window 1 MiB")
     (let [[cert key] (let [d (java.nio.file.Files/createTempDirectory "enso-h3-cfg" (make-array java.nio.file.attribute.FileAttribute 0))
                            c (str (.resolve d "c.pem")) k (str (.resolve d "k.pem"))]
                        (.waitFor (.start (ProcessBuilder. ^java.util.List
@@ -462,8 +601,14 @@
           q (com.s_exp.enso.quiche.QuicheConfig/server cfg)]
       (try
         (is (= (* 8 1024 1024) (.connectionWindow q)))
-        (is (= (* 1024 1024) (.streamWindowBidiRemote q)) "derived: max(1 MiB, data / streams)")
-        (finally (.close q))))))
+        (is (= (* 2 1024 1024) (.streamWindowBidiRemote q))
+            "derived: a quarter of the connection window, so one unread stream can't take all of it")
+        (finally (.close q)))
+      (let [q (com.s_exp.enso.quiche.QuicheConfig/server (.build (doto (com.s_exp.enso.api.Config/builder)
+                                                                   (.http3 true) (.http3CertPath cert) (.http3KeyPath key))))]
+        (try
+          (is (= (* 256 1024) (.streamWindowBidiRemote q)) "256 KiB by default, as HTTP/2's stream window")
+          (finally (.close q)))))))
 
 (deftest stateless-close-reuses-its-crypto
   ;; Forged Retry tokens each get a stateless INVALID_TOKEN close: building
@@ -482,6 +627,14 @@
       (dotimes [i 1000] (close! i))
       (let [per-call (quot (- (.getCurrentThreadAllocatedBytes mx) before) 1000)]
         (is (< per-call 4096) (str per-call " bytes per close"))))
+    (testing "Initials sharing a destination id (the same keys and nonce) each get their close"
+      ;; The JDK refuses to encrypt twice in a row with one GCM key and
+      ;; nonce; a different source id or error code must still be answered.
+      (let [scid-b (byte-array 8 (byte 4))]
+        (is (pos? (close! 77)))
+        (is (pos? (com.s_exp.enso.quiche.InitialClose/invalidToken dcid scid-b 1 out 0 1500)) "another source id")
+        (is (pos? (com.s_exp.enso.quiche.InitialClose/transportClose 0x08 dcid scid-b 1 out 0 1500)) "another code")
+        (is (pos? (com.s_exp.enso.quiche.InitialClose/invalidToken dcid scid 1 out 0 1500)) "the first again")))
     (testing "the same Initial answered twice gets the same packet"
       (let [n (close! 5)
             a (java.util.Arrays/copyOf (.array out) (int n))

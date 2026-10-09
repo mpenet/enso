@@ -95,8 +95,6 @@ public final class QuicheConnection {
 
     public boolean isEstablished() { return Quiche.connIsEstablished(p()); }
 
-    public boolean isDraining() { return Quiche.connIsDraining(p()); }
-
     /** Nanoseconds until quiche's next timer, or -1 when none is armed. */
     public long timeoutNanos() { return Quiche.connTimeoutAsNanos(p()); }
 
@@ -200,15 +198,6 @@ public final class QuicheConnection {
                              NativeBuffer out, int off, int cap) {
         try {
             return Quiche.retry(scid, dcid, newScid, token, version, out.address, out.capacity, off, cap);
-        } finally {
-            Reference.reachabilityFence(out);
-        }
-    }
-
-    /** A Version Negotiation packet into {@code out[off, off + cap)}; its length or a negative error. */
-    public static long negotiateVersion(byte[] scid, byte[] dcid, NativeBuffer out, int off, int cap) {
-        try {
-            return Quiche.negotiateVersion(scid, dcid, out.address, out.capacity, off, cap);
         } finally {
             Reference.reachabilityFence(out);
         }

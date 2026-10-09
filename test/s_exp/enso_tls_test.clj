@@ -573,3 +573,178 @@
             (Thread/sleep 1300)
             (post 50000)
             (is (.endsWith ^String (read-response) "\r\n\r\n50000"))))))))
+
+;; ---- Records trickled under the timeouts -------------------------------------
+
+(defn- drip-proxy
+  "A TCP proxy in front of 127.0.0.1:`port` for one connection. Client
+  bytes go through at once, or one byte every `@drip-ms` ms while that is
+  positive (a TLS record trickled under the socket timeouts). Returns the
+  proxy's ServerSocket; closing it ends the proxy."
+  ^java.net.ServerSocket [port drip-ms]
+  (let [ss (java.net.ServerSocket. 0 1 (java.net.InetAddress/getLoopbackAddress))]
+    (future
+      (try
+        (with-open [client (.accept ss)
+                    server (java.net.Socket. "127.0.0.1" (int port))]
+          (future
+            (try
+              (let [in (.getInputStream client)
+                    out (.getOutputStream server)
+                    buf (byte-array 16384)]
+                (loop []
+                  (let [n (.read in buf)]
+                    (when (pos? n)
+                      (let [d (long @drip-ms)]
+                        (if (pos? d)
+                          (dotimes [i n]
+                            (Thread/sleep d)
+                            (.write out (int (aget buf i)))
+                            (.flush out))
+                          (.write out buf 0 n)))
+                      (recur)))))
+              (catch Exception _)))
+          (let [in (.getInputStream server)
+                out (.getOutputStream client)
+                buf (byte-array 16384)]
+            (loop []
+              (let [n (.read in buf)]
+                (when (pos? n)
+                  (.write out buf 0 n)
+                  (recur))))))
+        (catch Exception _)))
+    ss))
+
+(defn- tls-connect
+  ^javax.net.ssl.SSLSocket [port]
+  (let [factory (.getSocketFactory (capturing-trust-context (atom [])))]
+    (doto ^javax.net.ssl.SSLSocket (.createSocket factory "127.0.0.1" (int port))
+      (.startHandshake))))
+
+(defn- tls-write! [^javax.net.ssl.SSLSocket sock ^String s]
+  (doto (.getOutputStream sock)
+    (.write (.getBytes s java.nio.charset.StandardCharsets/ISO_8859_1))
+    (.flush)))
+
+(defn- tls-read-to-end!
+  "Reads `sock` to its end: [text, :eof / :reset / :timeout, elapsed ms]."
+  [^javax.net.ssl.SSLSocket sock ms]
+  (.setSoTimeout sock (int ms))
+  (let [t0 (System/nanoTime)
+        in (.getInputStream sock)
+        sb (StringBuilder.)
+        end (try
+              (loop []
+                (let [b (.read in)]
+                  (if (neg? b)
+                    :eof
+                    (do (.append sb (char b)) (recur)))))
+              (catch java.net.SocketTimeoutException _ :timeout)
+              (catch java.io.IOException _ :reset))]
+    [(str sb) end (/ (- (System/nanoTime) t0) 1e6)]))
+
+(defn- tls-round-trip!
+  "One keep-alive GET answered \"ok\" on `sock`: once it returns, the
+  server has finished its side of the handshake (the client's Finished
+  may otherwise still be in flight when a test starts trickling)."
+  [^javax.net.ssl.SSLSocket sock]
+  (tls-write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+  (.setSoTimeout sock 5000)
+  (let [in (.getInputStream sock)
+        sb (StringBuilder.)]
+    (loop []
+      (let [b (.read in)]
+        (when (neg? b) (throw (java.io.EOFException. (str "closed before the response: " sb))))
+        (.append sb (char b))
+        (when-not (.endsWith (str sb) "\r\n\r\nok")
+          (recur))))))
+
+(deftest tls-trickled-records-bounded-by-the-idle-and-head-clocks
+  ;; SO_TIMEOUT restarts with every byte, and over TLS those bytes are
+  ;; ciphertext: a record trickled a byte at a time would hold one read
+  ;; for as long as the client likes. Reads are held to the wall clock
+  ;; of their phase instead.
+  (with-tls-server {:idle-timeout 2000 :header-timeout 500}
+    (fn [port]
+      (testing "a request record trickled into an idle connection"
+        (let [drip (atom 0)
+              proxy (drip-proxy port drip)]
+          (try
+            (with-open [sock (tls-connect (.getLocalPort proxy))]
+              (tls-round-trip! sock)
+              (reset! drip 150)
+              (tls-write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+              (let [[resp _ ms] (tls-read-to-end! sock 6000)]
+                (is (.startsWith ^String resp "HTTP/1.1 408") (pr-str resp))
+                (is (< ms 3000) (str "closed after " ms "ms"))))
+            (finally (.close proxy)))))
+      (testing "the rest of a request head trickled"
+        (let [drip (atom 0)
+              proxy (drip-proxy port drip)]
+          (try
+            (with-open [sock (tls-connect (.getLocalPort proxy))]
+              (tls-round-trip! sock)
+              (tls-write! sock "GET / HTTP/1.1\r\n")
+              (Thread/sleep 100)
+              (reset! drip 100)
+              (tls-write! sock "Host: x\r\n\r\n")
+              (let [[resp _ ms] (tls-read-to-end! sock 6000)]
+                (is (.startsWith ^String resp "HTTP/1.1 408") (pr-str resp))
+                (is (< ms 2000) (str "closed after " ms "ms"))))
+            (finally (.close proxy))))))))
+
+(deftest tls-trickled-body-record-bounded-by-the-min-data-rate
+  (with-tls-server {:min-data-rate-bytes 1000 :min-data-rate-grace 500 :read-timeout 10000
+                    :handler (fn [req] {:status 200 :body (str (count (slurp (:body req))))})}
+    (fn [port]
+      (let [drip (atom 0)
+            proxy (drip-proxy port drip)]
+        (try
+          (with-open [sock (tls-connect (.getLocalPort proxy))]
+            (tls-write! sock "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\n\r\n")
+            (Thread/sleep 100)
+            (reset! drip 100)
+            (tls-write! sock (apply str (repeat 50 "b")))
+            (let [[resp _ ms] (tls-read-to-end! sock 6000)]
+              (is (.startsWith ^String resp "HTTP/1.1 408") (pr-str resp))
+              (is (< ms 3000) (str "closed after " ms "ms"))))
+          (finally (.close proxy)))))))
+
+(deftest tls-failing-close-delimited-body-aborts
+  ;; An HTTP/1.0 body of unknown length ends with the connection: one
+  ;; that fails ends it without close_notify (and with a reset), so the
+  ;; client can't take the truncated body for a complete one.
+  (with-tls-server {:handler (fn [_]
+                               (let [left (atom 20000)]
+                                 {:status 200
+                                  :body (proxy [java.io.InputStream] []
+                                          (read
+                                            ([] (throw (UnsupportedOperationException.)))
+                                            ([^bytes b off len]
+                                             (let [k (min (long len) (long @left))]
+                                               (if (pos? k)
+                                                 (do (swap! left - k) (int k))
+                                                 (throw (java.io.IOException. "body source failed")))))))}))}
+    (fn [port]
+      (with-open [sock (tls-connect port)]
+        (tls-write! sock "GET / HTTP/1.0\r\nHost: x\r\n\r\n")
+        (let [[_ end] (tls-read-to-end! sock 3000)]
+          (is (= :reset end)))))))
+
+(deftest tls-input-pending-sees-what-the-socket-received
+  ;; Closing with unread input makes the kernel reset the connection, so
+  ;; the HTTP/1.1 driver closes lingering whenever input is waiting:
+  ;; plaintext or ciphertext held by the TLS socket, or bytes the socket
+  ;; received.
+  (with-open [server-ch (doto (java.nio.channels.ServerSocketChannel/open)
+                          (.bind (java.net.InetSocketAddress. "127.0.0.1" 0)))
+              client (java.nio.channels.SocketChannel/open (.getLocalAddress server-ch))
+              accepted (.accept server-ch)]
+    (let [tls (com.s_exp.enso.core.TlsSocket. accepted (.createSSLEngine (SSLContext/getDefault)))]
+      (is (false? (.inputPending tls)))
+      (.write client (java.nio.ByteBuffer/wrap (byte-array [22 3 3])))
+      (is (loop [n 0]
+            (cond
+              (.inputPending tls) true
+              (< n 200) (do (Thread/sleep 10) (recur (inc n)))
+              :else false))))))

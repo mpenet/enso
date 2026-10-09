@@ -5,7 +5,6 @@ package com.s_exp.enso.core;
 import com.s_exp.enso.api.Config;
 import com.s_exp.enso.api.RingErrorHandler;
 import com.s_exp.enso.api.RingHandler;
-import com.s_exp.enso.api.ServerEvents;
 import java.net.InetAddress;
 
 /**
@@ -21,7 +20,7 @@ public final class Service {
     public final Config config;
     public final Timer timer;
     /** The {@code :server-events} listener behind a {@link GuardedEvents}, or null. */
-    public final ServerEvents events;
+    public final GuardedEvents events;
     /** {@code :max-buffered-bytes}. */
     public final MemoryBudget budget;
     // Server and Alt-Svc values added to responses, or null.
@@ -59,6 +58,16 @@ public final class Service {
 
     public void connectionClosed(String protocol, InetAddress remote, long durationNanos) {
         if (events != null) events.connectionClosed(protocol, remote, durationNanos);
+    }
+
+    /** Server events dropped because the listener fell behind (see {@link GuardedEvents}). */
+    public long droppedEvents() {
+        return events == null ? 0 : events.droppedEvents();
+    }
+
+    /** Delivers the events still queued and stops their thread. Called once the server is down. */
+    public void close() {
+        if (events != null) events.close();
     }
 
     // ---- response fields the server adds ------------------------------------------

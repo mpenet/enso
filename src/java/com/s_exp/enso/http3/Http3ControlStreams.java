@@ -58,7 +58,7 @@ final class Http3ControlStreams {
     private long peerControlStreamId = -1;
     private long peerQpackEncStreamId = -1;
     private long peerQpackDecStreamId = -1;
-    // Peer uni streams of other types (grease / unknown) until they end,
+    // Peer grease uni streams until they end,
     // so their later bytes are never read as a type; the critical ones are
     // the ids above. Made on first need.
     private Long2ObjectHashMap<Long> peerUniTypes;
@@ -204,19 +204,22 @@ final class Http3ControlStreams {
                 // RFC 9114 §6.2.2: only servers push.
                 throw new Http3ConnectionException(Http3ConnectionException.H3_STREAM_CREATION_ERROR,
                     "client-initiated push stream " + streamId);
-            } else {
-                // Grease (RFC 9114 §7.2.8) or unknown type (§6.2): recorded
-                // until the stream ends so the rest is discarded. Unknown
-                // types get STOP_SENDING (H3_STREAM_CREATION_ERROR).
+            } else if (isGreaseType(type)) {
+                // Grease (RFC 9114 §7.2.8): recorded until the stream ends
+                // so the rest is discarded. An open stream holds the peer's
+                // uni-stream credit, so these are bounded by it.
                 if (!fin) {
                     if (peerUniTypes == null) peerUniTypes = new Long2ObjectHashMap<>();
                     peerUniTypes.put(streamId, type);
                 }
-                if (!isGreaseType(type)) {
-                    LOG.fine(() -> "h3 unknown peer uni stream type=0x" + Long.toHexString(type)
-                        + " id=" + streamId);
-                    if (out != null) out.stopSending(streamId, Http3ConnectionException.H3_STREAM_CREATION_ERROR);
-                }
+                return;
+            } else {
+                // Unknown type (§6.2): STOP_SENDING (H3_STREAM_CREATION_ERROR).
+                // Not recorded: quiche discards the rest and never reports
+                // the stream again, not even its end.
+                LOG.fine(() -> "h3 unknown peer uni stream type=0x" + Long.toHexString(type)
+                    + " id=" + streamId);
+                if (out != null) out.stopSending(streamId, Http3ConnectionException.H3_STREAM_CREATION_ERROR);
                 return;
             }
             buf = readView;
@@ -361,6 +364,9 @@ final class Http3ControlStreams {
         if (peerControlReader == null) peerControlReader = new Http3FrameReader();
         try {
             peerControlReader.feed(buf);
+        } catch (Http3FrameReader.TooLarge e) {
+            throw new Http3ConnectionException(Http3ConnectionException.H3_EXCESSIVE_LOAD,
+                "peer control-stream frame: " + e.getMessage());
         } catch (IllegalStateException e) {
             throw new Http3ConnectionException(Http3ConnectionException.H3_FRAME_ERROR,
                 "peer control-stream feed: " + e.getMessage());
@@ -376,6 +382,10 @@ final class Http3ControlStreams {
             Http3FrameReader.Frame f;
             try {
                 f = peerControlReader.poll();
+            } catch (Http3FrameReader.TooLarge e) {
+                // Not buffered, whatever it would hold (RFC 9114 §10.5).
+                throw new Http3ConnectionException(Http3ConnectionException.H3_EXCESSIVE_LOAD,
+                    "peer control-stream frame: " + e.getMessage());
             } catch (IllegalStateException e) {
                 throw new Http3ConnectionException(Http3ConnectionException.H3_FRAME_ERROR,
                     "peer control-stream frame reader: " + e.getMessage());

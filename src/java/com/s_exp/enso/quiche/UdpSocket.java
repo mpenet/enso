@@ -174,8 +174,9 @@ public final class UdpSocket implements AutoCloseable {
          * Waits until {@code recv} is readable, {@code send} writable (when
          * {@code wantWrite}), this waker signalled, or {@code timeoutNanos}
          * (negative: forever). Null sockets are ignored. Returns
-         * {@link #READABLE} / {@link #WAKE} / {@link #WRITABLE} bits. Only
-         * the thread that will {@link #close} this waker polls it.
+         * {@link #READABLE} / {@link #WAKE} / {@link #WRITABLE} bits. One
+         * thread polls (the event loop owning this waker); {@link #close}
+         * comes only once that thread has exited.
          */
         public int poll(UdpSocket recv, UdpSocket send, boolean wantWrite, long timeoutNanos) {
             return Quiche.poll(recv == null ? -1 : recv.fd(), send == null ? -1 : send.fd(),

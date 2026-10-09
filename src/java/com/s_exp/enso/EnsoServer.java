@@ -9,7 +9,6 @@ import com.s_exp.enso.api.ServerEvents;
 import com.s_exp.enso.core.ConnectionLimiter;
 import com.s_exp.enso.core.ConnectionRegistry;
 import com.s_exp.enso.core.Drainable;
-import com.s_exp.enso.core.GuardedEvents;
 import com.s_exp.enso.core.Jfr;
 import com.s_exp.enso.core.LogLimiter;
 import com.s_exp.enso.core.Service;
@@ -68,9 +67,6 @@ public final class EnsoServer implements AutoCloseable {
     private final RingHandler handler;
     private final RingErrorHandler errorHandler;
     private final Config config;
-    // The :server-events listener, guarded: a throwing listener never
-    // reaches the acceptor or a connection. Null without one.
-    private final ServerEvents events;
     private final ConnectionRegistry registry = new ConnectionRegistry();
     private final ConnectionLimiter limiter;
 
@@ -100,7 +96,6 @@ public final class EnsoServer implements AutoCloseable {
         this.handler = handler;
         this.errorHandler = errorHandler;
         this.config = config;
-        this.events = GuardedEvents.of(config.serverEvents);
         this.limiter = new ConnectionLimiter(config.maxConnections, config.maxConnectionsPerIp);
     }
 
@@ -198,9 +193,16 @@ public final class EnsoServer implements AutoCloseable {
         return timer;
     }
 
-    /** {@code :server-events} listener (guarded), or null. */
+    /** {@code :server-events} listener (guarded), or null (also before {@link #start}). */
     public ServerEvents events() {
-        return events;
+        Service s = service;
+        return s == null ? null : s.events;
+    }
+
+    /** Server events dropped because the {@code :server-events} listener fell behind. */
+    public long droppedEvents() {
+        Service s = service;
+        return s == null ? 0 : s.droppedEvents();
     }
 
     /** What the drivers serve (handler, config, events, budget); null before {@link #start}. */
@@ -220,35 +222,60 @@ public final class EnsoServer implements AutoCloseable {
     /**
      * Accept errors (e.g. EMFILE) back off briefly instead of spinning on
      * a condition that persists; one failing connection never stops the
-     * acceptor.
+     * acceptor, whatever it throws.
      */
     private void acceptLoop() {
         while (running) {
             SocketChannel sc;
             try {
                 sc = channel.accept();
-            } catch (IOException e) {
+            } catch (Throwable e) {
                 if (running) {
                     ACCEPT_FAILURES.log("accept failed", e);
                     backOffAfterAcceptFailure();
                 }
                 continue;
             }
-            InetAddress remote = sc.socket().getInetAddress();
-            if (remote == null || !limiter.tryAcquire(remote)) {
-                closeQuietly(sc);
-                service.protocolError("tcp", "connection-limit");
-                CONNECTION_FAILURES.log("connection refused: connection limit reached");
-                continue;
-            }
             try {
-                executor.execute(new Accepted(sc, remote));
+                admit(sc);
             } catch (Throwable t) {
-                limiter.release(remote);
                 closeQuietly(sc);
-                if (running) ACCEPT_FAILURES.log("connection dispatch failed", t);
+                if (running) {
+                    ACCEPT_FAILURES.log("connection admission failed", t);
+                    backOffAfterAcceptFailure();
+                }
             }
         }
+    }
+
+    /** Admits {@code sc} through the limiter and dispatches it; closes it when refused. */
+    private void admit(SocketChannel sc) {
+        InetAddress remote = sc.socket().getInetAddress();
+        if (remote == null || !limiter.tryAcquire(remote)) {
+            closeQuietly(sc);
+            service.protocolError("tcp", "connection-limit");
+            CONNECTION_FAILURES.log("connection refused: connection limit reached");
+            return;
+        }
+        try {
+            executor.execute(new Accepted(sc, remote));
+        } catch (Throwable t) {
+            limiter.release(remote);
+            closeQuietly(sc);
+            if (running) ACCEPT_FAILURES.log("connection dispatch failed", t);
+        }
+    }
+
+    /**
+     * Whether the server is running with its acceptor and timer threads
+     * alive (and, with {@code :http3}, every HTTP/3 event loop): both are
+     * supervised, so false means a fault worth alerting on.
+     */
+    public boolean isHealthy() {
+        Thread a = acceptor;
+        Timer t = timer;
+        return running && a != null && a.isAlive() && t != null && t.isAlive()
+            && (!(http3Listener instanceof Http3Listener h3) || h3.isHealthy());
     }
 
     private static void backOffAfterAcceptFailure() {
@@ -387,7 +414,7 @@ public final class EnsoServer implements AutoCloseable {
                         }
                     }
                 }
-                if (events != null || Jfr.connections()) {
+                if (service.events != null || Jfr.connections()) {
                     openedAt = System.nanoTime();
                     service.connectionOpened(protocol, remote);
                     if (Jfr.connections()) {
@@ -610,6 +637,9 @@ public final class EnsoServer implements AutoCloseable {
         }
         if (timer != null) {
             timer.close();
+        }
+        if (service != null) {
+            service.close();
         }
     }
 

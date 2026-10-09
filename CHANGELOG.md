@@ -48,8 +48,14 @@ hardening. Many options were renamed; read the breaking changes first.
   `:http3-qpack-blocked-streams` (QPACK uses the static table only),
   `:worker-executor` (handlers always run on virtual threads).
 - **Changed defaults and rules:**
-  - `:http3-initial-max-data-bytes`: 1 GiB → 4 MiB, now a hard bound that
-    also caps the request-body bytes buffered per connection.
+  - `:http3-initial-max-data-bytes`: 1 GiB → 1 MiB, now a hard bound
+    (quiche doesn't autotune past it) that also caps the request-body
+    bytes buffered per connection. The HTTP/3 per-stream windows default
+    to a quarter of it (256 KiB), so one stream whose handler doesn't read
+    can't stall the connection's other requests.
+  - `:http2-initial-window-bytes`: 1 MiB → 256 KiB (the connection window
+    stays 4× this, 1 MiB). One stream uploads at most a window per round
+    trip: raise both windows for large uploads over long round trips.
   - `:http2-initial-window-bytes` must be at least 65535.
   - `:max-request-body-bytes` no longer applies to WebSocket frames; use
     `:ws-max-message-bytes`.
@@ -76,7 +82,7 @@ hardening. Many options were renamed; read the breaking changes first.
 | `:http2-max-frame-size` | `:http2-max-frame-bytes` |
 | `:http2-max-header-list-size` | removed (`:max-header-bytes`) |
 | `:http3-max-idle-timeout` | removed (`:idle-timeout`) |
-| `:http3-initial-max-data` (1 GiB) | `:http3-initial-max-data-bytes` (4 MiB) |
+| `:http3-initial-max-data` (1 GiB) | `:http3-initial-max-data-bytes` (1 MiB) |
 | `:http3-max-udp-payload-size` | `:http3-max-udp-payload-bytes` |
 | `:http3-initial-max-stream-data-bidi-local` | `:http3-initial-max-stream-data-bidi-local-bytes` |
 | `:http3-initial-max-stream-data-bidi-remote` | `:http3-initial-max-stream-data-bidi-remote-bytes` |
@@ -150,12 +156,20 @@ Unchanged: `:port` `:host` `:backlog` `:shutdown-timeout`
   (30000), `:write-timeout` (30000), `:handler-timeout` (0).
 - `:max-header-fields` (100): request header fields per head, 431 above.
 - `:max-buffered-bytes` (0 = a quarter of the heap): server-wide budget for
-  bytes buffered on behalf of peers, enforced by backpressure.
+  bytes buffered on behalf of peers and the flow-control credit promised
+  to them, enforced by backpressure with fair shares per connection.
+- `:min-data-rate-bytes` (240), `:min-data-rate-grace` (5000): least
+  request body rate while a handler waits for it (Kestrel's defaults);
+  slower bodies fail with 408 ("min-data-rate").
 - `:http2c` (false): cleartext HTTP/2 with prior knowledge next to
   HTTP/1.1.
 - `:http3-cert-reload-interval` (10000): HTTP/3 certificate rotation.
 - `:http3-retry-threshold` (256), `:http3-max-half-open` (1024),
   `:http3-stream-reset-limit` (400): HTTP/3 flood protection.
+- `:http3-max-native-bytes` (-1 = the `:max-buffered-bytes` limit): cap
+  on the receive credit quiche holds off the heap, one connection window
+  per connection; a connection that would pass it is refused at
+  admission.
 - `:http3-event-loops` (0 = one per core on Linux, one elsewhere),
   `:http3-so-rcv-buf-bytes` / `:http3-so-snd-buf-bytes` (4194304).
 - `:ws-max-message-bytes` (1048576), `:ws-max-queued-bytes` (1048576),
@@ -163,7 +177,9 @@ Unchanged: `:port` `:host` `:backlog` `:shutdown-timeout`
   `:ws-ping-interval` (0), `:ws-allowed-origins` (same origin).
 - `:async` (false): Ring asynchronous handlers.
 - `:server-events` (nil): connection, request and protocol-error
-  callbacks.
+  callbacks, delivered in order from their own thread (never a server
+  thread); a listener that falls 8192 events behind loses the next ones,
+  counted by `EnsoServer.droppedEvents()`.
 
 ### Features and behaviour changes
 
@@ -209,12 +225,32 @@ Unchanged: `:port` `:host` `:backlog` `:shutdown-timeout`
   `com.s_exp.enso.Connection`, `Request` and `ProtocolError` on every
   protocol.
 - **Logging:** client-caused failures at FINE; server faults at WARNING,
-  rate-limited to one record per second per call site.
+  rate-limited to one record per second per call site. A logging setup
+  that throws never reaches a server thread.
+- **Supervised server threads:** the timer survives failing tasks and
+  restarts its loop, the acceptor survives any failure of one iteration,
+  an HTTP/3 event loop restart can't be undone by a failure while
+  reporting it; `EnsoServer.isHealthy()` tells whether they all run.
 - **Options taking a function accept a var** (`#'handler`).
 - **Stricter request parsing:** Content-Length must be digits and appear
   once (even with equal values); an HTTP/1.1 request without Host is 400;
   the request target and Host authority are validated; HTTP/2 and HTTP/3
-  heads follow the same rules; a well-formed CONNECT gets 501.
+  heads follow the same rules; a well-formed CONNECT gets 501. HTTP/1.1:
+  a request line over `:max-header-bytes` is 414 (protocol error
+  "uri-too-long"); a bare LF line ending is 400 at once instead of waiting
+  out `:header-timeout`.
+- **HTTP/1.1 response framing:** a body of unknown length is chunked on
+  every HTTP/1.1 response, also when the connection closes after it, so a
+  body cut short shows; on HTTP/1.0, where the end of the connection is
+  the only framing, a body that fails ends it with a reset (over TLS
+  without close_notify). When the server closes, a handler's `Connection`
+  field without "close" is left out. A handler throwing `HttpError` with a
+  status outside 4xx / 5xx gets 500.
+- **HEAD with a nil body** (Ring's `wrap-head`) carries no
+  Content-Length, on every protocol: nil says nothing of GET's length.
+- **`requestCompleted` for every HTTP/1.1 response**, a failed write or
+  101 flush included; the 101 after a keep-alive response reports its own
+  body bytes (none).
 
 ### Security fixes
 
@@ -233,7 +269,40 @@ Unchanged: `:port` `:host` `:backlog` `:shutdown-timeout`
   is credited on a length mismatch; HEADERS on a forgotten stream id is a
   connection error; trailers are validated; repeated SETTINGS are applied
   in one pass; request and response buffers count against
-  `:max-buffered-bytes`.
+  `:max-buffered-bytes`, and connection credit beyond the initial 65535
+  octets is paid for from it before it is granted (the connection window
+  grows only once body bytes arrive), shared fairly between connections
+  under pressure; budget wake-ups run off the releasing thread (an inline
+  wake-up could deadlock two connections); the default stream window is
+  256 KiB (1 MiB per connection, as Go and Kestrel). A graceful close
+  waits for responses still held by flow control after their handler
+  returned (they were cut short); a writer failure ends the connection
+  instead of leaving it unable to write; the SETTINGS ACK precedes any
+  header block using a new HPACK table size; SETTINGS ACK or PING off
+  stream 0 is a PROTOCOL_ERROR; END_STREAM on the DATA frame crossing
+  `:max-request-body-bytes` ends the stream; `:idle-timeout` counts from
+  the end of the last response; sparse empty DATA on closed streams is
+  no longer mistaken for a flood; tiny connection WINDOW_UPDATEs no longer
+  reschedule streams waiting on their own window; a header block can't be
+  starved by control frames; a TLS 1.3 KeyUpdate no longer makes the
+  framer wait for a blocked writer; small `ByteArrayInputStream` bodies
+  cost what a byte array does (about 21 KB less per response) and
+  streamed bodies use pooled, right-sized rings.
+- Every protocol: request bodies trickled below `:min-data-rate-bytes`
+  fail (408), so one byte every 29 s no longer holds a request forever;
+  HTTP/3 write progress needs 16 KiB per `:write-timeout`, as HTTP/2's.
+- HTTP/1.1 over TLS: socket timeouts restart with every ciphertext byte
+  and a read returns whole records, so a record trickled a byte at a time
+  held a read open; the idle wait, `:header-timeout` and the
+  `:min-data-rate-bytes` allowance are now wall clock over TLS too.
+- HTTP/1.1: the post-response drain of an unread body is held to 2 s; a
+  drain can no longer close a connection whose request just started
+  arriving; closing (a TLS close_notify, the lingering close's shutdown)
+  is bounded by `:write-timeout`; the `:handler-timeout` interrupt never
+  lands in a socket read, where it closed the socket (losing the
+  lingering close that keeps the 503 from a reset); a late
+  `:handler-timeout` expiry can't claim the next request on the
+  connection.
 - HTTP/3 / QUIC: Retry tokens are bound to the address family and the
   Retry connection id; Retry is required automatically past
   `:http3-retry-threshold` and half-open connections are capped; Initials
@@ -244,7 +313,18 @@ Unchanged: `:port` `:host` `:backlog` `:shutdown-timeout`
   caps decoded sections and rejects overlong integers; partial header
   sections share a per-connection budget and a timeout; QUIC connections
   count against `:max-connections`; the JNI shim bounds-checks its
-  arguments and connection teardown is idempotent.
+  arguments and connection teardown is idempotent; with
+  `:max-connections-per-ip` set, clients prove their address (Retry)
+  before taking a per-address slot; an oversized control frame is
+  refused (H3_EXCESSIVE_LOAD) before any of it is buffered; unknown
+  unidirectional stream types no longer leak state; streams the server
+  stopped reading don't count against `:header-timeout`; an event loop
+  restarts on fresh state after a failure; HTTP/3 response bytes waiting
+  for the peer count against `:max-buffered-bytes`.
+- QUIC interoperability: a long header with an unknown version gets
+  Version Negotiation whatever its connection id lengths (RFC 8999), as
+  the quic-interop-runner's readiness probe needs; Initial and 0-RTT
+  packets are spread over the event loops by the kernel's 4-tuple hash.
 - WebSocket: same-origin check by default (cross-site WebSocket
   hijacking); pongs to a ping flood are coalesced; a claimed frame length
   isn't allocated up front; deflate bombs are bounded; a message must
@@ -255,7 +335,9 @@ Unchanged: `:port` `:host` `:backlog` `:shutdown-timeout`
   plaintext.
 - Native loader: the development library probe only looks next to a
   classes directory, never relative to the working directory; on musl the
-  glibc shim is never tried; the Java side checks the shim's ABI version.
+  glibc shim is never tried (musl is detected from the JVM's own mapped
+  libc); the Java side checks the shim's ABI version and its record
+  layout, field by field.
 
 ### Performance
 
@@ -281,6 +363,11 @@ Measured during this rework, each against the code before the change
   WebSocket 16 / 25 KiB; HTTP/3 about 3 KB).
 - HTTP/2 GET on the in-process test path: about 760 bytes per request,
   from 3108.
+- HTTP/1.1 per request on the in-process test path: a browser-like
+  14-field GET 1728 → 329 bytes (header maps stay array maps up to 32
+  fields; names and values of fields `HeaderNames` doesn't know are reused
+  per connection), and reading `:remote-addr`, `:server-name` and
+  `:server-port` 376 → 240 (derived once per connection).
 
 ### Build and distribution
 

@@ -32,6 +32,10 @@ public final class Config {
     public final int headerTimeoutMillis;
     /** Request body: longest wait for read progress. */
     public final int readTimeoutMillis;
+    /** Request body: least bytes per second while a reader waits, after the grace period. 0 = off. */
+    public final int minDataRateBytes;
+    /** Waiting for request body bytes allowed before {@link #minDataRateBytes} applies. */
+    public final int minDataRateGraceMillis;
     /** Longest wait for write progress; expiry force-closes. */
     public final int writeTimeoutMillis;
     /** No request in progress: h1 between requests, h2/h3 no stream, WebSocket no frame. */
@@ -105,11 +109,18 @@ public final class Config {
     public final String http3CertPath;
     public final String http3KeyPath;
     public final long http3InitialMaxDataBytes;
+    /**
+     * Receive credit quiche may hold natively across connections (a
+     * connection window each): a new connection is refused while its
+     * window would pass it. -1 → the {@link #maxBufferedBytes} limit (at
+     * least one window); 0 = unlimited.
+     */
+    public final long http3MaxNativeBytes;
     public final int http3InitialMaxStreamsBidi;
     public final int http3InitialMaxStreamsUni;
     public final int http3MaxUdpPayloadBytes;
     public final boolean http3StatelessRetry;
-    /** -1 → max(1 MiB, initial max data / bidi streams), at most initial max data. */
+    /** -1 → a quarter of the initial max data (the connection window). */
     public final long http3InitialMaxStreamDataBidiLocalBytes;
     public final long http3InitialMaxStreamDataBidiRemoteBytes;
     public final long http3InitialMaxStreamDataUniBytes;
@@ -181,6 +192,8 @@ public final class Config {
         this.handshakeTimeoutMillis = b.handshakeTimeoutMillis;
         this.headerTimeoutMillis = b.headerTimeoutMillis;
         this.readTimeoutMillis = b.readTimeoutMillis;
+        this.minDataRateBytes = b.minDataRateBytes;
+        this.minDataRateGraceMillis = b.minDataRateGraceMillis;
         this.writeTimeoutMillis = b.writeTimeoutMillis;
         this.idleTimeoutMillis = b.idleTimeoutMillis;
         this.handlerTimeoutMillis = b.handlerTimeoutMillis;
@@ -217,6 +230,7 @@ public final class Config {
         this.http3CertPath = b.http3CertPath;
         this.http3KeyPath = b.http3KeyPath;
         this.http3InitialMaxDataBytes = b.http3InitialMaxDataBytes;
+        this.http3MaxNativeBytes = b.http3MaxNativeBytes;
         this.http3InitialMaxStreamsBidi = b.http3InitialMaxStreamsBidi;
         this.http3InitialMaxStreamsUni = b.http3InitialMaxStreamsUni;
         this.http3MaxUdpPayloadBytes = b.http3MaxUdpPayloadBytes;
@@ -268,6 +282,9 @@ public final class Config {
         private int handshakeTimeoutMillis = 10_000;
         private int headerTimeoutMillis = 10_000;
         private int readTimeoutMillis = 30_000;
+        // Kestrel's MinRequestBodyDataRate: 240 bytes/s after 5 s.
+        private int minDataRateBytes = 240;
+        private int minDataRateGraceMillis = 5000;
         private int writeTimeoutMillis = 30_000;
         private int idleTimeoutMillis = 75_000;
         private int handlerTimeoutMillis = 0;
@@ -293,7 +310,9 @@ public final class Config {
         private boolean http2;
         private boolean http2c;
         private int http2MaxConcurrentStreams = 100;
-        private int http2InitialWindowBytes = 1 << 20;   // 1 MiB
+        // 256 KiB per stream, so a 1 MiB connection window (Go's and
+        // Kestrel's): see :http2-initial-window-bytes.
+        private int http2InitialWindowBytes = 256 * 1024;
         private int http2MaxFrameBytes = 1 << 14;        // 16 KiB
         // nginx's post-CVE-2023-44487 default.
         private int http2StreamResetLimit = 400;
@@ -303,8 +322,9 @@ public final class Config {
         private String http3CertPath;
         private String http3KeyPath;
         // Connection window: also bounds the unread request-body bytes
-        // quiche buffers per connection (it autotunes up to 24 MiB).
-        private long http3InitialMaxDataBytes = 4L << 20; // 4 MiB
+        // quiche buffers per connection (its autotuning is capped at it).
+        private long http3InitialMaxDataBytes = 1L << 20; // 1 MiB
+        private long http3MaxNativeBytes = -1;
         private int http3InitialMaxStreamsBidi = 100;
         private int http3InitialMaxStreamsUni = 8;
         private int http3MaxUdpPayloadBytes = 1350;
@@ -342,6 +362,8 @@ public final class Config {
         public Builder handshakeTimeoutMillis(int v) { this.handshakeTimeoutMillis = v; return this; }
         public Builder headerTimeoutMillis(int v) { this.headerTimeoutMillis = v; return this; }
         public Builder readTimeoutMillis(int v) { this.readTimeoutMillis = v; return this; }
+        public Builder minDataRateBytes(int v) { this.minDataRateBytes = v; return this; }
+        public Builder minDataRateGraceMillis(int v) { this.minDataRateGraceMillis = v; return this; }
         public Builder writeTimeoutMillis(int v) { this.writeTimeoutMillis = v; return this; }
         public Builder idleTimeoutMillis(int v) { this.idleTimeoutMillis = v; return this; }
         public Builder handlerTimeoutMillis(int v) { this.handlerTimeoutMillis = v; return this; }
@@ -376,6 +398,7 @@ public final class Config {
         public Builder http3CertPath(String v) { this.http3CertPath = v; return this; }
         public Builder http3KeyPath(String v) { this.http3KeyPath = v; return this; }
         public Builder http3InitialMaxDataBytes(long v) { this.http3InitialMaxDataBytes = v; return this; }
+        public Builder http3MaxNativeBytes(long v) { this.http3MaxNativeBytes = v; return this; }
         public Builder http3InitialMaxStreamsBidi(int v) { this.http3InitialMaxStreamsBidi = v; return this; }
         public Builder http3InitialMaxStreamsUni(int v) { this.http3InitialMaxStreamsUni = v; return this; }
         public Builder http3MaxUdpPayloadBytes(int v) { this.http3MaxUdpPayloadBytes = v; return this; }
@@ -429,6 +452,8 @@ public final class Config {
             requireAtLeast(":handshake-timeout", handshakeTimeoutMillis, 0);
             requireAtLeast(":header-timeout", headerTimeoutMillis, 0);
             requireAtLeast(":read-timeout", readTimeoutMillis, 0);
+            requireAtLeast(":min-data-rate-bytes", minDataRateBytes, 0);
+            requireAtLeast(":min-data-rate-grace", minDataRateGraceMillis, 0);
             requireAtLeast(":write-timeout", writeTimeoutMillis, 0);
             requireAtLeast(":idle-timeout", idleTimeoutMillis, 0);
             requireAtLeast(":handler-timeout", handlerTimeoutMillis, 0);
@@ -564,6 +589,16 @@ public final class Config {
             if (http3InitialMaxDataBytes < 0) {
                 throw invalid(":http3-initial-max-data-bytes", http3InitialMaxDataBytes,
                               ":http3-initial-max-data-bytes must be >= 0, got " + http3InitialMaxDataBytes);
+            }
+            if (http3MaxNativeBytes < -1) {
+                throw invalid(":http3-max-native-bytes", http3MaxNativeBytes,
+                              ":http3-max-native-bytes must be >= -1, got " + http3MaxNativeBytes);
+            }
+            if (http3MaxNativeBytes > 0 && http3MaxNativeBytes < http3InitialMaxDataBytes) {
+                throw invalid(":http3-max-native-bytes", http3MaxNativeBytes,
+                              ":http3-max-native-bytes must hold one connection window"
+                                  + " (:http3-initial-max-data-bytes " + http3InitialMaxDataBytes + "), got "
+                                  + http3MaxNativeBytes);
             }
             requireAtLeast(":http3-initial-max-streams-bidi", http3InitialMaxStreamsBidi, 1);
             // Control + QPACK encoder + QPACK decoder.

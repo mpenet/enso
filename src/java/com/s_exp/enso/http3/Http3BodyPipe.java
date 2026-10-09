@@ -2,6 +2,7 @@
 // ABOUTME: the handler's virtual thread (blocking reads with the read timeout and truncation).
 package com.s_exp.enso.http3;
 
+import com.s_exp.enso.core.DataRate;
 import com.s_exp.enso.core.MemoryBudget;
 import com.s_exp.enso.core.RequestBodyException;
 import com.s_exp.enso.core.RequestBodyTimeoutException;
@@ -28,9 +29,11 @@ import java.util.concurrent.locks.ReentrantLock;
  * bodies hold: a pipe at most {@link #HIGH_WATER} bytes, the pipes of one
  * connection together at most its connection window (the connection's
  * {@link MemoryBudget}), every pipe of the server within
- * {@code :max-buffered-bytes} (the server's). Buffered bytes are charged
- * to both until read or discarded. quiche itself holds at most a
- * connection window more.
+ * {@code :max-buffered-bytes} (the server's, through the connection's
+ * {@link MemoryBudget.Account}: under pressure a connection over its fair
+ * share stops first). Buffered bytes are charged to both until read or
+ * discarded. quiche itself holds at most a connection window more
+ * (native memory, counted by {@code Http3Listener.nativeCreditBytes()}).
  *
  * <p>Failures a reader sees: over {@code :max-request-body-bytes} a
  * {@link RequestBodyException} (413), no byte within {@code :read-timeout}
@@ -56,14 +59,20 @@ public final class Http3BodyPipe {
     private long received;
     // Longest wait for body bytes (:read-timeout); 0 = none.
     private final long readTimeoutNanos;
+    // :min-data-rate-bytes (0 = off) and its grace period.
+    private final long minDataRate;
+    private final long minDataRateGraceNanos;
+    // Reader side, for the rate: bytes read and time spent waiting for them.
+    private long readBytes;
+    private long waitedNanos;
     // Unread bytes live in buf[rpos, wpos). Guarded by lock.
     private byte[] buf = EMPTY;
     private int rpos;
     private int wpos;
     private int state = OPEN;
     private Runnable onDrain;
-    // :max-buffered-bytes, or null (no accounting).
-    private final MemoryBudget budget;
+    // The connection's share of :max-buffered-bytes, or null (no accounting).
+    private final MemoryBudget.Account account;
     // The connection's share (its window), or null.
     private final MemoryBudget connectionBudget;
     // Wake a loop paused on either budget; allocated on first need.
@@ -74,50 +83,31 @@ public final class Http3BodyPipe {
     // The first failure a read raised (reader thread).
     private volatile IOException failure;
 
-    public Http3BodyPipe() {
-        this(0, -1);
-    }
-
     /**
-     * @param maxBytes hard cap on cumulative body bytes; 0 disables. When
-     *   exceeded, {@link #enqueueChecked} returns false so the caller can
-     *   reset the stream instead of pushing more bytes.
-     */
-    public Http3BodyPipe(long maxBytes) {
-        this(maxBytes, -1);
-    }
-
-    /**
+     * @param maxBytes cap on cumulative body bytes ({@code :max-request-body-bytes});
+     *   past it {@link #offer} returns {@link #OVER_CAP} and readers fail with a 413.
+     *   0 disables it
      * @param declaredLength the request's content-length, or -1; see
-     *   {@link #exceedsDeclaredLength} / {@link #matchesDeclaredLength}.
-     */
-    public Http3BodyPipe(long maxBytes, long declaredLength) {
-        this(maxBytes, declaredLength, 0);
-    }
-
-    /**
+     *   {@link #offer} / {@link #matchesDeclaredLength}
      * @param readTimeoutMillis longest a read waits for bytes before it
      *   throws {@link java.net.SocketTimeoutException}; 0 waits forever
-     */
-    public Http3BodyPipe(long maxBytes, long declaredLength, long readTimeoutMillis) {
-        this(maxBytes, declaredLength, readTimeoutMillis, null);
-    }
-
-    /** @param budget the server's {@code :max-buffered-bytes} accountant, or null */
-    public Http3BodyPipe(long maxBytes, long declaredLength, long readTimeoutMillis, MemoryBudget budget) {
-        this(maxBytes, declaredLength, readTimeoutMillis, budget, null);
-    }
-
-    /**
+     * @param minDataRate {@code :min-data-rate-bytes}: least bytes per
+     *   second a reader may wait for, once {@code minDataRateGraceMillis}
+     *   of waiting is spent; 0 = off
+     * @param account the connection's share of the server's
+     *   {@code :max-buffered-bytes}, or null
      * @param connectionBudget what the pipes of this pipe's connection may
      *   hold together (its connection window), or null
      */
-    public Http3BodyPipe(long maxBytes, long declaredLength, long readTimeoutMillis, MemoryBudget budget,
+    public Http3BodyPipe(long maxBytes, long declaredLength, long readTimeoutMillis, long minDataRate,
+                         long minDataRateGraceMillis, MemoryBudget.Account account,
                          MemoryBudget connectionBudget) {
         this.maxBytes = maxBytes;
         this.declaredLength = declaredLength;
         this.readTimeoutNanos = readTimeoutMillis * 1_000_000L;
-        this.budget = budget;
+        this.minDataRate = minDataRate;
+        this.minDataRateGraceNanos = minDataRateGraceMillis * 1_000_000L;
+        this.account = account;
         this.connectionBudget = connectionBudget;
     }
 
@@ -165,12 +155,17 @@ public final class Http3BodyPipe {
 
     /**
      * The exchange is over: buffered bytes nobody will read are dropped
-     * and their budget given back; a later read fails.
+     * and their budget given back, a pending wake-up leaves the budgets; a
+     * later read fails.
      */
     public void discard() {
         int unread;
+        MemoryBudget.Waiter onServer;
+        MemoryBudget.Waiter onConnection;
         lock.lock();
         try {
+            onServer = budgetWaiter;
+            onConnection = connectionWaiter;
             if (state == OPEN) state = TRUNCATED;
             unread = wpos - rpos;
             if (unread > 0) {
@@ -183,18 +178,14 @@ public final class Http3BodyPipe {
         } finally {
             lock.unlock();
         }
-        // Outside the lock: a release may run budget waiters.
+        if (onServer != null) account.budget().cancel(onServer);
+        if (onConnection != null) connectionBudget.cancel(onConnection);
         if (unread > 0) release(unread);
     }
 
     private void release(int n) {
-        if (budget != null) budget.release(n);
+        if (account != null) account.release(n);
         if (connectionBudget != null) connectionBudget.release(n);
-    }
-
-    /** True if {@code n} more body bytes would overrun the content-length. */
-    public boolean exceedsDeclaredLength(int n) {
-        return declaredLength >= 0 && received + n > declaredLength;
     }
 
     /** True unless a content-length was declared and the body differs. */
@@ -202,29 +193,12 @@ public final class Http3BodyPipe {
         return declaredLength < 0 || received == declaredLength;
     }
 
-    /** Appends {@code chunk}. Never blocks. */
-    public void enqueue(byte[] chunk) {
-        append(chunk, 0, chunk.length);
-    }
-
-    /**
-     * Appends {@code chunk} unless it would push the body past
-     * {@link #maxBytes}. Never blocks.
-     *
-     * @return false (nothing appended) when the cap is exceeded; callers
-     *   then reset the stream and {@link #signalTruncated()}.
-     */
-    public boolean enqueueChecked(byte[] chunk) {
-        received += chunk.length;
-        if (maxBytes > 0 && received > maxBytes) return false;
-        append(chunk, 0, chunk.length);
-        return true;
-    }
-
     /**
      * Body bytes the loop may move into this pipe now (event loop): what
      * keeps the pipe within {@link #HIGH_WATER} and the connection within
-     * its window; 0 while the server's budget is exhausted.
+     * its window; 0 while the connection's share of the server's budget is
+     * throttled (the budget exhausted, or under pressure with this
+     * connection over its fair share).
      */
     public int room() {
         int unread;
@@ -236,20 +210,16 @@ public final class Http3BodyPipe {
         }
         long room = HIGH_WATER - unread;
         if (connectionBudget != null) room = Math.min(room, connectionBudget.limit() - connectionBudget.used());
-        if (budget != null && budget.exhausted()) room = 0;
+        if (account != null && account.throttled()) room = 0;
         return (int) Math.max(0, room);
     }
 
-    /** True while {@link #room} is positive. */
-    public boolean hasRoom() {
-        return room() > 0;
-    }
-
     /**
-     * Arranges for {@code wake} to run (on the thread that frees room) once
-     * {@link #room} may be positive again: this pipe drained below
-     * {@link #HIGH_WATER}, or the budget it waits on has room. Runs it
-     * immediately if that already happened, so a wake-up can't be lost.
+     * Arranges for {@code wake} to run once {@link #room} may be positive
+     * again: this pipe drained below {@link #HIGH_WATER} (on the reader's
+     * thread), or the budget it waits on fell below its low-water mark (on
+     * the budget's waker thread). Runs it immediately if that already
+     * happened, so a wake-up can't be lost.
      */
     public void resumeWhenDrained(Runnable wake) {
         MemoryBudget.Waiter waiter = null;
@@ -260,11 +230,11 @@ public final class Http3BodyPipe {
                 onDrain = wake;
                 return;
             }
-            if (state == OPEN && budget != null && budget.exhausted()) {
+            if (state == OPEN && account != null && account.throttled()) {
                 // Paused on the server-wide budget, not on this pipe.
                 if (budgetWaiter == null) budgetWaiter = waiter(wake);
                 waiter = budgetWaiter;
-                on = budget;
+                on = account.budget();
             } else if (state == OPEN && connectionBudget != null && connectionBudget.exhausted()) {
                 // Paused on the connection's window: other streams hold it.
                 if (connectionWaiter == null) connectionWaiter = waiter(wake);
@@ -274,9 +244,7 @@ public final class Http3BodyPipe {
         } finally {
             lock.unlock();
         }
-        if (waiter != null) {
-            on.await(waiter);
-        } else {
+        if (waiter == null || !on.await(waiter)) {
             wake.run();
         }
     }
@@ -315,7 +283,7 @@ public final class Http3BodyPipe {
             if (buf.length - wpos < len) makeRoom(len);
             System.arraycopy(src, off, buf, wpos, len);
             wpos += len;
-            if (budget != null) budget.charge(len);
+            if (account != null) account.charge(len);
             if (connectionBudget != null) connectionBudget.charge(len);
             readable.signal();
         } finally {
@@ -370,6 +338,7 @@ public final class Http3BodyPipe {
                 n = Math.min(len, wpos - rpos);
                 System.arraycopy(buf, rpos, b, off, n);
                 rpos += n;
+                readBytes += n;
                 wake = drained();
             } catch (IOException e) {
                 if (failure == null) failure = e;
@@ -399,13 +368,25 @@ public final class Http3BodyPipe {
             long left = readTimeoutNanos;
             while (rpos == wpos && state == OPEN) {
                 try {
-                    if (readTimeoutNanos <= 0) {
+                    if (readTimeoutNanos > 0 && left <= 0) {
+                        throw new RequestBodyTimeoutException();
+                    }
+                    long wait = readTimeoutNanos > 0 ? left : Long.MAX_VALUE;
+                    if (minDataRate > 0) {
+                        long allowance = DataRate.allowanceNanos(minDataRate, minDataRateGraceNanos,
+                                                                 readBytes, waitedNanos);
+                        if (allowance <= 0) {
+                            throw RequestBodyTimeoutException.minDataRate();
+                        }
+                        wait = Math.min(wait, allowance);
+                    }
+                    if (wait == Long.MAX_VALUE) {
                         readable.await();
                     } else {
-                        if (left <= 0) {
-                            throw new RequestBodyTimeoutException();
-                        }
-                        left = readable.awaitNanos(left);
+                        long remaining = readable.awaitNanos(wait);
+                        long waited = wait - remaining;
+                        waitedNanos += waited;
+                        if (readTimeoutNanos > 0) left -= waited;
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();

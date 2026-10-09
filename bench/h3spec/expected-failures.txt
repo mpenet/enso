@@ -9,6 +9,6 @@
 #
 # Cases a full run must execute; a different count fails the run (truncated
 # run or changed suite).
-total-cases: 49
+total-cases: 77
 MUST send PROTOCOL_VIOLATION if reserved bits in Handshake are non-zero [Transport 17.2]
 MUST send PROTOCOL_VIOLATION if reserved bits in Short are non-zero [Transport 17.2]

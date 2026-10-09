@@ -13,6 +13,7 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import com.s_exp.enso.EnsoServer;
 import com.s_exp.enso.api.ChunkedWriter;
 import com.s_exp.enso.api.Response;
 import com.s_exp.enso.core.ChunkedWriters;
@@ -33,7 +34,11 @@ import com.s_exp.enso.websocket.WebSocketHandshake;
  * (hbuf): the response head is built in it and small writes join it (see
  * {@link Output}), so a head and a small body leave in one write, and
  * responses to pipelined requests share writes (see {@link #holdOutput}).
- * Used by the connection thread only, but for the held-output flusher.
+ * hbuf belongs to the connection thread, but for the held-output flusher;
+ * the handler-timeout 503 is written by another thread straight to the
+ * transport ({@link #writeDirect}), and after an upgrade the WebSocket
+ * writes through {@link #output} from its senders' threads, one at a time
+ * under its write lock.
  */
 final class ResponseWriter {
 
@@ -223,14 +228,18 @@ final class ResponseWriter {
 
     /**
      * Back to the connection thread owning hbuf: the held bytes are still
-     * there (timer cancelled in time) or were written by the flusher
-     * (waited for, then dropped).
+     * there (taken back before the timer fired) or were written by the
+     * flusher (waited for, then dropped). The timer is not cancelled: the
+     * next {@link #holdOutput} only moves its deadline (one CAS, where a
+     * cancel and a new arm cost the timer thread a visit per request), and
+     * an expiry that finds nothing held does nothing. One left over from an
+     * earlier hold flushes the bytes held now early, which only costs the
+     * coalescing.
      */
     void reclaimOutput() {
         if ((int) HELD_STATE.getVolatile(this) == HELD_NONE) {
             return;
         }
-        timer.cancel(heldFlush);
         if (HELD_STATE.compareAndSet(this, HELD_ARMED, HELD_NONE)) {
             return;
         }
@@ -308,6 +317,7 @@ final class ResponseWriter {
      * nothing written) when the response is invalid.
      */
     boolean prepare(Response response, boolean headRequest) {
+        bodyBytesWritten = 0;
         // hbuf may already hold earlier pipelined responses; only bytes past
         // this mark belong to the response being written.
         int responseStart = hlen;
@@ -333,9 +343,34 @@ final class ResponseWriter {
         ResponseHead h = head;
         try {
             int status = h.status();
+            int kind = h.bodyKind();
+            boolean streamed = kind == ResponseHead.BODY_STREAM || kind == ResponseHead.BODY_STREAMING;
+            long contentLength = h.contentLength();
+            boolean chunked = false;
+            // The body ends with the connection: nothing else marks its end.
+            boolean closeDelimited = false;
+            if (contentLength < 0 && streamed && status >= 200 && status != 204 && status != 304) {
+                // Unknown length: chunked framing, even on a connection
+                // about to close, so a body cut short shows (no last
+                // chunk). HTTP/1.0 has only the end of the connection.
+                if (http11) {
+                    chunked = true;
+                } else {
+                    keepAlive = false;
+                    closeDelimited = true;
+                }
+            }
+            // The server closing says Connection: close; a handler's
+            // Connection field without "close" (e.g. keep-alive) would
+            // contradict it, so it is left out.
+            boolean announceClose = !keepAlive && !h.closeRequested();
             hAppend(statusLine(status));
             for (int i = 0, n = h.fieldCount(); i < n; i++) {
-                appendField(h.name(i), h.value(i));
+                String name = h.name(i);
+                if (announceClose && name.equalsIgnoreCase("connection")) {
+                    continue;
+                }
+                appendField(name, h.value(i));
             }
             if (Service.addsDate(h)) {
                 hAppend(HttpDates.dateLine());
@@ -348,28 +383,14 @@ final class ResponseWriter {
             if (server != null) {
                 appendField("server", server);
             }
-
-            int kind = h.bodyKind();
-            boolean streamed = kind == ResponseHead.BODY_STREAM || kind == ResponseHead.BODY_STREAMING;
-            long contentLength = h.contentLength();
-            boolean chunked = false;
             if (contentLength >= 0) {
                 hAppend(CONTENT_LENGTH);
                 hAppendLong(contentLength);
                 hCrlf();
-            } else if (streamed && status >= 200 && status != 204 && status != 304) {
-                // Unknown length: chunked framing, or the end of the
-                // connection where HTTP/1.0 has nothing else.
-                if (http11 && keepAlive) {
-                    chunked = true;
-                    hAppend(TE_CHUNKED);
-                } else {
-                    keepAlive = false;
-                }
+            } else if (chunked) {
+                hAppend(TE_CHUNKED);
             }
-            // A handler-supplied Connection without "close" (e.g. keep-alive)
-            // must not hide that the server is closing.
-            if (!keepAlive && !h.closeRequested()) {
+            if (announceClose) {
                 hAppend(CONNECTION_CLOSE);
             }
             hCrlf();
@@ -460,7 +481,15 @@ final class ResponseWriter {
                     }
                 } catch (RuntimeException e) {
                     HttpConnection.BODY_FAILURES.log("response body failed, closing connection", e);
+                    if (closeDelimited) {
+                        abort();
+                    }
                     return false;
+                } catch (IOException e) {
+                    if (closeDelimited) {
+                        abort();
+                    }
+                    throw e;
                 }
             }
 
@@ -482,6 +511,7 @@ final class ResponseWriter {
      * handler's response is invalid. The head is released either way.
      */
     boolean writeSwitchingProtocols(Response response, String key, String protocol, PerMessageDeflate deflate) {
+        bodyBytesWritten = 0;
         int responseStart = hlen;
         try {
             head.prepare(response, false, ResponseHead.HTTP1);
@@ -508,6 +538,20 @@ final class ResponseWriter {
         } finally {
             head.release();
         }
+    }
+
+    /**
+     * Ends the connection with a reset (SO_LINGER 0) and, over TLS, without
+     * close_notify: a close-delimited body that failed must not end the way
+     * a complete one does.
+     */
+    private void abort() {
+        try {
+            socket.setSoLinger(true, 0);
+        } catch (IOException | RuntimeException ignored) {
+            // a socket already closed, or one without the option
+        }
+        EnsoServer.forceClose(socket);
     }
 
     /**

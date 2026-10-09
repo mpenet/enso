@@ -9,6 +9,7 @@ import com.s_exp.enso.api.ServerEvents;
 import com.s_exp.enso.core.ConnectionLimiter;
 import com.s_exp.enso.core.ConnectionRegistry;
 import com.s_exp.enso.core.LogLimiter;
+import com.s_exp.enso.core.MemoryBudget;
 import com.s_exp.enso.core.Service;
 import com.s_exp.enso.core.Timer;
 import com.s_exp.enso.http3.qpack.QpackFieldSection;
@@ -43,19 +44,23 @@ import java.util.logging.Logger;
  * {@link ConnectionIds}). On Linux every loop has its own SO_REUSEPORT
  * socket and a classic BPF program steers each datagram to the socket of
  * the loop named in its destination id, so the kernel spreads the load
- * and packets never change threads; without the program (or on other
- * systems, where one socket is shared and loop 0 receives) a datagram
- * landing on the wrong loop is copied to its owner's inbox. Handlers run
- * on virtual threads.
+ * and packets never change threads; Initial and 0-RTT packets, whose id
+ * the client chose, go by the kernel's 4-tuple hash and are accepted
+ * where they land. Without the program (or on other systems, where one
+ * socket is shared and loop 0 receives) a datagram landing on the wrong
+ * loop is copied to its owner's inbox. Handlers run on virtual threads.
  *
  * <p>Admission of a client Initial: a token is verified (an expired or
  * foreign Retry token closes with INVALID_TOKEN, RFC 9000 §8.1.2);
  * without a valid one, a stateless Retry is required while
  * {@code :http3-retry-threshold} or more connections are handshaking
- * (always with {@code :http3-stateless-retry}), so a spoofed flood can't
- * make the server sign handshakes; past {@code :http3-max-half-open}
- * handshaking connections Initials are dropped; every connection takes a
- * slot of the server's {@link ConnectionLimiter} ({@code :max-connections},
+ * (always with {@code :http3-stateless-retry}, and with
+ * {@code :max-connections-per-ip}, so per-address slots only count proven
+ * addresses), so a spoofed flood can't make the server sign handshakes;
+ * past {@code :http3-max-half-open} handshaking connections Initials are
+ * dropped; every connection reserves its connection window of native
+ * receive credit within {@code :http3-max-native-bytes} and takes a slot
+ * of the server's {@link ConnectionLimiter} ({@code :max-connections},
  * {@code :max-connections-per-ip}) for its whole life, and beyond while
  * any of its handlers still runs (closing a connection doesn't free
  * handlers to pile up).
@@ -94,12 +99,16 @@ public final class Http3Listener implements AutoCloseable {
     final Config config;
     final RingHandler handler;
     final Timer timer;
-    private final boolean ownsTimer;
+    private final boolean ownsService;
     final ConnectionRegistry registry;
     final ConnectionLimiter limiter;
     final ServerEvents events;
     final ThreadFactory handlerThreads = Thread.ofVirtual().factory();
     final Stats stats = new Stats();
+    // Receive credit quiche may hold natively: a connection window
+    // (:http3-initial-max-data-bytes) per live connection, reserved at
+    // admission within :http3-max-native-bytes.
+    private final MemoryBudget nativeCredit;
 
     /** The configuration new connections are accepted with; see {@link #acquireConfig}. */
     private volatile QuicheConfig currentConfig;
@@ -114,8 +123,14 @@ public final class Http3Listener implements AutoCloseable {
     Http3Loop[] loops = new Http3Loop[0];
     private UdpSocket[] sockets = new UdpSocket[0];
     private UdpSocket.Waker[] wakers = new UdpSocket.Waker[0];
-    /** Every datagram goes to the loop its destination id names (kernel steering or one shared socket). */
+    /** Datagrams reach the loop their destination id names (kernel steering or one shared socket). */
     boolean routeAll;
+    /**
+     * One socket for every loop: loop 0 receives and routes each datagram
+     * by destination id, client-chosen ones (Initial, 0-RTT) included, the
+     * only way handshakes spread across loops then.
+     */
+    boolean sharedSocket;
     private boolean gso;
     volatile boolean accepting;
     private InetSocketAddress localAddress;
@@ -168,17 +183,58 @@ public final class Http3Listener implements AutoCloseable {
         this(service, false, registry, limiter);
     }
 
-    private Http3Listener(Service service, boolean ownsTimer, ConnectionRegistry registry,
+    private Http3Listener(Service service, boolean ownsService, ConnectionRegistry registry,
                           ConnectionLimiter limiter) {
         this.service = service;
         this.config = service.config;
         this.handler = service.handler;
         this.timer = service.timer;
-        this.ownsTimer = ownsTimer;
+        this.ownsService = ownsService;
         this.registry = registry;
         this.limiter = limiter != null ? limiter
             : new ConnectionLimiter(config.maxConnections, config.maxConnectionsPerIp);
         this.events = service.events;
+        this.nativeCredit = new MemoryBudget(nativeLimit(config, service.budget));
+    }
+
+    /**
+     * {@code :http3-max-native-bytes} resolved: -1 is the
+     * {@code :max-buffered-bytes} limit, but at least one connection
+     * window (so a small budget still admits connections); 0 is unlimited.
+     */
+    private static long nativeLimit(Config config, MemoryBudget budget) {
+        if (config.http3MaxNativeBytes == 0) return Long.MAX_VALUE;
+        if (config.http3MaxNativeBytes > 0) return config.http3MaxNativeBytes;
+        return Math.max(budget.limit(), Math.max(1, config.http3InitialMaxDataBytes));
+    }
+
+    /**
+     * Bytes of request data quiche may buffer natively, off the Java heap
+     * and outside {@code :max-buffered-bytes}: the connection window
+     * ({@code :http3-initial-max-data-bytes}) of every live connection,
+     * at most {@link #maxNativeBytes}. The server reads request streams
+     * only while their pipes and the budget have room, so this much is
+     * reached only under pressure, by peers that keep sending.
+     */
+    public long nativeCreditBytes() {
+        return nativeCredit.used();
+    }
+
+    /**
+     * The cap on {@link #nativeCreditBytes} ({@code :http3-max-native-bytes}
+     * resolved; {@link Long#MAX_VALUE} when unlimited): a connection whose
+     * window would pass it is refused.
+     */
+    public long maxNativeBytes() {
+        return nativeCredit.limit();
+    }
+
+    /** Whether every event loop thread is alive (each is supervised: false means a fault). */
+    public boolean isHealthy() {
+        for (Http3Loop l : loops) {
+            if (!l.thread.isAlive()) return false;
+        }
+        return true;
     }
 
     /** Binds and starts the loops. On failure everything opened is released. */
@@ -214,13 +270,17 @@ public final class Http3Listener implements AutoCloseable {
         } catch (Throwable t) {
             long deadline = System.nanoTime() + STOP_JOIN_MILLIS * 1_000_000L;
             stopCertWatcher(deadline);
-            stopLoops(deadline);
-            releaseNative(true);
+            // A loop that didn't stop may still use the sockets and the
+            // configuration: left allocated rather than freed under it.
+            releaseNative(stopLoops(deadline));
             throw t;
         }
     }
 
     private QuicheConfig track(QuicheConfig c) {
+        // Freed ones leave as new ones come: the list stays as long as the
+        // configurations still in use.
+        configs.removeIf(QuicheConfig::isFreed);
         configs.add(c);
         return c;
     }
@@ -366,6 +426,7 @@ public final class Http3Listener implements AutoCloseable {
         }
         localAddress = sockets[0].localAddress();
         logBufferSizes(sockets[0]);
+        sharedSocket = !perLoopSockets;
         routeAll = !perLoopSockets || sockets[0].attachSteering(n);
         gso = sockets[0].gsoSupported();
         int sendFlags = (gso ? UdpSocket.SEND_GSO : 0)
@@ -467,7 +528,8 @@ public final class Http3Listener implements AutoCloseable {
      * Decides a client Initial's fate. {@code hdr} is its parsed header
      * (token included), {@code meta[peerOff]} its source address,
      * {@code dcid} its destination id. On {@link Admission#ACCEPT} a
-     * limiter slot and a half-open slot are taken: give them back through
+     * limiter slot, a half-open slot and the connection window of native
+     * credit are taken: give them back through
      * {@link #admissionFailed} if no connection results.
      */
     Admission admit(ByteBuffer hdr, int tokenLen, ByteBuffer meta, int peerOff, byte[] dcid) {
@@ -488,20 +550,32 @@ public final class Http3Listener implements AutoCloseable {
             // server) count as absent (§8.1.3).
             if (odcid == null && RetryToken.looksMinted(token)) return Admission.TOKEN_INVALID;
         }
-        if (odcid == null && (config.http3StatelessRetry || halfOpen.get() >= config.http3RetryThreshold)) {
+        // With a per-address limit the address is validated first: a slot
+        // taken for a spoofed source would lock that address out.
+        if (odcid == null && (config.http3StatelessRetry || config.maxConnectionsPerIp > 0
+                              || halfOpen.get() >= config.http3RetryThreshold)) {
             stats.retries.increment();
             return Admission.RETRY_REQUIRED;
         }
-        if (config.http3MaxHalfOpen > 0 && halfOpen.get() >= config.http3MaxHalfOpen) {
+        // Taken, then checked: loops admitting at once can't overshoot.
+        int handshaking = halfOpen.incrementAndGet();
+        if (config.http3MaxHalfOpen > 0 && handshaking > config.http3MaxHalfOpen) {
+            halfOpen.decrementAndGet();
             refused("handshake-limit", "h3 Initial dropped: too many handshaking connections");
             return Admission.DROPPED;
         }
         InetAddress remote = peer.getAddress();
+        if (!nativeCredit.tryReserve(config.http3InitialMaxDataBytes)) {
+            halfOpen.decrementAndGet();
+            refused("connection-limit", "h3 connection refused: :http3-max-native-bytes reached");
+            return Admission.DROPPED;
+        }
         if (!limiter.tryAcquire(remote)) {
+            halfOpen.decrementAndGet();
+            nativeCredit.release(config.http3InitialMaxDataBytes);
             refused("connection-limit", "h3 connection refused: connection limit reached");
             return Admission.DROPPED;
         }
-        halfOpen.incrementAndGet();
         return new Admission(Admission.ACCEPT, odcid, remote);
     }
 
@@ -518,6 +592,7 @@ public final class Http3Listener implements AutoCloseable {
     /** Undoes a successful {@link #admit} whose connection couldn't be created. */
     void admissionFailed(InetAddress remote) {
         halfOpen.decrementAndGet();
+        nativeCredit.release(config.http3InitialMaxDataBytes);
         limiter.release(remote);
     }
 
@@ -554,6 +629,7 @@ public final class Http3Listener implements AutoCloseable {
      */
     void released(Http3Connection c) {
         if (!c.release()) return;
+        nativeCredit.release(config.http3InitialMaxDataBytes);
         limiter.release(c.remote);
         if (registry != null) registry.unregister(c);
         if (live.decrementAndGet() == 0) {
@@ -601,7 +677,10 @@ public final class Http3Listener implements AutoCloseable {
         }
         boolean stopped = stopLoops(Math.max(deadline, System.nanoTime()) + STOP_GRACE_NANOS);
         releaseNative(stopped);
-        if (ownsTimer) timer.close();
+        if (ownsService) {
+            timer.close();
+            service.close();
+        }
     }
 
     private void awaitNoConnections(long deadline) {

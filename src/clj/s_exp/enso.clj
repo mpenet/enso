@@ -366,6 +366,12 @@
    {:key :read-timeout :group "Timeouts" :default 30000 :field "readTimeoutMillis" :check check-int
     :set (fn [^Config$Builder b v] (.readTimeoutMillis b (int v)))
     :doc "longest ms without progress reading a request body; the read fails (408 unless the handler catches it). Also bounds head reads when `:header-timeout` is 0, and is the wall-clock time a WebSocket message may take from its first frame to its last (CLOSE 1008)."}
+   {:key :min-data-rate-bytes :group "Timeouts" :default 240 :field "minDataRateBytes" :check check-int
+    :set (fn [^Config$Builder b v] (.minDataRateBytes b (int v)))
+    :doc "least request body bytes per second while a handler waits for them, once `:min-data-rate-grace` of waiting is spent (Kestrel's default), 0 = off. Below it the read fails (408, protocol error \"min-data-rate\"): a body trickled just inside `:read-timeout` can't hold a request forever. Time the handler isn't reading doesn't count."}
+   {:key :min-data-rate-grace :group "Timeouts" :default 5000 :field "minDataRateGraceMillis" :check check-int
+    :set (fn [^Config$Builder b v] (.minDataRateGraceMillis b (int v)))
+    :doc "ms of waiting for request body bytes allowed before `:min-data-rate-bytes` applies."}
    {:key :write-timeout :group "Timeouts" :default 30000 :field "writeTimeoutMillis" :check check-int
     :set (fn [^Config$Builder b v] (.writeTimeoutMillis b (int v)))
     :doc "longest ms without write progress (a peer that stopped reading); the connection is force-closed."}
@@ -394,7 +400,7 @@
     :doc "requests per HTTP/1.1 connection, 0 = unlimited. The last response carries Connection: close."}
    {:key :max-buffered-bytes :group "Limits" :default 0 :field "maxBufferedBytes" :check check-long
     :set (fn [^Config$Builder b v] (.maxBufferedBytes b (long v)))
-    :doc "bytes the server buffers for peers, server-wide: unread request bodies (HTTP/2, HTTP/3), streamed HTTP/2 response bytes, queued WebSocket sends and incoming WebSocket messages past 64 KiB. 0 = a quarter of the maximum heap. Past it HTTP/2 grants no more flow-control credit, HTTP/3 stops reading request streams until bodies are read and a WebSocket stops reading a large message until there is room (backpressure); WebSocket asynchronous sends fail at once."}
+    :doc "bytes the server buffers or promises (flow-control credit) for peers, server-wide: unread request bodies (HTTP/2, HTTP/3) and the HTTP/2 credit granted for them, streamed HTTP/2 response bytes, queued WebSocket sends and incoming WebSocket messages past 64 KiB. 0 = a quarter of the maximum heap. Credit is paid for before it is granted. From three quarters of it connections over their fair share are throttled, at the limit all are: HTTP/2 grants connection credit only up to the initial 65535 octets, HTTP/3 stops reading request streams until bodies are read and a WebSocket stops reading a large message until there is room (backpressure); WebSocket asynchronous sends fail at once."}
 
    ;; TCP
    {:key :so-nodelay :group "TCP" :default true :field "soNodelay" :check check-bool
@@ -449,9 +455,9 @@
    {:key :http2-max-concurrent-streams :group "HTTP/2" :default 100 :field "http2MaxConcurrentStreams" :check check-int
     :set (fn [^Config$Builder b v] (.http2MaxConcurrentStreams b (int v)))
     :doc "SETTINGS_MAX_CONCURRENT_STREAMS."}
-   {:key :http2-initial-window-bytes :group "HTTP/2" :default 1048576 :field "http2InitialWindowBytes" :check check-int
+   {:key :http2-initial-window-bytes :group "HTTP/2" :default 262144 :field "http2InitialWindowBytes" :check check-int
     :set (fn [^Config$Builder b v] (.http2InitialWindowBytes b (int v)))
-    :doc "per-stream receive window, [65535, 2^31-1]; the connection window is 4x this. Credit returns as handlers read."}
+    :doc "per-stream receive window, [65535, 2^31-1]; the connection window grows to 4x this (1 MiB by default) once request body bytes arrive, as far as `:max-buffered-bytes` pays for it. Credit returns as handlers read. Raise it for large uploads over long round trips."}
    {:key :http2-max-frame-bytes :group "HTTP/2" :default 16384 :field "http2MaxFrameBytes" :check check-int
     :set (fn [^Config$Builder b v] (.http2MaxFrameBytes b (int v)))
     :doc "SETTINGS_MAX_FRAME_SIZE, [16384, 16777215]."}
@@ -475,9 +481,12 @@
    {:key :http3-key-path :group "HTTP/3 (QUIC via quiche)" :default nil :field "http3KeyPath" :check check-string
     :set (fn [^Config$Builder b v] (.http3KeyPath b ^String v))
     :doc "PEM private key."}
-   {:key :http3-initial-max-data-bytes :group "HTTP/3 (QUIC via quiche)" :default 4194304 :field "http3InitialMaxDataBytes" :check check-long
+   {:key :http3-initial-max-data-bytes :group "HTTP/3 (QUIC via quiche)" :default 1048576 :field "http3InitialMaxDataBytes" :check check-long
     :set (fn [^Config$Builder b v] (.http3InitialMaxDataBytes b (long v)))
     :doc "connection flow-control window, a hard bound (no autotuning past it); also bounds request-body bytes buffered per connection."}
+   {:key :http3-max-native-bytes :group "HTTP/3 (QUIC via quiche)" :default -1 :field "http3MaxNativeBytes" :check check-long
+    :set (fn [^Config$Builder b v] (.http3MaxNativeBytes b (long v)))
+    :doc "receive credit quiche may hold natively, a connection window per connection: new connections are refused past it; -1 = the `:max-buffered-bytes` limit (at least one window), 0 = unlimited."}
    {:key :http3-initial-max-streams-bidi :group "HTTP/3 (QUIC via quiche)" :default 100 :field "http3InitialMaxStreamsBidi" :check check-int
     :set (fn [^Config$Builder b v] (.http3InitialMaxStreamsBidi b (int v)))
     :doc "concurrent request streams per connection; twice this many live handlers make new requests H3_REQUEST_REJECTED."}
@@ -513,7 +522,7 @@
     :doc "UDP socket send buffer requested (best effort); 0 = OS default."}
    {:key :http3-initial-max-stream-data-bidi-local-bytes :group "HTTP/3 (QUIC via quiche)" :default -1 :field "http3InitialMaxStreamDataBidiLocalBytes" :check check-long
     :set (fn [^Config$Builder b v] (.http3InitialMaxStreamDataBidiLocalBytes b (long v)))
-    :doc "per-stream window, -1 = max(1 MiB, `:http3-initial-max-data-bytes` / `:http3-initial-max-streams-bidi`), at most `:http3-initial-max-data-bytes`."}
+    :doc "per-stream window, -1 = a quarter of `:http3-initial-max-data-bytes` (256 KiB by default), so one unread stream can't stall the connection."}
    {:key :http3-initial-max-stream-data-bidi-remote-bytes :group "HTTP/3 (QUIC via quiche)" :default -1 :field "http3InitialMaxStreamDataBidiRemoteBytes" :check check-long
     :set (fn [^Config$Builder b v] (.http3InitialMaxStreamDataBidiRemoteBytes b (long v)))
     :doc "same, for peer-initiated streams."}
@@ -566,7 +575,7 @@
     :doc "`Server` response header value; nil or empty omits it. A handler-supplied `Server` wins."}
    {:key :server-events :group "Handler and observability" :default nil :check check-server-events
     :set (fn [^Config$Builder b v] (.serverEvents b ^ServerEvents v))
-    :doc "map of fns `{:connection-opened (fn [protocol remote-addr]) :connection-closed (fn [protocol remote-addr nanos]) :request-completed (fn [protocol method status request-bytes response-bytes nanos]) :protocol-error (fn [protocol kind])}`, or a `com.s_exp.enso.api.ServerEvents`. `remote-addr` is formatted as `:remote-addr`. `method` is nil for a head refused before it was parsed. Protocols: \"http/1.1\", \"h2\", \"h2c\", \"h3\"; \"websocket\" for an upgraded connection's open / close; \"tcp\" (connection refused at accept) and \"tls\" (handshake failures) for protocol errors. Called on connection threads; keep them fast; exceptions are logged and ignored. No cost when absent."}])
+    :doc "map of fns `{:connection-opened (fn [protocol remote-addr]) :connection-closed (fn [protocol remote-addr nanos]) :request-completed (fn [protocol method status request-bytes response-bytes nanos]) :protocol-error (fn [protocol kind])}`, or a `com.s_exp.enso.api.ServerEvents`. `remote-addr` is formatted as `:remote-addr`. `method` is nil for a head refused before it was parsed. Protocols: \"http/1.1\", \"h2\", \"h2c\", \"h3\"; \"websocket\" for an upgraded connection's open / close; \"tcp\" (connection refused at accept) and \"tls\" (handshake failures) for protocol errors. Delivered in order from one dedicated thread, never from a server thread; past 8192 queued events (a listener that fell behind) new ones are dropped and counted (`EnsoServer.droppedEvents`, a log warning, a JFR event). Exceptions are logged and ignored. No cost when absent."}])
 
 (def ^:private options-by-key
   (into {} (map (juxt :key identity)) options))

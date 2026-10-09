@@ -35,8 +35,10 @@ import java.util.logging.Logger;
  * {@link #run}) reads frames, decodes header blocks and admits streams;
  * one virtual thread per stream runs the Ring handler ({@link Http2Stream}
  * is its Runnable) and produces the response. There is no writer thread:
- * see {@link Http2Writer} for how output reaches the socket. The framer
- * never blocks on output. It reads ahead into one input buffer and parses
+ * see {@link Http2Writer} for how output reaches the socket. While the
+ * connection is open the framer never blocks on output (at teardown it
+ * waits for the active writer, bounded by the write watchdog). It reads
+ * ahead into one input buffer and parses
  * frames in place, so one socket read serves every frame that arrived;
  * after a quiet second it gives back what the connection grew (buffers,
  * TLS records, closed streams) and waits for the next frame with ~64 bytes.
@@ -91,6 +93,9 @@ public final class Http2Connection implements Runnable, Drainable {
     // Connection receive window, in stream windows: how many streams can
     // hold unread body data before the others stall.
     private static final int CONN_WINDOW_STREAM_MULTIPLE = 4;
+    // Owed connection credit is granted in pieces of at least this much
+    // (one frame), not dribbled out as the budget frees a few bytes.
+    private static final long MIN_CREDIT_GRANT = 16 * 1024;
     // Floor of the decoded header section ceiling (4x :max-header-bytes):
     // above it a block is a connection error rather than a 431.
     private static final long HEADER_LIST_CEILING_MIN = 64 * 1024;
@@ -112,6 +117,7 @@ public final class Http2Connection implements Runnable, Drainable {
     private static final VarHandle STATE;
     private static final VarHandle LIVE_STREAMS;
     private static final VarHandle RETIRED;
+    private static final VarHandle CREDIT_WAITER;
 
     static {
         try {
@@ -119,6 +125,7 @@ public final class Http2Connection implements Runnable, Drainable {
             STATE = l.findVarHandle(Http2Connection.class, "state", int.class);
             LIVE_STREAMS = l.findVarHandle(Http2Connection.class, "liveStreams", int.class);
             RETIRED = l.findVarHandle(Http2Connection.class, "retired", Http2Stream.class);
+            CREDIT_WAITER = l.findVarHandle(Http2Connection.class, "creditWaiter", MemoryBudget.Waiter.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -154,8 +161,12 @@ public final class Http2Connection implements Runnable, Drainable {
     private final AtomicInteger activeHandlers = new AtomicInteger();
     // The framer parked at exit until the handlers are done, or null.
     private volatile Thread awaitingHandlers;
-    // Grants held-back connection credit once the memory budget has room;
-    // allocated on first need.
+    // This connection's share of :max-buffered-bytes: DATA bytes it holds
+    // (buffered, or read and not yet granted again), the connection credit
+    // it reserved before granting, its streamed response rings.
+    private final MemoryBudget.Account account;
+    // Grants owed connection credit once the memory budget has room;
+    // allocated on first need (set through CREDIT_WAITER).
     private volatile MemoryBudget.Waiter creditWaiter;
 
     // Own settings, advertised in the initial SETTINGS.
@@ -205,9 +216,20 @@ public final class Http2Connection implements Runnable, Drainable {
     private int frameStreamId;
 
     // Receive flow control, connection level: the framer charges DATA,
-    // readers credit it back.
+    // readers credit it back. Credit past the RFC's initial window is
+    // reserved from the account before it is granted (reservedCredit, what
+    // of it arriving DATA hasn't used yet); credit that couldn't be paid
+    // for is owed and granted once the budget has room.
     private final AtomicLong connRecvWindow = new AtomicLong(Http2.DEFAULT_INITIAL_WINDOW_SIZE);
     private final AtomicLong connRecvUncredited = new AtomicLong();
+    private final AtomicLong reservedCredit = new AtomicLong();
+    private final AtomicLong owedCredit = new AtomicLong();
+    // The connection window this connection grows to once request body
+    // bytes arrive (framer: grown once).
+    private final long connRecvTarget;
+    private boolean connRecvGrown;
+    // Set at teardown: credit is no longer granted nor paid for.
+    private volatile boolean creditClosed;
 
     // Serialises GOAWAY emission with admitting new streams, so no handler
     // starts on a stream above the last-stream-id we announced.
@@ -221,6 +243,8 @@ public final class Http2Connection implements Runnable, Drainable {
     private int drainPhase;
     private volatile boolean peerGoaway;
     private volatile long idleSinceNanos = System.nanoTime();
+    // :idle-timeout expired and the graceful close was started.
+    private volatile boolean idleClosing;
 
     private final Deadlines deadlines = new Deadlines();
     private final long idleTimeoutNanos;
@@ -228,13 +252,6 @@ public final class Http2Connection implements Runnable, Drainable {
     /**
      * {@code handshakeDeadlineNanos}: end of the {@code :handshake-timeout}
      * budget started at accept (System.nanoTime), or 0 for none.
-     */
-    public Http2Connection(Socket socket, RingHandler handler, EnsoServer server,
-                           long handshakeDeadlineNanos) {
-        this(socket, handler, server, handshakeDeadlineNanos, false);
-    }
-
-    /**
      * {@code prefaceRead}: the 24-octet client preface was already consumed
      * from the socket (cleartext prior knowledge, detected by the listener).
      */
@@ -256,6 +273,9 @@ public final class Http2Connection implements Runnable, Drainable {
         this.headerListSoftLimit = config.maxHeaderBytes;
         this.headerListHardLimit = Math.max(4L * config.maxHeaderBytes, HEADER_LIST_CEILING_MIN);
         this.recvCreditThreshold = Math.max(1, ownInitialWindowSize / 2);
+        this.connRecvTarget = Math.min((long) ownInitialWindowSize * CONN_WINDOW_STREAM_MULTIPLE,
+                                       Http2.MAX_ALLOWED_WINDOW_SIZE);
+        this.account = service.budget.account();
         this.resetTokens = config.http2StreamResetLimit;
         this.idleTimeoutNanos = config.idleTimeoutMillis * 1_000_000L;
         int ring = Math.min(8192, Math.max(64, 2 * ownMaxConcurrentStreams));
@@ -326,7 +346,6 @@ public final class Http2Connection implements Runnable, Drainable {
             }
             readPayload();
             applySettings();
-            writer.settingsAck();
             // Until here reads were also bounded by the accept-time
             // SO_TIMEOUT (the idle timeout), so a silent peer is dropped even
             // with the handshake timeout disabled. From now on streams may
@@ -396,20 +415,30 @@ public final class Http2Connection implements Runnable, Drainable {
         p = putSetting(payload, p, Http2.SETTINGS_INITIAL_WINDOW_SIZE, ownInitialWindowSize);
         p = putSetting(payload, p, Http2.SETTINGS_MAX_FRAME_SIZE, ownMaxFrameSize);
         p = putSetting(payload, p, Http2.SETTINGS_MAX_HEADER_LIST_SIZE, (int) headerListSoftLimit);
-        // Raise the connection receive window to a multiple of the stream
-        // window: credit only comes back as handlers consume their body, so
-        // with equal windows a single handler that doesn't read would stall
-        // every other upload on the connection. The connection window still
-        // bounds the body bytes buffered per connection. RFC 9113 §6.9.2:
-        // SETTINGS_INITIAL_WINDOW_SIZE only applies to streams; the
-        // connection window starts at 65535 and grows by WINDOW_UPDATE.
-        long connTarget = Math.min((long) ownInitialWindowSize * CONN_WINDOW_STREAM_MULTIPLE,
-                                   Http2.MAX_ALLOWED_WINDOW_SIZE);
-        int connGrowth = (int) (connTarget - Http2.DEFAULT_INITIAL_WINDOW_SIZE);
-        if (connGrowth > 0) {
-            connRecvWindow.addAndGet(connGrowth);
+        // The connection window stays at the RFC's 65535 until request body
+        // bytes arrive (growConnectionWindow): credit is paid for from the
+        // memory budget, and a connection serving only GETs needs none.
+        writer.initialSettings(payload, p, 0);
+    }
+
+    /**
+     * Framer, at the first DATA octets the peer sends: raises the
+     * connection receive window, once, to a multiple of the stream window.
+     * Credit only comes back as handlers consume their body, so with equal
+     * windows a single handler that doesn't read would stall every other
+     * upload on the connection. RFC 9113 §6.9.2: SETTINGS_INITIAL_WINDOW_SIZE
+     * only applies to streams; the connection window starts at 65535 and
+     * grows by WINDOW_UPDATE. The growth is owed credit like any other:
+     * granted as far as the budget pays for it.
+     */
+    private void growConnectionWindow() {
+        if (connRecvGrown) return;
+        connRecvGrown = true;
+        long growth = connRecvTarget - Http2.DEFAULT_INITIAL_WINDOW_SIZE;
+        if (growth > 0) {
+            owedCredit.addAndGet(growth);
+            grantOwedCredit();
         }
-        writer.initialSettings(payload, p, connGrowth);
     }
 
     private static int putSetting(byte[] b, int p, int id, int value) {
@@ -613,18 +642,25 @@ public final class Http2Connection implements Runnable, Drainable {
             case Http2.TYPE_SETTINGS -> {
                 readPayload();
                 if ((frameFlags & Http2.FLAG_ACK) != 0) {
+                    // §6.5: the stream check comes first, as for any SETTINGS.
+                    if (frameStreamId != 0) {
+                        throw new Http2.ConnectionError(Http2.ERROR_PROTOCOL_ERROR, "SETTINGS on non-zero stream");
+                    }
                     if (frameLength != 0) {
                         throw new Http2.ConnectionError(
                             Http2.ERROR_FRAME_SIZE_ERROR, "SETTINGS ACK with payload");
                     }
                 } else {
                     applySettings();
-                    writer.settingsAck();
                 }
             }
             case Http2.TYPE_PING -> {
                 readPayload();
-                if (frameLength != 8 || frameStreamId != 0) {
+                // §6.7: PROTOCOL_ERROR off stream 0, FRAME_SIZE_ERROR for a length other than 8.
+                if (frameStreamId != 0) {
+                    throw new Http2.ConnectionError(Http2.ERROR_PROTOCOL_ERROR, "PING on non-zero stream");
+                }
+                if (frameLength != 8) {
                     throw new Http2.ConnectionError(Http2.ERROR_FRAME_SIZE_ERROR, "malformed PING");
                 }
                 if ((frameFlags & Http2.FLAG_ACK) == 0) {
@@ -717,14 +753,22 @@ public final class Http2Connection implements Runnable, Drainable {
                 Http2.ERROR_PROTOCOL_ERROR, "WINDOW_UPDATE on idle stream " + id);
         }
         Http2Stream st = streams.get(id);
+        if (increment == 0) {
+            // §6.9: a stream error on a stream window, whatever the stream's
+            // state: the frame is malformed, not credit in flight. A closed
+            // stream keeps why it closed.
+            if (st != null && !st.isClosed()) {
+                streamError(st, Http2.ERROR_PROTOCOL_ERROR);
+            } else {
+                resetClosedStream(id, Http2.ERROR_PROTOCOL_ERROR);
+            }
+            return;
+        }
         if (st == null || st.isClosed()) {
             // Closed streams may still see credit in flight (§5.1).
             return;
         }
-        if (increment == 0) {
-            // §6.9: a stream error on a stream window.
-            streamError(st, Http2.ERROR_PROTOCOL_ERROR);
-        } else if (!writer.streamWindowUpdate(st, increment)) {
+        if (!writer.streamWindowUpdate(st, increment)) {
             // §6.9.1: overflowing a stream window is a stream error.
             streamError(st, Http2.ERROR_FLOW_CONTROL_ERROR);
         }
@@ -856,9 +900,13 @@ public final class Http2Connection implements Runnable, Drainable {
     }
 
     /**
-     * The encoded block can't decode to less than it holds without padding
-     * tricks (size updates), so blocks over the decoded hard limit end the
-     * connection before they are buffered.
+     * Bounds what a header block makes us buffer before it is decoded: an
+     * encoded block over the decoded hard limit ends the connection.
+     * Blocks usually decode to more than they hold (an indexed field is a
+     * byte, each field counts 32 octets more), but not always (Huffman
+     * codes of up to 30 bits, dynamic table size updates), so a block may
+     * be refused here that would have decoded under the limit: the cap is
+     * on the bytes held.
      */
     private void checkEncodedHeaderSize(long encoded) throws Http2.ConnectionError {
         if (encoded > headerListHardLimit) {
@@ -1085,12 +1133,22 @@ public final class Http2Connection implements Runnable, Drainable {
         if (connRecvWindow.addAndGet(-frameLen) < 0) {
             throw new Http2.ConnectionError(Http2.ERROR_FLOW_CONTROL_ERROR, "peer overran receive window");
         }
+        // And is held by the connection until it leaves (creditConnection):
+        // paid for by credit reserved when it was granted, or charged when
+        // it came within the RFC's initial window.
+        account.charge(frameLen - takeReservedCredit(frameLen));
+        if (frameLen > 0 && !connRecvGrown) {
+            growConnectionWindow();
+        }
+        boolean endStream = (frameFlags & Http2.FLAG_END_STREAM) != 0;
+        if (frameLen > 0 || endStream) {
+            // Empty DATA on closed streams is a flood only while consecutive.
+            closedEmptyDataFrames = 0;
+        }
         Http2Stream st = streams.get(id);
         if (st == null || st.isClosed()) {
             creditConnection(frameLen);
-            if (frameLen > 0 || (frameFlags & Http2.FLAG_END_STREAM) != 0) {
-                closedEmptyDataFrames = 0;
-            } else if (++closedEmptyDataFrames > EMPTY_DATA_FRAME_LIMIT) {
+            if (frameLen == 0 && !endStream && ++closedEmptyDataFrames > EMPTY_DATA_FRAME_LIMIT) {
                 // CVE-2019-9518 on streams that are gone: ignored frames
                 // would otherwise cost a closed-ring lookup each, unbounded.
                 throw new Http2.ConnectionError(Http2.ERROR_ENHANCE_YOUR_CALM, "too many empty DATA frames");
@@ -1118,7 +1176,6 @@ public final class Http2Connection implements Runnable, Drainable {
         if (!body.charge(frameLen)) {
             throw new Http2.ConnectionError(Http2.ERROR_FLOW_CONTROL_ERROR, "peer overran stream window");
         }
-        boolean endStream = (frameFlags & Http2.FLAG_END_STREAM) != 0;
         if (len == 0 && !endStream) {
             // CVE-2019-9518: cap consecutive empty non-final DATA frames.
             if (++st.emptyDataFrames > EMPTY_DATA_FRAME_LIMIT) {
@@ -1136,6 +1193,10 @@ public final class Http2Connection implements Runnable, Drainable {
                 // stream window stays charged: the peer must not overrun it.
                 body.tooLarge();
                 creditConnection(frameLen);
+                if (endStream) {
+                    // The peer is done sending all the same.
+                    endBody(st);
+                }
                 return;
             }
             if (st.declaredContentLength >= 0 && st.receivedBodyBytes > st.declaredContentLength) {
@@ -1166,49 +1227,121 @@ public final class Http2Connection implements Runnable, Drainable {
         }
     }
 
+    /** Framer: what of a DATA frame of {@code n} octets the reserved credit pays for. */
+    private long takeReservedCredit(long n) {
+        while (true) {
+            long r = reservedCredit.get();
+            if (r <= 0) return 0;
+            long take = Math.min(r, n);
+            if (reservedCredit.compareAndSet(r, r - take)) return take;
+        }
+    }
+
     /**
      * {@code n} octets of DATA left the server's hands: returns them to the
-     * connection window, one WINDOW_UPDATE per half stream window. Any
-     * thread; never writes itself.
+     * connection window, one WINDOW_UPDATE per half stream window. The
+     * bytes stay paid for, as the credit granted for them, unless the
+     * connection is throttled (the budget is exhausted, or under pressure
+     * with this connection over its fair share): then only what keeps the
+     * window at the RFC's initial 65535 octets is granted (what any
+     * connection gets unasked, so it always makes progress), the rest is
+     * given back and owed until the budget has room (backpressure, not an
+     * error). Any thread; never writes itself.
      */
     void creditConnection(long n) {
         if (n <= 0) return;
         long u = connRecvUncredited.addAndGet(n);
-        if (u >= recvCreditThreshold) {
-            if (service.budget.exhausted()) {
-                // Over :max-buffered-bytes: the peer gets this credit once
-                // the budget has room again (backpressure, not an error).
-                service.budget.await(creditWaiter());
-                return;
-            }
-            if (connRecvUncredited.compareAndSet(u, 0)) {
-                connRecvWindow.addAndGet(u);
-                writer.windowUpdate(0, (int) u);
-            }
+        if (u < recvCreditThreshold || !connRecvUncredited.compareAndSet(u, 0)) return;
+        if (creditClosed) {
+            account.release(u);
+            return;
+        }
+        long keep = account.throttled()
+            ? Math.max(0, Math.min(u, Http2.DEFAULT_INITIAL_WINDOW_SIZE - connRecvWindow.get()))
+            : u;
+        if (keep > 0) {
+            reservedCredit.addAndGet(keep);
+            connRecvWindow.addAndGet(keep);
+            writer.windowUpdate(0, (int) keep);
+        }
+        if (u > keep) {
+            account.release(u - keep);
+            owedCredit.addAndGet(u - keep);
+            grantOwedCredit();
         }
     }
 
+    /**
+     * Grants owed connection credit as far as the account can reserve it,
+     * in chunks of at least one frame (halving what it asks for until a
+     * reservation succeeds), then waits for the budget for the rest. Any
+     * thread; never writes itself.
+     */
+    private void grantOwedCredit() {
+        while (!creditClosed) {
+            long o = owedCredit.get();
+            if (o <= 0) return;
+            long least = Math.min(o, MIN_CREDIT_GRANT);
+            long n = Math.min(o, Http2.MAX_ALLOWED_WINDOW_SIZE);
+            boolean reserved = account.tryReserve(n);
+            while (!reserved && n > least) {
+                n = Math.max(least, n >> 1);
+                reserved = account.tryReserve(n);
+            }
+            if (reserved) {
+                if (!owedCredit.compareAndSet(o, o - n)) {
+                    account.release(n);
+                    continue;
+                }
+                reservedCredit.addAndGet(n);
+                connRecvWindow.addAndGet(n);
+                writer.windowUpdate(0, (int) n);
+                continue;
+            }
+            // Nothing affordable: told once usage falls below the low-water
+            // mark. Already below it (a budget smaller than a frame), the
+            // owed credit waits for the next bytes this connection gives
+            // back, while the initial window keeps it moving.
+            MemoryBudget.Waiter w = creditWaiter();
+            if (service.budget.await(w) && creditClosed) {
+                // Registered as teardown gave the budget back: releaseBudget
+                // may have looked before it was registered.
+                service.budget.cancel(w);
+            }
+            return;
+        }
+    }
+
+    /** The connection's one budget waiter, created on first need (any thread). */
     private MemoryBudget.Waiter creditWaiter() {
         MemoryBudget.Waiter w = creditWaiter;
         if (w == null) {
-            w = new MemoryBudget.Waiter() {
+            MemoryBudget.Waiter fresh = new MemoryBudget.Waiter() {
                 @Override
                 protected void budgetAvailable() {
-                    grantHeldCredit();
+                    grantOwedCredit();
                 }
             };
-            creditWaiter = w;
+            // One instance, so releaseBudget cancels the one registered.
+            w = CREDIT_WAITER.compareAndSet(this, null, fresh)
+                ? fresh : (MemoryBudget.Waiter) CREDIT_WAITER.getVolatile(this);
         }
         return w;
     }
 
-    /** The memory budget has room again: the held-back connection credit goes out, whatever its size. */
-    private void grantHeldCredit() {
-        long u = connRecvUncredited.getAndSet(0);
-        if (u > 0) {
-            connRecvWindow.addAndGet(u);
-            writer.windowUpdate(0, (int) u);
+    /** Teardown, once no handler runs: credit stops, the waiter leaves the budget, the account is given back. */
+    private void releaseBudget() {
+        creditClosed = true;
+        MemoryBudget.Waiter w = creditWaiter;
+        if (w != null) {
+            service.budget.cancel(w);
         }
+        account.close();
+    }
+
+    /** This connection's share of the memory budget (response rings are charged to it). */
+    MemoryBudget.Account account() {
+        return account;
     }
 
     /** Stream WINDOW_UPDATE for consumed body bytes. Any thread; never writes itself. */
@@ -1288,7 +1421,7 @@ public final class Http2Connection implements Runnable, Drainable {
      * forget.
      */
     void onStreamClosed(Http2Stream s, int reason) {
-        LIVE_STREAMS.getAndAdd(this, -1);
+        boolean last = (int) LIVE_STREAMS.getAndAdd(this, -1) == 1;
         if (reason != Http2Stream.ENDED) {
             // Reset (by either side) or torn down: nobody will read a
             // response; a handler still at work is interrupted.
@@ -1305,6 +1438,15 @@ public final class Http2Connection implements Runnable, Drainable {
             head = (Http2Stream) RETIRED.getVolatile(this);
             s.nextRetired = head;
         } while (!RETIRED.compareAndSet(this, head, s));
+        if (last) {
+            // Idle from the end of the last stream (a response may outlive
+            // its handler, waiting for credit), and after a GOAWAY the
+            // connection may now be done.
+            idleSinceNanos = System.nanoTime();
+            if (draining()) {
+                closeDrained();
+            }
+        }
     }
 
     /** Framer: forget streams closed since the last frame, remembering why. */
@@ -1329,12 +1471,12 @@ public final class Http2Connection implements Runnable, Drainable {
     // ---- SETTINGS -------------------------------------------------------------------
 
     /**
-     * Applies a SETTINGS frame. Values apply in order (§6.5.3), but a frame
-     * repeating a setting costs what one occurrence does: only the last
-     * value of each takes effect, the smallest HEADER_TABLE_SIZE is
-     * signalled first (RFC 7541 §4.2), and the largest INITIAL_WINDOW_SIZE
-     * decides whether a stream window overflowed on the way (§6.9.2), in
-     * one pass over the streams.
+     * Applies a SETTINGS frame and acknowledges it. Values apply in order
+     * (§6.5.3), but a frame repeating a setting costs what one occurrence
+     * does: only the last value of each takes effect, the smallest
+     * HEADER_TABLE_SIZE is signalled first (RFC 7541 §4.2), and the largest
+     * INITIAL_WINDOW_SIZE decides whether a stream window overflowed on the
+     * way (§6.9.2), in one pass over the streams.
      */
     private void applySettings() throws IOException {
         if (frameStreamId != 0) {
@@ -1383,14 +1525,6 @@ public final class Http2Connection implements Runnable, Drainable {
                 }
             }
         }
-        if (tableSize >= 0) {
-            // Cap at the size we encode with: the peer can only shrink
-            // the encoder's table, never force it to grow.
-            if (minTableSize < tableSize) {
-                writer.setPeerHeaderTableSize((int) Math.min(minTableSize, Http2.DEFAULT_HEADER_TABLE_SIZE));
-            }
-            writer.setPeerHeaderTableSize((int) Math.min(tableSize, Http2.DEFAULT_HEADER_TABLE_SIZE));
-        }
         if (window >= 0) {
             long delta = window - peerInitialWindowSize;
             long maxDelta = maxWindow - peerInitialWindowSize;
@@ -1400,9 +1534,12 @@ public final class Http2Connection implements Runnable, Drainable {
                 writer.adjustInitialWindow(delta, maxDelta, streams);
             }
         }
-        if (frameSize >= 0) {
-            writer.setPeerMaxFrameSize((int) frameSize);
-        }
+        // Cap at the size we encode with: the peer can only shrink the
+        // encoder's table, never force it to grow.
+        writer.applySettingsAndAck(
+            (int) Math.min(minTableSize, Http2.DEFAULT_HEADER_TABLE_SIZE),
+            (int) Math.min(tableSize, Http2.DEFAULT_HEADER_TABLE_SIZE),
+            (int) frameSize);
     }
 
     // ---- Handlers ---------------------------------------------------------------------
@@ -1490,7 +1627,7 @@ public final class Http2Connection implements Runnable, Drainable {
     private void onHandlerDone() {
         if (activeHandlers.decrementAndGet() == 0) {
             idleSinceNanos = System.nanoTime();
-            if (peerGoaway || lastGoawayStreamId != Integer.MAX_VALUE) {
+            if (draining()) {
                 closeDrained();
             }
             Thread t = awaitingHandlers;
@@ -1663,16 +1800,24 @@ public final class Http2Connection implements Runnable, Drainable {
         });
     }
 
+    /** A GOAWAY went either way: no new stream will be served. */
+    private boolean draining() {
+        return peerGoaway || lastGoawayStreamId != Integer.MAX_VALUE;
+    }
+
     /**
-     * All handlers are done and no new stream will be served: flush, shut
-     * the output down and let the framer read out what the peer still
-     * sends. Called from handler or writer threads, so the flush runs on
-     * its own thread.
+     * Once no new stream will be served, all handlers are done and every
+     * stream closed (a handed-over response may still wait for credit after
+     * its handler returned; the flow-control stall deadline bounds that):
+     * flush, shut the output down and let the framer read out what the
+     * peer still sends. Called from handler, writer or framer threads, so
+     * the flush runs on its own thread. Any thread holding no writer lock.
      */
     private void closeDrained() {
         goawayLock.lock();
         try {
-            if (activeHandlers.get() != 0 || !advance(CLOSING)) return;
+            if (activeHandlers.get() != 0 || (int) LIVE_STREAMS.getVolatile(this) != 0
+                || !advance(CLOSING)) return;
         } finally {
             goawayLock.unlock();
         }
@@ -1740,6 +1885,7 @@ public final class Http2Connection implements Runnable, Drainable {
             streams.clear();
             pendingHeaderBytes = null;
             awaitHandlers();
+            releaseBudget();
         }
     }
 
@@ -1748,7 +1894,8 @@ public final class Http2Connection implements Runnable, Drainable {
         deadlines.linger = System.nanoTime() + LINGER_NANOS;
         rearm();
         long read = 0;
-        byte[] discard = inBuf;
+        // The input buffer, unless an idle connection gave it back.
+        byte[] discard = inBuf.length >= INPUT_INITIAL ? inBuf : new byte[INPUT_INITIAL];
         try {
             while (read < LINGER_MAX_BYTES) {
                 int n = in.read(discard, 0, discard.length);
@@ -1811,9 +1958,12 @@ public final class Http2Connection implements Runnable, Drainable {
                 if (next != 0) armFlowDeadline(next);
             });
         }
-        if (st == OPEN && idleTimeoutNanos > 0 && activeHandlers.get() == 0
+        if (st == OPEN && idleTimeoutNanos > 0 && !idleClosing && activeHandlers.get() == 0
             && (int) LIVE_STREAMS.getVolatile(this) == 0
             && now - idleSinceNanos >= idleTimeoutNanos) {
+            // Once: until the close moves the state on, the deadline is not
+            // re-armed for it (the expiry would start another close each tick).
+            idleClosing = true;
             Thread.startVirtualThread(this::beginGracefulClose);
         }
         rearm();
@@ -1840,7 +1990,7 @@ public final class Http2Connection implements Runnable, Drainable {
         next = earliest(next, d.drainPing);
         next = earliest(next, d.linger);
         int st = state();
-        if (st == OPEN && idleTimeoutNanos > 0) {
+        if (st == OPEN && idleTimeoutNanos > 0 && !idleClosing) {
             long base = activeHandlers.get() == 0 && (int) LIVE_STREAMS.getVolatile(this) == 0
                 ? idleSinceNanos : now;
             next = earliest(next, base + idleTimeoutNanos);

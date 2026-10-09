@@ -67,6 +67,18 @@ public final class Jfr {
         e.commit();
     }
 
+    /**
+     * {@code count} server events were dropped because the
+     * {@code :server-events} listener fell behind. Committed by the
+     * delivering thread; rare, so no enabled flag.
+     */
+    public static void eventsDropped(long count) {
+        EventsDroppedEvent e = new EventsDroppedEvent();
+        if (!e.isEnabled()) return;
+        e.count = count;
+        e.commit();
+    }
+
     /** A connection's lifetime: begins once its protocol is known, commits at close. */
     @Name("com.s_exp.enso.Connection")
     @Label("Enso Connection")
@@ -113,5 +125,15 @@ public final class Jfr {
         public String protocol;
         @Label("Kind")
         public String kind;
+    }
+
+    /** Server events dropped because the {@code :server-events} listener fell behind. */
+    @Name("com.s_exp.enso.EventsDropped")
+    @Label("Enso Server Events Dropped")
+    @Category({"Enso", "HTTP"})
+    @StackTrace(false)
+    public static final class EventsDroppedEvent extends Event {
+        @Label("Count")
+        public long count;
     }
 }

@@ -76,7 +76,11 @@ public abstract class Exchange extends Timer.Task {
 
     @SuppressWarnings("unused") // accessed through CLAIM
     private volatile int claim;
-    /** The thread running the handler (and producing a streamed body), while it does. */
+    /**
+     * The thread running the handler while it does (on HTTP/2 and HTTP/3
+     * also while it produces a streamed body), for interrupts. HTTP/1.1
+     * sets it only with {@code :handler-timeout}.
+     */
     public volatile Thread handlerThread;
     /** The request being served; set before the handler runs. */
     public Request request;
@@ -213,7 +217,7 @@ public abstract class Exchange extends Timer.Task {
         }
         if (clientStatus != 0) {
             outcome = CLIENT_ERROR;
-            s.protocolError(protocol(), clientErrorKind(clientStatus));
+            s.protocolError(protocol(), clientErrorKind(failure, clientStatus));
             CLIENT_FAILURES.log(protocol() + " request failed with " + clientStatus, failure);
             return HttpStatus.error(clientStatus);
         }
@@ -245,11 +249,27 @@ public abstract class Exchange extends Timer.Task {
         return 0;
     }
 
+    /**
+     * The protocol-error kind for client error {@code status} found in
+     * {@code t}: a body below {@code :min-data-rate-bytes} has its own.
+     */
+    public static String clientErrorKind(Throwable t, int status) {
+        Throwable c = t;
+        for (int i = 0; c != null && i < Causes.MAX_DEPTH; i++) {
+            if (c instanceof RequestBodyTimeoutException e) return e.kind();
+            Throwable next = c.getCause();
+            if (next == c) break;
+            c = next;
+        }
+        return clientErrorKind(status);
+    }
+
     /** The protocol-error kind reported for a client error status. */
     public static String clientErrorKind(int status) {
         return switch (status) {
             case 408 -> "read-timeout";
             case 413 -> "body-too-large";
+            case 414 -> "uri-too-long";
             case 431 -> "header-too-large";
             case 501 -> "not-implemented";
             case 505 -> "unsupported-version";

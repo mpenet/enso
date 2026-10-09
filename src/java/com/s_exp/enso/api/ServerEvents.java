@@ -1,17 +1,24 @@
 // ABOUTME: Optional observability hook: connection lifecycle, completed requests and protocol
-// ABOUTME: errors, called from the connection threads; absent means no cost at all.
+// ABOUTME: errors, delivered in order from one dedicated thread; absent means no cost at all.
 package com.s_exp.enso.api;
 
 import java.net.InetAddress;
 
 /**
- * Server event listener ({@code :server-events}). Every method runs on the
- * thread that owns the connection or request, in line with I/O: keep it
- * short and non-blocking (count, enqueue). Exceptions thrown here are
- * swallowed (and logged, rate-limited): a failing listener never affects a
- * connection. When no listener is configured the drivers skip the calls
- * and the timestamps they would need. Arguments are primitives or objects
- * the request already holds, so a call allocates nothing.
+ * Server event listener ({@code :server-events}). Methods never run on a
+ * server thread: the server queues each event (a bounded queue of
+ * preallocated slots, nothing allocated per event) and one daemon thread,
+ * {@code enso-events}, calls the listener in the order the events
+ * happened. A slow listener therefore delays only later events; once
+ * {@link com.s_exp.enso.core.GuardedEvents#DEFAULT_CAPACITY} events wait,
+ * new ones are dropped and counted
+ * ({@code EnsoServer.droppedEvents()}, a WARNING log record and a JFR
+ * {@code com.s_exp.enso.EventsDropped} event). Exceptions thrown here are
+ * swallowed (and logged, rate-limited). When no listener is configured the
+ * drivers skip the calls and the timestamps they would need, and no thread
+ * is started. Arguments are primitives or objects the request already
+ * holds. Closing the server delivers what is still queued (waiting at
+ * most a second for a stuck listener).
  *
  * <p>Protocol names: "http/1.1", "h2", "h2c" (cleartext HTTP/2,
  * {@code :http2c}), "h3" (the ALPN ids) for connections, requests and
@@ -31,11 +38,12 @@ public interface ServerEvents {
     default void connectionClosed(String protocol, InetAddress remote, long durationNanos) {}
 
     /**
-     * A response finished: {@code method} of the request (null when the
-     * head was rejected before it was known), {@code status} sent (101 for
-     * a WebSocket upgrade), {@code requestBytes} of request body received,
-     * {@code responseBytes} of response body written, {@code durationNanos}
-     * from the complete request head to the end of the response.
+     * A response finished: {@code method} of the request, {@code status}
+     * sent (101 for a WebSocket upgrade), {@code requestBytes} of request
+     * body received, {@code responseBytes} of response body written,
+     * {@code durationNanos} from the complete request head to the end of
+     * the response. A request head refused before it was parsed is only a
+     * {@link #protocolError}.
      */
     default void requestCompleted(String protocol, String method, int status, long requestBytes,
                                   long responseBytes, long durationNanos) {}

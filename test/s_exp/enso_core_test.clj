@@ -1,9 +1,10 @@
 ;; ABOUTME: Unit tests for the protocol-neutral core shared by every driver: timer, write
 ;; ABOUTME: watchdog, response head, request-head validation, limiter, events; incl. allocation bounds.
 (ns s-exp.enso-core-test
-  (:require [clojure.test :refer [are deftest testing is]])
-  (:import (com.s_exp.enso.api Response RingErrorHandler StreamingBody)
-           (com.s_exp.enso.core ConnectionLimiter ConnectionRegistry Drainable Jfr MemoryBudget
+  (:require [clojure.test :refer [are deftest testing is]]
+            [s-exp.enso-test-support :as support])
+  (:import (com.s_exp.enso.api Response RingErrorHandler ServerEvents StreamingBody)
+           (com.s_exp.enso.core ConnectionLimiter ConnectionRegistry DataRate Drainable GuardedEvents Jfr MemoryBudget
                                 MemoryBudget$Waiter RequestHead ResponseHead Timer Timer$Task
                                 WatchedOutputStream WriteWatchdog)
            (java.net InetAddress)
@@ -130,6 +131,36 @@
       (.schedule timer good 30)
       (is (.await latch 2 TimeUnit/SECONDS)))))
 
+(defn- with-throwing-log-handler
+  "Runs `f` while the logger named `logger-name` has a handler that throws
+  on every record, as a broken logging setup would."
+  [^String logger-name f]
+  (let [logger (java.util.logging.Logger/getLogger logger-name)
+        handler (proxy [java.util.logging.Handler] []
+                  (publish [_] (throw (IllegalStateException. "log handler broke")))
+                  (flush [])
+                  (close []))]
+    (.addHandler logger handler)
+    (try
+      (f)
+      (finally
+        (.removeHandler logger handler)))))
+
+(deftest timer-survives-a-failure-while-reporting-a-failed-task
+  ;; Reporting a task's failure goes through logging, which can throw too
+  ;; (a broken handler, out of memory building the record): the timer
+  ;; thread must still fire the next tasks.
+  (with-throwing-log-handler
+    (.getName Timer)
+    (fn []
+      (with-open [timer (Timer.)]
+        (let [latch (CountDownLatch. 1)
+              bad (proxy [Timer$Task] [] (onTimeout [] (throw (RuntimeException. "boom"))))
+              good (counting-task (AtomicInteger.) latch)]
+          (.schedule timer bad 5)
+          (.schedule timer good 60)
+          (is (.await latch 2 TimeUnit/SECONDS) "the timer thread is still firing"))))))
+
 (defn- collected? [^java.lang.ref.WeakReference ref ms]
   (let [deadline (+ (System/currentTimeMillis) ms)]
     (loop []
@@ -220,6 +251,17 @@
     (let [out (WatchedOutputStream. (OutputStream/nullOutputStream) (watchdog timer 60000 (promise)))
           buf (byte-array 512)]
       (is (> 1.0 (bytes-per-op 100000 (fn [] (.write out buf 0 512) (.flush out))))))))
+
+;; ---- Minimum data rate -----------------------------------------------------------
+
+(deftest data-rate-allowance
+  (let [grace 5000000000]
+    (is (= Long/MAX_VALUE (DataRate/allowanceNanos 0 grace 0 1000000000000)) "0 = off")
+    (is (= grace (DataRate/allowanceNanos 240 grace 0 0)) "the grace period first")
+    (is (= (+ grace 1000000000) (DataRate/allowanceNanos 240 grace 240 0)) "a second per rate's worth of bytes")
+    (is (= (- grace 1000000000) (DataRate/allowanceNanos 240 grace 0 1000000000)) "minus the time waited")
+    (is (neg? (DataRate/allowanceNanos 240 grace 240 7000000000)) "below the rate")
+    (is (= Long/MAX_VALUE (DataRate/allowanceNanos 1 grace Long/MAX_VALUE 0)) "no overflow")))
 
 ;; ---- Response head ---------------------------------------------------------
 
@@ -594,6 +636,100 @@
     (.forceCloseAll r)
     (is (= #{[:drain :a] [:drain :b] [:force :a] [:force :b]} (set @log)))))
 
+;; ---- Server events -------------------------------------------------------------
+
+(defn- recording-listener
+  "ServerEvents appending [kind ...] to `seen` (an atom); each call first
+  waits for `gate` (a CountDownLatch) when given."
+  ^ServerEvents [seen ^CountDownLatch gate]
+  (reify ServerEvents
+    (connectionOpened [_ protocol remote]
+      (when gate (.await gate))
+      (swap! seen conj [:opened protocol remote]))
+    (connectionClosed [_ protocol remote nanos]
+      (when gate (.await gate))
+      (swap! seen conj [:closed protocol remote nanos]))
+    (requestCompleted [_ protocol method status req-bytes resp-bytes nanos]
+      (when gate (.await gate))
+      (swap! seen conj [:request protocol method status req-bytes resp-bytes nanos]))
+    (protocolError [_ protocol kind]
+      (when gate (.await gate))
+      (swap! seen conj [:error protocol kind]))))
+
+(deftest events-are-delivered-in-order-off-the-calling-thread
+  (let [seen (atom [])
+        threads (atom #{})
+        listener (reify ServerEvents
+                   (protocolError [_ protocol kind]
+                     (swap! threads conj (Thread/currentThread))
+                     (swap! seen conj [protocol kind])))
+        addr (InetAddress/getLoopbackAddress)]
+    (with-open [ev (GuardedEvents/of listener)]
+      (dotimes [i 1000]
+        (.protocolError ev "h2" (if (even? i) "a" "b")))
+      (is (support/await-condition #(= 1000 (count @seen)) 2000 1))
+      (is (= (vec (take 1000 (cycle [["h2" "a"] ["h2" "b"]]))) @seen) "in call order")
+      (is (not (contains? @threads (Thread/currentThread))) "not on the caller's thread"))
+    (testing "every kind of event carries its arguments"
+      (let [seen (atom [])]
+        (with-open [ev (GuardedEvents/of (recording-listener seen nil))]
+          (.connectionOpened ev "h3" addr)
+          (.requestCompleted ev "h3" "GET" 200 1 2 3)
+          (.protocolError ev "h3" "bad-request")
+          (.connectionClosed ev "h3" addr 4))
+        (is (= [[:opened "h3" addr] [:request "h3" "GET" 200 1 2 3] [:error "h3" "bad-request"]
+                [:closed "h3" addr 4]]
+               @seen)
+            "close delivers what was queued before it")))))
+
+(deftest a-blocked-listener-never-blocks-the-server-and-overflow-is-counted
+  (let [seen (atom [])
+        gate (CountDownLatch. 1)]
+    (with-open [ev (GuardedEvents/of (recording-listener seen gate) 8)]
+      (let [t0 (System/nanoTime)]
+        (dotimes [_ 100]
+          (.protocolError ev "h1" "x"))
+        (is (< (/ (- (System/nanoTime) t0) 1e6) 1000.0) "calls return while the listener is stuck"))
+      (is (<= (- 100 8 1) (.droppedEvents ev) (- 100 8)) "past the queue's capacity events are dropped")
+      (.countDown gate)
+      (is (support/await-condition #(= (- 100 (.droppedEvents ev)) (count @seen)) 2000 1)
+          "the rest is delivered once the listener moves again"))))
+
+(deftest a-throwing-listener-is-contained
+  (let [seen (atom [])
+        listener (reify ServerEvents
+                   (protocolError [_ _ kind]
+                     (when (= kind "boom") (throw (StackOverflowError. "listener broke")))
+                     (swap! seen conj kind)))]
+    (with-open [ev (GuardedEvents/of listener)]
+      (.protocolError ev "h1" "boom")
+      (.protocolError ev "h1" "after")
+      (is (support/await-condition #(= ["after"] @seen) 2000 1)))))
+
+(deftest event-delivery-allocates-nothing
+  (let [n (AtomicInteger.)
+        listener (reify ServerEvents
+                   (requestCompleted [_ _ _ _ _ _ _] (.incrementAndGet n))
+                   (protocolError [_ _ _] (.incrementAndGet n)))
+        addr (InetAddress/getLoopbackAddress)
+        event-threads (fn [] (set (filter #(= "enso-events" (.getName ^Thread %)) (.keySet (Thread/getAllStackTraces)))))
+        ;; Other tests' delivering threads may still be alive: measure
+        ;; only the one this GuardedEvents starts.
+        others (event-threads)]
+    (with-open [ev (GuardedEvents/of listener)]
+      (let [drainer (first (remove others (event-threads)))
+            drained (fn [] (.getThreadAllocatedBytes thread-mx (.threadId ^Thread drainer)))
+            produce (fn [] (.requestCompleted ev "h2" "GET" 200 0 5 100) (.protocolError ev "h2" "x"))]
+        (is (some? drainer))
+        (is (> 1.0 (bytes-per-op 100000 produce)) "on the calling thread")
+        (is (support/await-condition #(zero? (- (* 4 100000) (.get n) (.droppedEvents ev))) 5000 1))
+        (let [before (drained)
+              accounted #(+ (.get n) (.droppedEvents ev))
+              start (accounted)]
+          (dotimes [_ 10000] (produce))
+          (is (support/await-condition #(= (+ start (* 2 10000)) (accounted)) 5000 1))
+          (is (> 1.0 (/ (double (- (drained) before)) 20000)) "on the delivering thread"))))))
+
 ;; ---- JFR -------------------------------------------------------------------
 
 (deftest jfr-flags-follow-recordings
@@ -625,32 +761,95 @@
 
 ;; ---- Memory budget ---------------------------------------------------------
 
-(defn- counting-waiter ^MemoryBudget$Waiter [^AtomicInteger woken]
+(defn- recording-waiter
+  "A waiter counting its wake-ups in `woken` and remembering the thread
+  that ran the last one in `on`."
+  ^MemoryBudget$Waiter [^AtomicInteger woken on]
   (proxy [MemoryBudget$Waiter] []
-    (budgetAvailable [] (.incrementAndGet woken))))
+    (budgetAvailable []
+      (reset! on (Thread/currentThread))
+      (.incrementAndGet woken))))
 
-(deftest memory-budget-reserves-charges-and-wakes-waiters
-  (let [b (MemoryBudget. 100)
-        woken (AtomicInteger.)
-        w (counting-waiter woken)]
+(deftest memory-budget-reserves-and-charges
+  (let [b (MemoryBudget. 100)]
+    (is (= 75 (.lowWater b)) "three quarters of the limit")
     (is (.tryReserve b 60))
     (is (not (.tryReserve b 50)) "refused past the limit")
+    (is (not (.pressured b)))
     (.charge b 50)
     (is (= 110 (.used b)) "a charge may go over")
     (is (.exhausted b))
-    (.await b w)
-    (is (zero? (.get woken)) "waits while exhausted")
-    (.await b w)
-    (.release b 5)
-    (is (zero? (.get woken)) "still over the limit")
-    (.release b 50)
-    (is (= 1 (.get woken)) "woken once, when room came back")
-    (.release b 55)
-    (is (zero? (.used b)))
-    (is (= 1 (.get woken)) "a woken waiter is no longer registered")
-    (.await b w)
-    (is (= 2 (.get woken)) "registering with room wakes at once (no lost wake-up)")))
+    (is (.pressured b))
+    (.release b 110)
+    (is (zero? (.used b)))))
+
+(deftest memory-budget-wakes-waiters-below-the-low-water-mark-off-the-releasing-thread
+  (let [b (MemoryBudget. 100)
+        woken (AtomicInteger.)
+        on (atom nil)
+        w (recording-waiter woken on)]
+    (.charge b 110)
+    (is (true? (.await b w)) "registered: no room")
+    (is (true? (.await b w)) "registering twice keeps one registration")
+    (.release b 20)
+    (Thread/sleep 50)
+    (is (zero? (.get woken)) "90: under the limit, but above the low-water mark")
+    (.release b 20)
+    (is (support/await-condition #(= 1 (.get woken)) 2000 1) "70: below the low-water mark")
+    (is (not= (Thread/currentThread) @on) "never on the releasing thread")
+    (Thread/sleep 50)
+    (is (= 1 (.get woken)) "woken once")
+    (is (false? (.await b w)) "with room: not registered, the caller goes on itself")
+    (.charge b 40)
+    (.release b 100)
+    (Thread/sleep 50)
+    (is (= 1 (.get woken)) "a woken or refused waiter is no longer registered")))
+
+(deftest memory-budget-waiters-can-be-cancelled
+  (let [b (MemoryBudget. 100)
+        gone (AtomicInteger.)
+        kept (AtomicInteger.)
+        w-gone (recording-waiter gone (atom nil))
+        w-kept (recording-waiter kept (atom nil))]
+    (.charge b 100)
+    (is (.await b w-gone))
+    (is (.await b w-kept))
+    (is (true? (.cancel b w-gone)))
+    (is (false? (.cancel b w-gone)) "already gone")
+    (.release b 100)
+    (is (support/await-condition #(= 1 (.get kept)) 2000 1))
+    (is (zero? (.get gone)) "a cancelled waiter is never told")
+    (is (false? (.cancel b w-kept)) "a woken waiter is no longer registered")))
+
+(deftest memory-budget-accounts-share-fairly-under-pressure
+  (let [b (MemoryBudget. 1000)
+        a1 (.account b)
+        a2 (.account b)]
+    (is (.tryReserve a1 700) "below the low-water mark anyone may reserve")
+    (is (.tryReserve a2 100))
+    (is (= 800 (.used b)))
+    (is (= 2 (.activeAccounts b)))
+    (is (not (.tryReserve a1 10)) "pressured: over its fair share (500)")
+    (is (.throttled a1))
+    (is (not (.throttled a2)))
+    (is (.tryReserve a2 100) "under its fair share, up to the limit")
+    (is (not (.tryReserve a2 200)) "never past the limit")
+    (.charge a2 50)
+    (is (= 250 (.held a2)))
+    (.release a1 600)
+    (is (= 100 (.held a1)))
+    (is (not (.throttled a1)))
+    (testing "closing gives back what an account holds and ends it"
+      (.close a2)
+      (is (= 100 (.used b)))
+      (is (= 1 (.activeAccounts b)))
+      (is (not (.tryReserve a2 1)))
+      (.charge a2 10)
+      (.release a2 10)
+      (is (= 100 (.used b)) "a closed account no longer counts"))))
 
 (deftest memory-budget-allocates-nothing
-  (let [b (MemoryBudget. Long/MAX_VALUE)]
-    (is (> 1.0 (bytes-per-op 100000 (fn [] (.tryReserve b 100) (.charge b 10) (.release b 110)))))))
+  (let [b (MemoryBudget. Long/MAX_VALUE)
+        a (.account b)]
+    (is (> 1.0 (bytes-per-op 100000 (fn [] (.tryReserve b 100) (.charge b 10) (.release b 110)))))
+    (is (> 1.0 (bytes-per-op 100000 (fn [] (.tryReserve a 100) (.charge a 10) (.release a 110) (.throttled a)))))))

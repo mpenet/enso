@@ -161,6 +161,34 @@ public final class Request extends AFn
         this.overlay = null;
     }
 
+    /**
+     * As above, for the request after {@code previous} on the same
+     * connection (null for the first): what {@code previous} derived from
+     * the connection is reused rather than derived again (one String or
+     * Long per request each): {@code :remote-addr}, {@code :server-port},
+     * {@code :ssl-client-cert}, and {@code :server-name} when the Host
+     * value is the same String (a driver reusing repeated header values
+     * hands back the same one).
+     */
+    public Request(String method, String uri, String queryString, String protocol,
+            IPersistentMap headers, InputStream body, InetAddress remoteAddress, int serverPort,
+            Keyword scheme, Socket connection, Request previous) {
+        this(method, uri, queryString, protocol, headers, body, remoteAddress, serverPort, scheme, connection);
+        if (previous != null && previous.peer == peer) {
+            // previous may be read on another thread, filling these racily:
+            // each holds one immutable value derived from the connection.
+            remoteAddr = previous.remoteAddr;
+            sslClientCert = previous.sslClientCert;
+            if (previous.serverPort == serverPort) {
+                serverPortValue = previous.serverPortValue;
+            }
+            String name = previous.serverName;
+            if (name != null && previous.headers.valAt("host") == headers.valAt("host")) {
+                serverName = name;
+            }
+        }
+    }
+
     private Request(Request r, IPersistentMap meta, IPersistentMap ext, int hidden) {
         this.method = r.method;
         this.uri = r.uri;

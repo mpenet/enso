@@ -38,15 +38,17 @@ import java.util.concurrent.locks.ReentrantLock;
  *   head (HPACK-encoded at pack time)                   │
  *   borrowed byte[] / ASCII String, or ring (≤ 64 KiB)  │
  *   │                                                   │
- *   └──► ready ring (round robin) ◄── credit ── blocked list (no credit; dribble pool,
- *              │                                 stall deadline → RST CANCEL / GOAWAY)
+ *   └──► ready ring (round robin) ◄── credit ── blocked lists (own window / connection
+ *              │                                 window; dribble pool, stall deadline →
+ *              │                                 RST CANCEL / GOAWAY)
  *              ▼
  *        fill(): inbox → ready, control lane first, then one frame per ready
  *        stream per turn, packed into a 64 KiB batch (four TLS records), under the lock
  *              │
  *              ▼
- *        out.write(batch) by the combining thread, outside the lock (WriteWatchdog),
- *        then exchanges whose END_STREAM went out are finished (events, accounting)
+ *        exchanges whose END_STREAM is in the batch are finished (stream state,
+ *        events, accounting), then out.write(batch) by the combining thread,
+ *        both outside the lock (WriteWatchdog)
  * </pre>
  *
  * <p>Whoever has something to send and finds no writer active becomes the
@@ -55,7 +57,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * queue and return: a response with a fixed body is handed over whole
  * through a lock-free inbox and its handler thread ends without taking
  * the lock or parking; a streamed body blocks only on its own stream's
- * room. The framer never writes:
+ * room. Once the connection is open the framer never writes:
  * when it queues a control frame or grants credit with no writer active it
  * hands the writer role to a parked producer or starts a short-lived
  * flusher thread. A producer whose own output is done hands the role on
@@ -65,13 +67,15 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>Memory is bounded in bytes: a stream holds at most {@link #RING_MAX}
  * copied bytes, and no more than its send window lets go (at least one
  * frame, see {@link #ringLimit}), so a peer that grants little credit or
- * reads slowly pins little. Copied bytes are charged to the server's
- * memory budget until sent or dropped; while it is exhausted a stream
+ * reads slowly pins little. Copied bytes are charged to the
+ * connection's share of the memory budget until sent or dropped; while
+ * the connection is throttled (the budget exhausted, or under pressure
+ * with this connection over its fair share) a stream
  * buffers one frame. A body array that already existed is sent in place.
  * The batch is {@link #BATCH_SIZE}, and the control lane is count-capped. A reset
  * purges the stream's output at once. HPACK encoding happens while
- * packing, so header blocks reach the wire in encoding order and a block
- * is never encoded for a stream that was reset first.
+ * packing, so header blocks reach the wire in encoding order and no block
+ * is encoded for a stream once a reset purged its output.
  *
  * <p>Lock discipline: {@link #lock} guards everything here, including the
  * output fields of {@link Http2Stream} and the HPACK encoder. It is never
@@ -122,7 +126,10 @@ final class Http2Writer {
 
     private static final int SCHED_NONE = 0;
     private static final int SCHED_READY = 1;
+    // Waiting for credit on its own window (a stream WINDOW_UPDATE or
+    // SETTINGS can help), or with its own window open, on the connection's.
     private static final int SCHED_BLOCKED = 2;
+    private static final int SCHED_CONN_BLOCKED = 3;
 
     private static final int UNTIL_ROOM = 0;
     private static final int UNTIL_ENDED = 1;
@@ -138,7 +145,8 @@ final class Http2Writer {
     private final Watchdog watchdog;
     private final long writeTimeoutNanos;
     private final Service service;
-    private final MemoryBudget budget;
+    // The connection's share of the memory budget, charged with ring bytes.
+    private final MemoryBudget.Account budget;
     private final int controlCap;
     private final ReentrantLock lock = new ReentrantLock();
     // Held around every socket write, so interrupts for handler threads
@@ -184,10 +192,11 @@ final class Http2Writer {
     private Http2Stream readyTail;
     private Http2Stream blockedHead;
     private Http2Stream blockedTail;
+    private Http2Stream connBlockedHead;
+    private Http2Stream connBlockedTail;
 
     // Ring bytes sent since the last batch was filled: released from the
-    // memory budget once the lock is let go (a release may run waiters,
-    // which take other locks).
+    // memory budget once the lock is let go, so it stays short.
     private long ringFreed;
 
     private long connSendWindow = Http2.DEFAULT_INITIAL_WINDOW_SIZE;
@@ -206,11 +215,17 @@ final class Http2Writer {
     private long writtenSeq;
     private Http2Stream[] batchStreams = new Http2Stream[LIST_INITIAL];
     private int batchStreamCount;
-    // A header block larger than a batch, written on its own.
+    // The batch, grown past BATCH_SIZE for a header block that can't fit
+    // one (see packStream); written in place of the scratch buffer.
     private byte[] oversized;
     // Set by packStream when the stream at the front of the ready ring
     // needs the next batch: the current one closes.
     private boolean batchFull;
+    // The stream whose header block didn't fit the rest of the last batch
+    // and opens the next one. If it still doesn't fit behind that batch's
+    // control frames, the batch grows for it (oversized): a steady flow of
+    // control frames can't starve it, and control frames still lead.
+    private Http2Stream deferredHeaders;
     // Streams whose END_STREAM is in the current batch, and handed-over
     // exchanges that were aborted: finished by the writer before the batch
     // is written.
@@ -228,7 +243,7 @@ final class Http2Writer {
         this.writeTimeoutNanos = config.writeTimeoutMillis * 1_000_000L;
         this.watchdog = config.writeTimeoutMillis > 0 ? new Watchdog(timer, config.writeTimeoutMillis) : null;
         this.service = conn.service();
-        this.budget = service.budget;
+        this.budget = conn.account();
         // Legitimate control traffic is a few frames per stream; a peer
         // making us queue more (PING / SETTINGS floods, induced resets)
         // without reading is cut off (nghttp2's outbound flood rule).
@@ -275,22 +290,34 @@ final class Http2Writer {
 
     // ---- Settings from the peer (framer) -------------------------------------------
 
-    void setPeerMaxFrameSize(int size) {
+    /**
+     * Applies the peer's SETTINGS values that shape our output and queues
+     * the SETTINGS ACK, in one lock section: control frames lead every
+     * batch and header blocks are encoded while packing, so the dynamic
+     * table size update follows the acknowledgment, in the first header
+     * block after it (RFC 7541 §4.2). -1: the value wasn't in the frame.
+     * {@code minTableSize}: the smallest HEADER_TABLE_SIZE the frame
+     * carried, signalled before the last when smaller.
+     */
+    void applySettingsAndAck(int minTableSize, int tableSize, int maxFrameSize) throws IOException {
+        boolean flusher;
         lock.lock();
         try {
-            peerMaxFrameSize = size;
+            if (tableSize >= 0) {
+                if (minTableSize < tableSize) {
+                    encoder.setMaxTableSize(minTableSize);
+                }
+                encoder.setMaxTableSize(tableSize);
+            }
+            if (maxFrameSize >= 0) {
+                peerMaxFrameSize = maxFrameSize;
+            }
+            appendControl(Http2.TYPE_SETTINGS, Http2.FLAG_ACK, 0, null, 0, 0, 0, true);
+            flusher = kickFromFramer(null);
         } finally {
             lock.unlock();
         }
-    }
-
-    void setPeerHeaderTableSize(int size) {
-        lock.lock();
-        try {
-            encoder.setMaxTableSize(size);
-        } finally {
-            lock.unlock();
-        }
+        if (flusher) startFlusher();
     }
 
     /**
@@ -322,23 +349,33 @@ final class Http2Writer {
         if (flusher) startFlusher();
     }
 
-    /** WINDOW_UPDATE on stream 0. */
+    /**
+     * WINDOW_UPDATE on stream 0. Only streams waiting on the connection
+     * window are rescheduled, and only once it opens (from zero or less)
+     * or reaches a useful size ({@link #MIN_DATA_CHUNK}): a stream whose
+     * own window is shut can't use it, and credit in between is pooled
+     * anyway (dribble), so a peer's tiny updates cost constant work, not a
+     * pass over every waiting stream.
+     */
     void connectionWindowUpdate(int increment) throws Http2.ConnectionError {
         boolean flusher;
         lock.lock();
         try {
+            long before = connSendWindow;
             connSendWindow += increment;
             if (connSendWindow > Http2.MAX_ALLOWED_WINDOW_SIZE) {
                 throw new Http2.ConnectionError(
                     Http2.ERROR_FLOW_CONTROL_ERROR, "connection window overflow");
             }
             Http2Stream preferred = null;
-            Http2Stream s = blockedHead;
-            while (s != null) {
-                Http2Stream next = s.schedNext;
-                schedule(s);
-                if (preferred == null && s.waiter != null) preferred = s;
-                s = next;
+            if (before <= 0 || connSendWindow >= MIN_DATA_CHUNK) {
+                Http2Stream s = connBlockedHead;
+                while (s != null) {
+                    Http2Stream next = s.schedNext;
+                    schedule(s);
+                    if (preferred == null && s.waiter != null) preferred = s;
+                    s = next;
+                }
             }
             flusher = kickFromFramer(preferred);
         } finally {
@@ -393,16 +430,8 @@ final class Http2Writer {
         drain(null);
     }
 
-    void settings(byte[] payload, int len) throws IOException {
-        control(Http2.TYPE_SETTINGS, 0, 0, payload, 0, len, false, false);
-    }
-
-    void settingsAck() throws IOException {
-        control(Http2.TYPE_SETTINGS, Http2.FLAG_ACK, 0, null, 0, 0, true, false);
-    }
-
     void ping(byte[] payload, int off, boolean ack) throws IOException {
-        control(Http2.TYPE_PING, ack ? Http2.FLAG_ACK : 0, 0, payload, off, 8, ack, false);
+        control(Http2.TYPE_PING, ack ? Http2.FLAG_ACK : 0, 0, payload, off, 8, 0, ack, false);
     }
 
     /** WINDOW_UPDATE from us; never fails (credit is bounded by the windows). */
@@ -410,17 +439,12 @@ final class Http2Writer {
         boolean flusher;
         lock.lock();
         try {
-            int p = reserveControl(4);
-            int base = p;
-            p = frameHeader(control, p, 4, Http2.TYPE_WINDOW_UPDATE, 0, streamId);
             // RFC 9113 §6.9: reserved (high) bit of the increment must be 0.
-            control[p] = (byte) ((increment >>> 24) & 0x7F);
-            control[p + 1] = (byte) (increment >>> 16);
-            control[p + 2] = (byte) (increment >>> 8);
-            control[p + 3] = (byte) increment;
-            controlLen = base + Http2.FRAME_HEADER_SIZE + 4;
-            controlFrames++;
+            appendControl(Http2.TYPE_WINDOW_UPDATE, 0, streamId, null, 0, 4, increment & 0x7FFFFFFF, false);
             flusher = kickFromFramer(null);
+        } catch (Http2.ConnectionError impossible) {
+            // Only induced frames are capped.
+            throw new IllegalStateException(impossible);
         } finally {
             lock.unlock();
         }
@@ -433,8 +457,7 @@ final class Http2Writer {
      * the writer (it is a producer that owns its response).
      */
     void rstStream(int streamId, int code, boolean induced, boolean mayWrite) throws IOException {
-        byte[] payload = {(byte) (code >>> 24), (byte) (code >>> 16), (byte) (code >>> 8), (byte) code};
-        control(Http2.TYPE_RST_STREAM, 0, streamId, payload, 0, 4, induced, mayWrite);
+        control(Http2.TYPE_RST_STREAM, 0, streamId, null, 0, 4, code, induced, mayWrite);
     }
 
     void goaway(int lastStreamId, int errorCode, String debugData) {
@@ -478,24 +501,18 @@ final class Http2Writer {
         }
     }
 
-    private void control(int type, int flags, int streamId, byte[] payload, int off, int len,
+    /**
+     * Queues a control frame whose payload is {@code payload[off, off+len)},
+     * or, when {@code payload} is null and {@code len} is 4, the 32-bit
+     * {@code word} (no array per frame).
+     */
+    private void control(int type, int flags, int streamId, byte[] payload, int off, int len, int word,
                          boolean induced, boolean mayWrite) throws IOException {
         boolean write = false;
         boolean flusher = false;
         lock.lock();
         try {
-            if (induced && controlFrames >= controlCap) {
-                throw new Http2.ConnectionError(
-                    Http2.ERROR_ENHANCE_YOUR_CALM, "peer is not reading its control frames");
-            }
-            int p = reserveControl(len);
-            int base = p;
-            p = frameHeader(control, p, len, type, flags, streamId);
-            if (len > 0) {
-                System.arraycopy(payload, off, control, p, len);
-            }
-            controlLen = base + Http2.FRAME_HEADER_SIZE + len;
-            controlFrames++;
+            appendControl(type, flags, streamId, payload, off, len, word, induced);
             if (mayWrite && !failed && tryWrite()) {
                 write = true;
             } else {
@@ -509,6 +526,32 @@ final class Http2Writer {
         } else if (flusher) {
             startFlusher();
         }
+    }
+
+    /**
+     * Lock held: appends one control frame to the lane (payload as for
+     * {@link #control}). {@code induced}: caused by the peer's frames, so a
+     * lane already holding {@link #controlCap} frames is a connection error.
+     */
+    private void appendControl(int type, int flags, int streamId, byte[] payload, int off, int len, int word,
+                               boolean induced) throws Http2.ConnectionError {
+        if (induced && controlFrames >= controlCap) {
+            throw new Http2.ConnectionError(
+                Http2.ERROR_ENHANCE_YOUR_CALM, "peer is not reading its control frames");
+        }
+        int p = reserveControl(len);
+        int base = p;
+        p = frameHeader(control, p, len, type, flags, streamId);
+        if (payload != null) {
+            System.arraycopy(payload, off, control, p, len);
+        } else if (len == 4) {
+            control[p] = (byte) (word >>> 24);
+            control[p + 1] = (byte) (word >>> 16);
+            control[p + 2] = (byte) (word >>> 8);
+            control[p + 3] = (byte) word;
+        }
+        controlLen = base + Http2.FRAME_HEADER_SIZE + len;
+        controlFrames++;
     }
 
     /** Room for one control frame with a {@code payloadLen} payload; returns where it starts. */
@@ -541,7 +584,10 @@ final class Http2Writer {
      * The writer owns the exchange from here: it releases the head once
      * encoded and finishes the exchange ({@link Http2Connection#exchangeFinished})
      * once END_STREAM is out or the stream is reset. No lock, no wait: the
-     * calling handler thread writes only if no one else is writing.
+     * calling handler thread writes only if no one else is writing. The
+     * fields written here are published by the inbox and only touched by
+     * the writer once it took the exchange ({@link #takeInbox}); a reset
+     * meanwhile leaves them alone ({@link #purge}).
      */
     void handOver(Http2Stream s, ResponseHead head, byte[] bytes, String text, int len) {
         s.head = head;
@@ -550,7 +596,6 @@ final class Http2Writer {
         s.srcPos = 0;
         s.srcEnd = len;
         s.endQueued = true;
-        s.detached = true;
         Http2Stream top;
         do {
             top = (Http2Stream) INBOX.getVolatile(this);
@@ -576,6 +621,7 @@ final class Http2Writer {
         for (s = reversed; s != null; ) {
             Http2Stream next = s.nextInbox;
             s.nextInbox = null;
+            s.detached = true;
             if (s.outputClosed || failed) {
                 // Reset before the writer saw it.
                 abortDetached(s);
@@ -703,11 +749,26 @@ final class Http2Writer {
                 if (s.ringCount < limit) break;
                 awaitLocked(s, UNTIL_ROOM);
             }
-            ensureRing(s, Math.min(limit, s.ringCount + DATA_FRAME_MAX));
+            // What the ring holds after this read at most (within the
+            // limit): what is left of a body of known length at once, rather
+            // than growing through every size; a frame's worth more for one
+            // of unknown length (its producer passes a huge max) or past
+            // 2 GiB. Not whatever a larger pooled array offers: each read is
+            // a step the limit is checked between (it shrinks to a frame
+            // while the connection is throttled).
+            long upTo = max > Integer.MAX_VALUE ? DATA_FRAME_MAX : max;
+            int target = (int) Math.min(limit, s.ringCount + upTo);
+            if (s.ring == null && max < RING_INITIAL) {
+                // What is left of the body is known and small: a ring of its size.
+                s.ring = new byte[(int) max];
+                s.ringHead = 0;
+            } else {
+                ensureRing(s, target);
+            }
             ring = s.ring;
             pos = (s.ringHead + s.ringCount) % ring.length;
-            // Contiguous free space from the tail, within the limit.
-            room = (int) Math.min(max, Math.min(Math.min(limit, ring.length) - s.ringCount, ring.length - pos));
+            // Contiguous free space from the tail, up to the target.
+            room = (int) Math.min(max, Math.min(target - s.ringCount, ring.length - pos));
             s.filling = true;
         } finally {
             lock.unlock();
@@ -767,10 +828,10 @@ final class Http2Writer {
     /**
      * Most bytes {@code s} may hold copied: what its send window lets go,
      * at least one frame and at most {@link #RING_MAX}; one frame while the
-     * memory budget is exhausted. Lock held.
+     * connection is throttled by the memory budget. Lock held.
      */
     private int ringLimit(Http2Stream s) {
-        if (budget.exhausted()) return DATA_FRAME_MAX;
+        if (budget.throttled()) return DATA_FRAME_MAX;
         return (int) Math.max(DATA_FRAME_MAX, Math.min(RING_MAX, s.sendWindow));
     }
 
@@ -779,7 +840,13 @@ final class Http2Writer {
         if (ring != null && ring.length >= need) return;
         int cap = ring == null ? RING_INITIAL : ring.length;
         while (cap < need) cap <<= 1;
-        byte[] bigger = new byte[Math.min(cap, RING_MAX)];
+        // A ring past its first size tends to reach the largest: a pooled
+        // one of that size, if any, saves the copies through every size in
+        // between and the allocation.
+        byte[] bigger = cap > RING_INITIAL ? take(RING_POOL) : null;
+        if (bigger == null) {
+            bigger = new byte[Math.min(cap, RING_MAX)];
+        }
         if (s.ringCount > 0) {
             int first = Math.min(s.ringCount, ring.length - s.ringHead);
             System.arraycopy(ring, s.ringHead, bigger, 0, first);
@@ -817,33 +884,39 @@ final class Http2Writer {
 
     /**
      * The stream is closed: drop its pending output and fail its producer,
-     * or finish its handed-over exchange as aborted. Any thread.
+     * or finish its handed-over exchange as aborted. An exchange still in
+     * the inbox is left to {@link #takeInbox}, which aborts it: its fields
+     * may still be being written by the handler handing it over. A
+     * producer's head is its own (it releases it on failing). Any thread.
      */
     void purge(Http2Stream s) {
-        boolean finish;
+        boolean finish = false;
         int dropped;
         lock.lock();
         try {
             s.outputClosed = true;
             unschedule(s);
-            s.srcBytes = null;
-            s.srcText = null;
-            s.srcPos = 0;
-            s.srcEnd = 0;
             dropped = s.ringCount;
+            if (!s.filling) {
+                // Else its producer is reading into it outside the lock.
+                recycleRing(s.ring);
+            }
             s.ring = null;
             s.ringCount = 0;
             Thread t = s.waiter;
             if (t != null) {
                 LockSupport.unpark(t);
             }
-            finish = s.detached && !s.finished;
-            if (finish) {
-                s.finished = true;
-                releaseHead(s);
-            } else if (!s.detached) {
-                // The producer still holds the head and releases it.
-                s.head = null;
+            if (s.detached) {
+                s.srcBytes = null;
+                s.srcText = null;
+                s.srcPos = 0;
+                s.srcEnd = 0;
+                if (!s.finished) {
+                    finish = true;
+                    s.finished = true;
+                    releaseHead(s);
+                }
             }
         } finally {
             lock.unlock();
@@ -965,7 +1038,9 @@ final class Http2Writer {
     /**
      * Writes batches until there is nothing sendable left. The caller
      * holds the writer role ({@link #tryWrite}). {@code own}: the stream
-     * the calling producer works for, null for a flusher.
+     * the calling producer works for, null for a flusher. Whatever it
+     * throws fails the connection ({@link #fail}), so the role can't be
+     * left taken with nobody writing.
      */
     private void drain(Http2Stream own) {
         ByteBuffer scratchBuf = borrowScratch();
@@ -983,6 +1058,8 @@ final class Http2Writer {
                 lock.lock();
                 try {
                     if (failed) {
+                        // Exchanges handed over since: aborted.
+                        takeInbox();
                         releaseWriting();
                         wakeIdleWaiter();
                         n = -1;
@@ -1044,12 +1121,15 @@ final class Http2Writer {
                         lock.unlock();
                     }
                 }
-                // Handed over after the last batch was filled: take it on.
-                if (n == 0 && INBOX.getVolatile(this) != null && tryWrite()) {
+                // Handed over after the last batch was filled (or after the
+                // connection failed): take it on.
+                if (n <= 0 && INBOX.getVolatile(this) != null && tryWrite()) {
                     continue;
                 }
                 return;
             }
+        } catch (Throwable t) {
+            fail(t);
         } finally {
             releaseScratch(scratchBuf);
             if (net != null) {
@@ -1074,11 +1154,19 @@ final class Http2Writer {
         }
     }
 
-    /** Outside the lock: finishes the exchanges in {@code list[0, n)} and clears it. */
+    /**
+     * Outside the lock: finishes the exchanges in {@code list[0, n)} and
+     * clears it. A stream whose END_STREAM is packed moves on in its state
+     * machine here rather than while packing: closing it may close the
+     * connection, which takes locks the writer's must not be held under.
+     */
     private void finish(Http2Stream[] list, int n) {
         for (int i = 0; i < n; i++) {
             Http2Stream s = list[i];
             list[i] = null;
+            if (s.endSent) {
+                s.sendEnd();
+            }
             conn.exchangeFinished(s, s.endSent);
         }
     }
@@ -1116,6 +1204,7 @@ final class Http2Writer {
     private boolean passOn() {
         Thread t = findWaiter(readyHead);
         if (t == null) t = findWaiter(blockedHead);
+        if (t == null) t = findWaiter(connBlockedHead);
         if (t != null) {
             handoff = t;
             LockSupport.unpark(t);
@@ -1136,8 +1225,10 @@ final class Http2Writer {
         // A pending interrupt would close the channel under the write
         // (InterruptibleChannel); it is restored once the batch is out.
         // Interrupts sent meanwhile wait for the write too (interrupt).
-        boolean interrupted = Thread.interrupted();
+        // The lock first: one delivered (by interrupt) before it is taken
+        // is pending and cleared here; none is delivered after.
         ioLock.lock();
+        boolean interrupted = Thread.interrupted();
         try {
             if (watchdog != null) watchdog.enter();
             try {
@@ -1240,6 +1331,7 @@ final class Http2Writer {
             controlFrames = 0;
             wakeAll(readyHead);
             wakeAll(blockedHead);
+            wakeAll(connBlockedHead);
             for (int i = 0; i < batchStreamCount; i++) {
                 wakeAll(batchStreams[i]);
             }
@@ -1265,25 +1357,29 @@ final class Http2Writer {
     /**
      * Connection teardown: waits for the active writer, writes what can
      * still be sent (the control lane first: a final GOAWAY), then stops
-     * all writing. A stalled socket is cut by the write watchdog; without
-     * one, waiting for another writer is bounded by
-     * {@link #SHUTDOWN_WAIT_NANOS} and the socket is closed under it.
-     * Several threads may call it; all return once writing has stopped.
+     * all writing. Waiting for another writer is bounded by twice the
+     * write timeout (a stalled socket write is cut by the write watchdog
+     * within that), or {@link #SHUTDOWN_WAIT_NANOS} without one: past it
+     * the socket is closed and nothing more is written. Several threads
+     * may call it; all return once writing has stopped.
      */
     void shutdown() {
         long deadline = System.nanoTime()
             + (writeTimeoutNanos > 0 ? 2 * writeTimeoutNanos : SHUTDOWN_WAIT_NANOS);
+        boolean write = false;
+        boolean stuck = false;
         lock.lock();
         try {
-            while (!failed && !tryWrite()) {
+            while (!failed) {
+                if (tryWrite()) {
+                    write = true;
+                    break;
+                }
                 if (System.nanoTime() - deadline >= 0) {
-                    lock.unlock();
-                    try {
-                        conn.onWriteFailure(new IOException("HTTP/2 writer did not finish"));
-                    } finally {
-                        lock.lock();
-                    }
-                    deadline = Long.MAX_VALUE;
+                    // The writer never finished: whatever it does now fails.
+                    failed = true;
+                    stuck = true;
+                    break;
                 }
                 idleWaiter = Thread.currentThread();
                 lock.unlock();
@@ -1294,11 +1390,15 @@ final class Http2Writer {
                     idleWaiter = null;
                 }
             }
-            if (failed) return;
         } finally {
             lock.unlock();
         }
-        drain(null);
+        if (stuck) {
+            conn.onWriteFailure(new IOException("HTTP/2 writer did not finish"));
+        }
+        if (write) {
+            drain(null);
+        }
         lock.lock();
         try {
             failed = true;
@@ -1311,8 +1411,12 @@ final class Http2Writer {
             for (Http2Stream s = blockedHead; s != null; s = s.schedNext) {
                 if (s.detached) abortDetached(s);
             }
+            for (Http2Stream s = connBlockedHead; s != null; s = s.schedNext) {
+                if (s.detached) abortDetached(s);
+            }
             wakeAll(readyHead);
             wakeAll(blockedHead);
+            wakeAll(connBlockedHead);
         } finally {
             lock.unlock();
         }
@@ -1332,7 +1436,7 @@ final class Http2Writer {
             unschedule(s);
             p = packStream(s, buf, p);
             if (oversized != null) {
-                // An oversized header block is this batch on its own.
+                // The batch grew for a header block: it ends with it.
                 return p;
             }
             if (batchFull) {
@@ -1368,8 +1472,9 @@ final class Http2Writer {
      * block if not sent yet, then at most one DATA frame. Returns the
      * position after what was packed. When s needs room the batch no
      * longer has, s is requeued at the front and {@link #batchFull} set;
-     * a header block larger than a batch is packed into {@link #oversized}
-     * instead and its length returned.
+     * a header block that can't fit a batch (or, the second time, what is
+     * left of one behind its control frames) is packed with the batch so
+     * far into {@link #oversized} instead and that length returned.
      */
     private int packStream(Http2Stream s, byte[] buf, int p) {
         if (s.outputClosed) {
@@ -1387,12 +1492,17 @@ final class Http2Writer {
             int frames = bound / peerMaxFrameSize + 1;
             int need = bound + frames * Http2.FRAME_HEADER_SIZE;
             if (need > buf.length - p) {
-                if (p > 0) {
+                if (p > 0 && deferredHeaders != s) {
+                    // It opens the next batch instead.
+                    deferredHeaders = s;
                     return full(s, p);
                 }
-                // A block larger than a batch goes out alone.
-                byte[] big = new byte[need];
-                int n = packHeaders(s, big, 0);
+                // Larger than a batch, or than what one has left behind its
+                // control frames even when it opens with this block: the
+                // batch grows for it.
+                byte[] big = new byte[p + need];
+                System.arraycopy(buf, 0, big, 0, p);
+                int n = packHeaders(s, big, p);
                 oversized = big;
                 if (s.pendingBytes() > 0 || (s.endQueued && !s.endSent)) {
                     schedule(s);
@@ -1500,6 +1610,9 @@ final class Http2Writer {
             flags = 0;
         } while (off < len);
         s.headersSent = true;
+        if (deferredHeaders == s) {
+            deferredHeaders = null;
+        }
         if (s.detached) {
             releaseHead(s);
         }
@@ -1582,17 +1695,20 @@ final class Http2Writer {
         return p;
     }
 
+    /** END_STREAM is packed; the stream's state moves on in {@link #finish}, before the batch leaves. */
     private void ended(Http2Stream s) {
         s.endSent = true;
         s.stalledSince = 0;
-        // END_STREAM goes with the last byte: the ring is empty for good.
+        // END_STREAM goes with the last byte: the ring is empty for good,
+        // its bytes copied into the batch, so it can serve another stream
+        // before this batch is even written.
+        recycleRing(s.ring);
         s.ring = null;
         s.ringHead = 0;
         if (!s.finished) {
             s.finished = true;
             addFinished(s);
         }
-        s.sendEnd();
     }
 
     private void inBatch(Http2Stream s) {
@@ -1623,24 +1739,34 @@ final class Http2Writer {
                 System.arraycopy(ring, 0, smaller, first, s.ringCount - first);
                 s.ring = smaller;
                 s.ringHead = 0;
+                recycleRing(ring);
             }
         }
         unschedule(s);
-        s.sched = SCHED_BLOCKED;
-        s.schedPrev = blockedTail;
+        int pending = s.pendingBytes();
+        // Waiting on its own window, or (that one open enough) on the connection's.
+        boolean own = s.sendWindow < Math.min(pending, MIN_DATA_CHUNK);
         s.schedNext = null;
-        if (blockedTail == null) blockedHead = s; else blockedTail.schedNext = s;
-        blockedTail = s;
+        if (own) {
+            s.sched = SCHED_BLOCKED;
+            s.schedPrev = blockedTail;
+            if (blockedTail == null) blockedHead = s; else blockedTail.schedNext = s;
+            blockedTail = s;
+        } else {
+            s.sched = SCHED_CONN_BLOCKED;
+            s.schedPrev = connBlockedTail;
+            if (connBlockedTail == null) connBlockedHead = s; else connBlockedTail.schedNext = s;
+            connBlockedTail = s;
+        }
         long now = System.nanoTime();
         if (s.blockedAt == 0) s.blockedAt = now;
         long deadline = Long.MAX_VALUE;
-        int pending = s.pendingBytes();
         long credit = Math.min(s.sendWindow, connSendWindow);
         if (credit > 0) {
             deadline = s.blockedAt + DRIBBLE_NANOS;
         }
         if (writeTimeoutNanos > 0) {
-            if (s.sendWindow < Math.min(pending, MIN_DATA_CHUNK)) {
+            if (own) {
                 if (s.stalledSince == 0) {
                     s.stalledSince = now;
                     s.sentSinceStall = 0;
@@ -1674,9 +1800,15 @@ final class Http2Writer {
         lock.lock();
         try {
             boolean connBlocking = false;
-            Http2Stream s = blockedHead;
+            // Both blocked lists, the streams waiting on their own window first.
+            boolean connList = blockedHead == null;
+            Http2Stream s = connList ? connBlockedHead : blockedHead;
             while (s != null) {
                 Http2Stream nextBlocked = s.schedNext;
+                if (nextBlocked == null && !connList) {
+                    connList = true;
+                    nextBlocked = connBlockedHead;
+                }
                 int pending = s.pendingBytes();
                 long credit = Math.min(s.sendWindow, connSendWindow);
                 if (credit > 0 && !s.dribbleDue) {
@@ -1754,16 +1886,19 @@ final class Http2Writer {
         if (s.sched == SCHED_READY) {
             if (prev == null) readyHead = next; else prev.schedNext = next;
             if (next == null) readyTail = prev; else next.schedPrev = prev;
-        } else {
+        } else if (s.sched == SCHED_BLOCKED) {
             if (prev == null) blockedHead = next; else prev.schedNext = next;
             if (next == null) blockedTail = prev; else next.schedPrev = prev;
+        } else {
+            if (prev == null) connBlockedHead = next; else prev.schedNext = next;
+            if (next == null) connBlockedTail = prev; else next.schedPrev = prev;
         }
         s.schedPrev = null;
         s.schedNext = null;
         s.sched = SCHED_NONE;
     }
 
-    // ---- Batch buffers ---------------------------------------------------------------
+    // ---- Batch buffers and rings -----------------------------------------------------
 
     // Batch buffers (plain and encrypted) are only needed while a
     // connection writes: an idle connection holds none. Shared
@@ -1772,46 +1907,58 @@ final class Http2Writer {
     // Batches are kept with their ByteBuffer wrapper, so writing one wraps nothing.
     private static final AtomicReferenceArray<ByteBuffer> POOL = new AtomicReferenceArray<>(POOL_SLOTS);
     private static final AtomicReferenceArray<ByteBuffer> NET_POOL = new AtomicReferenceArray<>(POOL_SLOTS);
+    // Streamed-body rings of the largest size, given back once their last
+    // bytes are packed (or dropped): a ring is only held while its stream
+    // has bytes to send. Fewer kept than batches: a ring is held longer.
+    private static final int RING_POOL_SLOTS = 32;
+    private static final AtomicReferenceArray<byte[]> RING_POOL = new AtomicReferenceArray<>(RING_POOL_SLOTS);
 
     private static ByteBuffer borrowNet() {
-        int start = (int) Thread.currentThread().threadId();
-        for (int i = 0; i < POOL_SLOTS; i++) {
-            int idx = (start + i) & (POOL_SLOTS - 1);
-            ByteBuffer b = NET_POOL.get(idx);
-            if (b != null && NET_POOL.compareAndSet(idx, b, null)) {
-                return b;
-            }
-        }
-        return ByteBuffer.allocate(NET_BUFFER_SIZE);
+        ByteBuffer b = take(NET_POOL);
+        return b != null ? b : ByteBuffer.allocate(NET_BUFFER_SIZE);
     }
 
     private static void releaseNet(ByteBuffer b) {
-        int start = (int) Thread.currentThread().threadId();
-        for (int i = 0; i < POOL_SLOTS; i++) {
-            int idx = (start + i) & (POOL_SLOTS - 1);
-            if (NET_POOL.get(idx) == null && NET_POOL.compareAndSet(idx, null, b)) {
-                return;
-            }
-        }
+        give(NET_POOL, b);
     }
 
     private static ByteBuffer borrowScratch() {
-        int start = (int) Thread.currentThread().threadId();
-        for (int i = 0; i < POOL_SLOTS; i++) {
-            int idx = (start + i) & (POOL_SLOTS - 1);
-            ByteBuffer b = POOL.get(idx);
-            if (b != null && POOL.compareAndSet(idx, b, null)) {
-                return b;
-            }
-        }
-        return ByteBuffer.allocate(BATCH_SIZE);
+        ByteBuffer b = take(POOL);
+        return b != null ? b : ByteBuffer.allocate(BATCH_SIZE);
     }
 
     private static void releaseScratch(ByteBuffer b) {
+        give(POOL, b);
+    }
+
+    /** Keeps {@code ring} for another stream if it has the largest size. */
+    private static void recycleRing(byte[] ring) {
+        if (ring != null && ring.length == RING_MAX) {
+            give(RING_POOL, ring);
+        }
+    }
+
+    /** A pooled item, or null: probes every slot from one spread by the calling thread. */
+    private static <T> T take(AtomicReferenceArray<T> pool) {
+        int n = pool.length();
         int start = (int) Thread.currentThread().threadId();
-        for (int i = 0; i < POOL_SLOTS; i++) {
-            int idx = (start + i) & (POOL_SLOTS - 1);
-            if (POOL.get(idx) == null && POOL.compareAndSet(idx, null, b)) {
+        for (int i = 0; i < n; i++) {
+            int idx = (start + i) & (n - 1);
+            T b = pool.get(idx);
+            if (b != null && pool.compareAndSet(idx, b, null)) {
+                return b;
+            }
+        }
+        return null;
+    }
+
+    /** Pools {@code b} in the first free slot, or drops it when there is none. */
+    private static <T> void give(AtomicReferenceArray<T> pool, T b) {
+        int n = pool.length();
+        int start = (int) Thread.currentThread().threadId();
+        for (int i = 0; i < n; i++) {
+            int idx = (start + i) & (n - 1);
+            if (pool.get(idx) == null && pool.compareAndSet(idx, null, b)) {
                 return;
             }
         }

@@ -315,6 +315,12 @@ final class Http2Exchange implements Hpack.FieldSink {
                 writer.handOver(s, rh, bytes, text, len);
                 return true;
             }
+            byte[] small = rh.bodyAllowed() && kind == ResponseHead.BODY_STREAM ? smallInMemoryBody(rh) : null;
+            if (small != null) {
+                handedOver = true;
+                writer.handOver(s, rh, small, null, small.length);
+                return true;
+            }
             writeStreamed(writer, s, rh);
             if (!s.remoteEnded()) {
                 // Complete response sent while the request body is still
@@ -337,6 +343,26 @@ final class Http2Exchange implements Hpack.FieldSink {
             }
         }
         return false;
+    }
+
+    /**
+     * The bytes of a stream body that is a {@link ByteArrayInputStream}
+     * (Ring's string-input-stream) holding the whole body, up to one frame,
+     * read out and the stream closed; null for any other body. Handed over
+     * like a byte array, it costs that array and nothing else: no ring, no
+     * handler thread waiting for its END_STREAM.
+     */
+    private static byte[] smallInMemoryBody(ResponseHead rh) throws IOException {
+        InputStream in = rh.stream();
+        if (in.getClass() != ByteArrayInputStream.class) return null;
+        long declared = rh.declaredLength();
+        int available = in.available();
+        long len = declared >= 0 ? declared : available;
+        if (len > available || len > Http2Writer.DATA_FRAME_MAX) return null;
+        byte[] body = in.readNBytes((int) len);
+        rh.disownBody();
+        in.close();
+        return body;
     }
 
     /** File, stream and streaming bodies, produced on the handler thread. */

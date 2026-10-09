@@ -34,8 +34,9 @@ import javax.net.ssl.SSLSession;
  * directions, so a framer vthread can call {@link RecordInputStream#read}
  * concurrently with a writer vthread calling
  * {@link RecordOutputStream#write}. Handshake / close_notify go through
- * {@link #handshakeLock}, which both directions acquire when they see
- * {@code NEED_TASK} or a pending renegotiation status.
+ * {@link #handshakeLock}. The read path never writes: a TLS 1.3 KeyUpdate
+ * that asks for ours leaves it queued in the engine for the next record
+ * written (see RecordInputStream#postHandshake).
  */
 public final class TlsSocket implements AutoCloseable {
 
@@ -87,6 +88,9 @@ public final class TlsSocket implements AutoCloseable {
     // whole handshake, so a peer dripping bytes under SO_TIMEOUT can't
     // hold it open indefinitely.
     private long handshakeDeadlineNanos;
+    // Wall-clock limit (System.nanoTime) of a plaintext read, 0 = none;
+    // see setReadDeadline. Reading thread only.
+    private long readDeadlineNanos;
     // The session's packet size, fixed once the handshake is done (TLS 1.3
     // has no renegotiation; earlier versions' is refused); 0 before.
     private volatile int packetSize;
@@ -220,6 +224,68 @@ public final class TlsSocket implements AutoCloseable {
         }
         int n = readNet();
         if (n < 0) throw new EOFException("peer closed");
+    }
+
+    /**
+     * Bounds the plaintext reads that follow by wall clock: a read with no
+     * plaintext to return by {@code deadlineNanos} ({@link System#nanoTime})
+     * fails with {@link SocketTimeoutException}, as SO_TIMEOUT fails one
+     * silent wait. SO_TIMEOUT alone restarts with every ciphertext byte, so
+     * a peer trickling one record a byte at a time would hold a read for as
+     * long as it likes. 0 = none (SO_TIMEOUT only). Set by the reading
+     * thread, for the reads it makes next.
+     */
+    public void setReadDeadline(long deadlineNanos) {
+        readDeadlineNanos = deadlineNanos;
+    }
+
+    /**
+     * Whether input is waiting unread: plaintext or ciphertext held here,
+     * or bytes the socket received. Closing now would make the kernel
+     * answer them with a reset.
+     */
+    public boolean inputPending() {
+        readLock.lock();
+        try {
+            if (peerAppData.hasRemaining() || peerNetData.position() > 0) {
+                return true;
+            }
+        } finally {
+            readLock.unlock();
+        }
+        try {
+            return netIn.available() > 0;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * {@link #readNet} within the read deadline (see
+     * {@link #setReadDeadline}): SO_TIMEOUT is lowered to what is left of it
+     * for this one wait, then restored.
+     */
+    private int readNetWithinDeadline() throws IOException {
+        long deadline = readDeadlineNanos;
+        if (deadline == 0) {
+            return readNet();
+        }
+        long remainingNs = deadline - System.nanoTime();
+        if (remainingNs <= 0) {
+            throw new SocketTimeoutException("TLS read deadline passed");
+        }
+        long remainingMs = (remainingNs + 999_999L) / 1_000_000L;
+        java.net.Socket raw = channel.socket();
+        int soTimeout = raw.getSoTimeout();
+        if (soTimeout != 0 && soTimeout <= remainingMs) {
+            return readNet();
+        }
+        raw.setSoTimeout((int) Math.min(remainingMs, Integer.MAX_VALUE));
+        try {
+            return readNet();
+        } finally {
+            raw.setSoTimeout(soTimeout);
+        }
     }
 
     /**
@@ -575,7 +641,7 @@ public final class TlsSocket implements AutoCloseable {
         private boolean unwrapUntilPlaintext() throws IOException {
             while (true) {
                 if (peerNetData.position() == 0) {
-                    int n = readNet();
+                    int n = readNetWithinDeadline();
                     if (n < 0) {
                         peerAppData.flip();
                         return false;
@@ -592,9 +658,14 @@ public final class TlsSocket implements AutoCloseable {
                     case OK -> {
                         HandshakeStatus hs = r.getHandshakeStatus();
                         if (hs != HandshakeStatus.NOT_HANDSHAKING && hs != HandshakeStatus.FINISHED) {
+                            // Back in write mode whatever postHandshake
+                            // throws: fillPlaintext's failure path flips it.
                             peerAppData.flip();
-                            postHandshake(hs);
-                            peerAppData.compact();
+                            try {
+                                postHandshake(hs);
+                            } finally {
+                                peerAppData.compact();
+                            }
                         }
                         if (peerAppData.position() > 0) {
                             peerAppData.flip();
@@ -606,7 +677,7 @@ public final class TlsSocket implements AutoCloseable {
                         if (peerNetData.capacity() < need) {
                             peerNetData = enlarge(peerNetData, need);
                         }
-                        int n = readNet();
+                        int n = readNetWithinDeadline();
                         if (n < 0) {
                             peerAppData.flip();
                             return false;
@@ -625,42 +696,30 @@ public final class TlsSocket implements AutoCloseable {
         }
 
         /**
-         * Handshake messages after the initial handshake. TLS 1.3 has no
-         * renegotiation: what arrives is a KeyUpdate (answered by a
-         * NEED_WRAP) and is driven through. Below 1.3 it is a
-         * client-initiated renegotiation, which is refused: it costs the
-         * server a full handshake per request a client chooses to send
-         * (a CPU amplification) and has a history of attacks. Called with
-         * peerAppData in read mode.
+         * Handshake messages after the initial handshake. Below TLS 1.3 it
+         * is a client-initiated renegotiation, which is refused: it costs
+         * the server a full handshake per request a client chooses to send
+         * (a CPU amplification) and has a history of attacks. TLS 1.3 has
+         * no renegotiation: what arrives is a KeyUpdate. One asking for
+         * ours in return leaves the engine with it queued (NEED_WRAP); it is
+         * not written from here but goes out ahead of the next record any
+         * writer wraps (RFC 8446 §4.6.3 asks for it before our next
+         * application data, not sooner), so a read never waits for the
+         * write lock, which a writer blocked on a peer that doesn't read
+         * may hold for a whole write timeout (the reader would stop
+         * reading every stream of an HTTP/2 connection meanwhile). Called
+         * with peerAppData in read mode.
          */
         private void postHandshake(HandshakeStatus hs) throws IOException {
             if (!"TLSv1.3".equals(engine.getSession().getProtocol())) {
                 renegotiationRefused = true;
                 throw new SSLHandshakeException("TLS renegotiation refused");
             }
-            driveHandshake(hs);
-        }
-
-        private void driveHandshake(HandshakeStatus start) throws IOException {
-            // A TLS 1.3 KeyUpdate received on the read path transitions to
-            // NEED_WRAP, which mutates myNetData — the same buffer the writer
-            // vthread uses under writeLock. Grab writeLock first (matching
-            // close()'s order) so a concurrent RecordOutputStream.write can
-            // never race with stepHandshake's wrap().
-            writeLock.lock();
-            try {
-                handshakeLock.lock();
-                try {
-                    HandshakeStatus hs = start;
-                    while (hs != HandshakeStatus.FINISHED
-                        && hs != HandshakeStatus.NOT_HANDSHAKING) {
-                        hs = stepHandshake(hs);
-                    }
-                } finally {
-                    handshakeLock.unlock();
+            if (hs == HandshakeStatus.NEED_TASK) {
+                Runnable task;
+                while ((task = engine.getDelegatedTask()) != null) {
+                    task.run();
                 }
-            } finally {
-                writeLock.unlock();
             }
         }
     }

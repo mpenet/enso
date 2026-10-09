@@ -45,7 +45,13 @@ public final class ConnectionLimiter {
             return false;
         }
         if (perAddress != null) {
-            Integer count = perAddress.compute(address, INCREMENT);
+            Integer count;
+            try {
+                count = perAddress.compute(address, INCREMENT);
+            } catch (RuntimeException | Error e) {
+                active.decrementAndGet();
+                throw e;
+            }
             if (count > maxPerAddress) {
                 perAddress.compute(address, DECREMENT);
                 active.decrementAndGet();

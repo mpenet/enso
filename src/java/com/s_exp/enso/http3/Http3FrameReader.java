@@ -30,6 +30,13 @@ public final class Http3FrameReader {
     /**
      * A parsed frame or a chunk of a streaming DATA body.
      */
+    /** A known frame declaring a payload over the accumulation cap: refused before it is buffered. */
+    public static final class TooLarge extends IllegalStateException {
+        TooLarge(String message) {
+            super(message);
+        }
+    }
+
     public static final class Frame {
         public final long type;
         /** Full payload for accumulating types; null for streaming DATA chunks. */
@@ -263,7 +270,7 @@ public final class Http3FrameReader {
         // sizes are all small in practice; exceeding the cap is a
         // malformed-frame condition to raise at the connection layer.
         if (pendingLength > maxAccum) {
-            throw new IllegalStateException(
+            throw new TooLarge(
                 "frame type=" + pendingType + " length=" + pendingLength
                     + " exceeds accum cap " + maxAccum);
         }

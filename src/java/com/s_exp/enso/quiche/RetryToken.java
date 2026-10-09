@@ -40,19 +40,32 @@ public final class RetryToken {
     static final int ISSUED_AT_LEN = 8;
     static final long TOKEN_MAX_AGE_SECONDS = 10;
 
-    private final Mac mac;
-    // HMAC output scratch for verify; guarded by the mac lock.
-    private final byte[] tag = new byte[HMAC_LEN];
+    /** A thread's HMAC keyed for this instance, and its tag scratch. */
+    private static final class Signer {
+        final Mac mac;
+        final byte[] tag = new byte[HMAC_LEN];
+
+        Signer(SecretKeySpec key) {
+            try {
+                mac = Mac.getInstance("HmacSHA256");
+                mac.init(key);
+            } catch (Exception e) {
+                throw new IllegalStateException("HmacSHA256 unavailable", e);
+            }
+        }
+    }
+
+    // One HMAC per thread (in practice per event loop): loops minting and
+    // verifying under a flood never wait on each other.
+    private final ThreadLocal<Signer> signers;
 
     public RetryToken() {
         byte[] key = new byte[32];
         new SecureRandom().nextBytes(key);
-        try {
-            this.mac = Mac.getInstance("HmacSHA256");
-            this.mac.init(new SecretKeySpec(key, "HmacSHA256"));
-        } catch (Exception e) {
-            throw new IllegalStateException("HmacSHA256 unavailable", e);
-        }
+        SecretKeySpec spec = new SecretKeySpec(key, "HmacSHA256");
+        // Fails here, when the listener starts, if HMAC is unavailable.
+        new Signer(spec);
+        this.signers = ThreadLocal.withInitial(() -> new Signer(spec));
     }
 
     /**
@@ -85,14 +98,13 @@ public final class RetryToken {
         System.arraycopy(odcid, 0, out, p, odcid.length); p += odcid.length;
         out[p++] = (byte) retryScid.length;
         System.arraycopy(retryScid, 0, out, p, retryScid.length);
-        synchronized (mac) {
-            mac.reset();
-            mac.update(out, HMAC_LEN, bodyLen);
-            try {
-                mac.doFinal(out, 0);
-            } catch (javax.crypto.ShortBufferException e) {
-                throw new IllegalStateException("HMAC output overflow", e);
-            }
+        Mac mac = signers.get().mac;
+        mac.reset();
+        mac.update(out, HMAC_LEN, bodyLen);
+        try {
+            mac.doFinal(out, 0);
+        } catch (javax.crypto.ShortBufferException e) {
+            throw new IllegalStateException("HMAC output overflow", e);
         }
         return out;
     }
@@ -109,17 +121,16 @@ public final class RetryToken {
                          byte[] dcid, int dcidLen) {
         if (buf == null || len < HMAC_LEN + MAGIC.length + ISSUED_AT_LEN + 1) return null;
         int end = off + len;
-        synchronized (mac) {
-            mac.reset();
-            mac.update(buf, off + HMAC_LEN, len - HMAC_LEN);
-            try {
-                mac.doFinal(tag, 0);
-            } catch (javax.crypto.ShortBufferException e) {
-                throw new IllegalStateException("HMAC output overflow", e);
-            }
-            // Constant-time compare over the tag prefix without slicing.
-            if (!constantTimeEquals(buf, off, tag, 0, HMAC_LEN)) return null;
+        Signer signer = signers.get();
+        signer.mac.reset();
+        signer.mac.update(buf, off + HMAC_LEN, len - HMAC_LEN);
+        try {
+            signer.mac.doFinal(signer.tag, 0);
+        } catch (javax.crypto.ShortBufferException e) {
+            throw new IllegalStateException("HMAC output overflow", e);
         }
+        // Constant-time compare over the tag prefix without slicing.
+        if (!constantTimeEquals(buf, off, signer.tag, 0, HMAC_LEN)) return null;
         int p = off + HMAC_LEN;
         for (int i = 0; i < MAGIC.length; i++) {
             if (p >= end || buf[p++] != MAGIC[i]) return null;

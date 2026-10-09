@@ -317,6 +317,7 @@ final class Http3ResponseWriter implements Http3ResponseBody.Sender {
         } finally {
             current = null;
         }
+        conn.bodyHeld(body, body.held());
         switch (st) {
             case Http3ResponseBody.SENDING -> conn.markBlocked(ex, now);
             case Http3ResponseBody.COMPLETE -> {
@@ -345,8 +346,9 @@ final class Http3ResponseWriter implements Http3ResponseBody.Sender {
         if (rc == Quiche.QUICHE_ERR_DONE) return 0;
         if (rc < 0) return -1;
         if (rc > 0) {
-            ex.writeProgressNanos = currentNow;
+            long before = ex.responseBytes;
             ex.responseBytes += rc;
+            ex.sent(before, ex.responseBytes, currentNow);
         }
         return (int) rc;
     }
@@ -426,6 +428,8 @@ final class Http3ResponseWriter implements Http3ResponseBody.Sender {
 
     private void abandonOne(long id, Http3Exchange ex) {
         ex.finished = true;
+        conn.discardPending(ex);
+        conn.bodyHeld(ex.body, 0);
         ex.abandon();
         if (ex.pipe != null) {
             // Nobody will read what is buffered: its budget goes back now.

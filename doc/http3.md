@@ -35,9 +35,11 @@ Available classifiers:
 - `linux-amd64`, `linux-arm64`
 - `linux-musl-amd64`, `linux-musl-arm64`
 
-On musl (detected by `/lib/ld-musl-*.so.1`: Alpine, Wolfi, Chimera) only
-the musl shim is loaded: a glibc build can't run there, so it is never
-tried as a fallback and a missing musl classifier is a clear load error.
+On musl (Alpine, Wolfi, Chimera; detected from the libc mapped into the
+JVM, `/proc/self/maps`, so a glibc host with the musl package installed
+isn't mistaken for one) only the musl shim is loaded: a glibc build can't
+run there, so it is never tried as a fallback and a missing musl
+classifier is a clear load error.
 
 Minimums: the glibc shims need glibc 2.28 or later (they are built on
 AlmaLinux 8), the darwin shim macOS 11 or later.
@@ -118,14 +120,17 @@ a random multiple of `N`).
   port, and a classic BPF program (`SO_ATTACH_REUSEPORT_CBPF`) makes the
   kernel deliver each datagram to the socket of the loop named by the
   first byte of its destination connection id (offset 1 in a short
-  header, 6 in a long one). A client's first Initial carries a random id
-  of its own choosing: the same rule spreads new connections across loops
-  and keeps its retransmissions (and the Initial after a Retry, whose id
-  the loop chose) on one loop. Packets never change threads. If the
-  program can't be attached the kernel's 4-tuple hash applies instead:
-  Initials are then accepted by the loop that received them, and the rare
-  datagram that lands elsewhere (after a NAT rebinding) is copied to its
-  owner's inbox.
+  header, 6 in a long one). Initial and 0-RTT packets are the exception:
+  their id is the client's choice, which must not pick the loop (a client
+  could aim every handshake at one loop, and ids spread unevenly when 256
+  isn't a multiple of the loop count), so the program hands them to the
+  kernel's 4-tuple hash and the loop that receives one accepts it; its
+  retransmissions, and the Initial after a Retry, come from the same
+  4-tuple to the same loop (one that doesn't, addressed to an id another
+  loop generated for its Retry, is handed to that loop). Packets never
+  change threads. If the program can't be attached the 4-tuple hash
+  applies to every datagram, and the rare one that lands elsewhere (after
+  a NAT rebinding) is copied to its owner's inbox.
 - **Elsewhere** (macOS, dev): one socket; loop 0 receives every datagram
   and hands those of other loops' connections to their inbox. With the
   default single loop nothing is handed over. This is a development
@@ -186,9 +191,12 @@ wake-up that found the socket not readable skips the receive call.
 
 ### Admission
 
-Datagrams shorter than 1200 bytes never create state or get an answer,
-and an unsupported QUIC version gets Version Negotiation. A client
-Initial for an unknown connection id is answered statelessly or admitted:
+Datagrams shorter than 1200 bytes never create state or get an answer.
+A long header of an unsupported version gets Version Negotiation from
+whichever loop receives it, whatever its connection ids (0 to 255 bytes,
+RFC 8999) and the rest of its first byte, built in Java without quiche
+(never for a Version Negotiation packet, version 0). A client Initial for
+an unknown connection id is answered statelessly or admitted:
 
 0. An Initial whose Destination Connection ID is shorter than 8 bytes is
    dropped (RFC 9000 §7.2).
@@ -198,13 +206,20 @@ Initial for an unknown connection id is answered statelessly or admitted:
    CONNECTION_CLOSE(INVALID_TOKEN) in a small server Initial built without
    any state (RFC 9000 §8.1.2); another server's token counts as absent.
 2. Without a valid token, a stateless Retry is required while
-   `:http3-retry-threshold` (256) or more connections are handshaking, or
-   always with `:http3-stateless-retry`. A spoofed flood therefore can't
-   make the server allocate connections or sign handshakes beyond the
-   threshold.
+   `:http3-retry-threshold` (256) or more connections are handshaking,
+   always with `:http3-stateless-retry`, and always when
+   `:max-connections-per-ip` is set (a per-address slot taken for a
+   spoofed source address would lock that address out, so the address is
+   proven first). A spoofed flood therefore can't make the server
+   allocate connections or sign handshakes beyond the threshold.
 3. Past `:http3-max-half-open` (1024) handshaking connections, Initials are
-   dropped.
-4. Every connection takes a slot of the server's connection limiter for
+   dropped (checked by taking the slot, so loops admitting at once can't
+   overshoot it).
+4. Every connection reserves its connection window
+   (`:http3-initial-max-data-bytes`) of native receive credit within
+   `:http3-max-native-bytes`, until it is freed; past it the Initial is
+   dropped ("connection-limit"). See Limits below.
+5. Every connection takes a slot of the server's connection limiter for
    its whole life: `:max-connections` and `:max-connections-per-ip` count
    TCP and QUIC connections together. Past either limit the Initial is
    dropped ("connection-limit").
@@ -213,10 +228,30 @@ Handshaking connections are dropped at `:handshake-timeout`.
 
 ### Limits and timeouts
 
-- Flow control: `:http3-initial-max-data-bytes` (4 MiB) is a hard bound on
-  what quiche buffers per connection, per-stream windows (1 MiB derived)
-  per stream: quiche's window autotuning is capped at the configured
-  values.
+- Flow control: `:http3-initial-max-data-bytes` (1 MiB, as HTTP/2's
+  connection window) is a hard bound on what quiche buffers per
+  connection, the per-stream windows (a quarter of it, 256 KiB by
+  default, as HTTP/2's) per stream: quiche's window autotuning is capped
+  at the configured values. A stream whose handler doesn't read can hold
+  only its stream window, so the connection's other requests still get
+  through. One stream uploads at most 256 KiB per round trip (about
+  5 MiB/s at 50 ms), a connection 1 MiB (about 20 MiB/s); on loopback
+  the windows are not the limit (a 32 MiB upload measured 200 to 370 MiB/s
+  with either the 1 MiB or a 4 MiB window, bound by the test client).
+  Raise them for large uploads over long round trips.
+- Native receive memory: what quiche buffers is native memory, outside
+  `:max-buffered-bytes`. `Http3Listener.nativeCreditBytes()` counts a
+  connection window per live connection, reserved at admission within
+  `:http3-max-native-bytes` (`maxNativeBytes()`); a connection whose
+  window would pass it is refused. By default the cap is the
+  `:max-buffered-bytes` limit (a quarter of the heap), so native receive
+  buffers are bounded like Java ones: with `-Xmx4g`, 1 GiB, 1024
+  connections at 1 MiB, whatever `:max-connections` allows. Unlimited
+  (0), the worst case is a window per connection: 10000 connections at
+  1 MiB is about 10 GiB. It is reached only by peers that keep sending
+  while the server stops reading their streams (bodies not read, budget
+  throttled), so size the window and the cap to the native memory
+  available.
 - Header sections: `:max-header-bytes` (advertised as
   SETTINGS_MAX_FIELD_SECTION_SIZE) and `:max-header-fields`, as on the
   other protocols: a decoded section over either is answered 431 without
@@ -224,7 +259,9 @@ Handshaking connections are dropped at `:handshake-timeout`.
   is reset with H3_EXCESSIVE_LOAD before anything is buffered. Bytes of
   incomplete sections buffered across a connection's streams are bounded
   by that ceiling (further streams get H3_REQUEST_REJECTED); a section not
-  complete within `:header-timeout` gets H3_REQUEST_REJECTED.
+  complete within `:header-timeout` gets H3_REQUEST_REJECTED. Time the
+  server spent not reading a stream (its connection's body buffers full)
+  doesn't count: the clock restarts when reading resumes.
 - `:max-request-body-bytes`: a larger Content-Length is answered 413
   without the handler; a body growing past it fails the handler's reads
   with a 413 (`RequestBodyException`), answered as such, and the rest of
@@ -239,14 +276,24 @@ Handshaking connections are dropped at `:handshake-timeout`.
   buffers give the client its flow-control credit back, so this, not
   quiche's windows, is the bound (quiche holds at most a window more).
 - `:max-buffered-bytes`: request-body bytes buffered for handlers count
-  against the server-wide budget too; while it is exhausted the loop stops
-  reading request streams until handlers read. A closed connection gives
-  back what its requests still held, read or not.
+  against the server-wide budget too, through the connection's fair
+  share; while the connection is throttled (the budget exhausted, or past
+  its low-water mark with this connection over its share) the loop stops
+  reading its request streams until handlers read. So do response bytes
+  held for the client's flow control: writes quiche didn't take yet (a
+  copy, or the handler's body array kept alive for them) and the part of
+  a streamed body's slice waiting to be sent; they are given back as they
+  are sent, when the stream is reset or stopped, and when the connection
+  goes. A closed connection gives back what its requests still held, read
+  or not.
 - `:read-timeout`: a handler waiting longer for body bytes gets a
-  `RequestBodyTimeoutException` (a `SocketTimeoutException`); 408.
+  `RequestBodyTimeoutException` (a `SocketTimeoutException`); 408. So does
+  a body arriving slower than `:min-data-rate-bytes` once
+  `:min-data-rate-grace` of waiting is spent ("min-data-rate").
 - `:write-timeout`: a response whose bytes make no progress (the client
   stopped reading) for that long is reset (H3_REQUEST_CANCELLED) and its
-  streamed body's producer fails.
+  streamed body's producer fails. Progress is 16 KiB sent: a client
+  handing out credit a few bytes at a time makes none.
 - `:idle-timeout`: quiche's `max_idle_timeout`, and a connection with no
   request in flight for that long sends GOAWAY and closes, even when the
   client keeps it alive with PINGs.
@@ -262,7 +309,10 @@ Handshaking connections are dropped at `:handshake-timeout`.
 - Event loops contain failures: one connection's failure closes it
   (H3_INTERNAL_ERROR) and nothing else; a failure escaping the loop is
   logged at SEVERE, reported as the protocol error "event-loop-failure",
-  closes that loop's connections and restarts the loop.
+  closes and frees that loop's connections (each teardown step guarded,
+  so a broken timer or table entry can't keep one alive) and restarts the
+  loop on fresh tables, timers and send batch. A handler thread that
+  fails to start is answered 503 and not counted as running.
 - A request stream that ends or is reset before its header section is
   complete gets H3_REQUEST_INCOMPLETE, releasing the stream.
 - A request whose HEADERS frame ends the stream has no `:body`. When the
@@ -294,16 +344,17 @@ closed by `:idle-timeout` drains the same way. For the last part of
 are closed, interrupting their handlers, which are waited for until the
 deadline. The loops are stopped then and joined until the deadline (plus
 0.1 s); the quiche configurations and sockets are freed only once every
-loop exited (a loop that didn't, e.g. blocked in a `:server-events`
-callback, is left holding them, and logged, rather than risk a
-use-after-free), so `close` returns at `:shutdown-timeout` either way.
+loop exited (a loop that didn't is left holding them, and logged,
+rather than risk a use-after-free), so `close` returns at `:shutdown-timeout` either way.
+`:server-events` callbacks never run on a loop: they are delivered from
+their own thread.
 
 ### Observability
 
 `:server-events` and JFR receive connection open/close (protocol "h3"),
 completed requests (method, status, body bytes each way, duration) and
 protocol errors: `bad-request`, `body-too-large`, `header-too-large`,
-`read-timeout`, `handler-timeout`, `protocol-error`, `rapid-reset`,
+`read-timeout`, `min-data-rate`, `handler-timeout`, `protocol-error`, `rapid-reset`,
 `header-timeout`, `write-timeout`, `handshake-timeout`,
 `connection-limit`, `handshake-limit`, `event-loop-failure`. Peer-caused failures log at FINE through rate limiters.
 
@@ -320,8 +371,12 @@ regions that span exactly one quiche call (a copy, never the handshake).
 Loading checks that the shim implements the JNI contract of the classes
 loading it (`Quiche.SHIM_ABI`, the shim's `ENSO_SHIM_ABI`, bumped whenever
 a native or a record layout changes), so a stale build is refused with a
-clear error, and that libquiche is the release the shim's header came from
-(`Quiche.QUICHE_VERSION`), since struct layouts change between releases.
+clear error; that the record sizes, field offsets and flag values the
+shim was compiled with (its `LAYOUT` table, also checked against each
+other by `_Static_assert`s) equal `Records` / `UdpSocket`'s, so a layout
+edited on one side only is refused by name; and that libquiche is the
+release the shim's header came from (`Quiche.QUICHE_VERSION`), since
+struct layouts change between releases.
 Only `Java_*` symbols are exported; builds use `-fstack-protector-strong`,
 `-D_FORTIFY_SOURCE=2`, stack-clash protection, full RELRO and a
 non-executable stack on Linux, CET (x86-64 Linux) or PAC/BTI (arm64); see
@@ -373,6 +428,7 @@ then `java.library.path`.
   dev/dynamic build via `make -C native/enso_quiche`)
 - Linux glibc → `linux-arm64` / `linux-amd64`
 - Linux musl (Alpine, Wolfi, Chimera) → `linux-musl-*` only. Detection:
+  the libc mapped into the JVM (`/proc/self/maps`), else
   `/lib/ld-musl-*.so.1`.
 
 Override for local dev:

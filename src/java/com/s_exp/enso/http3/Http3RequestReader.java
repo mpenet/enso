@@ -42,6 +42,7 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
 
     private static final Logger LOG = Logger.getLogger(Http3RequestReader.class.getName());
     private static final LogLimiter MALFORMED = new LogLimiter(LOG, Level.FINE);
+    private static final LogLimiter START_FAILURES = new LogLimiter(LOG, Level.WARNING);
 
     // Floor of the hard field-section ceiling (4x :max-header-bytes): a
     // section over it is never buffered or decoded (RFC 9114 §4.2.2).
@@ -140,6 +141,11 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
     void resume(Http3Exchange ex, long now) {
         if (!ex.readPaused) return;
         ex.readPaused = false;
+        if (ex.readPhase == Http3Exchange.READ_HEADERS) {
+            // :header-timeout ignores the time we didn't read it.
+            ex.firstByteNanos = now;
+            conn.headerPhaseStarted(ex);
+        }
         try {
             read(ex, now);
         } catch (Http3ConnectionException e) {
@@ -177,8 +183,10 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
                 long connRoom = conn.bodyBudget().limit() - conn.bodyBudget().used();
                 if (connRoom <= 0) {
                     ex.readPaused = true;
-                    conn.bodyBudget().await(ex.budgetWaiter());
-                    return;
+                    if (conn.bodyBudget().await(ex.budgetWaiter())) return;
+                    // Below the low-water mark already: read on.
+                    ex.readPaused = false;
+                    continue;
                 }
                 len = (int) Math.min(len, connRoom);
             }
@@ -227,7 +235,7 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
         if (conn.quiche.streamCapacity(ex.id) < 0) {
             // STOP_SENDING too: the request is cancelled (RFC 9114 §4.1.1).
             ex.sendClosed = true;
-            ex.clearPending();
+            conn.discardPending(ex);
             ex.abandon();
             conn.finish(ex, now);
             return;
@@ -585,7 +593,8 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
         java.io.InputStream body = null;
         if (!endsStream) {
             ex.pipe = new Http3BodyPipe(maxBody, contentLength, conn.config.readTimeoutMillis,
-                conn.listener.service.budget, conn.bodyBudget());
+                conn.config.minDataRateBytes, conn.config.minDataRateGraceMillis,
+                conn.account(), conn.bodyBudget());
             body = continuePending ? new ContinueOnRead(ex, ex.pipe.inputStream()) : ex.pipe.inputStream();
             ex.continuePending = continuePending;
         }
@@ -602,8 +611,18 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
         // Published before start, so an abandon right after can interrupt it.
         ex.handlerThread = t;
         conn.liveHandlers.incrementAndGet();
+        try {
+            t.start();
+        } catch (Throwable e) {
+            // Never started, so never finishing: uncounted here, else the
+            // connection's slot would wait for it forever.
+            conn.handlerFinished(ex);
+            if (e instanceof VirtualMachineError vme) throw vme;
+            START_FAILURES.log("h3 handler thread failed to start, sending 503", e);
+            respondEarly(ex, 503, now);
+            return;
+        }
         conn.handlerDispatched(now);
-        t.start();
     }
 
     /** Answers {@code status} without a handler (413, 417, 431, 501). */

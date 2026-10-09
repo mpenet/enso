@@ -187,7 +187,7 @@ results. Reports land under `target/conformance/<suite>/`.
 | h2spec 2.6.0 (HTTP/2 over TLS) | `bench/h2spec/run.sh` | `bench/h2spec/expected-failures.txt` | Linux x86-64 / Intel mac: downloaded + checksum-verified; Apple Silicon: `brew install h2spec`; elsewhere set `H2SPEC_BIN` |
 | h2spec 2.6.0 (cleartext HTTP/2, prior knowledge) | `bench/h2spec/run.sh h2c` | `bench/h2spec/expected-failures-h2c.txt` | as above |
 | Autobahn TestSuite 25.10.1 (WebSocket, fuzzingclient) | `bench/autobahn/run.sh` | `bench/autobahn/expected-failures.txt` | Docker (image pinned by digest) |
-| h3spec 0.1.13 (QUIC + HTTP/3) | `bench/h3spec/run.sh` | `bench/h3spec/expected-failures.txt` | the JNI shim; binary downloaded + checksum-verified (linux-x86_64, mac-arm64; on Linux it needs `libgmp10` and `zlib1g`) |
+| h3spec 0.1.14 (QUIC + HTTP/3) | `bench/h3spec/run.sh` | `bench/h3spec/expected-failures.txt` | the JNI shim; binary downloaded + checksum-verified (linux-x86_64, mac-arm64; on Linux it needs `libgmp10` and `zlib1g`) |
 
 Pinned tool binaries are cached in `target/tools/`. `ENSO_SERVER_OPTS`
 (an EDN map) passes extra `run-server` options to the test server, e.g.
@@ -211,7 +211,7 @@ Current results (default server options):
   so bytes that aren't the HTTP/2 preface are an HTTP/1.1 request,
   answered 400 and closed, where h2spec expects a GOAWAY.
 - Autobahn: 517 cases, no expected failures.
-- h3spec: 49 cases, 2 expected failures (reserved header bits, checked
+- h3spec: 77 cases, 2 expected failures (reserved header bits, checked
   only inside libquiche; see `doc/h3-conformance.md`).
 
 ### QUIC interop (quic-interop-runner)
@@ -254,18 +254,18 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v /tmp:/tmp \
 simulator containers see.) Apple Silicon runs arm64 images natively;
 quiche's client image is amd64-only and runs emulated.
 
-Current result: every client fails `http3` before any QUIC exchange.
-The simulator waits for the server to answer its readiness probe (an
-unknown-version long header, 1207 bytes, zero-length DCID) with Version
-Negotiation, and `Http3Loop.onDatagram` drops long-header datagrams with
-a DCID length of 0 or above 20 before looking at the version. RFC 9000
-§5.2.2 / §17.2 and RFC 8999 ask a server to answer unknown versions
-(DCIDs up to 255 bytes) with Version Negotiation. The expectations file
-records these failures until that is fixed. With that check relaxed
-locally (accepting a zero-length DCID), quic-go, ngtcp2, neqo and quinn
-pass `http3`; quiche's client (amd64 image, emulated on Apple Silicon)
-gets no answer to its Initial, cause not yet known: confirm on a native
-x86-64 run before recording it.
+Current result: quic-go, ngtcp2, neqo and quinn pass `http3` (run as
+above, arm64 images on Apple Silicon). The simulator starts once the
+server answers its readiness probe (an unknown-version long header,
+1207 bytes, zero-length DCID) with Version Negotiation, which the server
+sends for any unsupported version whatever its connection id lengths
+(0 to 255 bytes, RFC 8999). quiche's client image is amd64-only: emulated
+on Apple Silicon, its `ethtool -K eth0 tx off` fails ("Function not
+implemented"), its datagrams keep partial (offloaded) UDP checksums and
+the server's kernel drops them, so that pair fails there before enso sees
+a packet; the expectations file records the result expected on a native
+x86-64 host (the nightly job). On Apple Silicon run the other four:
+`... run.sh quic-go,ngtcp2,neqo,quinn`.
 
 The endpoint turns off checksum offload on its interface
 (`ethtool -K eth0 tx off` in `run_endpoint.sh`, as the runner's standard

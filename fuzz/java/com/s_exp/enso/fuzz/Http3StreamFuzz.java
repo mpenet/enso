@@ -196,6 +196,9 @@ public final class Http3StreamFuzz {
             }
             if (controlFailedAt >= 0) return;
             try {
+                // As quiche: a stream we sent STOP_SENDING for delivers
+                // nothing more, not even its end.
+                if (stopSending.contains(d.streamId)) return;
                 if (d.reset) {
                     ON_PEER_RESET.invokeExact(control, d.streamId);
                     return;
@@ -205,7 +208,7 @@ public final class Http3StreamFuzz {
                 if (b.length == 0) {
                     ON_PEER_DATA.invokeExact(control, d.streamId, b, 0, 0, d.fin);
                 }
-                for (int off = 0; off < b.length; off += step) {
+                for (int off = 0; off < b.length && !stopSending.contains(d.streamId); off += step) {
                     int n = Math.min(step, b.length - off);
                     ON_PEER_DATA.invokeExact(control, d.streamId, b, off, n, d.fin && off + n == b.length);
                 }
@@ -338,7 +341,7 @@ public final class Http3StreamFuzz {
             }
             if (!headersSeen) {
                 headersSeen = true;
-                pipe = new Http3BodyPipe(BODY_CAP, contentLength[0], 0, budget, connectionBudget);
+                pipe = new Http3BodyPipe(BODY_CAP, contentLength[0], 0, 0, 0, budget.account(), connectionBudget);
             }
         }
 

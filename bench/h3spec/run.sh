@@ -24,7 +24,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../conformance-lib.sh
 . "$HERE/../conformance-lib.sh"
 
-H3SPEC_VERSION=0.1.13
+H3SPEC_VERSION=0.1.14
 PORT="${H3SPEC_PORT:-18443}"
 WORK_DIR="$ROOT/target/conformance/h3spec"
 mkdir -p "$WORK_DIR"
@@ -41,9 +41,9 @@ done
 if [ -z "${H3SPEC_BIN:-}" ]; then
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) asset=h3spec-linux-x86_64
-                  sha=b5f8eddd968cb195d1e3e7698d33fa141d6b2ad56153089d89928ac0fdee28bf ;;
+                  sha=7f2e3232715a3f6ff5212d408b2a3e74d6aa3ca06f96efca9a4e5dc55f3c6860 ;;
     Darwin-arm64) asset=h3spec-mac-arm64
-                  sha=850ee3317b767db1e5e41cf3b9f034a74feabf52672744920ba41f330b710253 ;;
+                  sha=1d76372c74b5fbc28256229e01135f7c878045b8b0a1dc578eaa866e10df140a ;;
     *) echo "no pinned h3spec for $(uname -s)-$(uname -m); set H3SPEC_BIN" >&2; exit 1 ;;
   esac
   H3SPEC_BIN="$TOOLS_DIR/h3spec-$H3SPEC_VERSION"

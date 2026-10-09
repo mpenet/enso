@@ -649,7 +649,7 @@ public final class WebSocketConnection {
         } finally {
             queueLock.unlock();
         }
-        // Outside the lock: a release may run budget waiters.
+        // Outside the lock, which stays short.
         budget.release(dropped);
         if (left != null) {
             IOException closed = new SendRejected(CLOSED);
@@ -718,20 +718,25 @@ public final class WebSocketConnection {
             };
             budgetWaiter = w;
         }
-        while (budget.exhausted()) {
-            if (socketClosed) {
-                throw new EOFException("connection closed");
+        try {
+            while (budget.exhausted()) {
+                if (socketClosed) {
+                    throw new EOFException("connection closed");
+                }
+                int timeout = messageReadTimeout();
+                if (!budget.await(w)) {
+                    // Already below the low-water mark.
+                    return;
+                }
+                if (timeout == 0) {
+                    LockSupport.park(this);
+                } else {
+                    LockSupport.parkNanos(this, timeout * 1_000_000L);
+                }
             }
-            int timeout = messageReadTimeout();
-            budget.await(w);
-            if (!budget.exhausted()) {
-                return;
-            }
-            if (timeout == 0) {
-                LockSupport.park(this);
-            } else {
-                LockSupport.parkNanos(this, timeout * 1_000_000L);
-            }
+        } finally {
+            // Woken, timed out or closed: the budget forgets this reader.
+            budget.cancel(w);
         }
     }
 

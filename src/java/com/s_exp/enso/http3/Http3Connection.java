@@ -174,6 +174,9 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
     // Peer-controlled resources.
     /** Unread request-body bytes of this connection's pipes, bounded by its window; made on first need. */
     private MemoryBudget bodyBudget;
+    // This connection's share of the server's :max-buffered-bytes, created
+    // with its first request body; closed when it is destroyed.
+    private MemoryBudget.Account account;
     int bufferedHeaderBytes;
     final int headerBudget;
     private double resetTokens;
@@ -609,7 +612,12 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
         return true;
     }
 
-    private static void defer(Http3Stream s, byte[] b, int off, int len, boolean fin, boolean copy) {
+    /**
+     * Queues bytes quiche didn't take. They are held for the peer until
+     * sent: charged to this connection's share of {@code :max-buffered-bytes},
+     * whether copied here or a response body array kept alive for them.
+     */
+    private void defer(Http3Stream s, byte[] b, int off, int len, boolean fin, boolean copy) {
         if (copy) {
             byte[] own = new byte[len];
             System.arraycopy(b, off, own, 0, len);
@@ -617,6 +625,26 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
         } else {
             s.enqueue(new Http3Stream.Pending(b, off, len, fin));
         }
+        account().charge(len);
+    }
+
+    /** Drops {@code s}'s deferred bytes (the stream is done or dead) and gives back their charge. */
+    void discardPending(Http3Stream s) {
+        long n = s.pendingBytes;
+        s.clearPending();
+        if (n > 0) account.release(n);
+    }
+
+    /**
+     * A streamed body holds {@code n} bytes of its producer's slice for the
+     * peer's flow control: its charge follows ({@code body} may be null).
+     */
+    void bodyHeld(Http3ResponseBody body, int n) {
+        if (body == null) return;
+        int delta = n - body.charged;
+        if (delta == 0) return;
+        body.charged = n;
+        if (delta > 0) account().charge(delta); else account.release(-delta);
     }
 
     /** Retries {@code s}'s deferred bytes; false when the stream failed. */
@@ -629,15 +657,17 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
                 rc = 0;
             }
             if (rc < 0) {
-                s.clearPending();
+                discardPending(s);
                 unmarkBlocked(s);
                 sendFailed(s, rc);
                 return false;
             }
-            if (rc > 0) s.writeProgressNanos = now;
             p.off += (int) rc;
             p.len -= (int) rc;
+            long before = s.pendingBytes;
             s.pendingBytes -= rc;
+            account.release(rc);
+            s.sent(before, s.pendingBytes, now);
             if (p.len > 0) return true;
             if (p.fin) s.sendClosed = true;
             s.pendingHead = p.next;
@@ -702,11 +732,13 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
                 Http3ConnectionException.H3_REQUEST_CANCELLED);
             ex.sendClosed = true;
         }
-        ex.clearPending();
+        discardPending(ex);
+        bodyHeld(ex.body, 0);
         exchanges.remove(ex.id);
         if (recentStreams != null) recentStreams[recentCount++ & (RECENT_STREAMS - 1)] = ex.id;
         unmarkBlocked(ex);
         reader.release(ex);
+        if (bodyBudget != null) ex.cancelBudgetWait(bodyBudget);
         if (ex.pipe != null) {
             ex.pipe.signalTruncated();
             ex.pipe.discard();
@@ -731,7 +763,7 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
         quiche.streamShutdown(ex.id, Quiche.QUICHE_SHUTDOWN_READ, code);
         quiche.streamShutdown(ex.id, Quiche.QUICHE_SHUTDOWN_WRITE, code);
         ex.sendClosed = true;
-        ex.clearPending();
+        discardPending(ex);
         ex.readPhase = Http3Exchange.READ_DONE;
         ex.abandon();
         finish(ex, now);
@@ -792,7 +824,9 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
     private void scanOne(long id, Http3Exchange ex) {
         long due;
         if (scanKind == SCAN_HEADERS) {
-            if (ex.readPhase != Http3Exchange.READ_HEADERS) return;
+            // A stream we stopped reading (budget backpressure) can't be
+            // late: its clock restarts when reading resumes.
+            if (ex.readPhase != Http3Exchange.READ_HEADERS || ex.readPaused) return;
             due = ex.firstByteNanos + headerTimeoutNanos;
         } else {
             if (!ex.blocked) return;
@@ -962,6 +996,8 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
                 quiche.free();
             } finally {
                 quicheConfig.release();
+                // Pipes still read by handlers give nothing back from here on.
+                if (account != null) account.close();
             }
         }
         if (openedNanos != 0) {
@@ -979,6 +1015,16 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
     /** True once a request body was buffered on this connection (its body budget exists). */
     boolean bodyBudgetUsed() {
         return bodyBudget != null;
+    }
+
+    /** This connection's share of the server's memory budget (loop thread). */
+    MemoryBudget.Account account() {
+        MemoryBudget.Account a = account;
+        if (a == null) {
+            a = listener.service.budget.account();
+            account = a;
+        }
+        return a;
     }
 
     /** What this connection's request-body pipes may hold together: its connection window (loop thread). */

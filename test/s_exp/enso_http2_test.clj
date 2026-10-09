@@ -8,7 +8,8 @@
   cleartext HTTP/2 with prior knowledge (h2c) on the plain listener."
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.string :as str]
-            [s-exp.enso :as enso])
+            [s-exp.enso :as enso]
+            [s-exp.enso-test-support :as support])
   (:import (java.io ByteArrayInputStream)
            (java.net URI)
            (java.net.http HttpClient HttpClient$Version HttpRequest
@@ -649,15 +650,15 @@
       (try
         (binding [*port* (enso/port srv)]
           (with-conn [conn]
-            ;; Handshake frames, including the connection window growth.
+            ;; Handshake frames.
             (drain-frames conn 300)
             (send-request! conn 1 (request-headers "POST" "/up") false)
             (send-data! conn 1 65535 false)
             (let [before (drain-frames conn 500)]
               (is (empty? (window-updates before 1))
                   "no stream credit while the handler hasn't read")
-              (is (empty? (window-updates before 0))
-                  "no connection credit while the handler hasn't read"))
+              (is (= [(- (* 4 65535) 65535)] (map #(u32 (:payload %) 0) (window-updates before 0)))
+                  "no connection credit while the handler hasn't read, only the window's growth once body bytes arrive"))
             (.countDown release)
             (let [seen (atom [])]
               (read-until conn #(and (= frame-headers (:type %)) (= 1 (:sid %))) seen)
@@ -2198,6 +2199,38 @@
         (is (= "408" (get (response-on conn 1) ":status")))
         (is (instance? java.io.IOException (deref failure 1000 nil)))))))
 
+(deftest h2-min-data-rate-bounds-trickled-bodies
+  ;; :min-data-rate-bytes: a body trickled below the rate (one byte every
+  ;; 100 ms here, each resetting :read-timeout) fails once the grace
+  ;; period is over; the request is answered 408.
+  (let [errors (atom [])]
+    (with-server (fn [req] (slurp (:body req)) {:status 200 :body "ok"})
+      {:read-timeout 30000 :min-data-rate-bytes 100 :min-data-rate-grace 300
+       :server-events {:protocol-error (fn [_ kind] (swap! errors conj kind))}}
+      (with-conn [conn]
+        (send-request! conn 1 (request-headers "POST" "/") false)
+        (let [sender (future
+                       (try
+                         (dotimes [_ 40]
+                           (write-frame! conn frame-data 0 1 (byte-array 1))
+                           (Thread/sleep 100))
+                         (catch Exception _)))
+              t0 (System/nanoTime)]
+          (is (= "408" (get (response-on conn 1) ":status")))
+          (is (< (/ (- (System/nanoTime) t0) 1e6) 2500.0) "well before :read-timeout")
+          (future-cancel sender)))
+      (is (support/await-condition #(some #{"min-data-rate"} @errors) 2000 10) (pr-str @errors)))
+    (testing "a body at the rate is served"
+      (with-server (fn [req] {:status 200 :body (str (count (slurp (:body req))))})
+        {:min-data-rate-bytes 100 :min-data-rate-grace 300}
+        (with-conn [conn]
+          (send-request! conn 1 (request-headers "POST" "/") false)
+          (dotimes [_ 10]
+            (write-frame! conn frame-data 0 1 (byte-array 100))
+            (Thread/sleep 100))
+          (write-frame! conn frame-data flag-end-stream 1 (byte-array 0))
+          (is (= "200" (get (response-on conn 1) ":status"))))))))
+
 (deftest h2-server-events-and-protocol-errors
   (let [completed (atom [])
         errors (atom [])]
@@ -2210,8 +2243,9 @@
         (send-request! conn 3 (request-headers "GET" "relative") true)
         (is (some? (read-until conn (frame-on 3 frame-rst))))
         (ping-round-trip! conn)
-        (is (= [["h2" "GET" 201 0 5]] @completed))
-        (is (= [["h2" "bad-request"]] @errors))))))
+        ;; Events are delivered from their own thread, shortly after.
+        (is (support/await-condition #(= [["h2" "GET" 201 0 5]] @completed) 2000 1) (pr-str @completed))
+        (is (support/await-condition #(= [["h2" "bad-request"]] @errors) 2000 1) (pr-str @errors))))))
 
 ;; ---- Graceful shutdown -----------------------------------------------------------
 
@@ -2325,7 +2359,7 @@
                (getLocalSocketAddress [] local)
                (getLocalPort [] 8443)
                (close []))
-        c (com.s_exp.enso.http2.Http2Connection. sock handler srv 0)
+        c (com.s_exp.enso.http2.Http2Connection. sock handler srv 0 false)
         before (total-allocated)]
     (.run c)
     (- (total-allocated) before)))
@@ -2353,6 +2387,30 @@
       (let [per-request (/ (double (apply min (repeatedly 3 #(h2-connection-alloc-bytes srv handler input n current)))) n)]
         (println "h2 GET:" per-request "bytes/request")
         (is (< per-request 1000) (str per-request " bytes/request")))
+      (finally (enso/stop srv)))))
+
+(deftest h2-small-stream-body-allocation-budget
+  ;; A small body in a ByteArrayInputStream (Ring's string-input-stream)
+  ;; costs what a byte array body does: no ring, no handler thread parked
+  ;; waiting for its END_STREAM. Same harness as h2-get-allocation-budget.
+  (let [current (atom nil)
+        ->response @#'enso/->response
+        body (.getBytes "Hello, World!")
+        handler (reify com.s_exp.enso.api.RingHandler
+                  (handle [_ _] (->response {:status 200 :headers {"content-type" "text/plain"}
+                                             :body (ByteArrayInputStream. body)})))
+        events (reify com.s_exp.enso.api.ServerEvents
+                 (requestCompleted [_ _ _ _ _ _ _] (.countDown ^CountDownLatch @current)))
+        n 2000
+        input (h2-alloc-input n)
+        srv (enso/run-server (fn [_] {:status 200}) {:port 0 :http2 true :ssl-context (gen-server-context)
+                                                     :http2-max-concurrent-streams 4096
+                                                     :server-events events})]
+    (try
+      (dotimes [_ 20] (h2-connection-alloc-bytes srv handler input n current))
+      (let [per-request (/ (double (apply min (repeatedly 3 #(h2-connection-alloc-bytes srv handler input n current)))) n)]
+        (println "h2 GET, small InputStream body:" per-request "bytes/request")
+        (is (< per-request 1200) (str per-request " bytes/request")))
       (finally (enso/stop srv)))))
 
 (deftest h2-stream-slot-free-once-response-ends
@@ -2543,36 +2601,6 @@
         (send-request! conn 5 (request-headers "GET" "/") true)
         (is (contains? #{"503" "200"} (get (response-on conn 5) ":status")) "slot back once it returned")))))
 
-(deftest h2-memory-budget-holds-back-credit
-  ;; Past :max-buffered-bytes, bytes a handler reads earn no WINDOW_UPDATE
-  ;; until the budget has room again: backpressure through flow control.
-  (let [release-a (CountDownLatch. 1)
-        b-read (promise)]
-    (with-server (fn [req]
-                   (if (= "/a" (:uri req))
-                     (do (.await release-a 10 TimeUnit/SECONDS) {:status 200 :body (str (count (slurp (:body req))))})
-                     (let [buf (byte-array 65535)
-                           in ^java.io.InputStream (:body req)]
-                       ;; Reads what was sent without waiting for the end.
-                       (loop [n 0] (if (< n 65535) (recur (+ n (.read in buf n (- 65535 n)))) n))
-                       (deliver b-read true)
-                       {:status 200 :body (str (count (slurp in)))})))
-      {:max-buffered-bytes 60000 :http2-initial-window-bytes 65535}
-      (with-conn [conn]
-        (send-request! conn 1 (request-headers "POST" "/a") false)
-        (send-data! conn 1 65535 false)
-        (send-request! conn 3 (request-headers "POST" "/b") false)
-        (send-data! conn 3 65535 false)
-        (is (deref b-read 5000 false))
-        (let [seen (drain-frames conn 300)]
-          (is (empty? (window-updates seen 3)) "budget exhausted: stream 3's credit held back"))
-        (.countDown release-a)
-        (write-frame! conn frame-data flag-end-stream 1 (byte-array 0))
-        (let [seen (atom [])]
-          (read-until conn #(seq (window-updates [%] 3)) seen 3000)
-          (is (seq (window-updates @seen 3)) "credit granted once A's body was read"))
-        (write-frame! conn frame-data flag-end-stream 3 (byte-array 0))))))
-
 (deftest h2-stop-interrupts-and-joins-handlers-within-the-timeout
   ;; stop drains until the last part of :shutdown-timeout, then closes
   ;; what is left: running handlers are interrupted and stop returns once
@@ -2692,7 +2720,7 @@
         (is (some? (read-until conn (frame-on 1 frame-headers))))
         (write-frame! conn frame-rst 0 1 (u32-bytes 0x8))
         (ping-round-trip! conn)
-        (is (= [["h2" "GET" 200 0]] @completed) "reset while blocked on credit"))
+        (is (support/await-condition #(= [["h2" "GET" 200 0]] @completed) 2000 1) "reset while blocked on credit"))
       (reset! completed [])
       (let [conn (h2-connect! [[0x4 0]])]
         (send-request! conn 1 (request-headers "GET" "/") true)
@@ -2856,7 +2884,7 @@
 
 (deftest h2-drained-request-body-gives-back-its-buffer
   ;; The request body ring grows with what the peer sends ahead of the
-  ;; handler (up to the stream window, 1 MiB by default). Once the handler
+  ;; handler (up to the stream window, 1 MiB here). Once the handler
   ;; has read it all it is given back, while the upload goes on.
   (let [ready (CountDownLatch. 1)
         drained (CountDownLatch. 1)
@@ -2868,7 +2896,7 @@
                                    (.countDown drained)
                                    (.await finish 5 TimeUnit/SECONDS)
                                    {:status 200 :body (str (alength (.readAllBytes in)))}))
-                           {}]
+                           {:http2-initial-window-bytes 1048576}]
       (with-conn [conn]
         (open-windows! conn)
         (send-request! conn 1 (request-headers "POST" "/") false)
@@ -2986,6 +3014,105 @@
           (write-frame! conn frame-window-update 0 1 (u32-bytes 11000))
           (read-until conn (end-stream-on 1) seen)
           (is (= 61000 (data-bytes-on @seen 1))))))))
+
+;; ---- Memory budget: connection credit ---------------------------------------------
+
+(defn- budget-of ^com.s_exp.enso.core.MemoryBudget [srv]
+  (.budget (.service ^com.s_exp.enso.EnsoServer srv)))
+
+(defn- conn-credit
+  "Connection credit granted in `frames` (WINDOW_UPDATE on stream 0)."
+  [frames]
+  (reduce + 0 (map #(u32 (:payload %) 0) (window-updates frames 0))))
+
+(deftest h2-connection-credit-is-paid-for-before-it-is-granted
+  ;; Credit past the RFC's initial 65535-octet connection window is a
+  ;; promise to buffer that much: it comes out of :max-buffered-bytes
+  ;; before it goes out, only once request body bytes arrive, and goes
+  ;; back to the budget when the connection closes.
+  (with-server-instance [srv (fn [req] (when-let [b (:body req)] (slurp b)) {:status 200 :body "ok"}) {}]
+    (let [budget (budget-of srv)]
+      (with-conn [conn]
+        (send-request! conn 1 (request-headers "GET" "/") true)
+        (let [seen (atom [])]
+          (read-until conn (end-stream-on 1) seen)
+          (swap! seen into (drain-frames conn 200))
+          (is (zero? (conn-credit @seen)) "no connection credit without a request body")
+          (is (zero? (.used budget))))
+        (send-request! conn 3 (request-headers "POST" "/") false)
+        (is (zero? (conn-credit (drain-frames conn 200))) "not before body bytes arrive")
+        (send-data! conn 3 1000 false)
+        (let [granted (conn-credit (drain-frames conn 300))]
+          (is (= (- (* 4 262144) 65535) granted) "grown to four stream windows")
+          (is (= (+ granted 1000) (.used budget)) "and paid for, with the bytes held"))
+        (send-data! conn 3 100000 true)
+        (is (= "200" (get (response-on conn 3) ":status"))))
+      (is (support/await-condition #(zero? (.used budget)) 3000 10) "given back when the connection closes"))))
+
+(deftest h2-connection-credit-stays-within-the-budget
+  ;; Growth the budget can't pay for in full is granted in part.
+  (with-server-instance [srv (fn [req] {:status 200 :body (str (count (slurp (:body req))))})
+                         {:max-buffered-bytes 100000}]
+    (let [budget (budget-of srv)]
+      (with-conn [conn]
+        (send-request! conn 1 (request-headers "POST" "/") false)
+        (send-data! conn 1 1000 false)
+        (let [granted (conn-credit (drain-frames conn 300))]
+          (is (< 0 granted 100000) "part of the growth, within the limit")
+          (is (= (+ granted 1000) (.used budget))))
+        (send-data! conn 1 64535 true)
+        (is (= "200" (get (response-on conn 1) ":status")))))))
+
+(deftest h2-memory-budget-holds-back-connection-credit
+  ;; Past :max-buffered-bytes, bytes a handler reads earn connection credit
+  ;; only up to the RFC's initial window (so the connection keeps moving);
+  ;; the rest is owed until the budget falls below its low-water mark:
+  ;; backpressure through flow control. Here another connection fills its
+  ;; window with bodies its handlers don't read; reading them lets the
+  ;; owed credit out (granted from the budget's own thread, never inline
+  ;; under the releasing connection's locks).
+  (let [release-hog (CountDownLatch. 1)
+        go (CountDownLatch. 1)
+        read-all (promise)
+        window 131070]
+    (with-server-instance [srv (fn [req]
+                                 (if (= "/hog" (:uri req))
+                                   (.await release-hog 10 TimeUnit/SECONDS)
+                                   (.await go 10 TimeUnit/SECONDS))
+                                 (let [n (count (slurp (:body req)))]
+                                   (when (= "/up" (:uri req)) (deliver read-all n))
+                                   {:status 200 :body (str n)}))
+                           {:max-buffered-bytes 600000 :http2-initial-window-bytes window}]
+      (let [budget (budget-of srv)]
+        (with-conn [hog]
+          ;; Four streams of a full stream window fill the connection window.
+          (doseq [sid [1 3 5 7]]
+            (send-request! hog sid (request-headers "POST" "/hog") false))
+          (send-data! hog 1 1 false)
+          (is (= (- (* 4 window) 65535) (conn-credit (drain-frames hog 300))))
+          (send-data! hog 1 (dec window) true)
+          (doseq [sid [3 5 7]]
+            (send-data! hog sid window true))
+          (ping-round-trip! hog)
+          (is (= (* 4 window) (.used budget)) "the window it was granted, all of it paid for or charged")
+          (with-conn [conn]
+            (send-request! conn 1 (request-headers "POST" "/up") false)
+            (send-data! conn 1 1 false)
+            (let [grown (conn-credit (drain-frames conn 300))]
+              (is (< 0 grown (- 600000 (* 4 window) -1)) "only what is left of the budget")
+              (send-data! conn 1 (dec window) true)
+              (ping-round-trip! conn)
+              (is (.exhausted budget) (str "used " (.used budget)))
+              (.countDown go)
+              (is (= window (deref read-all 5000 nil)))
+              (let [answered (drain-frames conn 500)
+                    held (conn-credit answered)]
+                (is (= "200" (some #(get-in % [:headers ":status"]) answered)))
+                (is (< held window) "credit for what was read is held back, in part")
+                (.countDown release-hog)
+                (let [seen (atom [])]
+                  (read-until conn #(pos? (conn-credit [%])) seen 3000)
+                  (is (pos? (conn-credit @seen)) "more once the other connection's bodies were read"))))))))))
 
 (deftest h2-response-rings-are-charged-to-the-memory-budget
   ;; Streamed response bytes waiting in a stream's ring are held for a peer
@@ -3223,6 +3350,24 @@
                (reset! pos (+ p k))
                k))))))))
 
+(defn- patterned-stream-of
+  "An InputStream over `b` returning reads of random sizes."
+  ^java.io.InputStream [^bytes b]
+  (let [pos (atom 0)
+        rnd (java.util.Random. (alength b))]
+    (proxy [java.io.InputStream] []
+      (read
+        ([] (let [p @pos]
+              (if (>= p (alength b)) -1 (do (swap! pos inc) (bit-and (aget b p) 0xFF)))))
+        ([^bytes dst off len]
+         (let [p @pos]
+           (if (>= p (alength b))
+             -1
+             (let [k (min len (- (alength b) p) (inc (.nextInt rnd 40000)))]
+               (System/arraycopy b p dst off k)
+               (reset! pos (+ p k))
+               k))))))))
+
 (deftest h2-streamed-body-integrity-under-backpressure
   ;; A streamed body read in irregular chunks into a ring the writer drains
   ;; at the pace of a slow reader: every byte arrives once, in order.
@@ -3260,3 +3405,330 @@
         ;; PADDED (0x8), pad length 10 with a 1-byte payload.
         (write-frame! conn frame-data 0x8 1 (byte-array [10 97]))
         (is (= 0x1 (some-> (read-until conn #(= frame-goaway (:type %))) goaway-code)) "PROTOCOL_ERROR")))))
+
+;; ---- Closing, writer failures, flow-control fairness ------------------------------
+
+(defn- set-field!
+  "Sets the field named `fname` declared by `obj`'s class or a superclass."
+  [obj ^String fname v]
+  (loop [^Class c (class obj)]
+    (if-let [^java.lang.reflect.Field f (try (.getDeclaredField c fname)
+                                             (catch NoSuchFieldException _ nil))]
+      (.set (doto f (.setAccessible true)) obj v)
+      (if-let [s (.getSuperclass c)]
+        (recur s)
+        (throw (NoSuchFieldException. fname))))))
+
+(deftest h2-graceful-close-waits-for-responses-held-by-flow-control
+  ;; A handler that answered with a fixed body is done, but its response
+  ;; may still wait for the peer's credit: after a GOAWAY the connection
+  ;; closes once that response is out, not as soon as the handler returned.
+  (with-server (fn [_] {:status 200 :body (byte-array 1000)}) {}
+    (with-conn [conn [[0x4 100]]]
+      (send-request! conn 1 (request-headers "GET" "/") true)
+      (let [seen (atom [])]
+        (is (some? (read-until conn (frame-on 1 frame-data) seen)))
+        (write-frame! conn frame-goaway 0 0 (byte-array 8))
+        (ping-round-trip! conn)
+        ;; Long enough for the handler thread to have given its slot back.
+        (Thread/sleep 300)
+        (write-frame! conn frame-window-update 0 1 (u32-bytes 900))
+        (is (some? (read-until conn (end-stream-on 1) seen)) "the response completes")
+        (is (= 1000 (data-bytes-on @seen 1)))
+        (is (eof-within? conn 3000) "then the connection closes")))))
+
+(deftest h2-writer-failure-ends-the-connection
+  ;; Whatever packing a batch throws, the writer gives its role up and the
+  ;; connection ends, rather than nothing being written ever again.
+  (with-server-instance [srv (fn [_] {:status 200 :body "ok"}) {}]
+    (with-conn [conn]
+      (send-request! conn 1 (request-headers "GET" "/") true)
+      (is (= "200" (get (response-on conn 1) ":status")))
+      ;; No encoder: packing the next header block throws.
+      (set-field! (field-of (server-h2-connection srv) "writer") "encoder" nil)
+      (send-request! conn 3 (request-headers "GET" "/") true)
+      (is (eof-within? conn 3000)))))
+
+(deftest h2-teardown-is-bounded-when-the-writer-never-finishes
+  ;; Teardown waits for the active writer, but not forever: past twice
+  ;; :write-timeout it stops waiting and the connection leaves the registry.
+  (with-server-instance [srv (fn [_] {:status 200 :body "ok"}) {:write-timeout 200}]
+    (with-conn [conn]
+      (send-request! conn 1 (request-headers "GET" "/") true)
+      (is (= "200" (get (response-on conn 1) ":status")))
+      ;; A writer role nobody gives back.
+      (set-field! (field-of (server-h2-connection srv) "writer") "writing" (int 1)))
+    (let [^com.s_exp.enso.core.ConnectionRegistry registry (field-of srv "registry")]
+      (is (.awaitEmpty registry (+ (System/nanoTime) 3000000000)) "connection gone"))))
+
+(deftest h2-request-body-ring-shrinks-as-it-is-read
+  ;; A body ring grown by a burst is cut down as the handler reads it, not
+  ;; only once read empty: a handler leaving a few bytes unread can't keep
+  ;; a burst-sized ring per stream (only buffered bytes are charged to
+  ;; :max-buffered-bytes).
+  (let [go (CountDownLatch. 1)
+        body (promise)
+        release (CountDownLatch. 1)]
+    (with-server (fn [req]
+                   (let [^java.io.InputStream in (:body req)]
+                     (.await go 5 TimeUnit/SECONDS)
+                     (.readNBytes in (- 65536 100))
+                     (deliver body in)
+                     (.await release 5 TimeUnit/SECONDS)
+                     (slurp in)
+                     {:status 200 :body "ok"}))
+      {}
+      (with-conn [conn]
+        (send-request! conn 1 (request-headers "POST" "/") false)
+        (send-data! conn 1 65536 false)
+        (ping-round-trip! conn)
+        (.countDown go)
+        (let [in (deref body 5000 nil)]
+          (is (some? in))
+          (is (>= 16384 (alength ^bytes (field-of in "ring"))) "100 bytes left in a small ring"))
+        (.countDown release)
+        (write-frame! conn frame-data flag-end-stream 1 (byte-array 0))
+        (is (= "200" (get (response-on conn 1) ":status")))))))
+
+(deftest h2-settings-ack-and-ping-on-a-stream-are-protocol-errors
+  ;; RFC 9113 §6.5 / §6.7: SETTINGS and PING belong to stream 0; on any
+  ;; other the frame is a connection error PROTOCOL_ERROR, whatever its length.
+  (with-server (fn [_] {:status 200 :body "ok"}) {}
+    (testing "SETTINGS ACK"
+      (with-conn [conn]
+        (write-frame! conn frame-settings 0x1 1 (byte-array 0))
+        (is (= 0x1 (some-> (read-until conn #(= frame-goaway (:type %))) goaway-code)))))
+    (testing "PING"
+      (with-conn [conn]
+        (write-frame! conn frame-ping 0 1 (byte-array 8))
+        (is (= 0x1 (some-> (read-until conn #(= frame-goaway (:type %))) goaway-code)))))))
+
+(deftest h2-end-stream-past-the-body-cap-ends-the-stream
+  ;; The DATA frame taking a body past :max-request-body-bytes may carry
+  ;; END_STREAM: the peer is done, so after the 413 the stream is closed
+  ;; without a RST_STREAM asking it to stop sending.
+  (with-server (fn [req] (slurp (:body req)) {:status 200 :body "ok"}) {:max-request-body-bytes 1000}
+    (with-conn [conn]
+      (send-request! conn 1 (request-headers "POST" "/") false)
+      (write-frame! conn frame-data flag-end-stream 1 (byte-array 2000))
+      (let [seen (atom [])]
+        (read-until conn (end-stream-on 1) seen)
+        (is (= "413" (some #(get-in % [:headers ":status"]) @seen)))
+        (write-frame! conn frame-ping 0 0 (byte-array 8))
+        (read-until conn ping-ack? seen)
+        (swap! seen into (drain-frames conn 300))
+        (is (not-any? (frame-on 1 frame-rst) @seen))))))
+
+(deftest h2-idle-timeout-counts-from-the-last-response
+  ;; :idle-timeout runs from the end of the last stream, not from when its
+  ;; handler returned: a response held by flow control is activity.
+  (with-server (fn [_] {:status 200 :body "hello"}) {:idle-timeout 1000}
+    (with-conn [conn [[0x4 0]]]
+      (send-request! conn 1 (request-headers "GET" "/") true)
+      (is (some? (read-until conn (frame-on 1 frame-headers))))
+      (Thread/sleep 1500)
+      (write-frame! conn frame-window-update 0 1 (u32-bytes 100))
+      (let [seen (atom [])]
+        (is (some? (read-until conn (end-stream-on 1) seen)))
+        (is (nil? (read-until conn #(= frame-goaway (:type %)) seen 800))
+            "no GOAWAY right after the response")
+        (is (some? (read-until conn #(= frame-goaway (:type %)) seen 2000))
+            "GOAWAY once idle")))))
+
+(deftest h2-sparse-empty-data-on-closed-streams-is-not-a-flood
+  ;; Empty DATA frames on streams we reset are counted only while
+  ;; consecutive: interleaved with body bytes they are no flood.
+  (let [release (CountDownLatch. 1)]
+    (with-server (fn [req]
+                   (if (= "/hold" (:uri req))
+                     (do (.await release 10 TimeUnit/SECONDS) {:status 200 :body (slurp (:body req))})
+                     {:status 200 :body "early"}))
+      {}
+      (with-conn [conn]
+        ;; Answered while its body is open: the server resets stream 1.
+        (send-request! conn 1 (request-headers "POST" "/") false)
+        (is (some? (read-until conn (frame-on 1 frame-rst))))
+        (send-request! conn 3 (request-headers "POST" "/hold") false)
+        (dotimes [_ 30]
+          (write-frame! conn frame-data 0 1 (byte-array 0))
+          (write-frame! conn frame-data 0 3 (byte-array 1)))
+        (let [seen (atom [])]
+          (write-frame! conn frame-ping 0 0 (byte-array 8))
+          (read-until conn ping-ack? seen)
+          (.countDown release)
+          (write-frame! conn frame-data flag-end-stream 3 (byte-array 0))
+          (read-until conn (end-stream-on 3) seen)
+          (is (not-any? #(= frame-goaway (:type %)) @seen))
+          (is (= "200" (some #(get-in % [:headers ":status"]) @seen))))))))
+
+(deftest h2-connection-window-updates-skip-streams-waiting-on-their-own-window
+  ;; A connection WINDOW_UPDATE can't help a stream whose own window is
+  ;; shut: it must leave it waiting rather than reschedule it, or tiny
+  ;; connection updates would cost a pass over every such stream each.
+  ;; White-box: no writer may run meanwhile (the role is held for it), so
+  ;; the stream's scheduling state is what the update left.
+  (with-server-instance [srv (fn [_] {:status 200 :body "hello"}) {}]
+    (with-conn [conn [[0x4 0]]]
+      (send-request! conn 1 (request-headers "GET" "/") true)
+      (is (some? (read-until conn #(and (= 1 (:sid %)) (:headers %)))))
+      (let [writer (field-of (server-h2-connection srv) "writer")
+            s (loop [i 0]
+                (or (field-of writer "blockedHead")
+                    (when (< i 200) (Thread/sleep 10) (recur (inc i)))))
+            window (field-of writer "connSendWindow")]
+        (is (some? s) "the stream waits for credit")
+        (set-field! writer "writing" (int 1))
+        (try
+          (write-frame! conn frame-window-update 0 0 (u32-bytes 100000))
+          (is (support/await-condition #(not= window (field-of writer "connSendWindow")) 3000 5)
+              "the update was handled")
+          (is (= 2 (field-of s "sched")) "still waiting on its own window")
+          (finally (set-field! writer "writing" (int 0))))
+        (write-frame! conn frame-window-update 0 1 (u32-bytes 100))
+        (is (some? (read-until conn (end-stream-on 1))) "sent once its own window opens")))))
+
+(def ^:private key-update-client
+  "Client run in its own JVM: the JDK reads jdk.tls.keyLimits once, so only
+  a fresh JVM can be made to send TLS 1.3 KeyUpdate (update_requested)
+  after a few KiB. It asks for a large response and doesn't read it (the
+  server's writer blocks on the socket), crosses its key limit with
+  ignored frames, sends a second request, waits, then reads everything.
+  Prints when it sent the second request and when it started reading."
+  "(java.security.Security/setProperty \"jdk.tls.keyLimits\"
+     \"AES/GCM/NoPadding KeyUpdate 2^13, ChaCha20-Poly1305 KeyUpdate 2^13\")
+   (let [port (Integer/parseInt (System/getProperty \"enso.port\"))
+         tm (reify javax.net.ssl.X509TrustManager
+              (checkClientTrusted [_ _ _]) (checkServerTrusted [_ _ _])
+              (getAcceptedIssuers [_] (make-array java.security.cert.X509Certificate 0)))
+         ctx (doto (javax.net.ssl.SSLContext/getInstance \"TLSv1.3\")
+               (.init nil (into-array javax.net.ssl.TrustManager [tm]) nil))
+         ^javax.net.ssl.SSLSocket sock (.createSocket (.getSocketFactory ctx))
+         _ (.setReceiveBufferSize sock 4096)
+         _ (.connect sock (java.net.InetSocketAddress. \"127.0.0.1\" (int port)))
+         _ (.setTcpNoDelay sock true)
+         params (doto (.getSSLParameters sock) (.setApplicationProtocols (into-array String [\"h2\"])))
+         _ (.setSSLParameters sock params)
+         _ (.startHandshake sock)
+         out (.getOutputStream sock)
+         in (java.io.DataInputStream. (.getInputStream sock))
+         enc (com.s_exp.enso.http2.Hpack$Encoder. 4096)
+         frame (fn [type flags sid ^bytes payload]
+                 (let [n (alength payload)]
+                   (.write out (byte-array (map unchecked-byte [(bit-shift-right n 16) (bit-shift-right n 8) n type flags
+                                                                (bit-shift-right sid 24) (bit-shift-right sid 16)
+                                                                (bit-shift-right sid 8) sid])))
+                   (.write out payload)
+                   (.flush out)))
+         request (fn [sid path]
+               (let [l (java.util.ArrayList.)]
+                 (doseq [[k v] [[\":method\" \"GET\"] [\":scheme\" \"https\"] [\":path\" path] [\":authority\" \"localhost\"]]]
+                   (.add l (com.s_exp.enso.http2.Hpack$HeaderField. k v)))
+                 (frame 1 5 sid (.encode enc l))))]
+     (.write out (.getBytes \"PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n\" \"ISO-8859-1\"))
+     (frame 4 0 0 (byte-array (map unchecked-byte [0 4 0x7F 0xFF 0xFF 0xFF])))
+     (frame 8 0 0 (byte-array (map unchecked-byte [0x7F 0xFF 0 0])))
+     (request 1 \"/big\")
+     (Thread/sleep 1000)
+     (dotimes [_ 3] (frame 0xF0 0 0 (byte-array 12000)))
+     (request 3 \"/mark\")
+     (println \"sent\" (System/currentTimeMillis))
+     (Thread/sleep 3000)
+     (println \"reading\" (System/currentTimeMillis))
+     (loop [ended #{}]
+       (when-not (= ended #{1 3})
+         (let [hdr (byte-array 9)
+               _ (.readFully in hdr)
+               n (bit-or (bit-shift-left (bit-and (aget hdr 0) 0xFF) 16)
+                         (bit-shift-left (bit-and (aget hdr 1) 0xFF) 8)
+                         (bit-and (aget hdr 2) 0xFF))
+               _ (.readFully in (byte-array n))
+               sid (bit-and (aget hdr 8) 0xFF)]
+           (recur (if (and (#{0 1} (aget hdr 3)) (pos? (bit-and 1 (aget hdr 4)))) (conj ended sid) ended)))))
+     (println \"done\")
+     (.close sock))")
+
+(deftest h2-tls-key-update-does-not-stall-the-framer
+  ;; A TLS 1.3 KeyUpdate from the client asks for ours in return. The
+  ;; framer reads it while the writer may be blocked on a peer that isn't
+  ;; reading: it must not wait for the writer (it would stop reading every
+  ;; stream); ours goes out with the next record written.
+  (let [marked (promise)
+        big (byte-array (* 16 1024 1024))]
+    (with-server (fn [req]
+                   (if (= "/mark" (:uri req))
+                     (do (deliver marked (System/currentTimeMillis)) {:status 200 :body "mark"})
+                     {:status 200 :body big}))
+      {}
+      (let [^java.util.List cmd [(str (System/getProperty "java.home") "/bin/java")
+                                 (str "-Denso.port=" *port*)
+                                 "-cp" (System/getProperty "java.class.path")
+                                 "clojure.main" "-e" key-update-client]
+            pb (doto (ProcessBuilder. cmd) (.redirectErrorStream true))
+            p (.start pb)
+            output (future (slurp (.getInputStream p)))]
+        (try
+          (is (.waitFor p 60 TimeUnit/SECONDS) "client finished")
+          (let [out @output
+                at (fn [k] (some->> (re-find (re-pattern (str k " (\\d+)")) out) second parse-long))]
+            (is (str/includes? out "done") out)
+            (is (some? (at "sent")) out)
+            (is (realized? marked) "second request served")
+            (when (and (realized? marked) (at "reading"))
+              (is (< @marked (at "reading")) "served while the client wasn't reading")))
+          (finally (.destroyForcibly p)))))))
+
+(deftest h2-concurrent-streamed-bodies-stay-intact-across-resets
+  ;; Streamed-body rings are pooled and reused as soon as a stream's last
+  ;; bytes are packed or it is reset: waves of concurrent bodies (each its
+  ;; own pattern), some reset mid-way, on two connections at once, must
+  ;; arrive whole and unmixed while later waves reuse the rings.
+  (let [n (* 200 1024)
+        body-of (fn [sid] (let [b (byte-array n)]
+                            (dotimes [i n] (aset b i (unchecked-byte (+ i sid))))
+                            b))
+        sids (range 1 121 2)
+        bodies (into {} (map (fn [sid] [sid (body-of sid)])) sids)
+        reset? #(zero? (mod % 7))
+        received (fn [frames sid]
+                   (let [data (filter (frame-on sid frame-data) frames)
+                         got (byte-array (reduce + 0 (map #(alength ^bytes (:payload %)) data)))]
+                     (reduce (fn [off f] (let [^bytes p (:payload f)]
+                                           (System/arraycopy p 0 got off (alength p))
+                                           (+ off (alength p))))
+                             0 data)
+                     got))
+        run-waves (fn [conn]
+                    (open-windows! conn)
+                    (doall
+                     (for [wave (partition 10 sids)]
+                       (let [seen (atom [])]
+                         (doseq [sid wave]
+                           (send-request! conn sid (request-headers "GET" (str "/" sid)) true))
+                         (doseq [sid (filter reset? wave)]
+                           (write-frame! conn frame-rst 0 sid (u32-bytes 0x8)))
+                         (doall
+                          (for [sid (remove reset? wave)]
+                            (do (or (some (end-stream-on sid) @seen) (read-until conn (end-stream-on sid) seen 30000))
+                                [sid (java.util.Arrays/equals ^bytes (get bodies sid) ^bytes (received @seen sid))])))))))]
+    (with-server (fn [req] {:status 200
+                            :body (patterned-stream-of (get bodies (parse-long (subs (:uri req) 1))))})
+      {}
+      (let [conns [(h2-connect! [[0x4 0x7FFFFFFF]]) (h2-connect! [[0x4 0x7FFFFFFF]])]]
+        (try
+          (let [results (mapv deref (mapv #(future (run-waves %)) conns))]
+            (doseq [[sid ok] (apply concat (apply concat results))]
+              (is ok (str "stream " sid))))
+          (finally (run! close-conn! conns)))))))
+
+(deftest h2-zero-window-update-is-a-stream-error-whatever-the-state
+  ;; §6.9: a WINDOW_UPDATE with a 0 increment is malformed, so a stream
+  ;; error even on a stream already closed (as Go's server does), not
+  ;; ignored like credit in flight: what the peer sees can't depend on
+  ;; whether its response won the race.
+  (with-server (fn [_] {:status 200 :body "ok"}) {}
+    (with-conn [conn]
+      (send-request! conn 1 (request-headers "GET" "/") true)
+      (is (some? (read-until conn (end-stream-on 1))))
+      (ping-round-trip! conn)
+      (write-frame! conn frame-window-update 0 1 (u32-bytes 0))
+      (is (= 0x1 (some-> (read-until conn (frame-on 1 frame-rst)) rst-code)) "RST_STREAM(PROTOCOL_ERROR)"))))

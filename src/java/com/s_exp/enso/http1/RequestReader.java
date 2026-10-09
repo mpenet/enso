@@ -6,7 +6,10 @@ import java.io.ByteArrayInputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.SequenceInputStream;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
@@ -20,6 +23,7 @@ import com.s_exp.enso.core.HttpError;
 import com.s_exp.enso.core.HttpStatus;
 import com.s_exp.enso.core.RequestBodyException;
 import com.s_exp.enso.core.RequestBodyTimeoutException;
+import com.s_exp.enso.core.DataRate;
 import com.s_exp.enso.core.HttpFields;
 import com.s_exp.enso.core.RequestHead;
 import com.s_exp.enso.core.TlsSocket;
@@ -32,8 +36,12 @@ import com.s_exp.enso.util.RingHeaders;
  * {@link HttpConnection}): {@code :idle-timeout} while waiting for the
  * first byte of a request, the remaining {@code :header-timeout} budget
  * while the head is incomplete, {@code :read-timeout} for body reads.
- * The parse buffer and its cursors live here, so the parsing loops touch
- * only this object's fields.
+ * Over TLS a read returns only whole records, which a client can trickle
+ * a byte per socket timeout, so the TLS socket is also held to the wall
+ * clock of the phase ({@link TlsSocket#setReadDeadline}): the idle wait,
+ * the header deadline, a body read's {@code :min-data-rate-bytes}
+ * allowance. The parse buffer and its cursors live here, so the parsing
+ * loops touch only this object's fields.
  */
 final class RequestReader {
 
@@ -53,6 +61,32 @@ final class RequestReader {
     // Longest chunk-size line, extensions included (nginx and Netty cap it
     // far below the header limit too): framing, not payload.
     private static final int MAX_CHUNK_LINE_BYTES = 4096;
+    // Header maps up to this many fields are array maps over the parsed
+    // array (one Object[] and the map), larger ones hash maps. Clojure's own
+    // array maps stop at 8, but a browser sends 10 to 20 fields, and a hash
+    // map of those costs several times more to build than a lookup scanning
+    // them (names are interned, so most comparisons are by identity).
+    private static final int MAX_ARRAY_MAP_FIELDS = 32;
+    // Fields with names HeaderNames doesn't know whose name and value are
+    // kept per connection, by position (see unknownNames).
+    private static final int UNKNOWN_FIELD_SLOTS = 16;
+    // A wait longer than this has no SO_TIMEOUT to express it.
+    private static final long MAX_WAIT_NANOS = Integer.MAX_VALUE * 1_000_000L;
+
+    // States of a socket read, for :handler-timeout interrupts (see interrupt).
+    private static final int READ_NONE = 0;
+    private static final int READ_BLOCKED = 1;
+    private static final int READ_INTERRUPT_PENDING = 2;
+    private static final int READ_INTERRUPTING = 3;
+    private static final VarHandle READ_STATE;
+
+    static {
+        try {
+            READ_STATE = MethodHandles.lookup().findVarHandle(RequestReader.class, "readState", int.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
 
     // Which timeout bounds the next socket read.
     private static final int PHASE_IDLE = 0;
@@ -67,6 +101,10 @@ final class RequestReader {
     private final java.net.InetAddress remoteAddress;
     private final int localPort;
     private final clojure.lang.Keyword scheme;
+    // The TLS socket under the connection, null in cleartext.
+    private final TlsSocket tls;
+    // With :handler-timeout the handler (on this thread) may be interrupted.
+    private final boolean interruptible;
 
     private InputStream in;
     private byte[] buf;
@@ -81,6 +119,14 @@ final class RequestReader {
     private final String[] lastValues = new String[HeaderNames.COUNT];
     private String lastUri;
     private String lastQuery;
+    // Likewise for names HeaderNames doesn't know: the name and value of the
+    // i-th such field of the last request, as a keep-alive client sends its
+    // fields in the same order every time. Allocated by the first one.
+    private String[] unknownNames;
+    private String[] unknownValues;
+    // The last request parsed: what it derived from the connection
+    // (:remote-addr, :server-name, ...) is handed to the next one.
+    private Request lastRequest;
     private int phase;
     // This idle period already gave its buffers back (see IDLE_SHRINK_MILLIS).
     private boolean idleShrunk;
@@ -89,8 +135,18 @@ final class RequestReader {
     private int headBytes;
     private long headerDeadlineNanos;
     private int currentSoTimeout = -1;
+    // Body phase, for :min-data-rate-bytes: bytes read off the socket and
+    // time spent waiting for them.
+    private long bodyBytes;
+    private long bodyWaitedNanos;
     // Set while a body may only consume what is already buffered.
     private boolean bufferedOnly;
+    // Wall-clock end of the post-response drain of an unread body, 0 when
+    // none is running.
+    private long drainDeadlineNanos;
+    // READ_*: whether this thread is in a socket read, for interrupt.
+    @SuppressWarnings("unused") // accessed through READ_STATE
+    private volatile int readState;
 
     RequestReader(HttpConnection connection, ResponseWriter writer, Socket socket, Config config) {
         this.connection = connection;
@@ -100,7 +156,9 @@ final class RequestReader {
         this.buf = new byte[Math.min(REQUEST_BUFFER_BYTES, config.maxHeaderBytes)];
         this.remoteAddress = socket.getInetAddress();
         this.localPort = socket.getLocalPort();
-        this.scheme = socket instanceof TlsSocket.AdapterSocket ? Request.K_HTTPS : Request.K_HTTP;
+        this.tls = socket instanceof TlsSocket.AdapterSocket adapter ? adapter.tls() : null;
+        this.scheme = tls != null ? Request.K_HTTPS : Request.K_HTTP;
+        this.interruptible = config.handlerTimeoutMillis > 0;
     }
 
     /** {@code prefix[0, prefixLen)}: bytes already read from {@code in}, parsed first (none when null). */
@@ -138,9 +196,11 @@ final class RequestReader {
         return phase == PHASE_BODY;
     }
 
-    /** Reads from here on are request body reads, bounded by :read-timeout. */
+    /** Reads from here on are request body reads, bounded by :read-timeout and :min-data-rate-bytes. */
     void startBody() {
         phase = PHASE_BODY;
+        bodyBytes = 0;
+        bodyWaitedNanos = 0;
     }
 
     /** The next read waits for a request under :idle-timeout. */
@@ -156,6 +216,9 @@ final class RequestReader {
     boolean inputPending() {
         if (pos < limit) {
             return true;
+        }
+        if (tls != null) {
+            return tls.inputPending();
         }
         try {
             return in != null && in.available() > 0;
@@ -174,8 +237,11 @@ final class RequestReader {
      */
     void lingeringClose() {
         try {
-            socket.shutdownOutput();
+            connection.shutdownOutputWatched();
             long deadline = System.nanoTime() + LINGER_MILLIS * 1_000_000L;
+            if (tls != null) {
+                tls.setReadDeadline(deadline);
+            }
             byte[] discard = buf;
             while (true) {
                 long remainingMs = (deadline - System.nanoTime()) / 1_000_000L;
@@ -198,6 +264,10 @@ final class RequestReader {
      * before the socket.
      */
     InputStream upgradeInput() {
+        if (tls != null) {
+            // The WebSocket bounds its reads its own way.
+            tls.setReadDeadline(0);
+        }
         InputStream wsIn = pos < limit
             ? new SequenceInputStream(new ByteArrayInputStream(buf, pos, limit - pos), in)
             : in;
@@ -219,34 +289,150 @@ final class RequestReader {
         writer.reclaimOutput();
         writer.flush();
         int timeout;
+        // Wall-clock end of this read for a TLS socket (class doc), 0 = none.
+        long deadline = 0;
         if (phase == PHASE_IDLE) {
             timeout = idleReadTimeout();
+            if (tls != null && timeout > 0) {
+                deadline = System.nanoTime() + timeout * 1_000_000L;
+            }
         } else if (phase == PHASE_HEAD && headerDeadlineNanos != 0) {
             long remainingNs = headerDeadlineNanos - System.nanoTime();
             if (remainingNs <= 0) {
                 throw new HttpError(408, "Request Timeout");
             }
-            timeout = (int) Math.max(1, Math.min(Integer.MAX_VALUE, (remainingNs + 999_999L) / 1_000_000L));
+            timeout = ceilMillis(remainingNs);
+            deadline = headerDeadlineNanos;
         } else {
             timeout = config.readTimeoutMillis;
+        }
+        if (phase == PHASE_BODY && drainDeadlineNanos != 0) {
+            long remainingNs = drainDeadlineNanos - System.nanoTime();
+            if (remainingNs <= 0) {
+                throw WouldBlock.INSTANCE;
+            }
+            int ms = ceilMillis(remainingNs);
+            if (timeout == 0 || ms < timeout) {
+                timeout = ms;
+            }
+            deadline = drainDeadlineNanos;
+        }
+        boolean rated = phase == PHASE_BODY && config.minDataRateBytes > 0;
+        long waitStart = 0;
+        long allowance = 0;
+        if (rated) {
+            allowance = DataRate.allowanceNanos(config.minDataRateBytes,
+                                                config.minDataRateGraceMillis * 1_000_000L,
+                                                bodyBytes, bodyWaitedNanos);
+            if (allowance <= 0) {
+                throw RequestBodyTimeoutException.minDataRate();
+            }
+            waitStart = System.nanoTime();
+            if (allowance < MAX_WAIT_NANOS) {
+                int ms = ceilMillis(allowance);
+                if (timeout == 0 || ms < timeout) {
+                    timeout = ms;
+                }
+                long rateDeadline = waitStart + allowance;
+                if (deadline == 0 || rateDeadline - deadline < 0) {
+                    deadline = rateDeadline;
+                }
+            }
         }
         if (timeout != currentSoTimeout) {
             socket.setSoTimeout(timeout);
             currentSoTimeout = timeout;
         }
+        if (tls != null) {
+            tls.setReadDeadline(deadline);
+        }
         int n;
+        if (interruptible) {
+            enterRead();
+        }
         try {
             n = in.read(dst, off, len);
         } catch (SocketTimeoutException e) {
             if (phase == PHASE_IDLE) {
                 throw e;
             }
+            long now = System.nanoTime();
+            if (drainDeadlineNanos != 0 && now - drainDeadlineNanos >= 0) {
+                throw WouldBlock.INSTANCE;
+            }
+            if (rated && now - waitStart >= allowance) {
+                throw RequestBodyTimeoutException.minDataRate();
+            }
             throw new HttpError(408, "Request Timeout");
+        } finally {
+            if (interruptible) {
+                exitRead();
+            }
+        }
+        if (rated) {
+            bodyWaitedNanos += System.nanoTime() - waitStart;
+            if (n > 0) bodyBytes += n;
         }
         if (n > 0 && phase == PHASE_IDLE) {
             startHead();
         }
         return n;
+    }
+
+    private static int ceilMillis(long nanos) {
+        return (int) Math.max(1, Math.min(Integer.MAX_VALUE, (nanos + 999_999L) / 1_000_000L));
+    }
+
+    /**
+     * Interrupts {@code t}, the handler's thread, for :handler-timeout. The
+     * handler runs on this connection's thread, and an interrupt landing in
+     * a blocked socket read closes the socket (interruptible channels), so
+     * the lingering close that keeps the 503 from a reset would be lost.
+     * During a read it is deferred: the reading thread interrupts itself
+     * once the read returns (bounded by the read's own timeouts), and its
+     * next read fails with {@link InterruptedIOException}. Any thread.
+     */
+    void interrupt(Thread t) {
+        while (true) {
+            int s = (int) READ_STATE.getVolatile(this);
+            if (s == READ_BLOCKED) {
+                if (READ_STATE.compareAndSet(this, READ_BLOCKED, READ_INTERRUPT_PENDING)) {
+                    return;
+                }
+            } else if (s == READ_NONE) {
+                if (READ_STATE.compareAndSet(this, READ_NONE, READ_INTERRUPTING)) {
+                    try {
+                        t.interrupt();
+                    } finally {
+                        READ_STATE.setVolatile(this, READ_NONE);
+                    }
+                    return;
+                }
+            } else {
+                // Already pending or being delivered.
+                return;
+            }
+        }
+    }
+
+    /** A socket read starts (see {@link #interrupt}); an interrupted thread reads nothing. */
+    private void enterRead() throws InterruptedIOException {
+        while (!READ_STATE.compareAndSet(this, READ_NONE, READ_BLOCKED)) {
+            // An interrupt is being delivered: it takes no longer than that.
+            Thread.onSpinWait();
+        }
+        if (Thread.currentThread().isInterrupted()) {
+            READ_STATE.setVolatile(this, READ_NONE);
+            throw new InterruptedIOException("handler interrupted");
+        }
+    }
+
+    /** The socket read returned: an interrupt deferred meanwhile is delivered now. */
+    private void exitRead() {
+        if (!READ_STATE.compareAndSet(this, READ_BLOCKED, READ_NONE)) {
+            READ_STATE.setVolatile(this, READ_NONE);
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
@@ -262,6 +448,12 @@ final class RequestReader {
             try {
                 n = socketRead(buf, limit, buf.length - limit);
             } catch (SocketTimeoutException e) {
+                if (phase == PHASE_IDLE && tls != null && tls.inputPending()) {
+                    // Part of a record is in: a request is arriving, under
+                    // the header clock from now on.
+                    startHead();
+                    continue;
+                }
                 if (idleShrunk || !shrinksWhenIdle()) {
                     throw e;
                 }
@@ -313,17 +505,25 @@ final class RequestReader {
         Arrays.fill(lastValues, null);
         lastUri = null;
         lastQuery = null;
-        if (socket instanceof TlsSocket.AdapterSocket tls) {
-            tls.tls().releaseIdleBuffers();
+        if (unknownNames != null) {
+            Arrays.fill(unknownNames, null);
+            Arrays.fill(unknownValues, null);
+        }
+        lastRequest = null;
+        if (tls != null) {
+            tls.releaseIdleBuffers();
         }
     }
 
-    /** The first byte of a request is here: no longer idle, header clock starts. */
-    void startHead() {
-        // Clearing idle here closes the shutdown race: a drain only
-        // closes a socket while idle is still true, i.e. before any
-        // request byte has been observed.
-        connection.idle = false;
+    /**
+     * The first byte of a request is here: no longer idle, header clock
+     * starts. Fails when a drain closed the idle connection first (see
+     * {@link HttpConnection#leaveIdle}): the request is not served.
+     */
+    void startHead() throws IOException {
+        if (!connection.leaveIdle()) {
+            throw new IOException("connection closed by a drain");
+        }
         phase = PHASE_HEAD;
         headerDeadlineNanos = config.headerTimeoutMillis > 0
             ? System.nanoTime() + config.headerTimeoutMillis * 1_000_000L : 0;
@@ -333,12 +533,12 @@ final class RequestReader {
 
     Request parseRequest() throws IOException {
         headBytes = 0;
-        int lineEnd = scanHeadLine();
+        int lineEnd = scanRequestLine();
         while (lineEnd == pos) {
             // Empty lines before the request line (RFC 9112 §2.2) are
             // skipped but count towards the head's size.
             consumeHeadLine(lineEnd);
-            lineEnd = scanHeadLine();
+            lineEnd = scanRequestLine();
         }
         if (lineEnd < 0) {
             if (pos == limit) {
@@ -456,8 +656,10 @@ final class RequestReader {
             }
         }
         currentBody = body;
-        return new Request(method, uri, queryString, protocol, headers, body,
-                           remoteAddress, localPort, scheme, socket);
+        Request request = new Request(method, uri, queryString, protocol, headers, body,
+                                      remoteAddress, localPort, scheme, socket, lastRequest);
+        lastRequest = request;
+        return request;
     }
 
     /**
@@ -503,21 +705,31 @@ final class RequestReader {
         // Node[] + N Node allocations. The field count cap keeps that scan
         // bounded.
         headerScratchLen = 0;
+        int unknown = 0;
         while (true) {
             int start = pos;
             int i = start;
             int colon = -1;
             while (true) {
-                while (i + 1 < limit) {
+                boolean lineEnds = false;
+                while (i < limit) {
                     byte b = buf[i];
-                    if (b == ':' && colon < 0) {
-                        colon = i;
-                    } else if (b == '\r' && buf[i + 1] == '\n') {
-                        break;
+                    if (b == ':') {
+                        if (colon < 0) colon = i;
+                    } else if (b == '\r') {
+                        if (i + 1 == limit) {
+                            break;
+                        }
+                        if (buf[i + 1] == '\n') {
+                            lineEnds = true;
+                            break;
+                        }
+                    } else if (b == '\n') {
+                        throw bareLf();
                     }
                     i++;
                 }
-                if (i + 1 < limit) {
+                if (lineEnds) {
                     break;
                 }
                 if (limit == buf.length) {
@@ -559,7 +771,9 @@ final class RequestReader {
                 // has nothing to merge, and the scratch is reused. Its output
                 // has unique keys, so the map skips a second dedupe pass.
                 Object[] copy = Arrays.copyOf(headerScratch, headerScratchLen);
-                return RingHeaders.toMap(RingHeaders.mergeDuplicates(copy, headerScratchLen));
+                Object[] fields = RingHeaders.mergeDuplicates(copy, headerScratchLen);
+                return fields.length <= 2 * MAX_ARRAY_MAP_FIELDS
+                    ? new PersistentArrayMap(fields) : RingHeaders.toMap(fields);
             }
             // RFC 7230 §3.2.4: obs-fold (a header line starting with SP or HTAB
             // is a continuation of the previous one) is deprecated and must be
@@ -576,7 +790,6 @@ final class RequestReader {
             // proxy tokenises differently.
             validateTokenBytes(start, colon);
             int known = HeaderNames.index(buf, start, colon);
-            String name = known >= 0 ? HeaderNames.name(known) : lowerAscii(start, colon);
             int vs = colon + 1;
             while (vs < lineEnd && (buf[vs] == ' ' || buf[vs] == '\t')) {
                 vs++;
@@ -586,8 +799,10 @@ final class RequestReader {
                 ve--;
             }
             validateFieldValueBytes(vs, ve);
+            String name;
             String value;
             if (known >= 0) {
+                name = HeaderNames.name(known);
                 // A keep-alive client repeats most values (Host,
                 // User-Agent, Accept*, Cookie): reuse the last String seen
                 // for this name on this connection when the bytes match.
@@ -598,7 +813,27 @@ final class RequestReader {
                     value = str(vs, ve);
                     lastValues[known] = value;
                 }
+            } else if (unknown < UNKNOWN_FIELD_SLOTS) {
+                String[] names = unknownNames;
+                if (names == null) {
+                    names = unknownNames = new String[UNKNOWN_FIELD_SLOTS];
+                    unknownValues = new String[UNKNOWN_FIELD_SLOTS];
+                }
+                String lastName = names[unknown];
+                if (lastName != null && sameLowerBytes(lastName, start, colon)) {
+                    name = lastName;
+                } else {
+                    name = names[unknown] = lowerAscii(start, colon);
+                }
+                String lastValue = unknownValues[unknown];
+                if (lastValue != null && sameBytes(lastValue, vs, ve)) {
+                    value = lastValue;
+                } else {
+                    value = unknownValues[unknown] = str(vs, ve);
+                }
+                unknown++;
             } else {
+                name = lowerAscii(start, colon);
                 value = str(vs, ve);
             }
             if (name.equals("content-length")
@@ -637,9 +872,18 @@ final class RequestReader {
         pos = lineEnd + 2;
     }
 
-    /** The next line of the request head; see {@link #scanLine}. */
-    private int scanHeadLine() throws IOException {
-        return scanLine(config.maxHeaderBytes - headBytes, 431);
+    /**
+     * The request line (or an empty line before it); see {@link #scanLine}.
+     * A request line too long for the head on its own is 414 URI Too Long
+     * (RFC 9112 §3); after empty lines, the head is too long: 431.
+     */
+    private int scanRequestLine() throws IOException {
+        return scanLine(config.maxHeaderBytes - headBytes, headBytes == 0 ? 414 : 431);
+    }
+
+    /** RFC 9112 §2.2: a line ends with CRLF; a bare LF is refused as soon as it is seen. */
+    private static HttpError bareLf() {
+        return new HttpError(400, "Bad Request");
     }
 
     void compact() {
@@ -655,17 +899,26 @@ final class RequestReader {
     /**
      * Returns the index of the CR of the next CRLF, or -1 on EOF. A line
      * that can't end within {@code maxLineBytes} (CRLF included) fails
-     * with {@code status} before more bytes are read for it.
+     * with {@code status} before more bytes are read for it; a bare LF
+     * fails with 400.
      */
     private int scanLine(int maxLineBytes, int status) throws IOException {
         int i = pos;
         while (true) {
-            while (i + 1 < limit) {
-                if (buf[i] == '\r' && buf[i + 1] == '\n') {
-                    if (i + 2 - pos > maxLineBytes) {
-                        throw new HttpError(status, HttpStatus.reason(status));
+            while (i < limit) {
+                byte b = buf[i];
+                if (b == '\r') {
+                    if (i + 1 == limit) {
+                        break;
                     }
-                    return i;
+                    if (buf[i + 1] == '\n') {
+                        if (i + 2 - pos > maxLineBytes) {
+                            throw new HttpError(status, HttpStatus.reason(status));
+                        }
+                        return i;
+                    }
+                } else if (b == '\n') {
+                    throw bareLf();
                 }
                 i++;
             }
@@ -790,6 +1043,27 @@ final class RequestReader {
         return true;
     }
 
+    /**
+     * Whether {@code lower}, a lowercase name, is {@code buf[from, to)}
+     * lowercased.
+     */
+    private boolean sameLowerBytes(String lower, int from, int to) {
+        int len = to - from;
+        if (lower.length() != len) {
+            return false;
+        }
+        for (int i = 0; i < len; i++) {
+            int b = buf[from + i];
+            if (b >= 'A' && b <= 'Z') {
+                b += 32;
+            }
+            if (lower.charAt(i) != (char) (b & 0xFF)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** {@link #str}, reusing {@code last} when it holds the same bytes. */
     private String strOrLast(String last, int from, int to) {
         return last != null && sameBytes(last, from, to) ? last : str(from, to);
@@ -859,11 +1133,11 @@ final class RequestReader {
      */
     abstract class RequestBody extends InputStream {
 
-        // Reused single-byte scratch for read() so a client using
-        // Reader.read()-style byte-at-a-time consumption doesn't allocate
-        // per call. Thread-confined — one RequestBody per stream, and the
-        // Ring handler runs on a single vthread.
-        private final byte[] oneByte = new byte[1];
+        // Single-byte scratch for read(), allocated by its first call, so a
+        // handler reading byte at a time doesn't allocate per call and one
+        // reading arrays never does. Thread-confined: one RequestBody per
+        // request, read by its handler.
+        private byte[] oneByte;
         IOException failure;
         // Body bytes read off the connection (by the handler or a drain), for events.
         long received;
@@ -873,7 +1147,11 @@ final class RequestReader {
 
         @Override
         public final int read() throws IOException {
-            return read(oneByte, 0, 1) < 0 ? -1 : oneByte[0] & 0xFF;
+            byte[] one = oneByte;
+            if (one == null) {
+                one = oneByte = new byte[1];
+            }
+            return read(one, 0, 1) < 0 ? -1 : one[0] & 0xFF;
         }
 
         @Override
@@ -902,6 +1180,9 @@ final class RequestReader {
             } catch (HttpError e) {
                 failure = e.status == 408 ? new RequestBodyTimeoutException()
                     : new RequestBodyException(e.status, e.getMessage());
+                throw failure;
+            } catch (RequestBodyTimeoutException e) {
+                failure = e;
                 throw failure;
             } catch (EOFException e) {
                 failure = RequestBodyException.malformed("request body ended early");
@@ -939,6 +1220,22 @@ final class RequestReader {
         }
 
         /**
+         * {@link #drain} after the response, within {@code millis} of wall
+         * clock: a client trickling the rest, each byte resetting
+         * :read-timeout, gets no longer. False when the time ran out.
+         */
+        boolean drainWithin(long maxBytes, long millis) throws IOException {
+            drainDeadlineNanos = System.nanoTime() + millis * 1_000_000L;
+            try {
+                return drain(maxBytes);
+            } catch (WouldBlock e) {
+                return false;
+            } finally {
+                drainDeadlineNanos = 0;
+            }
+        }
+
+        /**
          * Discards what is already buffered, never waiting on the socket;
          * true when that finished the body. A body left unfinished here
          * must not be read again (its parser may be mid-line).
@@ -955,7 +1252,10 @@ final class RequestReader {
         }
     }
 
-    /** Thrown by {@link #socketRead} while only buffered bytes may be read. */
+    /**
+     * Thrown by {@link #socketRead} when it may not wait: only buffered
+     * bytes may be read, or the post-response drain's time is up.
+     */
     private static final class WouldBlock extends RuntimeException {
         static final WouldBlock INSTANCE = new WouldBlock();
 

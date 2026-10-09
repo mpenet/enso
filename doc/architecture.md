@@ -42,8 +42,10 @@ Clojure maps.
 
 | Thread | Kind | Runs |
 |---|---|---|
-| `enso-acceptor` | platform, daemon | `accept()`, limiter check, dispatch. Never blocks on a connection. |
-| `enso-timer` | platform, daemon | the shared `Timer` wheel; callbacks only (never block). |
+| `enso-acceptor` | platform, daemon | `accept()`, limiter check, dispatch. Never blocks on a connection; whatever one iteration throws is logged and backed off from, the loop goes on. |
+| `enso-timer` | platform, daemon | the shared `Timer` wheel; callbacks only (never block). Supervised: a failing task is logged, a failure of the loop itself restarts it. |
+| `enso-events` | platform, daemon, only with `:server-events` | delivers the queued `ServerEvents` to the listener, in order (`GuardedEvents`); the only thread that runs listener code |
+| memory budget waker | short-lived virtual, one per episode of pressure relief | runs the `MemoryBudget` waiters once usage falls below the low-water mark (never the releasing thread) |
 | connection thread | virtual, one per TCP connection | socket options, TLS handshake + ALPN (or, with `:http2c`, a look at the first bytes for the HTTP/2 preface), then the driver |
 | HTTP/1.1 | the connection thread | parse, handler, write, keep-alive loop; a WebSocket read loop after an upgrade |
 | WebSocket sends | any thread | synchronous: the caller, under the connection's write lock |
@@ -89,16 +91,26 @@ Clojure maps.
   connection; TLS 1.3 post-handshake messages (KeyUpdate) are driven
   through. Handshake failures are reported as "tls" protocol errors:
   "handshake-timeout" (deadline or a silent peer), "handshake",
-  "renegotiation". `shutdownOutput()` sends close_notify then FIN and
+  "renegotiation". A KeyUpdate asking for ours leaves it queued in the
+  engine: it goes out ahead of the next record written (RFC 8446 §4.6.3),
+  so the read path never writes and never waits for a writer (one
+  blocked on a peer that doesn't read would stall it).
+  `shutdownOutput()` sends close_notify then FIN and
   keeps the input open (lingering close); `releaseIdleBuffers()` swaps
   the ~16 KiB record buffers for 512-byte ones while a connection is
   idle (they grow back through the underflow / overflow paths).
 - `close()`: see Graceful shutdown.
 - The `:server-events` listener is wrapped by `core.GuardedEvents` in the
-  server's `Service`: every call swallows and logs (WARNING,
-  rate-limited) what the listener throws, so a faulty listener can't kill
-  the acceptor, a connection or an HTTP/3 event loop, and no call site
-  needs its own guard. `start()` builds the server's `core.Service`.
+  server's `Service`: a call never runs listener code, it fills a
+  preallocated slot of a bounded queue that the `enso-events` thread
+  drains into the listener (see Observability), so a slow or faulty
+  listener can't stall or kill the acceptor, the timer, a connection, an
+  HTTP/2 writer or an HTTP/3 event loop, and no call site needs its own
+  guard. `start()` builds the server's `core.Service`; `close()` closes it
+  last, delivering the events still queued.
+- `isHealthy()`: running, with the acceptor, the timer and every HTTP/3
+  event loop thread alive (each is supervised, so false is a fault worth
+  alerting on).
 
 ## Shared core contracts
 
@@ -124,7 +136,9 @@ HTTP/2 the `Http2Stream`; HTTP/3 the request stream (`Http3Stream` extends
 it, the control streams are a `Control` subclass that never serves).
 Drivers parse heads and frame bytes; the exchange decides what to send.
 
-- The exchange is a `Timer.Task`: the `:handler-timeout` node.
+- The exchange is a `Timer.Task`: the `:handler-timeout` node (HTTP/2,
+  HTTP/3; HTTP/1.1, whose exchange is reused, has a connection node of
+  its own that claims through it, see HTTP/1.1).
 - Claim (one CAS): exactly one of the handler (`HANDLER`), the timeout
   (`TIMED_OUT`) or a cancel (`CANCELLED`: reset, connection gone) owns
   the response. `onTimeout()` claims and calls the driver's
@@ -159,31 +173,65 @@ Drivers parse heads and frame bytes; the exchange decides what to send.
 ### Memory budget (`core.MemoryBudget`)
 
 `:max-buffered-bytes` (default a quarter of the max heap, at least
-1 MiB): one atomic counter for every byte buffered on behalf of peers,
-server-wide. HTTP/3 also gives each connection a budget of its own, its
-connection window, that caps what that connection's request bodies hold
-together.
-`tryReserve(n)` refuses past the limit (for buffers that can say no);
-`charge(n)` keeps bytes that already arrived (the peer was entitled to
-send them) and lets the counter go over; `release(n)` gives back and,
-when that leaves room, wakes the registered `Waiter`s (intrusive nodes,
-lock-free stack; callbacks run on the releasing thread and must not
-block). `exhausted()` is the backpressure signal. Allocation-free.
+1 MiB): atomic counters for every byte held for peers, server-wide, and
+for the flow-control credit granted to them (a promise to hold that much
+more).
+
+- Reserve before granting: a credit-granting path reserves the credit
+  it grants (`tryReserve`, or `Account.tryReserve` for a connection) and
+  gives it back when the bytes leave (read, written, dropped) or the
+  credit is abandoned (stream or connection closed). Bytes arriving
+  within credit a protocol grants unasked (the RFC 9113 initial
+  65535-octet windows) are `charge`d, which may pass the limit; that
+  overshoot is bounded by those defaults (65535 octets per HTTP/2
+  connection receiving a body).
+- Pressure: `exhausted()` at the limit, `pressured()` from the low-water
+  mark, three quarters of it.
+- Fair shares: a connection holds its bytes through an `Account`. Under
+  pressure an account over its fair share (the limit divided by the
+  accounts holding bytes) is refused and `throttled()`; smaller ones may
+  still reserve up to the limit, so one client can't freeze every other
+  connection's uploads. `Account.close()` gives back what it still holds
+  and ends it (connection teardown).
+- Waiters: `await(waiter)` registers unless usage is already below the
+  low-water mark (false: the caller goes on itself, so no wake-up is lost
+  and no callback runs on the caller's thread). Waiters are woken once
+  usage falls below the low-water mark (hysteresis), by a short-lived
+  virtual thread that holds no lock, never by the releasing thread: a
+  release under one connection's locks can't run another connection's
+  callback, which takes its locks (the cross-connection deadlock an
+  inline wake allowed on HTTP/2). `cancel(waiter)` removes one, so a closed
+  stream or connection doesn't stay reachable from the budget.
+- Allocation-free but for a wake-up (one virtual thread per episode of
+  relief).
 
 Adopted:
-- HTTP/2 request bodies (`RequestBody`): buffered DATA charged until
-  read or dropped; while exhausted, credit for read bytes is held back
-  (stream and connection WINDOW_UPDATEs) and granted by a waiter once the
-  budget has room. Overshoot is bounded by credit already granted.
+- HTTP/2 request bodies and connection credit (`Http2Connection`): the
+  connection window stays at 65535 until request body bytes arrive, then
+  grows to four stream windows as far as the budget pays for it (a
+  connection serving only GETs reserves nothing). Every DATA
+  byte is held by the connection's account from its arrival (paid for by
+  reserved credit, or charged within the initial window) until it leaves
+  the stream's ring (`creditConnection`). Bytes that leave stay paid for,
+  as the credit granted again for them, unless the account is throttled:
+  then only what keeps the window at 65535 is granted (the connection
+  keeps moving), the rest is given back and owed, granted in pieces of at
+  least a frame by a waiter once the budget has room. Stream credit is
+  granted as bytes are read: the connection window bounds what a
+  connection's bodies hold. The account is closed at teardown, once no
+  handler runs.
 - HTTP/2 streamed responses (`Http2Writer`): bytes copied into a
-  stream's ring are charged until written or dropped; while exhausted a
-  ring holds one frame, so its producer waits.
-- HTTP/3 request bodies (`Http3BodyPipe`): charged, to the server's
-  budget and to the connection's, until read or discarded (the
-  exchange's end discards what's left); `hasRoom()` is false while either
-  is exhausted, so the loop stops reading request streams (QUIC flow
-  control pushes back), and `resumeWhenDrained` registers a waiter that
-  signals the stream's loop.
+  stream's ring are charged to the connection's account until written or
+  dropped; while it is throttled a ring holds one frame, so its producer
+  waits.
+- HTTP/3 request bodies (`Http3BodyPipe`): charged, to the connection's
+  account and to the connection's own budget (its connection window),
+  until read or discarded (the exchange's end discards what's left and
+  cancels the pipe's waiters); `hasRoom()` is false while the account is
+  throttled or the connection budget exhausted, so the loop stops reading
+  request streams (QUIC flow control pushes back), and
+  `resumeWhenDrained` registers a waiter that signals the stream's loop.
+  The account is closed when the connection is destroyed.
 - WebSocket asynchronous sends: `tryReserve` per queued frame, a send
   over budget fails at once (its fail callback runs); released once
   written or dropped.
@@ -191,13 +239,26 @@ Adopted:
   64 KiB is charged until `on-message` returns; while exhausted the read
   loop stops reading the message (TCP pushes back), within the message's
   `:read-timeout`.
+- HTTP/3 response bytes quiche didn't take yet: charged to the
+  connection's account while held for the peer's flow control, whether
+  copied (deferred frames) or a response body array kept alive for them
+  (`Http3Connection.defer`), and the slice of a streamed body waiting for
+  credit (`bodyHeld`); released when sent, or when the stream is reset or
+  stopped or the connection goes. Charged without throttling: a fixed body
+  is already in memory and a streamed body's producer blocks on its
+  hand-off, so the charge makes the bytes count toward other buffers'
+  pressure.
 
-Not charged: HTTP/3 response bytes quiche didn't take yet (a fixed body
-is sent from the handler's array; a streamed body is a blocking hand-off,
-so it holds only the producer's buffer). A buffer joins the budget by
-charging what it holds for a peer, releasing it on every path the bytes
-leave (read, written, dropped at close), and pausing its credit / reads
-while `exhausted()` with a `Waiter` to resume.
+Not charged: the receive credit quiche holds natively, up to a
+connection window (`:http3-initial-max-data-bytes`) per connection, off
+the heap. It is capped apart (`:http3-max-native-bytes`, counted by
+`Http3Listener.nativeCreditBytes()`): each connection reserves its window
+at admission and is refused ("connection-limit") when that would pass the
+cap. A buffer joins the
+budget by charging what it holds for a peer (through its connection's
+account), releasing it on every path the bytes leave (read, written,
+dropped at close), and pausing its credit / reads while throttled with a
+`Waiter` to resume, cancelled when it goes away.
 
 ### Timer (`core.Timer`)
 
@@ -226,7 +287,11 @@ their slot for later rotations).
 - `onTimeout()` runs on the timer thread and must not block: flip state,
   interrupt, enqueue, or start a virtual thread for anything that may
   block (writing a 503, closing a socket with `SO_LINGER`). It may re-arm
-  its own task. Exceptions are logged (rate-limited) and swallowed.
+  its own task. Exceptions are logged (rate-limited) and swallowed;
+  `LogLimiter.log` never throws, so a broken logging setup can't escape
+  either. Anything else escaping the loop (an Error in the wheel's own
+  bookkeeping) is logged and the loop restarts after 10 ms: the server
+  never runs without its timeouts.
 - Allocation: none for schedule / cancel / expiry.
 
 ### Write watchdog (`core.WriteWatchdog`, `core.WatchedOutputStream`)
@@ -264,7 +329,9 @@ the body the caller's to close; the driver answers 500 instead.
   per non-nil element.
 - Framing is the server's: `Transfer-Encoding` is dropped; a handler
   `Content-Length` is dropped when the length is known, kept (and must be
-  1*DIGIT) for stream bodies, HEAD and 304; never on 1xx / 204.
+  1*DIGIT) for stream bodies, HEAD and 304; never on 1xx / 204. HEAD
+  otherwise carries the length GET would send, none for a nil body (Ring's
+  `wrap-head` drops the GET response's body).
   `declaredLength()` is a handler length the driver must honour exactly
   (send that many bytes or abort).
 - `MULTIPLEXED` mode (h2 / h3) drops Connection, Keep-Alive,
@@ -323,7 +390,9 @@ per request, used by the thread that decodes headers.
 - Ring header maps: `RingHeaders.mergeDuplicates` (joins repeats, unique
   names out) then `RingHeaders.toMap`: an array map over the array
   itself up to 8 fields (no second duplicate scan), a hash map beyond,
-  so building and looking up stay linear in the field count.
+  so building and looking up stay linear in the field count. HTTP/1.1
+  keeps array maps up to 32 fields (a browser sends 10 to 20, and a hash
+  map of 14 costs about 1.2 KB more per request than scanning them).
 - `HeaderNames.index` / `name` / `COUNT`: known request header names by
   index, so the HTTP/1.1 parser keeps per-name state (the last value) in
   a plain array.
@@ -365,9 +434,11 @@ outlives `close()`. Registry loops visit every entry whatever one throws.
 
 - `beginDrain()`: stop taking requests, finish in-flight ones, close.
   HTTP/1.1 closes an idle connection at once (a TLS close_notify bounded by
-  the write watchdog) and sends `Connection: close` on the response in
-  flight; HTTP/2 sends GOAWAY(NO_ERROR) and closes when
-  its handlers are done; a WebSocket starts the closing handshake with 1001;
+  the write watchdog; idle and the first byte of a request race on one
+  CAS, so a request already arriving is served, never cut) and sends
+  `Connection: close` on the response in flight; HTTP/2 sends GOAWAY(NO_ERROR) and closes when
+  its handlers are done and its responses sent (one handed over whole may
+  still wait for flow-control credit after its handler returned); a WebSocket starts the closing handshake with 1001;
   HTTP/3 sends a GOAWAY that refuses nothing, then, after twice the RTT
   (10 ms to 1 s), a second one naming the first refused request, and
   closes once the requests below it are answered. A connection still in
@@ -387,10 +458,18 @@ outlives `close()`. Registry loops visit every entry whatever one throws.
 
 - `ServerEvents` (`:server-events`): `connectionOpened`,
   `connectionClosed`, `requestCompleted` (protocol, method, status,
-  request and response body bytes, duration), `protocolError`. Called on
-  the connection's threads through `GuardedEvents` (exceptions swallowed
-  and logged). With no listener a driver makes no call and takes no
-  timestamp. Protocols: "http/1.1", "h2", "h2c" (cleartext, `:http2c`),
+  request and response body bytes, duration), `protocolError`. Drivers
+  call `GuardedEvents`, which never runs listener code on the calling
+  thread: the arguments go into a preallocated slot of a bounded
+  multi-producer queue (Vyukov's: a CAS on the tail, field writes, an
+  unpark only when the delivering thread is parked; nothing allocated),
+  and the `enso-events` daemon thread delivers them in order, swallowing
+  and logging what the listener throws. A slow listener delays only later
+  events; with 8192 waiting, new ones are dropped and counted
+  (`EnsoServer.droppedEvents()`, a rate-limited WARNING, a JFR
+  `EventsDropped` event from the delivering thread). JFR events stay
+  committed inline (cheap, no user code). With no listener a driver
+  makes no call and takes no timestamp, and no thread is started. Protocols: "http/1.1", "h2", "h2c" (cleartext, `:http2c`),
   "h3"; "websocket" for an
   upgraded connection (opened at the 101, closed when it ends, inside
   the "http/1.1" connection's own events); "tcp" and "tls" for errors
@@ -404,6 +483,27 @@ outlives `close()`. Registry loops visit every entry whatever one throws.
   with a count of suppressed ones). Nothing a client can trigger logs a
   stack trace at INFO or above.
 
+### Minimum data rate (`core.DataRate`)
+
+`:read-timeout` restarts with every byte, so a body trickled just inside
+it would hold a request (and its handler thread) forever.
+`:min-data-rate-bytes` (240 bytes/s by default, after
+`:min-data-rate-grace`, 5 s, of waiting: Kestrel's defaults) bounds the
+time a reader spends waiting for body bytes to one second per rate's
+worth of bytes received. Only waiting counts, so a handler that reads
+slowly is never held against the client. The reader keeps two primitives
+(bytes, nanoseconds waited) and bounds each wait it already makes by
+`DataRate.allowanceNanos` (the socket timeout of an HTTP/1.1 body read,
+the park of an HTTP/2 body read, the condition wait of an HTTP/3 pipe
+read): no object, no timer, one clock read on each side of a wait. Below
+the rate the read fails with `RequestBodyTimeoutException.minDataRate()`:
+408, protocol error "min-data-rate".
+
+Responses are held to a rate by `:write-timeout` progress: an HTTP/1.1
+write slice (256 KiB at most) must complete, a blocked HTTP/2 or HTTP/3
+stream must send 16 KiB per period (credit handed out a few bytes at a
+time makes no progress).
+
 ### TLS socket (`core.TlsSocket`)
 
 Besides its stream view, two calls for drivers that manage their own
@@ -416,6 +516,14 @@ output:
 - `shutdownOutput()` sends close_notify and half-closes the channel
   while input stays readable, for a lingering close; `close()` still
   closes the channel. The `AdapterSocket` forwards `shutdownOutput`.
+- `setReadDeadline(nanos)`: SO_TIMEOUT bounds one wait for ciphertext,
+  and a read returns only whole records, so a peer trickling a record a
+  byte per timeout holds one read for as long as it likes. With a
+  deadline, a read with no plaintext by then fails with
+  `SocketTimeoutException` (SO_TIMEOUT is lowered to what is left for
+  each wait). Set by the reading thread; HTTP/1.1 sets it per read.
+- `inputPending()`: plaintext or ciphertext held, or bytes the socket
+  received (a close now would be answered with a reset).
 
 ### Configuration
 
@@ -448,6 +556,7 @@ sampled. The tests assert the bounds.
 | `RequestHead` reset + 8 fields + finish | 0 | `enso-core-test/request-head-validation-allocates-nothing` |
 | `ConnectionLimiter` global acquire + release | 0 | `enso-core-test/limiter-unlimited-and-allocation-free` |
 | HTTP/1.1 GET, 3 request headers and a query, String body, in-memory socket, whole path incl. Ring adapter, calling thread | ~176-184 (bound 300) | `enso-http1-test/h1-get-allocation-budget` |
+| The same reading `:remote-addr`, `:server-name`, `:server-port` and a header (3 fields; a 14-field browser-like head) | ~240 (bound 300); ~329 (bound 400) | `enso-http1-test/h1-get-allocation-with-ring-keys-and-many-fields` |
 
 Across a whole server JVM (every thread, sockets, the Ring adapter, the
 JDK's virtual thread bookkeeping) the separate-process harness measures
@@ -464,6 +573,13 @@ persistent map of Strings. Header names are interned through
 `HeaderNames`; a value String is only allocated when it differs from the
 last one this connection saw for that name (a keep-alive client repeats
 Host, User-Agent, Accept*, Cookie), and likewise the path and query.
+Names `HeaderNames` doesn't know, and their values, are kept per
+position (the i-th such field of the last request, 16 positions): a
+client sends its fields in the same order every time. What a request
+derives from its connection (`:remote-addr`, `:server-port`,
+`:ssl-client-cert`, and `:server-name` while Host is the same String)
+is handed from one request to the next, so it is computed once per
+connection.
 Nothing is allocated for timeouts, the write watchdog, response
 validation, the Date header (cached bytes), status lines (pre-built) or
 the response head (written into a reused buffer).
@@ -520,6 +636,14 @@ or timeouts. Over TLS the JDK's
 AES-GCM allocates about 1.3 KB per record written; batching packs several
 responses per record when streams are concurrent.
 
+The same GET answered with a 13-byte `ByteArrayInputStream` (Ring's
+string-input-stream) costs what the String body does
+(`h2-small-stream-body-allocation-budget`, bound 1200; about 21 KB before
+small in-memory streams were handed over whole: a frame-sized ring and
+the handler's parked stack). A streamed body of known length gets a ring
+of its final size at once (a 100 KB body: one 64 KiB ring, or none from
+the pool, rather than 16 + 32 + 64 KiB).
+
 HTTP/3 per request, held to a bound by `h3-get-allocation-budget`
 (about 730 bytes with compressed oops, bound 900; about 1050 without,
 bound 1300): the request stream
@@ -570,14 +694,20 @@ handler-timeout 503 and held-output flush:
 The reader calls the writer before each socket read (held output taken
 back, pending responses flushed), shares its body copy buffer for drains,
 and calls the connection for the 100 Continue (ordered with the
-handler-timeout 503) and to clear `idle` on a request's first byte.
+handler-timeout 503), to leave the idle state on a request's first byte
+(which fails if a drain closed the idle connection first) and to shut
+the output down for a lingering close under the write watchdog.
 
 - Timeouts are socket read timeouts per phase: `:idle-timeout` before the
   first byte of a request (split in two: after one second idle the
   connection gives back its grown buffers, then waits out the rest),
   the remaining `:header-timeout` (wall clock from that byte) while the
   head is incomplete, `:read-timeout` for body reads. No timer operation
-  on the common path.
+  on the common path. Over TLS each read also gets the wall clock of its
+  phase (`TlsSocket.setReadDeadline`): the idle stage, the header
+  deadline, a body read's `:min-data-rate-bytes` allowance, the
+  post-response drain. An idle stage that ends inside a record (part of
+  it received) starts the head phase: a request is arriving.
 - Writes go through `WatchedOutputStream`; `FileChannel.transferTo` calls
   are bracketed with the watchdog by hand, one slice at a time (a
   transferTo that moves nothing hands the rest to a user-space copy).
@@ -591,16 +721,30 @@ handler-timeout 503) and to clear `idle` on a request's first byte.
   next request is already buffered. While its handler runs, held bytes
   are on a one-tick (10 ms) timer: a handler returning first takes them
   back, a slower one doesn't delay them (a virtual thread writes them).
-- `:handler-timeout`: the connection's `Call` exchange is the timer
-  node; a 503 is written from a virtual thread only if the timeout won the
-  claim, then the handler thread is interrupted, then that is published:
-  the connection thread waits for it and only then clears its interrupt,
-  so the interrupt can't land later (in the lingering close).
+  The timer isn't cancelled when the bytes are taken back (the next hold
+  moves its deadline); a late expiry only flushes what is held early.
+- `:handler-timeout`: one timer node per connection (`HandlerTimeout`),
+  armed per request and never cancelled: the next request's arm only
+  moves its deadline (one CAS, where cancel + arm costs a timer-thread
+  visit per request). An expiry may therefore belong to an earlier
+  request: the node holds the start of the timed request in flight, and
+  an expiry claims the exchange through one CAS on it, only once that
+  request has run for the whole timeout; the connection thread ends the
+  request with the same CAS, waiting for an expiry that won it to finish
+  before the exchange is reused. A 503 is written from a virtual thread
+  only if the timeout won the claim, then the handler thread is
+  interrupted, then that is published: the connection thread waits for it
+  and only then clears its interrupt, so the interrupt can't land later
+  (in the lingering close). The interrupt never lands in a socket read
+  (an interruptible channel would close the socket): during one it is
+  deferred until the read returns, and the handler's next read fails with
+  `InterruptedIOException`.
 - `ResponseHead.prepare(..., HTTP1)`, serialised straight into the head
   buffer; Date from `HttpDates.dateLine()`.
 - Request head: `:max-header-bytes` bounds the whole head (request line,
   field lines, CRLFs, empty lines before it), `:max-header-fields` field
-  lines at most. Field values without CTL but HTAB. Host and absolute-form
+  lines at most; a request line too long on its own is 414. Lines end with
+  CRLF: a bare LF is 400 as soon as it is seen. Field values without CTL but HTAB. Host and absolute-form
   targets through `RequestHead.isValidAuthority` / `parseAbsoluteForm`;
   origin-form must start with '/', '*' only for OPTIONS, authority-form
   only for CONNECT, which is answered 501.
@@ -615,21 +759,32 @@ handler-timeout 503) and to clear `idle` on a request's first byte.
 - Unread bodies: whether the connection survives is decided before the
   response head (so `Connection: close` is announced): buffered bytes are
   drained without blocking; a known remainder up to 64 KiB is drained
-  after the response; otherwise (a larger or chunked remainder, a 100
-  Continue never sent) the connection closes.
+  after the response, within 2 s of wall clock (each byte resets
+  `:read-timeout`, so a client trickling it would hold the connection);
+  otherwise (a larger or chunked remainder, a 100 Continue never sent)
+  the connection closes.
+- Response framing: a body of unknown length is chunked on HTTP/1.1, also
+  when the connection closes after it, so a body cut short shows (no last
+  chunk). HTTP/1.0 has only the end of the connection: a body that fails
+  ends it with a reset (SO_LINGER 0, over TLS without close_notify). When
+  the server closes, a handler's `Connection` field without "close" is
+  left out (it would contradict `Connection: close`).
 - Lingering close after an error response, an unread body, or a close
   the client didn't ask for (keep-alive cap, drain, the handler's
   `Connection: close` on an HTTP/1.1 request without `Connection:
-  close`), and whenever input is buffered or readable at close: output
-  shut down (FIN, close_notify over TLS), input discarded for up to 2 s
-  or until the peer closes, so the client reads the responses instead of
-  a reset.
+  close`), and whenever input is buffered or readable at close (over TLS
+  `TlsSocket.inputPending`): output shut down (FIN, close_notify over
+  TLS), input discarded for up to 2 s or until the peer closes, so the
+  client reads the responses instead of a reset. Shutting the output
+  down and closing are writes over TLS (close_notify): the write
+  watchdog bounds them.
 - `Drainable`, `ServerEvents` and JFR wired: every parsed request ends in
   `requestCompleted` (error responses, 503, WebSocket handshake errors
-  included); protocol errors "header-timeout", "read-timeout",
-  "bad-request", "body-too-large", "header-too-large", "not-implemented",
-  "unsupported-version", "handler-timeout", "write-timeout". The
-  connection's timer nodes are retired at close.
+  included, and a response whose write failed); protocol errors
+  "header-timeout", "read-timeout", "min-data-rate", "bad-request",
+  "body-too-large", "header-too-large", "uri-too-long",
+  "not-implemented", "unsupported-version", "handler-timeout",
+  "write-timeout". The connection's timer nodes are retired at close.
 
 Measured with `clojure -M:perf` when the design above landed, against
 the code before it (10 s after 5 s warm-up, two alternating rounds each;
@@ -688,12 +843,17 @@ honours `SO_TIMEOUT`, so they need a heap array.
   buffers (`TlsSocket.writeRecords`), in cleartext it is written to the
   socket as packed. Ring `:scheme` is `:https` or `:http` accordingly.
 - Threads: the connection thread is the framer (frame reads, HPACK
-  decode, stream admission) and never blocks on output; one virtual
+  decode, stream admission) and, while the connection is open, never
+  blocks on output (TLS included: see Lifecycle for KeyUpdate); one virtual
   thread per stream runs the handler. There is no writer thread.
 - Output (`Http2Writer`): pull scheduling with a combining writer.
   Handlers queue their response on their own stream (a fixed body is
   handed over whole through a lock-free inbox, a streamed body is copied
-  into a per-stream ring of at most 64 KiB); the framer queues control
+  into a per-stream ring of at most 64 KiB, sized at once for a body of
+  known length, from a server-wide pool of full-size rings to which it
+  returns as soon as its last bytes are packed; a `ByteArrayInputStream`
+  of up to a frame is read out and handed over like a byte array); the
+  framer queues control
   frames (SETTINGS / PING ACKs, WINDOW_UPDATE, RST_STREAM, GOAWAY) on a
   priority lane, count-capped (a peer that makes us queue more without
   reading gets GOAWAY(ENHANCE_YOUR_CALM)). Whoever has output and finds
@@ -704,7 +864,15 @@ honours `SO_TIMEOUT`, so they need a heap array.
   while packing, so header blocks reach the wire in encoding order and
   are never encoded for a stream already reset. A reset purges the
   stream's output at once. Producers wait only on their own stream.
-- Flow control: streams without credit wait on a blocked list. Credit
+- Receive flow control: the connection window grows past 65535 only
+  once request body bytes arrive, and only as far as the memory budget
+  pays for it (see Memory budget); credit for read bytes is granted again
+  unless the connection is throttled.
+- Flow control: streams without credit wait on one of two blocked lists:
+  their own window shut (a stream WINDOW_UPDATE or SETTINGS reschedules
+  them), or their own open and the connection's shut (a connection
+  WINDOW_UPDATE reschedules only these, once the window opens or reaches
+  1 KiB, so tiny updates cost constant work). Credit
   below 1 KiB (and below what the stream has pending) is pooled for
   20 ms (CVE-2019-9511 data dribble). One deadline per connection covers
   stalls: a stream whose window stays shut for `:write-timeout` is reset
@@ -724,8 +892,10 @@ honours `SO_TIMEOUT`, so they need a heap array.
   are always decoded so HPACK stays in sync.
 - Request side: `RequestHead` validates every head (CONNECT → 501); the
   request body is a per-stream byte ring bounded by the receive window
-  (tiny DATA frames cost no object each), read with `:read-timeout` and
-  charged to the memory budget; a header block over CONTINUATION frames
+  (tiny DATA frames cost no object each; past 16 KiB it is halved as it
+  is read while at most a quarter full, so it never holds more than four
+  times its bytes), read with `:read-timeout` and
+  `:min-data-rate-bytes`, its bytes held by the connection's account; a header block over CONTINUATION frames
   is bounded by `:header-timeout`. A decoded field section over
   `:max-header-bytes` or with more than `:max-header-fields` fields is
   answered 431 on its stream up to the hard ceiling (4x, at least 64
@@ -750,7 +920,9 @@ honours `SO_TIMEOUT`, so they need a heap array.
   errors, CVE-2025-8671 MadeYouReset) share one token bucket
   (`:http2-stream-reset-limit`).
 - Shutdown: `Drainable`; a graceful close is two-phase (GOAWAY(2^31-1)
-  and a PING, then GOAWAY with the last stream served), followed by a
+  and a PING, then GOAWAY with the last stream served), completes once
+  every handler is done and every stream closed (a response waiting for
+  credit is bounded by the flow-control stall deadline), followed by a
   lingering close (output shut down, input read out for up to 2 s) so
   the final GOAWAY isn't lost to a TCP reset.
 - `ServerEvents` and JFR request / protocol-error events. Every deadline
@@ -790,12 +962,14 @@ honours `SO_TIMEOUT`, so they need a heap array.
   per loop-wide step (logged, the iteration goes on). Anything escaping
   reaches the loop's supervisor: SEVERE log, an "event-loop-failure"
   protocol error, the loop's connections closed, the loop restarted on
-  the same thread after 100 ms.
+  the same thread after 100 ms. Nothing the supervisor calls can escape
+  it (reporting failures are dropped), so a loop never dies for good.
 - Request bodies: an `Http3BodyPipe` per request holds at most 64 KiB
-  and is charged to the server's memory budget and to the connection's
-  own (its connection window), so unread bodies can't exceed the window
-  however many streams are open; past either the loop stops reading
-  those streams.
+  and is charged to the connection's account of the server's memory
+  budget and to the connection's own budget (its connection window), so
+  unread bodies can't exceed the window however many streams are open;
+  past either (or with the account throttled under pressure) the loop
+  stops reading those streams.
 - Shutdown and `:idle-timeout` drain in two GOAWAYs (RFC 9114 §5.2), as
   under Graceful shutdown.
 - Certificates: quiche loads the PEM pair itself, into a quiche

@@ -25,10 +25,11 @@ import java.nio.file.StandardOpenOption;
  * the shim (record layouts in {@link Records}); stream payloads in byte[]
  * accessed through one-call critical regions.
  *
- * <p>Loading checks {@link #version()} against {@link #QUICHE_VERSION}: the
- * shim is compiled against that release's header, whose struct layouts
- * change between releases, so a dynamically linked libquiche of another
- * version is refused rather than misread.
+ * <p>Loading checks the shim's ABI number ({@link #SHIM_ABI}) and record
+ * layouts ({@link #requireLayout}), then {@link #version()} against
+ * {@link #QUICHE_VERSION}: the shim is compiled against that release's
+ * header, whose struct layouts change between releases, so a dynamically
+ * linked libquiche of another version is refused rather than misread.
  */
 public final class Quiche {
 
@@ -60,7 +61,7 @@ public final class Quiche {
      * {@code target/native}, a classifier jar of another release) is
      * refused at load instead of failing on the first changed call.
      */
-    public static final int SHIM_ABI = 1;
+    public static final int SHIM_ABI = 2;
 
     /** System property naming the shim to load, bypassing every lookup. */
     static final String SHIM_PROPERTY = "enso.quiche.shim";
@@ -71,7 +72,72 @@ public final class Quiche {
     static {
         loadLibrary();
         requireShimAbi(loadedShimAbi());
+        requireLayout(loadedLayout());
         requireVersion(version());
+    }
+
+    /**
+     * What the shim and the Java side must agree on, in the order of the
+     * shim's {@code LAYOUT} table: record sizes and field offsets
+     * ({@link Records}), flag and result bits ({@link UdpSocket}), limits
+     * and the shim's own error code. Checked at load, so a layout edited
+     * on one side only is refused by name even when the ABI number wasn't
+     * bumped with it.
+     */
+    private static final String[] LAYOUT_NAMES = {
+        "ADDR_LEN", "ADDR_FAMILY", "ADDR_PORT", "ADDR_SCOPE", "ADDR_IP",
+        "RECV_META_LEN", "RECV_LEN", "RECV_FLAGS", "RECV_PEER", "RECV_LOCAL", "RECV_FLAG_TRUNCATED",
+        "SEND_HEADER_LEN", "SEND_STATUS_DROPPED", "SEND_STATUS_ERRNO", "SEND_STATUS_FLAGS",
+        "SEND_STATUS_GSO_DISABLED", "SEND_META_LEN", "SEND_OFF", "SEND_LEN", "SEND_TO", "SEND_FROM",
+        "PKT_DELAY",
+        "HDR_VERSION", "HDR_TYPE", "HDR_SCID_LEN", "HDR_DCID_LEN", "HDR_TOKEN_LEN", "HDR_SCID", "HDR_DCID",
+        "HDR_TOKEN", "HDR_MAX_TOKEN", "HDR_LEN",
+        "UDP_OPEN_REUSEPORT", "UDP_OPEN_PKTINFO", "UDP_SEND_GSO", "UDP_SEND_PKTINFO",
+        "POLL_READABLE", "POLL_WAKE", "POLL_WRITABLE",
+        "QUICHE_MAX_CONN_ID_LEN", "SHIM_ERR_INVALID_ARGUMENT"};
+
+    static String[] layoutNames() {
+        return LAYOUT_NAMES.clone();
+    }
+
+    /** The Java side's values for {@link #LAYOUT_NAMES}. */
+    static int[] expectedLayout() {
+        return new int[] {
+            Records.ADDR_LEN, Records.ADDR_FAMILY, Records.ADDR_PORT, Records.ADDR_SCOPE, Records.ADDR_IP,
+            Records.RECV_META_LEN, Records.RECV_LEN, Records.RECV_FLAGS, Records.RECV_PEER, Records.RECV_LOCAL,
+            Records.RECV_FLAG_TRUNCATED,
+            Records.SEND_HEADER_LEN, Records.SEND_STATUS_DROPPED, Records.SEND_STATUS_ERRNO,
+            Records.SEND_STATUS_FLAGS, Records.SEND_STATUS_GSO_DISABLED, Records.SEND_META_LEN, Records.SEND_OFF,
+            Records.SEND_LEN, Records.SEND_TO, Records.SEND_FROM,
+            Records.PKT_DELAY,
+            Records.HDR_VERSION, Records.HDR_TYPE, Records.HDR_SCID_LEN, Records.HDR_DCID_LEN,
+            Records.HDR_TOKEN_LEN, Records.HDR_SCID, Records.HDR_DCID, Records.HDR_TOKEN, Records.HDR_MAX_TOKEN,
+            Records.HDR_LEN,
+            UdpSocket.OPEN_REUSEPORT, UdpSocket.OPEN_PKTINFO, UdpSocket.SEND_GSO, UdpSocket.SEND_PKTINFO,
+            UdpSocket.Waker.READABLE, UdpSocket.Waker.WAKE, UdpSocket.Waker.WRITABLE,
+            QUICHE_MAX_CONN_ID_LEN, (int) SHIM_ERR_INVALID_ARGUMENT};
+    }
+
+    /**
+     * Refuses a shim whose {@code layout} (its LAYOUT table, null when it
+     * has none) differs from {@link #expectedLayout}.
+     *
+     * @throws UnsatisfiedLinkError naming the first difference
+     */
+    static void requireLayout(int[] layout) {
+        int[] expected = expectedLayout();
+        if (layout == null || layout.length != expected.length) {
+            throw new UnsatisfiedLinkError("enso_quiche shim record layout has "
+                + (layout == null ? "no" : String.valueOf(layout.length)) + " entries, this enso expects "
+                + expected.length + ": rebuild the shim (make -C native/enso_quiche)");
+        }
+        for (int i = 0; i < expected.length; i++) {
+            if (layout[i] != expected[i]) {
+                throw new UnsatisfiedLinkError("enso_quiche shim record layout differs at " + LAYOUT_NAMES[i]
+                    + ": shim " + layout[i] + ", Java " + expected[i]
+                    + ": rebuild the shim (make -C native/enso_quiche) or fix the layout on both sides");
+            }
+        }
     }
 
     /**
@@ -107,6 +173,15 @@ public final class Quiche {
             return shimAbi();
         } catch (UnsatisfiedLinkError e) {
             return 0;
+        }
+    }
+
+    /** The loaded shim's LAYOUT table, or null for a shim without one. */
+    private static int[] loadedLayout() {
+        try {
+            return layout();
+        } catch (UnsatisfiedLinkError e) {
+            return null;
         }
     }
 
@@ -198,8 +273,8 @@ public final class Quiche {
     /**
      * OS classifiers in load-preference order. Linux with musl libc (Alpine,
      * Wolfi, Chimera) loads only the musl build: the glibc one can't run
-     * there, so it is never tried as a fallback. Detection looks for
-     * {@code /lib/ld-musl-*.so.1}, which every musl install has.
+     * there, so it is never tried as a fallback. Detection: see
+     * {@link #isMusl}.
      */
     private static String[] detectOsClassifiers() {
         String n = System.getProperty("os.name").toLowerCase();
@@ -213,10 +288,19 @@ public final class Quiche {
     }
 
     /**
-     * Detect musl libc. Fast + cheap: check for the dynamic linker path
-     * that musl always installs. Avoids exec of ldd + parse.
+     * Whether this JVM runs on musl libc: the libc mapped into the process
+     * ({@code /proc/self/maps}), so a glibc host that merely has the musl
+     * package installed isn't mistaken for one. Without {@code /proc}, the
+     * dynamic linker path musl always installs ({@code /lib/ld-musl-*}).
      */
     private static boolean isMusl() {
+        try (java.io.BufferedReader maps = Files.newBufferedReader(Path.of("/proc/self/maps"),
+                                                                    java.nio.charset.StandardCharsets.ISO_8859_1)) {
+            String libc = libcFromMaps(maps);
+            if (libc != null) return libc.equals("musl");
+        } catch (IOException | RuntimeException e) {
+            // No /proc: the installed loader decides.
+        }
         Path lib = Path.of("/lib");
         if (!Files.isDirectory(lib)) return false;
         try (java.util.stream.Stream<Path> s = Files.list(lib)) {
@@ -224,6 +308,16 @@ public final class Quiche {
         } catch (IOException e) {
             return false;
         }
+    }
+
+    /** "musl" or "glibc" from a process's memory map (the libc it loaded), null when neither shows. */
+    static String libcFromMaps(java.io.BufferedReader maps) throws IOException {
+        String line;
+        while ((line = maps.readLine()) != null) {
+            if (line.contains("/ld-musl-") || line.contains("/libc.musl-")) return "musl";
+            if (line.contains("/libc.so.6") || line.contains("/libc-2.")) return "glibc";
+        }
+        return null;
     }
 
     private static String detectArch() {
@@ -293,6 +387,9 @@ public final class Quiche {
     /** The shim's ENSO_SHIM_ABI; see {@link #SHIM_ABI}. */
     static native int shimAbi();
 
+    /** The shim's LAYOUT table: its values for {@link #LAYOUT_NAMES}, in order. */
+    static native int[] layout();
+
     /** Address of a direct buffer's memory (0 for heap buffers); see {@link NativeBuffer}. */
     static native long bufferAddress(java.nio.ByteBuffer buf);
 
@@ -322,7 +419,7 @@ public final class Quiche {
     static native void configVerifyPeer(long config, boolean v);
 
     // -----------------------------------------------------------------
-    // Accept / connect / retry / negotiate / header info
+    // Accept / connect / retry / header info
     // -----------------------------------------------------------------
     /** Addresses are ADDR records in {@code addrs}; {@code odcid} null without a Retry. 0 on failure. */
     static native long accept(byte[] scid, byte[] odcid, long addrs, int addrsCap,
@@ -332,9 +429,6 @@ public final class Quiche {
     /** Writes a Retry packet into {@code out[off, off + cap)}; its length, or < 0. */
     static native long retry(byte[] scid, byte[] dcid, byte[] newScid, byte[] token,
                              int version, long out, int outCap, int off, int cap);
-    /** Writes a Version Negotiation packet into {@code out[off, off + cap)}; its length, or < 0. */
-    static native long negotiateVersion(byte[] scid, byte[] dcid, long out, int outCap,
-                                        int off, int cap);
     /** Parses the header of {@code buf[off, off + len)} into the HDR record at {@code out[outOff]}. */
     static native int headerInfo(long buf, int bufCap, int off, int len, int dcil,
                                  long out, int outCap, int outOff);
@@ -346,7 +440,6 @@ public final class Quiche {
     static native void connFree(long conn);
     static native boolean connIsClosed(long conn);
     static native boolean connIsEstablished(long conn);
-    static native boolean connIsDraining(long conn);
     static native long connTimeoutAsNanos(long conn);
     /** {@link #connTimeoutAsNanos}, or -2 once the connection is closed: one call where both are asked. */
     static native long connTimeoutAsNanosOrClosed(long conn);

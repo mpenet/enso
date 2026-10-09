@@ -87,11 +87,10 @@ final class Http3Exchange extends Http3Stream implements Runnable, SignalStack.N
     int fieldLen;
     /** Discarding the payload of the current frame (unknown type). */
     boolean skipping;
-    /** System.nanoTime of the first request byte, for :header-timeout. */
+    /** System.nanoTime the header section clock started (first request byte, or reading resumed), for :header-timeout. */
     long firstByteNanos;
     Http3BodyPipe pipe;
     boolean readPaused;
-    boolean finSeen;
 
     // ---- dispatch ----------------------------------------------------
     boolean headRequest;
@@ -148,6 +147,12 @@ final class Http3Exchange extends Http3Stream implements Runnable, SignalStack.N
             budgetWaiter = w;
         }
         return w;
+    }
+
+    /** The exchange is over: a read paused on the connection's body budget no longer waits. */
+    void cancelBudgetWait(com.s_exp.enso.core.MemoryBudget b) {
+        com.s_exp.enso.core.MemoryBudget.Waiter w = budgetWaiter;
+        if (w != null) b.cancel(w);
     }
 
     @Override public Http3Exchange pushNext() { return pushNext; }
@@ -340,7 +345,10 @@ final class Http3Exchange extends Http3Stream implements Runnable, SignalStack.N
             throws IOException {
         boolean exact = in instanceof java.io.ByteArrayInputStream
             || in instanceof java.io.FileInputStream;
-        byte[] buf = new byte[STREAM_CHUNK_BYTES];
+        // Sized to what the body can need when that is known (its
+        // Content-Length, or the exact remainder), a slice otherwise.
+        long need = declared >= 0 ? declared : exact ? in.available() : STREAM_CHUNK_BYTES;
+        byte[] buf = new byte[(int) Math.max(1, Math.min(STREAM_CHUNK_BYTES, need))];
         long sent = 0;
         while (true) {
             int n = in.read(buf, 0, buf.length);

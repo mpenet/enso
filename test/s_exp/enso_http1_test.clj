@@ -6,7 +6,8 @@
   sendfile, body kinds), pipelining edge cases, the timeout model,
   connection limits, shutdown, and the per-request allocation budget."
   (:require [clojure.test :refer [deftest testing is]]
-            [s-exp.enso :as enso])
+            [s-exp.enso :as enso]
+            [s-exp.enso-test-support :as support])
   (:import (com.s_exp.enso.api RingHandler)
            (com.s_exp.enso.http1 HttpConnection)
            (java.io ByteArrayInputStream OutputStream SequenceInputStream)
@@ -655,6 +656,38 @@
           (is (true? (deref stalled 3000 false)) "write-timeout reported")
           (is (await-connections (:server *server*) 0 3000) "connection closed"))))))
 
+(deftest min-data-rate-bounds-trickled-bodies
+  ;; :min-data-rate-bytes: a body trickled below the rate (one byte every
+  ;; 100 ms, each resetting :read-timeout) fails once the grace period is
+  ;; over: 408, reported as "min-data-rate". A body at the rate is served.
+  (let [errors (atom [])]
+    (with-server
+      (fn [req] {:status 200 :body (str (count (slurp (:body req))))})
+      {:read-timeout 30000 :min-data-rate-bytes 100 :min-data-rate-grace 300
+       :server-events {:protocol-error (fn [_ kind] (swap! errors conj kind))}}
+      (fn []
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (write! sock "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n")
+          (let [sender (future
+                         (try
+                           (dotimes [_ 40]
+                             (write! sock "a")
+                             (Thread/sleep 100))
+                           (catch Exception _)))
+                [resp ms] (read-all-timed sock 4000)]
+            (future-cancel sender)
+            (is (clojure.string/starts-with? resp "HTTP/1.1 408") (pr-str resp))
+            (is (< ms 2500) "well before :read-timeout")))
+        (is (support/await-condition #(some #{"min-data-rate"} @errors) 2000 10) (pr-str @errors))
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (write! sock "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n")
+          (dotimes [_ 10]
+            (write! sock (apply str (repeat 100 "a")))
+            (Thread/sleep 100))
+          (let [[resp _] (read-all-timed sock 4000)]
+            (is (clojure.string/starts-with? resp "HTTP/1.1 200") (pr-str resp))
+            (is (clojure.string/ends-with? resp "1000"))))))))
+
 (deftest handler-timeout-answers-503-and-interrupts
   (let [interrupted (promise)]
     (with-server
@@ -764,6 +797,35 @@
           (is (some #{[:request "http/1.1" "POST" 201 3 5 true]} events) "request body bytes received")
           (is (some #{[:closed "http/1.1" "127.0.0.1" true]} events))
           (is (some #{[:error "http/1.1" "bad-request"]} events)))))))
+
+(deftest a-stuck-event-listener-never-stalls-the-server
+  ;; Events are delivered from their own thread: a listener that blocks
+  ;; holds up neither the connection threads, nor the timer firing
+  ;; :handler-timeout, nor the acceptor refusing a connection.
+  (let [gate (java.util.concurrent.CountDownLatch. 1)
+        stuck (fn [& _] (.await gate))]
+    (try
+      (with-server
+        (fn [req]
+          (when (= "/slow" (:uri req)) (Thread/sleep 5000))
+          {:status 200 :body "ok"})
+        {:handler-timeout 200
+         :max-connections 1
+         :server-events {:connection-opened stuck :connection-closed stuck
+                         :request-completed stuck :protocol-error stuck}}
+        (fn []
+          (is (= 200 (status-of (send-and-read! close-req 3000))) "served while the listener is stuck")
+          (is (= 503 (status-of (send-and-read! "GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" 3000)))
+              "the timer still fires :handler-timeout")
+          (is (await-connections (:server *server*) 0 2000))
+          (with-open [holder (Socket. "127.0.0.1" (int (:port *server*)))]
+            (write! holder "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+            (is (await-connections (:server *server*) 1 2000))
+            (is (= "" (send-and-read! close-req 2000)) "the acceptor still refuses over the limit"))
+          (is (await-connections (:server *server*) 0 3000))
+          (is (= 200 (status-of (send-and-read! close-req 3000))) "and still accepts")))
+      (finally
+        (.countDown gate)))))
 
 ;; ---- A throwing :server-events listener -------------------------------------
 
@@ -1335,6 +1397,29 @@
       (is (await-connections (:server *server*) 0 2000))
       (is (= 200 (status-of (send-and-read! close-req)))))))
 
+(deftest acceptor-survives-an-unexpected-failure
+  ;; Whatever escapes the per-connection admission (here the per-address
+  ;; map fails once), the acceptor keeps accepting.
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {:max-connections-per-ip 10}
+    (fn []
+      (let [^com.s_exp.enso.EnsoServer srv (:server *server*)
+            field (fn [^Class c obj ^String n] (.get (doto (.getDeclaredField c n) (.setAccessible true)) obj))
+            limiter (field com.s_exp.enso.EnsoServer srv "limiter")
+            failed (java.util.concurrent.atomic.AtomicBoolean.)
+            m (proxy [java.util.concurrent.ConcurrentHashMap] []
+                (compute [k f]
+                  (if (.compareAndSet failed false true)
+                    (throw (IllegalStateException. "admission broke"))
+                    (proxy-super compute k f))))]
+        (.set (doto (.getDeclaredField com.s_exp.enso.core.ConnectionLimiter "perAddress") (.setAccessible true))
+              limiter m)
+        (send-and-read! close-req 1000)
+        (is (.get failed) "the first admission failed")
+        (is (= 200 (status-of (send-and-read! close-req 3000))) "later connections are still accepted")
+        (is (.isHealthy srv))))))
+
 (deftest string-and-seq-bodies-use-content-type-charset
   ;; Ring encodes String and seq bodies with the Content-Type charset.
   (doseq [body ["\u00e9t\u00e9" (list "\u00e9" "t\u00e9")]]
@@ -1371,9 +1456,9 @@
   handler call and response writing, plus the connection's own buffers
   (amortized over `n`). `pipelined`: all requests arrive in one read,
   else one per read with a flush per response."
-  ^long [srv handler n pipelined]
-  (let [^bytes req alloc-request
-        in (if pipelined
+  ([srv handler n pipelined] (connection-alloc-bytes srv handler n pipelined alloc-request))
+  ([srv handler n pipelined ^bytes req]
+  (let [in (if pipelined
              (ByteArrayInputStream. (byte-array (mapcat seq (repeat n req))))
              (SequenceInputStream. (java.util.Collections/enumeration
                                     (vec (repeatedly n #(ByteArrayInputStream. req))))))
@@ -1389,7 +1474,7 @@
         c (HttpConnection. sock handler srv)
         before (.getCurrentThreadAllocatedBytes thread-mx)]
     (.run c)
-    (- (.getCurrentThreadAllocatedBytes thread-mx) before)))
+    (- (.getCurrentThreadAllocatedBytes thread-mx) before))))
 
 (deftest h1-get-allocation-budget
   ;; A plain GET (3 request headers and a query, String body) through the whole
@@ -1419,6 +1504,46 @@
           (is (< per-request 300) (str (if pipelined "pipelined" "one request per read")
                                        ": " per-request " bytes/request"))
           (println "h1 GET," (if pipelined "pipelined:" "one request per read:") per-request "bytes/request")))
+      (finally (enso/stop srv)))))
+
+;; A browser-like keep-alive GET: more fields than an array map's 8, some
+;; with names HeaderNames doesn't know.
+(def ^:private browser-request
+  (.getBytes (str "GET /app/page?id=42 HTTP/1.1\r\nHost: localhost:8080\r\n"
+                  "User-Agent: Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/131.0\r\n"
+                  "Accept: text/html,application/xhtml+xml\r\nAccept-Language: en-US,en;q=0.5\r\n"
+                  "Accept-Encoding: gzip, deflate, br\r\nConnection: keep-alive\r\n"
+                  "Cookie: session=abc123; theme=dark\r\nUpgrade-Insecure-Requests: 1\r\n"
+                  "Sec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\nSec-GPC: 1\r\n"
+                  "X-Request-Id: 7d1c2e7a\r\nX-Csrf-Token: t0k3n\r\nTraceparent: 00-4bf92f35-00f067aa-01\r\n\r\n")
+             StandardCharsets/ISO_8859_1))
+
+(deftest h1-get-allocation-with-ring-keys-and-many-fields
+  ;; What a typical middleware stack touches per request (:remote-addr,
+  ;; :server-name, :server-port, a header lookup) and a browser-like head
+  ;; (14 fields, 4 names HeaderNames doesn't know): values derived from
+  ;; the connection, and fields repeated by a keep-alive client, cost
+  ;; nothing per request after the first.
+  (let [served (java.util.concurrent.atomic.AtomicLong.)
+        ->response @#'enso/->response
+        resp {:status 200 :headers {"content-type" "text/plain"} :body "hello world"}
+        handler (reify RingHandler
+                  (handle [_ req]
+                    (when (and (:remote-addr req) (:server-name req) (:server-port req)
+                               (get-in req [:headers "user-agent"]))
+                      (.incrementAndGet served))
+                    (->response resp)))
+        srv (enso/run-server (fn [_] resp) {:port 0 :max-keep-alive-requests 0})
+        n 2000]
+    (try
+      (doseq [[label req bound] [["3 fields" alloc-request 300] ["14 fields" browser-request 400]]]
+        (dotimes [_ 30] (connection-alloc-bytes srv handler n false req))
+        (let [before (.get served)
+              per-request (/ (double (apply min (repeatedly 3 #(connection-alloc-bytes srv handler n false req))))
+                             n)]
+          (is (= (* 3 n) (- (.get served) before)) "every request was served")
+          (is (< per-request bound) (str label ": " per-request " bytes/request"))
+          (println "h1 GET with Ring keys," label ":" per-request "bytes/request")))
       (finally (enso/stop srv)))))
 
 (defn- collected? [^java.lang.ref.WeakReference ref ms]
@@ -1713,3 +1838,277 @@
           (write! sock (str "POST / HTTP/1.1\r\nHost: x\r\nX-Big: " big "\r\nContent-Length: " (count body)
                             "\r\nConnection: close\r\n\r\n" body))
           (is (clojure.string/ends-with? (read-until-quiet! sock 2000) (str "9000|" body))))))))
+
+;; ---- Connection end: interrupts, drains, aborts, closes ----------------------
+
+(defn- read-until-includes!
+  "Reads `sock` until what arrived includes `s`, EOF, or `ms` pass."
+  [^Socket sock ^String s ms]
+  (.setSoTimeout sock (int ms))
+  (let [in (.getInputStream sock)
+        sb (StringBuilder.)
+        buf (byte-array 4096)]
+    (try
+      (loop []
+        (when-not (clojure.string/includes? (str sb) s)
+          (let [n (.read in buf)]
+            (when (pos? n)
+              (.append sb (String. buf 0 n StandardCharsets/ISO_8859_1))
+              (recur)))))
+      (catch java.io.IOException _))
+    (str sb)))
+
+(defn- read-to-end!
+  "Reads `sock` to its end: [what was read, how it ended (:eof, :reset or
+  :timeout)]."
+  [^Socket sock ms]
+  (.setSoTimeout sock (int ms))
+  (let [in (.getInputStream sock)
+        baos (java.io.ByteArrayOutputStream.)
+        buf (byte-array 8192)
+        end (try
+              (loop []
+                (let [n (.read in buf)]
+                  (if (neg? n)
+                    :eof
+                    (do (.write baos buf 0 n) (recur)))))
+              (catch java.net.SocketTimeoutException _ :timeout)
+              (catch java.io.IOException _ :reset))]
+    [(String. (.toByteArray baos) StandardCharsets/ISO_8859_1) end]))
+
+(deftest handler-timeout-interrupt-never-closes-a-body-read
+  ;; The handler is blocked reading its body when :handler-timeout
+  ;; answers 503. An interrupt landing in that socket read would close the
+  ;; socket under it (no lingering close): it waits for the read to
+  ;; return, and the handler's next read fails with InterruptedIOException.
+  (let [seen (promise)]
+    (with-server
+      (fn [req]
+        (let [^java.io.InputStream in (:body req)
+              buf (byte-array 16)]
+          (try
+            (loop []
+              (when (pos? (.read in buf))
+                (recur)))
+            (deliver seen :eof)
+            (catch Exception e (deliver seen e))))
+        {:status 200 :body "late"})
+      {:handler-timeout 300 :read-timeout 5000 :min-data-rate-bytes 0}
+      (fn []
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (write! sock "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n01234")
+          (is (clojure.string/starts-with? (read-until-includes! sock "Service Unavailable" 3000) "HTTP/1.1 503"))
+          (write! sock "567")
+          (let [e (deref seen 3000 :never)]
+            (is (= java.io.InterruptedIOException (class e)) (pr-str e)))
+          (is (= ["" :eof] (read-to-end! sock 3000)) "closed lingering: FIN, no reset"))))))
+
+(deftest unknown-length-body-is-chunked-even-on-a-closing-connection
+  ;; Without chunked framing the end of a close-delimited body is the end
+  ;; of the connection, so a body that fails half-way would look complete.
+  (with-server
+    (fn [_] {:status 200 :body (list "chunk-1" "chunk-2")})
+    {}
+    (fn []
+      (let [resp (send-and-read! close-req)]
+        (is (clojure.string/includes? resp "Transfer-Encoding: chunked\r\n") resp)
+        (is (clojure.string/includes? resp "Connection: close\r\n"))
+        (is (clojure.string/ends-with? resp "0\r\n\r\n"))))))
+
+(defn- failing-stream
+  "An InputStream giving `n` bytes of 'x', then failing."
+  ^java.io.InputStream [n]
+  (let [left (atom n)]
+    (proxy [java.io.InputStream] []
+      (read
+        ([] (throw (UnsupportedOperationException.)))
+        ([^bytes b off len]
+         (let [k (min (long len) (long @left))]
+           (if (pos? k)
+             (do (java.util.Arrays/fill b (int off) (int (+ off k)) (byte 120))
+                 (swap! left - k)
+                 (int k))
+             (throw (java.io.IOException. "body source failed")))))))))
+
+(deftest failing-close-delimited-body-resets-the-connection
+  ;; HTTP/1.0 has no chunked framing: a body of unknown length ends with
+  ;; the connection, so one that fails must end it with a reset, never the
+  ;; FIN a complete body ends with.
+  (with-server
+    (fn [_] {:status 200 :body (failing-stream 20000)})
+    {}
+    (fn []
+      (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+        (write! sock "GET / HTTP/1.0\r\nHost: x\r\n\r\n")
+        (let [[_ end] (read-to-end! sock 3000)]
+          (is (= :reset end)))))))
+
+(deftest drain-and-a-first-request-byte-never-both-win
+  ;; A drain closes an idle connection; a request whose first bytes are in
+  ;; must be served instead. Here the drain comes in just as those bytes
+  ;; are read: one of the two wins, never both (a request served on a
+  ;; socket the drain is closing).
+  (let [resp {:status 200 :body "ok"}
+        ->response @#'enso/->response
+        served (promise)
+        closed (promise)
+        handler (reify RingHandler (handle [_ _] (deliver served true) (->response resp)))
+        srv (enso/run-server (fn [_] resp) {:port 0})
+        conn (promise)
+        req (.getBytes close-req StandardCharsets/ISO_8859_1)
+        first-read (atom true)
+        in (proxy [java.io.InputStream] []
+             (read
+               ([] (throw (UnsupportedOperationException.)))
+               ([^bytes b off len]
+                (if (compare-and-set! first-read true false)
+                  (do (.beginDrain ^HttpConnection @conn)
+                      (System/arraycopy req 0 b off (alength req))
+                      (alength req))
+                  -1))))
+        addr (InetAddress/getLoopbackAddress)
+        sock (proxy [Socket] []
+               (getInputStream [] in)
+               (getOutputStream [] (OutputStream/nullOutputStream))
+               (setSoTimeout [_])
+               (getInetAddress [] addr)
+               (getLocalPort [] 8080)
+               (close [] (deliver closed true)))]
+    (try
+      (deliver conn (HttpConnection. sock handler srv))
+      (.run ^HttpConnection @conn)
+      (is (deref closed 2000 false) "the drain closed the idle connection")
+      (is (not (realized? served)) "and its request was not served")
+      (finally (enso/stop srv)))))
+
+(deftest unread-body-drain-after-the-response-is-bounded
+  ;; A small unread body is drained after the response to keep the
+  ;; connection, but a client trickling it (each byte resets
+  ;; :read-timeout) gets two seconds, then the connection closes.
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {:read-timeout 5000 :min-data-rate-bytes 0}
+    (fn []
+      (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+        (write! sock "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\nabc")
+        (let [dripper (future
+                        (try
+                          (dotimes [_ 997]
+                            (Thread/sleep 100)
+                            (write! sock "z"))
+                          (catch Exception _)))
+              [resp ms] (read-all-timed sock 6000)]
+          (future-cancel dripper)
+          (is (clojure.string/starts-with? (str resp) "HTTP/1.1 200") (pr-str resp))
+          (is (< ms 3500) (str "closed after " ms "ms")))))))
+
+(deftest head-with-nil-body-omits-content-length
+  ;; Ring's wrap-head answers HEAD with the GET response minus its body:
+  ;; nil says nothing of the length GET would have, so none is sent.
+  (with-server
+    (fn [_] {:status 200 :headers {"content-type" "text/plain"} :body nil})
+    {}
+    (fn []
+      (let [resp (send-and-read! "HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")]
+        (is (= 200 (status-of resp)))
+        (is (not (re-find #"(?i)content-length" resp)) resp))
+      (is (clojure.string/includes? (send-and-read! close-req) "Content-Length: 0\r\n")
+          "GET still says its body is empty"))))
+
+(deftest server-events-report-every-response
+  ;; The 101 after a keep-alive response reports its own body bytes
+  ;; (none), and a response whose body failed is still reported.
+  (let [log (atom [])]
+    (with-server
+      (fn [req]
+        (case (:uri req)
+          "/ws" (echo-ws-handler req)
+          "/fail" {:status 200 :body (failing-stream 10)}
+          {:status 200 :body "hello"}))
+      {:server-events {:request-completed (fn [_ method status _ bytes _]
+                                            (swap! log conj [method status bytes]))}}
+      (fn []
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (.setSoTimeout sock 3000)
+          (write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+          (is (clojure.string/ends-with? (read-until-includes! sock "hello" 3000) "hello"))
+          (write! sock (clojure.string/replace (ws-request) "GET / " "GET /ws "))
+          (is (clojure.string/starts-with? (read-http-head (.getInputStream sock)) "HTTP/1.1 101")))
+        (send-and-read! "GET /fail HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        (is (support/await-condition #(= 3 (count @log)) 3000 10) (pr-str @log))
+        (is (= #{["GET" 200 5] ["GET" 101 0]} (set (take 2 @log))) (pr-str @log))
+        (is (= "GET" (first (nth @log 2 nil))) "the failed response is reported")))))
+
+(deftest closing-a-connection-is-bounded-by-the-write-timeout
+  ;; Closing writes (a close_notify over TLS), which blocks on a peer that
+  ;; stopped reading with the send buffer full: :write-timeout bounds it
+  ;; like any write, force-closing the socket.
+  (let [resp {:status 200 :body "ok"}
+        ->response @#'enso/->response
+        handler (reify RingHandler (handle [_ _] (->response resp)))
+        srv (enso/run-server (fn [_] resp) {:port 0 :write-timeout 200})
+        closes (java.util.concurrent.atomic.AtomicInteger.)
+        forced (java.util.concurrent.CountDownLatch. 1)
+        in (ByteArrayInputStream. (.getBytes close-req StandardCharsets/ISO_8859_1))
+        addr (InetAddress/getLoopbackAddress)
+        sock (proxy [Socket] []
+               (getInputStream [] in)
+               (getOutputStream [] (OutputStream/nullOutputStream))
+               (setSoTimeout [_])
+               (getInetAddress [] addr)
+               (getLocalPort [] 8080)
+               (close []
+                 (if (= 1 (.incrementAndGet closes))
+                   (.await forced 5 java.util.concurrent.TimeUnit/SECONDS)
+                   (.countDown forced))))]
+    (try
+      (let [t0 (System/nanoTime)]
+        (.run (HttpConnection. sock handler srv))
+        (is (< (/ (- (System/nanoTime) t0) 1e6) 2000) "the stuck close was force-closed"))
+      (finally (enso/stop srv)))))
+
+(deftest over-long-request-line-is-414
+  ;; RFC 9112 §3: a request-target longer than the server parses is 414
+  ;; URI Too Long, not a header error.
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {:max-header-bytes 1024}
+    (fn []
+      (let [resp (send-and-read! (str "GET /" (apply str (repeat 2000 "a")) " HTTP/1.1\r\nHost: x\r\n\r\n"))]
+        (is (= 414 (status-of resp)) (subs resp 0 (min 40 (count resp))))))))
+
+(deftest bare-lf-line-ends-are-rejected-at-once
+  ;; RFC 9112 §2.2: lines end with CRLF. A bare LF is refused as soon as
+  ;; it is seen instead of waiting for a CRLF that never comes.
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {:header-timeout 5000}
+    (fn []
+      (doseq [raw ["GET / HTTP/1.1\nHost: x\n\n" "GET / HTTP/1.1\r\nHost: x\n\n" "GET / HTTP/1.1\n"]]
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (write! sock raw)
+          (let [[resp ms] (read-all-timed sock 3000)]
+            (is (clojure.string/starts-with? (str resp) "HTTP/1.1 400") (pr-str raw resp))
+            (is (< ms 1000) (pr-str raw))))))))
+
+(deftest handler-connection-field-dropped-when-the-server-closes
+  ;; The server closing after this response says Connection: close; a
+  ;; handler's Connection: keep-alive alongside would contradict it.
+  (with-server
+    (fn [_] {:status 200 :headers {"Connection" "keep-alive"} :body "ok"})
+    {}
+    (fn []
+      (let [resp (send-and-read! close-req)]
+        (is (clojure.string/includes? resp "Connection: close\r\n"))
+        (is (not (re-find #"(?i)connection: keep-alive" resp)) resp)))))
+
+(deftest http-error-outside-the-error-range-is-500
+  ;; A handler throwing HttpError with a status that isn't 4xx / 5xx has
+  ;; a bug: 500.
+  (with-server
+    (fn [req] (throw (com.s_exp.enso.core.HttpError. (int (Long/parseLong (subs (:uri req) 1))) "odd")))
+    {}
+    (fn []
+      (doseq [status [99 200 999]]
+        (let [resp (send-and-read! (str "GET /" status " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))]
+          (is (clojure.string/starts-with? resp "HTTP/1.1 500") (pr-str status resp)))))))

@@ -1,15 +1,18 @@
 # ABOUTME: Expected quic-interop-runner results with enso as the server, one "<client> <test> <result>" per
 # ABOUTME: line, checked by check_results.py; a pair that ran and differs (or is missing) fails the job.
 #
-# Every pair fails today, before any QUIC exchange: the simulator only
-# starts once the server answers its readiness probe (wait-for-it-quic, an
-# unknown-version long header with a zero-length DCID) with Version
-# Negotiation, and Http3Loop.onDatagram drops long headers whose DCID
-# length is 0 or above 20 before the version check (RFC 9000 §5.2.2 /
-# §17.2, RFC 8999). When that is fixed these lines turn into mismatches:
-# replace them with the results of that run.
-quiche http3 failed
-ngtcp2 http3 failed
-quic-go http3 failed
-neqo http3 failed
-quinn http3 failed
+# Only http3 applies (the other cases use hq-interop, which enso doesn't
+# serve). quic-go, ngtcp2, neqo and quinn were run natively (arm64 images
+# on Apple Silicon, from the Linux container of doc/testing.md).
+#
+# quiche's client image is amd64-only: emulated on Apple Silicon, its
+# `ethtool -K eth0 tx off` fails ("Function not implemented"), so its
+# datagrams leave with partial (offloaded) UDP checksums that the server's
+# kernel drops, and the pair fails there before enso sees a packet (the
+# capture shows it). This line is the result expected on a native x86-64
+# host (the nightly job); run the other four clients on Apple Silicon.
+quic-go http3 succeeded
+ngtcp2 http3 succeeded
+neqo http3 succeeded
+quinn http3 succeeded
+quiche http3 succeeded

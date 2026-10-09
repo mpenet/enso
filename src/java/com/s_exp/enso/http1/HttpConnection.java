@@ -5,6 +5,8 @@ package com.s_exp.enso.http1;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -60,7 +62,27 @@ public final class HttpConnection implements Runnable, Drainable {
     // Largest unread request body drained to keep the connection; above
     // it the connection is closed instead.
     private static final int MAX_DRAIN_BYTES = 65_536;
+    // How long that drain may take after the response (nginx's
+    // lingering_time): a client trickling the rest gets no longer.
+    private static final int MAX_DRAIN_MILLIS = 2000;
     private static final String WEBSOCKET = "websocket";
+
+    // Connection states (see state).
+    private static final int ACTIVE = 0;
+    private static final int IDLE = 1;
+    private static final int CLOSING = 2;
+    private static final VarHandle STATE;
+    private static final VarHandle TIMED_SINCE;
+
+    static {
+        try {
+            MethodHandles.Lookup lookup = MethodHandles.lookup();
+            STATE = lookup.findVarHandle(HttpConnection.class, "state", int.class);
+            TIMED_SINCE = lookup.findVarHandle(HandlerTimeout.class, "timedSince", long.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
 
     private final Socket socket;
     private final RingHandler handler;
@@ -72,20 +94,22 @@ public final class HttpConnection implements Runnable, Drainable {
     private final Watchdog watchdog;
     private final ResponseWriter writer;
     private final RequestReader reader;
-    // The exchange of the request in flight, reused for every request; also
-    // the :handler-timeout timer node.
+    // The exchange of the request in flight, reused for every request.
     private final Call call = new Call();
+    // :handler-timeout timer node, created by the first timed request.
+    private HandlerTimeout handlerTimeout;
 
     /**
-     * True while this connection is between requests: keep-alive completed the
-     * previous response, no bytes for the next request have been buffered or
-     * observed on the socket yet. Read by {@link #beginDrain} to tell sockets
-     * that can be closed without dropping an in-flight request from those
-     * still handling one. Cleared by {@link RequestReader#socketRead} on the
-     * first byte received of a new request, closing the shutdown race to the
-     * kernel-read latency window.
+     * {@link #IDLE} between requests: the previous response is on the wire
+     * and no byte of the next request has been read. A drain closes an idle
+     * connection ({@link #beginDrain}: IDLE to {@link #CLOSING}); the first
+     * byte of a request makes it {@link #ACTIVE} ({@link #leaveIdle}: IDLE
+     * to ACTIVE). Both are one CAS from IDLE, so exactly one wins: a drain
+     * never closes a connection that started a request, and a request is
+     * never served on a connection a drain is closing.
      */
-    public volatile boolean idle;
+    @SuppressWarnings("unused") // accessed through STATE
+    private volatile int state;
     /**
      * The WebSocket this connection was upgraded to, once its handshake is
      * written. Read by {@link #beginDrain} to close it gracefully.
@@ -103,7 +127,6 @@ public final class HttpConnection implements Runnable, Drainable {
     private final ReentrantLock handlerWriteLock = new ReentrantLock();
     // The handler-timeout 503 is written and the handler interrupted.
     private volatile boolean timeoutResponded;
-    private boolean timerUsed;
     private Thread connectionThread;
     private final byte[] prefix;
     private final int prefixLen;
@@ -142,9 +165,9 @@ public final class HttpConnection implements Runnable, Drainable {
     @Override
     public void run() {
         connectionThread = Thread.currentThread();
-        try (Socket s = socket) {
-            reader.start(s.getInputStream(), prefix, prefixLen);
-            OutputStream t = s.getOutputStream();
+        try {
+            reader.start(socket.getInputStream(), prefix, prefixLen);
+            OutputStream t = socket.getOutputStream();
             if (watchdog != null) {
                 t = new WatchedOutputStream(t, watchdog);
             }
@@ -161,11 +184,12 @@ public final class HttpConnection implements Runnable, Drainable {
         } catch (IOException e) {
             // client went away or timed out
         } finally {
+            closeWatched();
             // A cancelled node stays in the wheel until its slot comes
             // around, keeping this connection reachable: retire unlinks it
             // on the next tick.
             if (watchdog != null) timer.retire(watchdog);
-            if (timerUsed) timer.retire(call);
+            if (handlerTimeout != null) timer.retire(handlerTimeout);
             writer.retireTimers();
         }
     }
@@ -181,19 +205,19 @@ public final class HttpConnection implements Runnable, Drainable {
         WebSocketConnection ws = webSocket;
         if (ws != null) {
             Thread.ofVirtual().name("enso-ws-close").start(ws::shutdown);
-        } else if (idle) {
-            Thread.ofVirtual().name("enso-h1-close").start(this::closeIdle);
+        } else if (STATE.compareAndSet(this, IDLE, CLOSING)) {
+            Thread.ofVirtual().name("enso-h1-close").start(this::closeWatched);
         }
     }
 
     /**
-     * Closes an idle connection for a drain. Over TLS that writes a
-     * close_notify, which blocks if the peer stopped reading with the send
-     * buffer full: the write watchdog bounds it, so the drain doesn't wait
-     * for the shutdown deadline (that deadline's force close still bounds
-     * it when :write-timeout is off).
+     * Closes the socket. Over TLS that writes a close_notify, which blocks
+     * if the peer stopped reading with the send buffer full: the write
+     * watchdog bounds it like any write (so a drain doesn't wait for the
+     * shutdown deadline either; that deadline's force close still bounds it
+     * when :write-timeout is off).
      */
-    private void closeIdle() {
+    private void closeWatched() {
         Watchdog wd = watchdog;
         if (wd != null) wd.enter();
         try {
@@ -202,6 +226,33 @@ public final class HttpConnection implements Runnable, Drainable {
         } finally {
             if (wd != null) wd.exit();
         }
+    }
+
+    /**
+     * Shuts the output down for a lingering close (FIN, after a close_notify
+     * over TLS), bounded by the write watchdog as {@link #closeWatched} is.
+     */
+    void shutdownOutputWatched() throws IOException {
+        Watchdog wd = watchdog;
+        if (wd != null) wd.enter();
+        try {
+            socket.shutdownOutput();
+        } finally {
+            if (wd != null) wd.exit();
+        }
+    }
+
+    /** About to wait for the next request: a drain may close the connection from now on. */
+    private void enterIdle() {
+        STATE.setVolatile(this, IDLE);
+    }
+
+    /**
+     * The first byte of a request is in: no drain may close the connection
+     * now. False when one already did (the request is not served).
+     */
+    boolean leaveIdle() {
+        return STATE.compareAndSet(this, IDLE, ACTIVE) || (int) STATE.getVolatile(this) == ACTIVE;
     }
 
     @Override
@@ -220,7 +271,7 @@ public final class HttpConnection implements Runnable, Drainable {
             // drain closing an idle connection could cut it off.
             writer.flush();
             reader.startIdle();
-            idle = true;
+            enterIdle();
             // A drain that began while this connection was busy didn't see
             // it idle; it would otherwise wait out the idle timeout.
             if (!server.isRunning()) {
@@ -230,8 +281,16 @@ public final class HttpConnection implements Runnable, Drainable {
                 if (!reader.awaitRequest()) {
                     return false;
                 }
+            } catch (HttpError e) {
+                // A request began arriving (a TLS record at a time) and its
+                // head ran out of time.
+                headError(e.status);
+                writeError(e.status, e.getMessage());
+                return false;
             } catch (IOException e) {
-                if (!server.isRunning() && idle) {
+                // A drain closed the connection while it waited (or a
+                // force close while it was still idle).
+                if (!server.isRunning() && (int) STATE.getVolatile(this) != ACTIVE) {
                     return false;
                 }
                 throw e;
@@ -241,17 +300,10 @@ public final class HttpConnection implements Runnable, Drainable {
         try {
             request = reader.parseRequest();
         } catch (HttpError e) {
-            idle = false;
             headError(e.status);
             writeError(e.status, e.getMessage());
             return false;
-        } catch (IOException e) {
-            if (!server.isRunning() && idle) {
-                return false;
-            }
-            throw e;
         }
-        idle = false;
         if (request == null) {
             return false;
         }
@@ -270,18 +322,22 @@ public final class HttpConnection implements Runnable, Drainable {
                 writer.holdOutput();
             }
         }
+        HandlerTimeout ht = null;
         if (timed) {
             // hbuf is empty here (flushed above), so a 503 written from
             // another thread can't overtake a pipelined response.
             timeoutResponded = false;
-            timerUsed = true;
             c.handlerThread = connectionThread;
-            timer.schedule(c, config.handlerTimeoutMillis);
+            ht = handlerTimeout;
+            if (ht == null) {
+                ht = handlerTimeout = new HandlerTimeout();
+            }
+            ht.arm();
         }
         Response response = c.serve(handler);
         writer.reclaimOutput();
         if (timed) {
-            timer.cancel(c);
+            ht.disarm();
             c.handlerThread = null;
             if (response == null) {
                 // The 503 went out in its place.
@@ -296,7 +352,9 @@ public final class HttpConnection implements Runnable, Drainable {
         if (c.outcome != Exchange.RESPONSE) {
             // A client error (the body failed) or a handler failure with no
             // error handler response: answered, then the connection ends.
-            writeError(request, response.status, HttpStatus.reason(response.status));
+            // A handler's HttpError outside 4xx / 5xx is its own bug: 500.
+            int status = response.status >= 400 && response.status <= 599 ? response.status : 500;
+            writeError(request, status, HttpStatus.reason(status));
             return false;
         }
 
@@ -313,10 +371,14 @@ public final class HttpConnection implements Runnable, Drainable {
             writeError(request, 500, HttpStatus.reason(500));
             return false;
         }
-        writer.bodyBytesWritten = 0;
         int status = writer.head.status();
-        boolean keepAlive = writeResponse(request, bodyAllowsReuse);
-        complete(status);
+        boolean keepAlive;
+        try {
+            keepAlive = writeResponse(request, bodyAllowsReuse);
+        } finally {
+            // Reported however the write ended: the response was decided.
+            complete(status);
+        }
         if (!bodyAllowsReuse) {
             linger = true;
             return false;
@@ -331,7 +393,7 @@ public final class HttpConnection implements Runnable, Drainable {
             linger = true;
             return false;
         } catch (RequestBodyTimeoutException e) {
-            service.protocolError(EnsoServer.HTTP_1_1, Exchange.clientErrorKind(408));
+            service.protocolError(EnsoServer.HTTP_1_1, e.kind());
             linger = true;
             return false;
         }
@@ -406,7 +468,7 @@ public final class HttpConnection implements Runnable, Drainable {
         if (body == null || body.isFinished()) {
             return true;
         }
-        return body.drain(MAX_DRAIN_BYTES);
+        return body.drainWithin(MAX_DRAIN_BYTES, MAX_DRAIN_MILLIS);
     }
 
     /** The first read of a body whose request said Expect: 100-continue. */
@@ -468,6 +530,69 @@ public final class HttpConnection implements Runnable, Drainable {
     }
 
     /**
+     * The {@code :handler-timeout} node, one per connection and armed for
+     * each timed request, but never cancelled: the next request's
+     * {@link #arm} only moves its deadline (one CAS, no timer thread visit
+     * per request, as a cancel then a new arm would cost). So an expiry may
+     * belong to an earlier request; {@link #timedSince} tells: the start of
+     * the timed request in flight, or {@link #NONE}. An expiry claims the
+     * request through one CAS on it, and only once the request has run for
+     * the whole timeout; the connection thread ends a request with the same
+     * CAS, waiting for an expiry that won it to finish its claim before
+     * the exchange is reused (the exchange alone could not tell a late
+     * expiry of the previous request from one of the next).
+     */
+    private final class HandlerTimeout extends Timer.Task {
+        private static final long NONE = 0;
+        private static final long EXPIRING = Long.MIN_VALUE;
+        private final long timeoutNanos = config.handlerTimeoutMillis * 1_000_000L;
+        private volatile long timedSince;
+        private long armedSince;
+
+        /** The request about to be served starts its timeout (connection thread). */
+        void arm() {
+            long now = System.nanoTime();
+            if (now == NONE || now == EXPIRING) {
+                now++;
+            }
+            armedSince = now;
+            timedSince = now;
+            timer.schedule(this, config.handlerTimeoutMillis);
+        }
+
+        /**
+         * The handler returned (connection thread): the expiry can no longer
+         * claim this request. When one is claiming it right now, waits for
+         * it to finish (it never blocks), so the claim says who won.
+         */
+        void disarm() {
+            if (TIMED_SINCE.compareAndSet(this, armedSince, NONE)) {
+                return;
+            }
+            while (timedSince == EXPIRING) {
+                Thread.yield();
+            }
+        }
+
+        @Override
+        protected void onTimeout() {
+            long since = timedSince;
+            if (since == NONE || since == EXPIRING || System.nanoTime() - since < timeoutNanos) {
+                // Between requests, or an expiry armed for an earlier one:
+                // the request in flight armed its own after setting since.
+                return;
+            }
+            if (TIMED_SINCE.compareAndSet(this, since, EXPIRING)) {
+                try {
+                    call.expire();
+                } finally {
+                    timedSince = NONE;
+                }
+            }
+        }
+    }
+
+    /**
      * Nothing of the response was written (it is only written once the
      * handler returns), so the 503 owns the connection: written in one
      * piece, then the handler is interrupted and the connection ends.
@@ -518,6 +643,21 @@ public final class HttpConnection implements Runnable, Drainable {
         @Override
         protected void handlerTimedOut() {
             Thread.ofVirtual().name("enso-h1-handler-timeout").start(HttpConnection.this::respondHandlerTimeout);
+        }
+
+        /**
+         * The handler runs on the connection thread, which also reads the
+         * socket for it: an interrupt landing in that read would close the
+         * socket, so the reader defers it past the read.
+         */
+        @Override
+        protected void interrupt(Thread t) {
+            reader.interrupt(t);
+        }
+
+        /** {@code :handler-timeout} expired for the request in flight (see {@link HandlerTimeout}). */
+        void expire() {
+            onTimeout();
         }
     }
 
@@ -601,8 +741,11 @@ public final class HttpConnection implements Runnable, Drainable {
             writeError(request, 500, HttpStatus.reason(500));
             return;
         }
-        writer.flush();
-        complete(101);
+        try {
+            writer.flush();
+        } finally {
+            complete(101);
+        }
 
         WebSocketConnection ws = new WebSocketConnection(socket, reader.upgradeInput(), writer.output(),
                                                          response.webSocketListener, config, deflate, timer,

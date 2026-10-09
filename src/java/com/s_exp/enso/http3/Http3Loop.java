@@ -9,10 +9,12 @@ import com.s_exp.enso.http3.qpack.QpackDecoder;
 import com.s_exp.enso.http3.qpack.QpackFieldSection;
 import com.s_exp.enso.quiche.InitialClose;
 import com.s_exp.enso.quiche.NativeBuffer;
+import com.s_exp.enso.quiche.Quiche;
 import com.s_exp.enso.quiche.QuicheConfig;
 import com.s_exp.enso.quiche.QuicheConnection;
 import com.s_exp.enso.quiche.Records;
 import com.s_exp.enso.quiche.UdpSocket;
+import com.s_exp.enso.quiche.VersionNegotiation;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.net.InetAddress;
@@ -120,7 +122,11 @@ final class Http3Loop implements Runnable {
 
     // Accept-path scratch.
     private final NativeBuffer hdr = NativeBuffer.allocate(Records.HDR_LEN);
-    private final SecureRandom rng = new SecureRandom();
+    // This loop's own generator: the platform default (NativePRNG on Linux)
+    // serialises every caller on one lock.
+    private final SecureRandom rng = loopRandom();
+    // The arbitrary bits of Version Negotiation's first byte.
+    private int vnBits;
 
     // Per-thread scratch for the connections of this loop: one copy per
     // loop rather than per connection, which an idle connection would hold.
@@ -145,12 +151,14 @@ final class Http3Loop implements Runnable {
     private byte[] dateField;
 
     // Connections of this loop.
-    private final ConnectionIds.Map<Http3Connection> conns = new ConnectionIds.Map<>(256);
+    // Replaced (with the timers) when a failed loop restarts: its state
+    // can't be trusted.
+    private ConnectionIds.Map<Http3Connection> conns = new ConnectionIds.Map<>(256);
     // Client-chosen destination ids of handshaking connections (the
     // client's Initials before it learnt ours).
     private final HashMap<AliasKey, Http3Connection> aliases = new HashMap<>();
     private final AliasKey lookup = new AliasKey();
-    private final DeadlineHeap<Http3Connection> timers = new DeadlineHeap<>();
+    private DeadlineHeap<Http3Connection> timers = new DeadlineHeap<>();
     private Http3Connection[] dirty = new Http3Connection[64];
     private int dirtyCount;
     private final SignalStack<Http3Connection> ready = new SignalStack<>();
@@ -192,6 +200,15 @@ final class Http3Loop implements Runnable {
         this.sendRecords = sendMeta.buffer;
         this.inbox = new Inbox(INBOX_SLOTS, slotSize);
         this.thread = Thread.ofPlatform().name("enso-h3-loop-" + index).daemon(true).unstarted(this);
+    }
+
+    /** A DRBG instance of its own, seeded from the platform; the default generator when DRBG is missing. */
+    private static SecureRandom loopRandom() {
+        try {
+            return SecureRandom.getInstance("DRBG");
+        } catch (java.security.NoSuchAlgorithmException e) {
+            return new SecureRandom();
+        }
     }
 
     // ---- cross-thread entry points ---------------------------------------
@@ -300,19 +317,40 @@ final class Http3Loop implements Runnable {
      * (their state can't be trusted) and let {@link #run} restart it.
      */
     private void loopFailed(Throwable t) {
-        listener.stats.loopRestarts.increment();
-        LOOP_FAILURES.log("h3 event loop " + index + " failed; closing its connections and restarting it", t);
-        listener.protocolError("event-loop-failure");
+        // Nothing here may escape: the supervisor must get to the restart.
+        try {
+            listener.stats.loopRestarts.increment();
+            LOOP_FAILURES.log("h3 event loop " + index + " failed; closing its connections and restarting it", t);
+            listener.protocolError("event-loop-failure");
+        } catch (Throwable ignored) {
+            // Out of memory reporting it: the restart matters more.
+        }
         try {
             closeAll();
         } catch (Throwable inner) {
             LOOP_FAILURES.log("h3 event loop " + index + " cleanup failed", inner);
         }
-        dirtyCount = 0;
-        Arrays.fill(dirty, null);
+        resetState();
         if (!stopRequested) {
             java.util.concurrent.locks.LockSupport.parkNanos(this, RESTART_PAUSE_NANOS);
         }
+    }
+
+    /**
+     * After a failure: the restarted loop starts from fresh tables, timers
+     * and an empty send batch (whatever a broken step left half-done in
+     * them is dropped; closeAll freed every connection they named).
+     */
+    private void resetState() {
+        conns = new ConnectionIds.Map<>(256);
+        aliases.clear();
+        timers = new DeadlineHeap<>();
+        dirty = new Http3Connection[64];
+        dirtyCount = 0;
+        sendCount = 0;
+        sendOff = 0;
+        sendBlocked = false;
+        mayReceive = true;
     }
 
     private void park(long now) {
@@ -386,14 +424,25 @@ final class Http3Loop implements Runnable {
             dcidLen = ConnectionIds.LENGTH;
         } else {
             if (len < 7) return;
+            int version = VersionNegotiation.version(buf, off);
+            if (version != Quiche.QUICHE_PROTOCOL_VERSION && !QuicheConnection.versionIsSupported(version)) {
+                // RFC 8999 §6: whatever its connection ids (up to 255
+                // bytes, possibly empty) and the other bits of its first
+                // byte. Answered by the receiving loop: there is no
+                // connection to route to. Never a VN (version 0) itself.
+                if (version != 0 && len >= MIN_INITIAL_DATAGRAM) negotiateVersion(packets, off, len, meta, rec);
+                return;
+            }
             dcidLen = buf.get(off + 5) & 0xFF;
             if (dcidLen == 0 || dcidLen > 20 || len < 6 + dcidLen) return;
             dcidOff = off + 6;
         }
         // Initial and 0-RTT packets (long header, type bits 00 / 01) of a
-        // client that doesn't know our id yet.
+        // client that doesn't know our id yet. With per-loop sockets the
+        // kernel spread them by 4-tuple (an id the client chose must not
+        // pick the loop): accepted where they land.
         boolean clientChosen = longHeader && (b0 & 0x20) == 0;
-        if (loops > 1 && (listener.routeAll || !clientChosen)) {
+        if (loops > 1 && (listener.sharedSocket || !clientChosen)) {
             int owner = ConnectionIds.owner(buf.get(dcidOff), loops);
             if (owner != index) {
                 listener.loops[owner].forward(buf, off, len, meta.buffer, rec);
@@ -458,16 +507,19 @@ final class Http3Loop implements Runnable {
         byte[] scid = bytes(h, Records.HDR_SCID, h.get(Records.HDR_SCID_LEN) & 0xFF);
         byte[] dcid = bytes(h, Records.HDR_DCID, h.get(Records.HDR_DCID_LEN) & 0xFF);
         int version = h.getInt(Records.HDR_VERSION);
-        if (!QuicheConnection.versionIsSupported(version)) {
-            // RFC 9000 §6.1: never for a short header (none reaches here).
-            if (ensureSendRoom()) {
-                writePacket(meta, rec, QuicheConnection.negotiateVersion(scid, dcid, sendSlab, sendOff,
-                                                                         maxPayload));
-            }
-            return;
-        }
         if (type != TYPE_INITIAL || !listener.accepting || dcid.length < MIN_CLIENT_DCID) return;
         int tokenLen = h.getInt(Records.HDR_TOKEN_LEN);
+        if (tokenLen > 0 && loops > 1 && dcid.length == ConnectionIds.LENGTH) {
+            // The Initial after our Retry is addressed to the id that loop
+            // generated: the connection must live there. The same 4-tuple
+            // hashes to the same socket, so this is rare (a client that
+            // moved between its Initials).
+            int owner = ConnectionIds.owner(dcid[0], loops);
+            if (owner != index) {
+                listener.loops[owner].forward(buf.buffer, off, len, meta.buffer, rec);
+                return;
+            }
+        }
         Http3Listener.Admission a = listener.admit(h, tokenLen, meta.buffer, rec + Records.RECV_PEER, dcid);
         switch (a.verdict) {
             case Http3Listener.Admission.DROP -> {
@@ -514,19 +566,42 @@ final class Http3Loop implements Runnable {
             listener.admissionFailed(remote);
             return;
         }
-        Http3Connection c = new Http3Connection(this, q, cfg, cid, alias, scid, remote, now);
-        if (conns.putIfAbsent(cid, c) != null) {
-            // A retried Initial for a connection that exists; can't happen
-            // as that one would have been found first.
+        Http3Connection c = null;
+        Throwable failure = null;
+        try {
+            c = new Http3Connection(this, q, cfg, cid, alias, scid, remote, now);
+            // A retried Initial for a connection that exists can't get
+            // here: that one would have been found first.
+            if (conns.putIfAbsent(cid, c) != null) c = null;
+        } catch (Throwable t) {
+            c = null;
+            failure = t;
+        }
+        if (c == null) {
             q.free();
             cfg.release();
             listener.admissionFailed(remote);
+            if (failure != null) phaseFailed("accept", failure);
             return;
         }
-        if (alias != null) aliases.put(new AliasKey(alias), c);
-        listener.opened(c);
-        c.recv(buf, off, len, meta, rec);
+        // Registered: from here a failure closes the connection like any
+        // other, so its slot, timer and native state are given back.
+        try {
+            if (alias != null) aliases.put(new AliasKey(alias), c);
+            listener.opened(c);
+            c.recv(buf, off, len, meta, rec);
+        } catch (Throwable t) {
+            connectionFailed(c, "accept", t);
+        }
         markDirty(c);
+    }
+
+    /** Answers the unsupported-version long header {@code buf[off, off + len)} with Version Negotiation. */
+    private void negotiateVersion(NativeBuffer buf, int off, int len, NativeBuffer meta, int rec) {
+        // RFC 9000 §6.1: never for a short header (none reaches here).
+        if (!ensureSendRoom()) return;
+        writePacket(meta, rec, VersionNegotiation.write(buf.buffer, off, len, vnBits++, sendSlab.buffer, sendOff,
+                                                        maxPayload));
     }
 
     private static byte[] bytes(ByteBuffer b, int off, int len) {
@@ -632,14 +707,20 @@ final class Http3Loop implements Runnable {
         }
     }
 
-    /** Drops a connection whose settling failed, so the loop holds nothing of it. */
+    /**
+     * Drops a connection whose settling (or the loop) failed, so the loop
+     * holds nothing of it: every step runs even when an earlier one throws.
+     */
     private void forget(Http3Connection c) {
         try {
             timers.remove(c);
         } catch (Throwable ignored) {
         }
-        conns.remove(c.cid, c);
-        if (c.alias != null) aliases.remove(new AliasKey(c.alias), c);
+        try {
+            conns.remove(c.cid, c);
+            if (c.alias != null) aliases.remove(new AliasKey(c.alias), c);
+        } catch (Throwable ignored) {
+        }
         try {
             c.destroy();
         } catch (Throwable t) {
@@ -697,13 +778,9 @@ final class Http3Loop implements Runnable {
         } catch (Throwable t) {
             FAILURES.log("h3 final flush failed", t);
         }
-        for (Http3Connection c : connections()) {
-            try {
-                destroy(c);
-            } catch (Throwable t) {
-                FAILURES.log("h3 connection teardown failed", t);
-            }
-        }
+        // Each step guarded: a broken timer entry or table must not keep a
+        // connection (its quiche state, limiter slot, native credit) alive.
+        for (Http3Connection c : connections()) forget(c);
         aliases.clear();
     }
 
@@ -751,7 +828,7 @@ final class Http3Loop implements Runnable {
     void sendInitialClose(int code, byte[] keysDcid, byte[] clientScid, NativeBuffer meta, int rec) {
         if (!ensureSendRoom()) return;
         writePacket(meta, rec, InitialClose.transportClose(code, keysDcid, clientScid,
-            com.s_exp.enso.quiche.Quiche.QUICHE_PROTOCOL_VERSION, sendSlab.buffer, sendOff, maxPayload));
+            Quiche.QUICHE_PROTOCOL_VERSION, sendSlab.buffer, sendOff, maxPayload));
     }
 
     /** A stateless reply (Retry, Version Negotiation, close) to the datagram of {@code meta[rec]}. */
@@ -768,9 +845,11 @@ final class Http3Loop implements Runnable {
         if (sendCount == 0) return;
         int n = sendSocket.sendBatch(sendSlab, sendMeta, sendCount, sendFlags);
         if (n < 0) {
-            // A socket-level failure: the packets are lost, quiche's loss
-            // recovery resends what matters.
-            FAILURES.log("h3 send failed (errno " + -n + "), " + sendCount + " packets dropped");
+            // A socket-level failure (or a batch the shim refused, which
+            // sent nothing): the packets are lost, quiche's loss recovery
+            // resends what matters.
+            FAILURES.log("h3 send failed (" + (n == Quiche.SHIM_ERR_INVALID_ARGUMENT ? "invalid batch" : "errno " + -n)
+                + "), " + sendCount + " packets dropped");
             n = sendCount;
         }
         int dropped = sendRecords.getInt(Records.SEND_STATUS_DROPPED);
@@ -844,11 +923,14 @@ final class Http3Loop implements Runnable {
     /**
      * Datagrams other loops received for connections of this one, copied
      * into fixed slots. Producers append under the lock; the loop reads a
-     * snapshot of filled slots without it, then releases them.
+     * snapshot of filled slots without it, then releases them. The slots
+     * (direct memory) are allocated by the first datagram handed over: a
+     * single loop, or kernel steering, may never need them.
      */
     private static final class Inbox {
-        final NativeBuffer slab;
-        final NativeBuffer meta;
+        // Set once, under the lock; read by the loop after a snapshot.
+        NativeBuffer slab;
+        NativeBuffer meta;
         final int slotSize;
         private final int capacity;
         private long head;
@@ -858,12 +940,14 @@ final class Http3Loop implements Runnable {
         Inbox(int capacity, int slotSize) {
             this.capacity = capacity;
             this.slotSize = slotSize;
-            this.slab = NativeBuffer.allocate(capacity * slotSize);
-            this.meta = NativeBuffer.allocate(capacity * Records.RECV_META_LEN);
         }
 
         synchronized boolean offer(ByteBuffer src, int off, int len, ByteBuffer srcMeta, int rec) {
             if (tail - head == capacity || len > slotSize) return false;
+            if (slab == null) {
+                slab = NativeBuffer.allocate(capacity * slotSize);
+                meta = NativeBuffer.allocate(capacity * Records.RECV_META_LEN);
+            }
             int slot = (int) (tail % capacity);
             slab.buffer.put(slot * slotSize, src, off, len);
             int m = slot * Records.RECV_META_LEN;

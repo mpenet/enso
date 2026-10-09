@@ -113,11 +113,19 @@ Classifiers: `darwin-arm64`, `linux-{amd64,arm64}`,
   listener.
 - The defaults bound what one client can make the server hold: 64 KiB
   request heads, 10 MiB request bodies, 1 MiB WebSocket messages, 10000
-  connections, a quarter of the heap for buffered peer data. Review
-  [doc/options.md](doc/options.md#limits) for your traffic, and set
-  `:max-connections-per-ip` when clients don't share addresses.
-- `:handler-timeout` is off by default: a handler's duration is
-  application policy.
+  connections, a quarter of the heap for buffered peer data and the
+  flow-control credit promised to peers (shared fairly under pressure),
+  request bodies no slower than 240 bytes/s after 5 s of waiting
+  (`:min-data-rate-bytes`). Review
+  [doc/options.md](doc/options.md#limits) for your traffic.
+- Set `:max-connections-per-ip` when clients reach the server directly:
+  without it one address can take every connection slot. Leave it off
+  behind a load balancer or NAT, where clients share addresses, and limit
+  per client there.
+- Set `:handler-timeout` in production: it is off by default (a
+  handler's duration is application policy), and without it a handler
+  stuck on a slow dependency holds its connection (or HTTP/2 / HTTP/3
+  stream slot) and virtual thread until it returns.
 - HTTP/3: prefer an ECDSA (P-256) certificate. Each QUIC handshake signs
   on an event loop thread, and ECDSA signing costs a fraction of RSA's,
   which matters under a connection flood.

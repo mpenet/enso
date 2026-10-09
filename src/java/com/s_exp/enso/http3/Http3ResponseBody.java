@@ -66,6 +66,10 @@ final class Http3ResponseBody {
     private int headerOff;
     private int headerEnd;
     private boolean headerPending;
+    // Loop only: bytes of the slice the last pump left waiting, and those
+    // charged to the connection's budget share (see Http3Connection.bodyHeld).
+    private int held;
+    int charged;
 
     Http3ResponseBody(Http3Exchange exchange, long declaredLength) {
         this.exchange = exchange;
@@ -146,6 +150,11 @@ final class Http3ResponseBody {
         return offered;
     }
 
+    /** Bytes of the producer's slice the last {@link #pump} left waiting for flow control (loop only). */
+    int held() {
+        return held;
+    }
+
     boolean failed() {
         return failed || cancelled;
     }
@@ -161,6 +170,7 @@ final class Http3ResponseBody {
      *   failed (the caller resets the stream)
      */
     int pump(Sender sender) {
+        held = 0;
         if (failed || cancelled) {
             cancel();
             return ABORTED;
@@ -189,7 +199,10 @@ final class Http3ResponseBody {
                     return ABORTED;
                 }
                 headerOff += n;
-                if (headerOff < headerEnd) return SENDING;
+                if (headerOff < headerEnd) {
+                    held = len;
+                    return SENDING;
+                }
             }
             int n = sender.send(buf, off, len, fin);
             if (n < 0) {
@@ -198,7 +211,10 @@ final class Http3ResponseBody {
             }
             off += n;
             len -= n;
-            if (len > 0) return SENDING;
+            if (len > 0) {
+                held = len;
+                return SENDING;
+            }
             return release(fin);
         } finally {
             lock.unlock();

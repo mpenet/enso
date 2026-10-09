@@ -94,12 +94,6 @@ public final class Records {
         return b.getShort(off + ADDR_PORT) & 0xFFFF;
     }
 
-    /** True when the ADDR records at {@code a} in {@code x} and {@code b} in {@code y} are equal. */
-    public static boolean sameAddress(ByteBuffer x, int a, ByteBuffer y, int b) {
-        return x.getLong(a) == y.getLong(b) && x.getLong(a + 8) == y.getLong(b + 8)
-            && x.getLong(a + 16) == y.getLong(b + 16);
-    }
-
     /** Copies the ADDR record at {@code from} in {@code src} to {@code to} in {@code dst}. */
     public static void copyAddress(ByteBuffer src, int from, ByteBuffer dst, int to) {
         dst.putLong(to, src.getLong(from));

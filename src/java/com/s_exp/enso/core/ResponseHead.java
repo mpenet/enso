@@ -39,7 +39,9 @@ import java.util.function.BiConsumer;
  *   <li>Framing is the server's: Transfer-Encoding is always dropped; a
  *       handler Content-Length is dropped when the server knows the body
  *       length, kept (and parsed: 1*DIGIT) for stream bodies, HEAD and 304.
- *       1xx and 204 never carry one. Two Content-Length keys (differing
+ *       HEAD otherwise carries the length of its body as GET would send
+ *       it, none for a nil body (Ring's wrap-head drops the body of the GET
+ *       response). 1xx and 204 never carry one. Two Content-Length keys (differing
  *       in case) with different values are an error.
  *   <li>{@link #MULTIPLEXED} (HTTP/2, HTTP/3) drops connection-specific
  *       fields (Connection, Keep-Alive, Proxy-Connection, Upgrade) and
@@ -234,7 +236,10 @@ public final class ResponseHead {
         }
         long known = knownLength();
         if (!bodyAllowed) {
-            contentLength = handlerLength >= 0 ? handlerLength : known;
+            // HEAD: the length GET would have. A nil body says nothing of
+            // it (Ring's wrap-head answers HEAD with the GET response minus
+            // its body), so then there is none.
+            contentLength = handlerLength >= 0 ? handlerLength : bodyKind == BODY_NONE ? -1 : known;
         } else if (known >= 0) {
             contentLength = known;
         } else if (handlerLength >= 0) {
