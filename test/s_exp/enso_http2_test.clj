@@ -1221,8 +1221,11 @@
             (is (nil? (read-until conn #(= frame-goaway (:type %)) nil 500)))))
         (testing "a burst over the budget is cut off"
           (with-conn [conn]
-            ;; The server may close mid-burst.
-            (try (request-and-reset! conn (range 1 65 2))
+            ;; 100 resets against a budget of 30 refilling at 1/s: the
+            ;; burst trips the limit unless it takes over 70 s, so a slow
+            ;; (loaded) run can't refill its way past it. The server may
+            ;; close mid-burst.
+            (try (request-and-reset! conn (range 1 201 2))
                  (catch java.io.IOException _))
             (let [ga (read-until conn #(= frame-goaway (:type %)))]
               (is (= 0xb (some-> ga goaway-code)) "ENHANCE_YOUR_CALM")))))
