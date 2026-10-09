@@ -74,6 +74,40 @@ its tag points at, the Rust toolchain, and the oldest macOS supported.
 Crate versions come from `native/enso_quiche/quiche-Cargo.lock` (quiche
 does not ship a lockfile; builds use `--locked`).
 
+`build-libquiche.sh` applies the patches in `native/enso_quiche/patches/`
+(in name order, `git apply`) before building; they are part of its cache
+key, as of the CI caches'. They add to quiche, in its own style (doc
+comments, `quiche.h`, unit tests), what enso uses beyond the stock API, so
+they can be sent upstream as they are:
+
+- `0001-live-receive-window-maximums.patch`:
+  `quiche_conn_set_max_connection_window` /
+  `quiche_conn_set_max_stream_window` raise the receive-window bounds of a
+  live connection, `quiche_conn_connection_window` reads its connection
+  window. enso grows each connection's window as its memory budget pays
+  for it (`:http3-max-window-bytes`).
+- `0002-bound-out-of-order-fragments.patch` (cloudflare/quiche#2814): a
+  stream buffers at most 64 out-of-order fragments plus one per 256 bytes
+  of stream they span; past that the connection is closed with
+  FLOW_CONTROL_ERROR. Without it a peer sending one-byte STREAM frames one
+  byte apart makes quiche hold about 75 times its flow-control window
+  (38 MiB per connection at enso's default 512 KiB window, from 2 MiB of
+  frames); with it, at most the window plus about 150 bytes per allowed
+  fragment (about 1.5 MiB at the defaults).
+
+`build-libquiche.sh` applies every patch or fails, so a libquiche with the
+receive-window calls (what `check-shim.sh` can detect) has the fragment
+bound too; the bound itself exports nothing to check.
+
+The shim links them directly when built against the patched header
+(`ENSO_QUICHE_RECV_WINDOW`, set by the Makefile) and looks them up at load
+otherwise, so it still builds and runs on a stock libquiche (development
+builds against a distribution's), with fixed windows
+(`Quiche.RECV_WINDOW_CONTROL` false). Release shims must have them:
+`check-shim.sh` fails otherwise, and CI's test jobs set
+`ENSO_H3_REQUIRE_RECV_WINDOW_CONTROL` so the tests needing them fail
+rather than skip.
+
 ```
 native/enso_quiche/build-libquiche.sh /tmp/quiche     # fetch + build libquiche.a, stage it
 make -C native/enso_quiche QUICHE_STATIC=1 \
@@ -102,7 +136,7 @@ when:
   container's glibc;
 - macOS: its minimum OS version is above `MACOSX_DEPLOYMENT_TARGET`;
 - the libquiche it links reports a version other than
-  `Quiche.QUICHE_VERSION`;
+  `Quiche.QUICHE_VERSION`, or lacks the patches' receive-window control;
 - a JVM cannot load it from the jar layout
   (`META-INF/native/<classifier>/` on the classpath, run from an empty
   directory) and create a QUIC client config through it.
@@ -124,16 +158,18 @@ shim for `script/sanitizer-test.sh` (see [testing.md](testing.md#sanitizer-run))
 1. Update `native/enso_quiche/pins.env` (`QUICHE_COMMIT` from
    `git ls-remote https://github.com/cloudflare/quiche 'refs/tags/<version>^{}'`)
    and `Quiche.QUICHE_VERSION`.
-2. Regenerate the lockfile in a checkout of that commit
+2. Check every patch in `native/enso_quiche/patches/` still applies (and
+   drop the ones upstream merged).
+3. Regenerate the lockfile in a checkout of that commit
    (`cargo generate-lockfile`) and copy it to
    `native/enso_quiche/quiche-Cargo.lock`.
-3. Regenerate the attributions:
+4. Regenerate the attributions:
    `python3 native/enso_quiche/third_party_notices.py quiche-src > THIRD-PARTY-NOTICES`,
    and update the BoringSSL section of `NOTICE` if boring-sys vendors a
    different BoringSSL (its commit is the `boring-sys/deps/boringssl`
    submodule of the matching cloudflare/boring tag). The `shim` CI job
    fails while THIRD-PARTY-NOTICES is out of date.
-4. Check the lockfile against the RustSec database
+5. Check the lockfile against the RustSec database
    (`cargo audit --file native/enso_quiche/quiche-Cargo.lock`, also run
    nightly). A bump made for a security advisory follows the process in
    [SECURITY.md](../SECURITY.md#native-dependency-advisories).

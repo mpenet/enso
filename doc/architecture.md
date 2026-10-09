@@ -218,8 +218,25 @@ Adopted:
   keeps moving), the rest is given back and owed, granted in pieces of at
   least a frame by a waiter once the budget has room. Stream credit is
   granted as bytes are read: the connection window bounds what a
-  connection's bodies hold. The account is closed at teardown, once no
-  handler runs.
+  connection's bodies hold. Windows autotune (see HTTP/2 receive flow
+  control): a connection window's growth is reserved from the account
+  before it is granted and skipped when the reservation fails; a stream
+  window's growth needs no reservation (the connection window, paid
+  for, bounds what the peer may send on all streams) and is skipped
+  while the account is throttled, like the connection's. Once no request
+  body is open (from its first DATA to its end or abort), the connection
+  window goes back to its baseline (four initial stream windows): read
+  bytes earn credit only while the peer holds less than that, the rest
+  of their reservation is released at once, so the grown window's cost
+  decays as the peer spends what it holds; the next body grows it again.
+  Credit the peer still holds stays paid for. A body that declares a
+  Content-Length is never granted stream credit past what it has left
+  to send (plus 256 octets, one frame's padding, so a padding peer can
+  always send its next frame), and while every open body declares one
+  the connection credit the peer holds stays within what they have left
+  (at least the baseline) and the window doesn't autotune past it: once
+  such an upload is sent the peer holds no grown window. The account is
+  closed at teardown, once no handler runs.
 - HTTP/2 streamed responses (`Http2Writer`): bytes copied into a
   stream's ring are charged to the connection's account until written or
   dropped; while it is throttled a ring holds one frame, so its producer
@@ -232,6 +249,30 @@ Adopted:
   request streams (QUIC flow control pushes back), and
   `resumeWhenDrained` registers a waiter that signals the stream's loop.
   The account is closed when the connection is destroyed.
+- HTTP/3 receive credit: what quiche may hold natively for a connection
+  is at most its connection window, which quiche autotunes up to a bound
+  (`max_connection_window`) that starts at the initial window. While the
+  connection reads a request body (`Http3Connection.bodyStarted` to the
+  last `readDone`) the initial window is charged to its account; charged,
+  not reserved, as the credit was granted in the handshake. With the
+  patched libquiche (`Quiche.RECV_WINDOW_CONTROL`) the bound is raised per
+  connection (`growConnectionWindow`): once quiche autotuned the window to
+  it and handlers read a window of body bytes since, the doubling is reserved
+  from the account, then granted to quiche
+  (`quiche_conn_set_max_connection_window`), up to twice
+  `:http3-max-window-bytes`; a failed reservation (throttled) leaves the
+  bound. The reservation is held until the connection goes (the window
+  never shrinks), as HTTP/2's grown connection window. Stream windows
+  autotune up to `:http3-max-window-bytes` unpaid: the connection window
+  bounds what the peer may send on all streams. A connection reading no
+  body costs nothing, so the number of idle connections isn't bounded by
+  the budget; the initial window promised to them is the unpaid exposure,
+  at most that window per connection, as HTTP/2's initial 65535 octets.
+  New QUIC connections are refused while the budget is exhausted
+  (overload), not merely under pressure: from the low-water mark fair
+  shares already keep a connection over its share from growing, and
+  refusing there would turn GET-only traffic away for bodies it doesn't
+  send.
 - WebSocket asynchronous sends: `tryReserve` per queued frame, a send
   over budget fails at once (its fail callback runs); released once
   written or dropped.
@@ -249,12 +290,10 @@ Adopted:
   hand-off, so the charge makes the bytes count toward other buffers'
   pressure.
 
-Not charged: the receive credit quiche holds natively, up to a
-connection window (`:http3-initial-max-data-bytes`) per connection, off
-the heap. It is capped apart (`:http3-max-native-bytes`, counted by
-`Http3Listener.nativeCreditBytes()`): each connection reserves its window
-at admission and is refused ("connection-limit") when that would pass the
-cap. A buffer joins the
+Not charged: the receive credit quiche holds natively for a connection
+that reads no request body, up to its initial window
+(`:http3-initial-max-data-bytes`) each, off the heap (see HTTP/3 receive
+credit above). A buffer joins the
 budget by charging what it holds for a peer (through its connection's
 account), releasing it on every path the bytes leave (read, written,
 dropped at close), and pausing its credit / reads while throttled with a
@@ -868,6 +907,30 @@ honours `SO_TIMEOUT`, so they need a heap array.
   once request body bytes arrive, and only as far as the memory budget
   pays for it (see Memory budget); credit for read bytes is granted again
   unless the connection is throttled.
+- Receive window autotuning (BDP-style, as quiche's and quic-go's): a
+  stream returns its credit once its handler has read half its window
+  (`RequestBody.credit`); when the previous return was less than
+  `4 × smoothed RTT × fraction of the window read` ago (half a window
+  within two round trips: the handler reads faster than a quarter of the
+  window per round trip, so the window, not the handler, limits the
+  upload) the window doubles, up to `:http2-max-window-bytes`, the
+  growth carried by the same WINDOW_UPDATE. The connection window
+  (starting at four initial stream windows) follows the same rule over
+  epochs of half its size, up to twice `:http2-max-window-bytes`
+  (`autotuneConnectionWindow`). quiche's rule, phrased per update, and
+  quic-go's, per epoch, are the same threshold; Linux TCP's receive
+  buffer autotuning likewise sizes to twice what was read in a round
+  trip. No growth while the round trip is unknown or the account is
+  throttled; windows never shrink actively while bodies are open (under
+  pressure credit for read bytes is held back as above), the connection
+  window goes back to its baseline once none is (see Memory budget), and
+  a grown stream window ends with its stream. The round trip is the SETTINGS acknowledgement's, then
+  refreshed (RFC 6298 smoothing) by a PING sent with a stream
+  WINDOW_UPDATE when the last sample is more than a second old and none
+  is in flight: one per second of uploading at most, none for GETs. A
+  peer delaying its acknowledgements only makes windows grow sooner, as
+  far as `:http2-max-window-bytes` and the budget allow. One
+  `System.nanoTime` per window update, no allocation.
 - Flow control: streams without credit wait on one of two blocked lists:
   their own window shut (a stream WINDOW_UPDATE or SETTINGS reschedules
   them), or their own open and the connection's shut (a connection
@@ -891,10 +954,12 @@ honours `SO_TIMEOUT`, so they need a heap array.
   on a closed stream always returns its connection credit; header blocks
   are always decoded so HPACK stays in sync.
 - Request side: `RequestHead` validates every head (CONNECT → 501); the
-  request body is a per-stream byte ring bounded by the receive window
-  (tiny DATA frames cost no object each; past 16 KiB it is halved as it
-  is read while at most a quarter full, so it never holds more than four
-  times its bytes), read with `:read-timeout` and
+  request body is bounded by the receive window and costs no object per
+  DATA frame: up to 8 KiB buffered in a ring of the stream's own, past
+  that in a chain of 64 KiB segments from the pool streamed-response
+  rings use, each given back once the handler has read it (a stream holds
+  less than one segment beyond its bytes, and a long upload allocates
+  nothing per burst), read with `:read-timeout` and
   `:min-data-rate-bytes`, its bytes held by the connection's account; a header block over CONTINUATION frames
   is bounded by `:header-timeout`. A decoded field section over
   `:max-header-bytes` or with more than `:max-header-fields` fields is

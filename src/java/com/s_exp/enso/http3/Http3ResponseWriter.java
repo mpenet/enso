@@ -290,7 +290,7 @@ final class Http3ResponseWriter implements Http3ResponseBody.Sender {
     private void afterResponse(Http3Exchange ex, long now) {
         if (ex.readPhase != Http3Exchange.READ_DONE) {
             conn.quiche.streamShutdown(ex.id, Quiche.QUICHE_SHUTDOWN_READ, Http3ConnectionException.H3_NO_ERROR);
-            ex.readPhase = Http3Exchange.READ_DONE;
+            conn.readDone(ex);
             if (ex.pipe != null) ex.pipe.signalTruncated();
         }
         conn.maybeFinish(ex, now);

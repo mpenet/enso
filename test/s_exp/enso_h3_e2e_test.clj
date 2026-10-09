@@ -2060,7 +2060,7 @@
 (deftest a-restarted-loop-frees-connections-whose-teardown-fails
   ;; The loop's own state can't be trusted after a failure: a connection
   ;; whose timer entry is broken (removing it throws) is still freed (its
-  ;; quiche state, limiter slot and native credit given back), and the
+  ;; quiche state and limiter slot given back), and the
   ;; restarted loop starts from fresh timers and tables.
   (h3/with-server [srv (fn [_] (ok "ok"))
                    (fn [^com.s_exp.enso.api.Config$Builder b] (.http3EventLoops b 1))]
@@ -2077,7 +2077,6 @@
         (is (h3/await-peer-error c 3000) "the failed loop's connections are closed"))
       (set-private-field! l "ready" ready)
       (is (zero? (await-connection-count srv 0 3000)) "freed despite its broken timer entry")
-      (is (zero? (.nativeCreditBytes srv)))
       (is (empty? (loop-connections srv)))
       (is (not (identical? timers (private-field l "timers"))) "fresh timers")
       (h3/with-client [c (.port srv)]
@@ -2321,7 +2320,8 @@
 (deftest unread-bodies-of-a-connection-are-bounded-by-its-window
   ;; Body bytes the loop moves out of quiche into pipes return flow-control
   ;; credit to the peer, so the pipes, not quiche, must bound what one
-  ;; connection's unread bodies hold: at most its connection window.
+  ;; connection's unread bodies hold: at most its connection window, on
+  ;; top of the window itself, charged while bodies are read.
   (let [gate (promise)
         window (* 256 1024)
         [^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
@@ -2342,80 +2342,295 @@
                        (do (h3/pump! c 20)
                            (recur deadline (max peak (budget-used service))))))]
           (is (pos? peak))
-          (is (<= peak window) (str "peak buffered " peak " bytes, window " window))))
+          (is (<= peak (* 2 window)) (str "peak charged " peak " bytes, window " window))))
       (finally
         (deliver gate true)
         (.close l)
         (.close timer)))))
 
-(deftest native-receive-credit-is-counted
-  ;; quiche may hold a connection window of request data per connection,
-  ;; off the heap and outside :max-buffered-bytes: counted while the
-  ;; connection lives.
-  (h3/with-server [srv (fn [_] (ok "ok"))
-                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3InitialMaxDataBytes b (* 512 1024)))]
-    (is (zero? (.nativeCreditBytes srv)))
-    (h3/with-client [c (.port srv)]
-      (h3/open-control! c)
-      (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))
-      (is (= (* 512 1024) (.nativeCreditBytes srv))))
-    (is (support/await-condition #(zero? (.nativeCreditBytes srv)) 3000 10))))
-
-(deftest native-receive-credit-is-capped
-  ;; :http3-max-native-bytes bounds what quiche may hold natively: a
-  ;; connection whose window would pass it is refused at admission
-  ;; ("connection-limit"), before any state; the cap frees with closes.
-  (let [errors (atom [])
-        listener (reify com.s_exp.enso.api.ServerEvents
-                   (protocolError [_ _ kind] (swap! errors conj kind)))
-        window (* 256 1024)]
-    (h3/with-server [srv (fn [_] (ok "ok"))
-                     (fn [^com.s_exp.enso.api.Config$Builder b]
-                       (.http3InitialMaxDataBytes b window)
-                       (.http3MaxNativeBytes b (* 2 window))
-                       (.serverEvents b listener))]
-      (is (= (* 2 window) (.maxNativeBytes srv)))
-      (h3/with-client [a (.port srv)]
-        (h3/with-client [b (.port srv)]
-          (is (= (* 2 window) (.nativeCreditBytes srv)))
-          ;; The third client's Initial (not serviced further: a client
-          ;; left unserviced for seconds would distort a and b's RTT).
-          (let [third (h3/start-handshake (.port srv))]
-            (try
-              (is (support/await-condition #(some #{"connection-limit"} @errors) 3000 10) (str @errors))
-              (is (= 2 (connection-count srv)) "a third window passes the cap")
-              (is (= (* 2 window) (.nativeCreditBytes srv)) "nothing reserved for the refused one")
-              (finally (h3/close! third))))
-          (h3/open-control! a)
-          (is (= "ok" (h3/body-str (h3/request! a 0 (h3/request-headers "GET" "/")))))))
-      (is (zero? (await-connection-count srv 0 3000)))
-      (is (zero? (.nativeCreditBytes srv)))
-      (h3/with-client [c (.port srv)]
+(deftest connection-window-is-charged-while-a-body-is-read
+  ;; quiche holds, or was promised, up to a connection window of request
+  ;; data natively: charged to :max-buffered-bytes while a request body
+  ;; of the connection is being read, given back once no body is (here:
+  ;; the body was read to its end while the handler still runs).
+  (let [window (* 256 1024)
+        start (promise)
+        body-read (promise)
+        respond (promise)
+        [^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+        (start-with-service (fn [^Request req]
+                              @start
+                              (.readAllBytes ^java.io.InputStream (.-body req))
+                              (deliver body-read true)
+                              @respond
+                              (ok "x"))
+                            (fn [^com.s_exp.enso.api.Config$Builder b]
+                              (.http3InitialMaxDataBytes b window)))]
+    (try
+      (h3/with-client [c (.port l)]
         (h3/open-control! c)
-        (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))) "room again")))))
+        (is (support/await-condition #(do (h3/pump! c 20) (zero? (budget-used service))) 2000 1)
+            "an idle connection costs nothing")
+        (h3/send! c 0 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                       (h3/data-frame (byte-array (* 16 1024))))
+                  false)
+        (is (support/await-condition #(do (h3/pump! c 20) (>= (budget-used service) (+ window (* 16 1024)))) 5000 1)
+            (str "window and buffered body charged: " (budget-used service)))
+        (deliver start true)
+        (h3/send! c 0 (h3/data-frame (byte-array 100)) true)
+        (is (deref body-read 5000 false))
+        (is (support/await-condition #(do (h3/pump! c 20) (zero? (budget-used service))) 5000 1)
+            (str "nothing in play while the handler runs: " (budget-used service)))
+        (deliver respond true)
+        (h3/pump-until! c #(h3/stream-done? c 0) 5000)
+        (is (= 200 (:status (h3/response c 0))))
+        (testing "charged again by the next body, once"
+          (h3/send! c 4 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                         (h3/data-frame (byte-array 10)))
+                    false)
+          (h3/send! c 8 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                         (h3/data-frame (byte-array 10)))
+                    false)
+          (is (support/await-condition #(do (h3/pump! c 20) (= window (budget-used service))) 5000 1)
+              (str "one window for the connection (the handlers read the bytes): " (budget-used service)))
+          (h3/send! c 4 (byte-array 0) true)
+          (h3/send! c 8 (byte-array 0) true)
+          (h3/pump-until! c #(and (h3/stream-done? c 4) (h3/stream-done? c 8)) 5000)
+          (is (support/await-condition #(do (h3/pump! c 20) (zero? (budget-used service))) 5000 1)
+              (str "still charged: " (budget-used service)))))
+      (finally
+        (deliver start true)
+        (deliver respond true)
+        (.close l)
+        (.close timer)))))
 
-(deftest native-receive-credit-cap-defaults
-  ;; -1 (the default): :max-buffered-bytes' limit, at least one window;
-  ;; 0: unlimited.
-  (doseq [[what configure expected]
-          [["default window 1 MiB, max-buffered-bytes 8 MiB" #(.maxBufferedBytes ^com.s_exp.enso.api.Config$Builder % (* 8 1024 1024))
-            (* 8 1024 1024)]
-           ["max-buffered-bytes below one window" #(doto ^com.s_exp.enso.api.Config$Builder %
-                                                     (.maxBufferedBytes (* 64 1024))
-                                                     (.http3InitialMaxDataBytes (* 512 1024)))
-            (* 512 1024)]
-           ["0 = unlimited" #(.http3MaxNativeBytes ^com.s_exp.enso.api.Config$Builder % 0) Long/MAX_VALUE]]]
-    (testing what
-      (h3/with-server [srv (fn [_] (ok "ok")) configure]
-        (is (= expected (.maxNativeBytes srv))))))
-  (testing "the default connection window is 1 MiB, as HTTP/2's connection window"
-    (is (= (* 1024 1024) (.-http3InitialMaxDataBytes (h3/server-config identity))))
-    (is (= -1 (.-http3MaxNativeBytes (h3/server-config identity)))))
-  (testing "validation"
-    (is (thrown? com.s_exp.enso.api.Config$InvalidOptionException
-                 (h3/server-config #(.http3MaxNativeBytes ^com.s_exp.enso.api.Config$Builder % -2))))
-    (is (thrown-with-msg? com.s_exp.enso.api.Config$InvalidOptionException #"one connection window"
-                          (h3/server-config #(.http3MaxNativeBytes ^com.s_exp.enso.api.Config$Builder % 1000))))))
+(deftest connection-window-charge-is-released-on-reset-and-close
+  ;; A body that never completes gives the window back when its stream is
+  ;; reset (the bytes already buffered stay charged until the exchange
+  ;; ends), or when the connection goes.
+  (let [window (* 256 1024)
+        gate (promise)
+        [^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+        (start-with-service (fn [_] @gate (ok "x"))
+                            (fn [^com.s_exp.enso.api.Config$Builder b]
+                              (.http3InitialMaxDataBytes b window)))
+        post! (fn [c sid]
+                (h3/send! c sid (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                                 (h3/data-frame (byte-array 1000)))
+                          false)
+                (is (support/await-condition #(do (h3/pump! c 20) (>= (budget-used service) window)) 5000 1)
+                    (str "window charged: " (budget-used service))))]
+    (try
+      (testing "peer reset"
+        (h3/with-client [c (.port l)]
+          (h3/open-control! c)
+          (post! c 0)
+          (h3/reset-stream! c 0 0x10c)
+          (is (support/await-condition #(do (h3/pump! c 20) (= 1000 (budget-used service))) 5000 1)
+              (str "only the unread body left: " (budget-used service)))))
+      (testing "connection closed"
+        (let [c (h3/connect (.port l))]
+          (h3/open-control! c)
+          (post! c 0)
+          (h3/close! c)
+          (is (support/await-condition #(zero? (budget-used service)) 5000 20)
+              (str "still charged: " (budget-used service)))))
+      (finally
+        (deliver gate true)
+        (.close l)
+        (.close timer)))))
+
+;; ---- receive-window autotuning (patched libquiche) ----------------------------
+
+(def ^:private recv-window-control com.s_exp.enso.quiche.Quiche/RECV_WINDOW_CONTROL)
+
+(defn- skip-without-recv-window-control
+  "Skips (or fails, with ENSO_H3_REQUIRE_RECV_WINDOW_CONTROL set, as in CI)
+  a test that needs the patched libquiche."
+  []
+  (when-not recv-window-control
+    (is (nil? (System/getenv "ENSO_H3_REQUIRE_RECV_WINDOW_CONTROL"))
+        "ENSO_H3_REQUIRE_RECV_WINDOW_CONTROL is set but the shim's libquiche lacks the patches")
+    (println "SKIP: the loaded libquiche lacks receive-window control (native/enso_quiche/patches/);"
+             "build the shim against build-libquiche.sh's libquiche to run this test")))
+
+(defn- the-connection [l]
+  (first (loop-connections l)))
+
+(defn- connection-window
+  "[the window quiche autotunes to at most, quiche's current connection window]"
+  [conn]
+  [(private-field conn "connectionWindowMax")
+   (.connectionWindow ^com.s_exp.enso.quiche.QuicheConnection (private-field conn "quiche"))])
+
+(defn- upload!
+  "POSTs `n` bytes on stream `sid` of `c`, pumping until the response."
+  [c sid n]
+  (h3/send! c sid (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                   (h3/data-frame (byte-array n)))
+            true)
+  (h3/pump-until! c #(h3/stream-done? c sid) 20000)
+  (h3/response c sid))
+
+(deftest receive-window-grows-while-drained-and-stops-at-the-max
+  ;; With receive-window control the connection window autotunes like
+  ;; quiche's own, from :http3-initial-max-data-bytes up to twice
+  ;; :http3-max-window-bytes, each step reserved from the connection's
+  ;; account before quiche may use it; given back when the connection goes.
+  (if-not recv-window-control
+    (skip-without-recv-window-control)
+    (let [initial (* 16 1024)
+          max-window (* 128 1024)
+          [^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+          (start-with-service (fn [^Request req]
+                                (ok (str (.transferTo ^java.io.InputStream (.-body req)
+                                                      (java.io.OutputStream/nullOutputStream)))))
+                              (fn [^com.s_exp.enso.api.Config$Builder b]
+                                (.http3InitialMaxDataBytes b initial)
+                                (.http3MaxWindowBytes b max-window)))]
+      (try
+        (let [c (h3/connect (.port l))]
+          (h3/open-control! c)
+          (is (= [initial initial] (connection-window (the-connection l))) "starts at the initial window")
+          (doseq [sid [0 4 8]]
+            (is (= (str (* 4 1024 1024)) (h3/body-str (upload! c sid (* 4 1024 1024))))))
+          (let [[window-max window] (connection-window (the-connection l))]
+            (is (= (* 2 max-window) window-max) "grown to twice :http3-max-window-bytes, no further")
+            (is (< initial window) (str "quiche's window grew: " window))
+            (is (<= window window-max))
+            (is (= (- window-max initial) (budget-used service)) "the growth stays reserved, nothing else"))
+          (h3/close! c))
+        (is (support/await-condition #(zero? (budget-used service)) 5000 20)
+            (str "given back with the connection: " (budget-used service)))
+        (finally
+          (.close l)
+          (.close timer))))))
+
+(deftest receive-window-does-not-grow-when-the-budget-cannot-pay
+  ;; A step the account can't reserve isn't granted: quiche keeps the
+  ;; window it has, and the upload goes on within it.
+  (if-not recv-window-control
+    (skip-without-recv-window-control)
+    (let [initial (* 256 1024)
+          [^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+          (start-with-service (fn [^Request req]
+                                (ok (str (.transferTo ^java.io.InputStream (.-body req)
+                                                      (java.io.OutputStream/nullOutputStream)))))
+                              (fn [^com.s_exp.enso.api.Config$Builder b]
+                                (.maxBufferedBytes b (* 1024 1024))
+                                (.http3InitialMaxDataBytes b initial)))
+          budget ^com.s_exp.enso.core.MemoryBudget (.-budget ^com.s_exp.enso.core.Service service)]
+      (try
+        ;; Below the low-water mark with the window charged, but no room
+        ;; for one more window.
+        (.charge budget (* 520 1024))
+        (h3/with-client [c (.port l)]
+          (h3/open-control! c)
+          (is (= (str (* 4 1024 1024)) (h3/body-str (upload! c 0 (* 4 1024 1024)))))
+          (let [[window-max window] (connection-window (the-connection l))]
+            (is (= initial window-max))
+            (is (<= window initial)))
+          (is (= (* 520 1024) (budget-used service)) "nothing reserved"))
+        (.release budget (* 520 1024))
+        (finally
+          (.close l)
+          (.close timer))))))
+
+(deftest receive-window-stays-fixed-without-recv-window-control
+  ;; On a stock libquiche the windows stay where they start.
+  (if recv-window-control
+    (println "SKIP: the loaded libquiche has receive-window control; this covers a stock one")
+    (let [initial (* 64 1024)
+          [^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+          (start-with-service (fn [^Request req]
+                                (ok (str (.transferTo ^java.io.InputStream (.-body req)
+                                                      (java.io.OutputStream/nullOutputStream)))))
+                              (fn [^com.s_exp.enso.api.Config$Builder b]
+                                (.http3InitialMaxDataBytes b initial)))]
+      (try
+        (h3/with-client [c (.port l)]
+          (h3/open-control! c)
+          (is (= (str (* 1024 1024)) (h3/body-str (upload! c 0 (* 1024 1024)))))
+          (is (= [initial -1] (connection-window (the-connection l))))
+          (is (support/await-condition #(do (h3/pump! c 20) (zero? (budget-used service))) 5000 1)))
+        (finally
+          (.close l)
+          (.close timer))))))
+
+(deftest idle-connections-cost-no-budget
+  ;; No connection reserves anything at admission: far more connections
+  ;; than :max-buffered-bytes could hold windows for are admitted and
+  ;; served, and while idle they cost nothing.
+  (let [[^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+        (start-with-service (fn [_] (ok "ok"))
+                            (fn [^com.s_exp.enso.api.Config$Builder b]
+                              (.maxBufferedBytes b (* 1024 1024))
+                              (.http3InitialMaxDataBytes b (* 1024 1024))))
+        clients (atom [])]
+    (try
+      (dotimes [_ 16]
+        (let [c (h3/connect (.port l))]
+          (swap! clients conj c)
+          (h3/open-control! c)
+          (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))))
+      (is (= 16 (count @clients)))
+      (is (zero? (budget-used service)))
+      (finally
+        (run! h3/close! @clients)
+        (.close l)
+        (.close timer)))))
+
+(deftest default-max-connections-idle-connections-fit-a-small-heap
+  ;; With a 1 GiB heap's budget (a quarter of it) every connection
+  ;; :max-connections allows (10000) is admitted and, idle, costs nothing.
+  (let [[^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+        (start-with-service (fn [_] (ok "ok"))
+                            (fn [^com.s_exp.enso.api.Config$Builder b]
+                              (.maxBufferedBytes b (* 256 1024 1024))))
+        n (.-maxConnections ^com.s_exp.enso.api.Config (.-config ^com.s_exp.enso.core.Service service))]
+    (try
+      (is (= 10000 n))
+      (let [{:keys [established close!]} (h3/storm (.port l) n {})]
+        (try
+          (is (= n established))
+          (is (= n (await-connection-count l n 5000)))
+          (is (zero? (budget-used service)))
+          (finally (close!))))
+      (finally
+        (.close l)
+        (.close timer)))))
+
+(deftest new-connections-are-refused-while-the-budget-is-exhausted
+  ;; At the :max-buffered-bytes limit the server is overloaded: a new
+  ;; connection's Initial is dropped before any state ("connection-limit");
+  ;; connections are admitted again once the budget has room.
+  (let [errors (atom [])
+        events (reify com.s_exp.enso.api.ServerEvents
+                 (protocolError [_ _ kind] (swap! errors conj kind)))
+        [^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+        (start-with-service (fn [_] (ok "ok"))
+                            (fn [^com.s_exp.enso.api.Config$Builder b]
+                              (.maxBufferedBytes b (* 1024 1024))
+                              (.serverEvents b events)))
+        budget ^com.s_exp.enso.core.MemoryBudget (.-budget ^com.s_exp.enso.core.Service service)]
+    (try
+      (.charge budget (* 3 256 1024))
+      (testing "under pressure, below the limit: admitted"
+        (h3/with-client [c (.port l)]
+          (h3/open-control! c)
+          (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))))
+      (.charge budget (* 256 1024))
+      (let [refused (h3/start-handshake (.port l))]
+        (try
+          (is (support/await-condition #(some #{"connection-limit"} @errors) 3000 10) (str @errors))
+          (finally (h3/close! refused))))
+      (.release budget (* 4 256 1024))
+      (h3/with-client [c (.port l)]
+        (h3/open-control! c)
+        (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))) "room again"))
+      (finally
+        (.close l)
+        (.close timer)))))
 
 (deftest stream-body-longer-than-content-length-is-truncated
   ;; As on HTTP/1.1 and HTTP/2: a declared Content-Length bounds what an

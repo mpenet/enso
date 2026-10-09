@@ -1,0 +1,308 @@
+ABOUTME: quiche patch applied by build-libquiche.sh: raise the receive-window maximums of a live
+ABOUTME: connection and read its connection window (upstreamable as is; the diff starts below).
+
+Raise the receive-window maximums of a live connection
+
+Config::set_max_connection_window() and Config::set_max_stream_window()
+bound receive-window autotuning, but only for connections created
+afterwards. An application that accounts for receive memory must then
+either pin the windows (no autotuning) or commit to the largest window
+for every connection up front.
+
+Add Connection::set_max_connection_window() and
+Connection::set_max_stream_window(), the live connection's equivalents
+(the latter applies to existing and future streams; neither lowers a
+maximum below the current window), and Connection::connection_window(),
+which returns the current connection-level window, so an application can
+grant more window to a connection once it can afford to. Exposed through
+the FFI as quiche_conn_set_max_connection_window(),
+quiche_conn_set_max_stream_window() and quiche_conn_connection_window().
+
+diff --git a/quiche/include/quiche.h b/quiche/include/quiche.h
+index 3afa20e2..2b453e0e 100644
+--- a/quiche/include/quiche.h
++++ b/quiche/include/quiche.h
+@@ -657,6 +657,17 @@ typedef struct {
+     bool tx_buffered_inconsistent;
+ } quiche_stats;
+ 
++// Sets the maximum size of the connection window, never below the current
++// window.
++void quiche_conn_set_max_connection_window(quiche_conn *conn, uint64_t v);
++
++// Sets the maximum size of the stream windows, for existing and future streams,
++// never below a stream's current window.
++void quiche_conn_set_max_stream_window(quiche_conn *conn, uint64_t v);
++
++// Returns the current size of the connection-level receive window.
++uint64_t quiche_conn_connection_window(const quiche_conn *conn);
++
+ // Collects and returns statistics about the connection.
+ void quiche_conn_stats(const quiche_conn *conn, quiche_stats *out);
+ 
+diff --git a/quiche/src/ffi.rs b/quiche/src/ffi.rs
+index 3306b618..f6c4b65b 100644
+--- a/quiche/src/ffi.rs
++++ b/quiche/src/ffi.rs
+@@ -1367,6 +1367,25 @@ pub struct TransportParams {
+     max_datagram_frame_size: ssize_t,
+ }
+ 
++#[no_mangle]
++pub extern "C" fn quiche_conn_set_max_connection_window(
++    conn: &mut Connection, v: u64,
++) {
++    conn.set_max_connection_window(v);
++}
++
++#[no_mangle]
++pub extern "C" fn quiche_conn_set_max_stream_window(
++    conn: &mut Connection, v: u64,
++) {
++    conn.set_max_stream_window(v);
++}
++
++#[no_mangle]
++pub extern "C" fn quiche_conn_connection_window(conn: &Connection) -> u64 {
++    conn.connection_window()
++}
++
+ #[no_mangle]
+ pub extern "C" fn quiche_conn_stats(conn: &Connection, out: &mut Stats) {
+     let stats = conn.stats();
+diff --git a/quiche/src/flowcontrol.rs b/quiche/src/flowcontrol.rs
+index 0398ad9a..5e2e6675 100644
+--- a/quiche/src/flowcontrol.rs
++++ b/quiche/src/flowcontrol.rs
+@@ -72,6 +72,11 @@ impl FlowControl {
+         self.window
+     }
+ 
++    /// Sets the maximum receive window, never below the current window.
++    pub fn set_max_window(&mut self, max_window: u64) {
++        self.max_window = std::cmp::max(max_window, self.window);
++    }
++
+     /// Returns the current flow limit.
+     pub fn max_data(&self) -> u64 {
+         self.max_data
+@@ -145,6 +150,28 @@ mod tests {
+         assert_eq!(fc.window, 50);
+     }
+ 
++    #[test]
++    fn set_max_window() {
++        let mut fc = FlowControl::new(100, 20, 20);
++
++        // Capped: no growth.
++        fc.add_consumed(15);
++        fc.update_max_data(Instant::now());
++        fc.autotune_window(Instant::now(), Duration::from_secs(1));
++        assert_eq!(fc.window(), 20);
++
++        // Raised: grows up to the new maximum.
++        fc.set_max_window(30);
++        fc.autotune_window(Instant::now(), Duration::from_secs(1));
++        assert_eq!(fc.window(), 30);
++
++        // Never below the current window.
++        fc.set_max_window(10);
++        assert_eq!(fc.max_window, 30);
++        fc.autotune_window(Instant::now(), Duration::from_secs(1));
++        assert_eq!(fc.window(), 30);
++    }
++
+     #[test]
+     fn max_data() {
+         let fc = FlowControl::new(100, 20, 100);
+diff --git a/quiche/src/lib.rs b/quiche/src/lib.rs
+index d08110e6..3718a609 100644
+--- a/quiche/src/lib.rs
++++ b/quiche/src/lib.rs
+@@ -7796,6 +7796,46 @@ impl<F: BufFactory> Connection<F> {
+         self.local_error.as_ref()
+     }
+ 
++    /// Sets the maximum size of the connection window.
++    ///
++    /// This is the live connection's equivalent of
++    /// [`Config::set_max_connection_window()`]: the connection-level receive
++    /// window is autotuned up to this value from now on. The maximum is never
++    /// set below the current window, which [`connection_window()`] returns.
++    ///
++    /// Raising it on a live connection lets an application grant more receive
++    /// memory to a connection once it can afford to, rather than committing
++    /// to the largest window for every connection up front.
++    ///
++    /// [`Config::set_max_connection_window()`]:
++    /// struct.Config.html#method.set_max_connection_window
++    /// [`connection_window()`]: struct.Connection.html#method.connection_window
++    pub fn set_max_connection_window(&mut self, v: u64) {
++        self.flow_control.set_max_window(v);
++    }
++
++    /// Sets the maximum size of the stream windows.
++    ///
++    /// This is the live connection's equivalent of
++    /// [`Config::set_max_stream_window()`], applied to existing and future
++    /// streams. The maximum window of an existing stream is never set below
++    /// its current window.
++    ///
++    /// [`Config::set_max_stream_window()`]:
++    /// struct.Config.html#method.set_max_stream_window
++    pub fn set_max_stream_window(&mut self, v: u64) {
++        self.streams.set_max_stream_window(v);
++    }
++
++    /// Returns the current size of the connection-level receive window.
++    ///
++    /// The peer may have up to this many bytes of stream data in flight or
++    /// buffered, unread by the application, at any time.
++    #[inline]
++    pub fn connection_window(&self) -> u64 {
++        self.flow_control.window()
++    }
++
+     /// Collects and returns statistics about the connection.
+     #[inline]
+     pub fn stats(&self) -> Stats {
+diff --git a/quiche/src/stream/mod.rs b/quiche/src/stream/mod.rs
+index d51bdc60..95d75365 100644
+--- a/quiche/src/stream/mod.rs
++++ b/quiche/src/stream/mod.rs
+@@ -219,6 +219,18 @@ impl<F: BufFactory> StreamMap<F> {
+         }
+     }
+ 
++    /// Sets the maximum receive window of existing and future streams.
++    ///
++    /// The window of an existing stream is never lowered below its current
++    /// value.
++    pub fn set_max_stream_window(&mut self, max_stream_window: u64) {
++        self.max_stream_window = max_stream_window;
++
++        for stream in self.streams.values_mut() {
++            stream.recv.set_max_window(max_stream_window);
++        }
++    }
++
+     /// Returns the stream with the given ID if it exists.
+     pub fn get(&self, id: u64) -> Option<&Stream<F>> {
+         self.streams.get(&id)
+diff --git a/quiche/src/stream/recv_buf.rs b/quiche/src/stream/recv_buf.rs
+index 738f2292..95ba6d69 100644
+--- a/quiche/src/stream/recv_buf.rs
++++ b/quiche/src/stream/recv_buf.rs
+@@ -354,6 +354,11 @@ impl RecvBuf {
+         self.flow_control.window()
+     }
+ 
++    /// Sets the maximum window, never below the current window.
++    pub fn set_max_window(&mut self, max_window: u64) {
++        self.flow_control.set_max_window(max_window);
++    }
++
+     /// Autotune the window size.
+     pub fn autotune_window(&mut self, now: Instant, rtt: Duration) {
+         self.flow_control.autotune_window(now, rtt);
+diff --git a/quiche/src/tests.rs b/quiche/src/tests.rs
+index b22be3a3..fd2d0404 100644
+--- a/quiche/src/tests.rs
++++ b/quiche/src/tests.rs
+@@ -7866,6 +7866,96 @@ fn retransmit_data_acked_before_fully_retransmitted(
+     );
+ }
+ 
++/// Sends as much stream data as flow control allows from the client on stream
++/// 0, reads it all on the server and lets the server update its limits.
++/// Returns the number of bytes transferred.
++fn transfer_round(pipe: &mut test_utils::Pipe) -> usize {
++    let mut buf = [0; 65535];
++
++    let sent = pipe
++        .client
++        .stream_send(0, &[42u8; 10_000], false)
++        .unwrap_or(0);
++    assert_eq!(pipe.advance(), Ok(()));
++
++    let mut read = 0;
++    while let Ok((len, _)) = pipe.server.stream_recv(0, &mut buf) {
++        read += len;
++    }
++    assert_eq!(read, sent);
++    assert_eq!(pipe.advance(), Ok(()));
++
++    sent
++}
++
++#[rstest]
++/// Tests that raising the maximum connection window of a live connection
++/// lets the connection window autotune past the configured maximum.
++fn set_max_connection_window(
++    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
++) {
++    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
++    config.set_initial_max_data(30);
++    config.set_max_connection_window(30);
++    config.set_initial_max_stream_data_bidi_local(1000);
++    config.set_initial_max_stream_data_bidi_remote(1000);
++    config.set_max_stream_window(1000);
++    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
++    assert_eq!(pipe.handshake(), Ok(()));
++
++    for _ in 0..4 {
++        assert_eq!(transfer_round(&mut pipe), 30);
++    }
++    assert_eq!(pipe.server.connection_window(), 30);
++
++    pipe.server.set_max_connection_window(10_000);
++
++    let mut last = 0;
++    for _ in 0..8 {
++        last = transfer_round(&mut pipe);
++    }
++    assert!(last > 30);
++    assert!(pipe.server.connection_window() > 30);
++    assert!(pipe.server.connection_window() <= 10_000);
++
++    // Never set below the current window.
++    let window = pipe.server.connection_window();
++    pipe.server.set_max_connection_window(10);
++    transfer_round(&mut pipe);
++    assert!(pipe.server.connection_window() >= window);
++}
++
++#[rstest]
++/// Tests that raising the maximum stream window of a live connection lets
++/// the window of an existing stream autotune past the configured maximum.
++fn set_max_stream_window(
++    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
++) {
++    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
++    config.set_initial_max_data(100_000);
++    config.set_initial_max_stream_data_bidi_local(30);
++    config.set_initial_max_stream_data_bidi_remote(30);
++    config.set_max_stream_window(30);
++    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
++    assert_eq!(pipe.handshake(), Ok(()));
++
++    for _ in 0..4 {
++        assert_eq!(transfer_round(&mut pipe), 30);
++    }
++    assert_eq!(pipe.server.streams.get(0).unwrap().recv.window(), 30);
++
++    pipe.server.set_max_stream_window(1000);
++
++    let mut last = 0;
++    for _ in 0..8 {
++        last = transfer_round(&mut pipe);
++    }
++    assert!(last > 30);
++    let window = pipe.server.streams.get(0).unwrap().recv.window();
++    assert!(window > 30);
++    assert!(window <= 1000);
++}
++
+ #[rstest]
+ /// Tests that MAX_DATA, STREAM_MAX_DATA frames are retransmitted if lost
+ fn max_data_frames_retransmit(

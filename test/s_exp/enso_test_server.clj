@@ -14,6 +14,7 @@
 
   `GET /__stats` answers an EDN map of process counters (total bytes
   allocated by all threads, GC count and time) for the load harness.
+  `/upload` reads the request body to its end and answers its length.
   Every other request is answered `200 text/plain \"Hello, World!\"`.
   Prints `READY ...` on stdout once every listener is bound."
   (:require [clojure.edn :as edn]
@@ -52,7 +53,20 @@
     (= "/__stats" (:uri request)) {:status 200
                                    :headers {"content-type" "application/edn"}
                                    :body (pr-str (stats))}
-    :else hello-response))
+    (= "/upload" (:uri request)) {:status 200
+                                  :headers {"content-type" "text/plain"}
+                                  :body (str (if-let [^java.io.InputStream body (:body request)]
+                                               (.transferTo body (java.io.OutputStream/nullOutputStream))
+                                               0))}
+    ;; The body is read to its end first: h2spec's body-validation cases
+    ;; need the server still reading the stream when the bad frames arrive
+    ;; (an answer before them resets the stream, and later frames on it are
+    ;; ignored, RFC 9113 §5.1).
+    :else (do (when-let [^java.io.InputStream body (:body request)]
+                (try
+                  (.transferTo body (java.io.OutputStream/nullOutputStream))
+                  (catch java.io.IOException _)))
+              hello-response)))
 
 (defn- parse-args [args]
   (into {}

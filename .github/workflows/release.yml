@@ -99,7 +99,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: quiche-src
-          key: quiche-${{ steps.pins.outputs.QUICHE_COMMIT }}-${{ hashFiles('native/enso_quiche/quiche-Cargo.lock') }}-${{ steps.pins.outputs.RUST_TOOLCHAIN }}-linux-${{ matrix.libc }}-${{ matrix.arch }}
+          key: quiche-${{ steps.pins.outputs.QUICHE_COMMIT }}-${{ hashFiles('native/enso_quiche/quiche-Cargo.lock', 'native/enso_quiche/patches/*.patch') }}-${{ steps.pins.outputs.RUST_TOOLCHAIN }}-linux-${{ matrix.libc }}-${{ matrix.arch }}
 
       - name: Build, check and load-test the shim (${{ matrix.image }})
         env:

@@ -48,14 +48,18 @@ hardening. Many options were renamed; read the breaking changes first.
   `:http3-qpack-blocked-streams` (QPACK uses the static table only),
   `:worker-executor` (handlers always run on virtual threads).
 - **Changed defaults and rules:**
-  - `:http3-initial-max-data-bytes`: 1 GiB → 1 MiB, now a hard bound
-    (quiche doesn't autotune past it) that also caps the request-body
-    bytes buffered per connection. The HTTP/3 per-stream windows default
-    to a quarter of it (256 KiB), so one stream whose handler doesn't read
+  - `:http3-initial-max-data-bytes`: 1 GiB → 512 KiB, now where the
+    connection window starts (it grows up to twice
+    `:http3-max-window-bytes` as `:max-buffered-bytes` pays, with the
+    release builds' libquiche) and a cap on the request-body bytes
+    buffered per connection; charged to `:max-buffered-bytes` while the
+    connection reads a request body. The HTTP/3 per-stream windows default
+    to half of it (256 KiB), so one stream whose handler doesn't read
     can't stall the connection's other requests.
-  - `:http2-initial-window-bytes`: 1 MiB → 256 KiB (the connection window
-    stays 4× this, 1 MiB). One stream uploads at most a window per round
-    trip: raise both windows for large uploads over long round trips.
+  - `:http2-initial-window-bytes`: 1 MiB → 256 KiB, now where windows
+    start: a stream window doubles up to `:http2-max-window-bytes` (8 MiB)
+    while its handler keeps up, the connection window (4× the initial
+    one, 1 MiB) up to twice that, as far as `:max-buffered-bytes` pays.
   - `:http2-initial-window-bytes` must be at least 65535.
   - `:max-request-body-bytes` no longer applies to WebSocket frames; use
     `:ws-max-message-bytes`.
@@ -82,7 +86,7 @@ hardening. Many options were renamed; read the breaking changes first.
 | `:http2-max-frame-size` | `:http2-max-frame-bytes` |
 | `:http2-max-header-list-size` | removed (`:max-header-bytes`) |
 | `:http3-max-idle-timeout` | removed (`:idle-timeout`) |
-| `:http3-initial-max-data` (1 GiB) | `:http3-initial-max-data-bytes` (1 MiB) |
+| `:http3-initial-max-data` (1 GiB) | `:http3-initial-max-data-bytes` (512 KiB) |
 | `:http3-max-udp-payload-size` | `:http3-max-udp-payload-bytes` |
 | `:http3-initial-max-stream-data-bidi-local` | `:http3-initial-max-stream-data-bidi-local-bytes` |
 | `:http3-initial-max-stream-data-bidi-remote` | `:http3-initial-max-stream-data-bidi-remote-bytes` |
@@ -163,13 +167,14 @@ Unchanged: `:port` `:host` `:backlog` `:shutdown-timeout`
   slower bodies fail with 408 ("min-data-rate").
 - `:http2c` (false): cleartext HTTP/2 with prior knowledge next to
   HTTP/1.1.
+- `:http2-max-window-bytes` (8388608): most an HTTP/2 stream's receive
+  window autotunes to; the connection window grows to twice this.
+- `:http3-max-window-bytes` (8388608): most an HTTP/3 stream's receive
+  window autotunes to; the connection window grows to twice this. Needs
+  the release builds' patched libquiche; ignored on a stock one.
 - `:http3-cert-reload-interval` (10000): HTTP/3 certificate rotation.
 - `:http3-retry-threshold` (256), `:http3-max-half-open` (1024),
   `:http3-stream-reset-limit` (400): HTTP/3 flood protection.
-- `:http3-max-native-bytes` (-1 = the `:max-buffered-bytes` limit): cap
-  on the receive credit quiche holds off the heap, one connection window
-  per connection; a connection that would pass it is refused at
-  admission.
 - `:http3-event-loops` (0 = one per core on Linux, one elsewhere),
   `:http3-so-rcv-buf-bytes` / `:http3-so-snd-buf-bytes` (4194304).
 - `:ws-max-message-bytes` (1048576), `:ws-max-queued-bytes` (1048576),
@@ -188,6 +193,28 @@ Unchanged: `:port` `:host` `:backlog` `:shutdown-timeout`
 - **Cleartext HTTP/2** (`:http2c`) with prior knowledge on the plain
   listener, next to HTTP/1.1; no `Upgrade: h2c`. Reported as protocol
   "h2c".
+- **HTTP/2 receive windows autotune** (as quiche's and quic-go's): a
+  window doubles when its handler reads half of it within two round
+  trips (measured from the SETTINGS acknowledgement, refreshed by a PING
+  at most once a second while uploading), from `:http2-initial-window-bytes`
+  up to `:http2-max-window-bytes`, the connection's up to twice that;
+  every growth of the connection window is paid for from
+  `:max-buffered-bytes` first, nothing grows while the connection is
+  throttled, the connection window goes back to its baseline once no
+  request body is open, and no credit is granted past what bodies
+  declaring a Content-Length have left to send.
+- **HTTP/2 request bodies allocate nothing per burst:** past 8 KiB they
+  are buffered in pooled 64 KiB segments, given back as the handler reads
+  them.
+- **HTTP/3 receive windows autotune** (quiche's own rule) from the
+  initial windows up to `:http3-max-window-bytes`, the connection's up to
+  twice that; every doubling of the connection window is paid for from
+  `:max-buffered-bytes` first and skipped while the connection is
+  throttled. Release shims link libquiche with patches adding
+  receive-window control to a live connection and bounding the
+  out-of-order fragments a stream buffers (`native/enso_quiche/patches/`);
+  on a stock libquiche (development builds) windows stay at their initial
+  sizes and fragments are unbounded.
 - **HTTP/3 certificate rotation:** changed PEM files are loaded for new
   connections without a restart.
 - **HTTP/3 on several cores:** connections are sharded over event loops

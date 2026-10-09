@@ -5,7 +5,11 @@
   `clojure -M:perf '{:duration-s 10 :scenarios [:h1-get :h1-pipelined]}'`.
 
   Options (all optional):
-  - `:scenarios` subset of [:h1-get :h1-get-rate :h1-pipelined :h2-get :h3-get :ws-echo]
+  - `:scenarios` subset of [:h1-get :h1-get-rate :h1-pipelined :h2-get :h3-get :ws-echo],
+    plus the upload scenarios, run only when named: :h2-upload (one
+    stream) and :h2-upload-4 (four concurrent streams on one connection),
+    :h3-upload and :h3-upload-4 (the same over HTTP/3)
+  - `:upload-bytes` request body size for the upload scenarios (default 16 MiB)
   - `:duration-s` measured seconds per scenario (default 10)
   - `:warmup-s` unmeasured seconds before each scenario (default 5)
   - `:connections` h1 connections (default 64)
@@ -17,7 +21,7 @@
   - `:ws-depth` messages in flight per :ws-echo connection (default 8)
   - `:server-jvm-opts` JVM options for the server process (default [\"-Xmx1g\"])
   - `:server-opts` run-server options for the server (default unlimited
-    keep-alive requests, as load generators expect)
+    keep-alive requests, as load generators expect, and no request body cap)
   - `:out-dir` (default \"target/perf\")
 
   Allocation per request is measured inside the server process: the
@@ -51,8 +55,10 @@
    :h3-in-flight 32
    :ws-message-bytes 128
    :ws-depth 8
+   :upload-bytes (* 16 1024 1024)
    :server-jvm-opts ["-Xmx1g"]
-   :server-opts {:max-keep-alive-requests 0}
+   ;; No body cap: the upload scenarios post more than the default 10 MiB.
+   :server-opts {:max-keep-alive-requests 0 :max-request-body-bytes 0}
    :out-dir "target/perf"})
 
 ;; ---- process helpers ---------------------------------------------------------------
@@ -371,6 +377,50 @@
     {:skipped "h2load not found on PATH"}
     (measured (:h1 ports) #(h2load (:h2 ports) warmup-s) #(h2load (:h2 ports) duration-s))))
 
+;; ---- HTTP/2 uploads via h2load -----------------------------------------------------------------
+
+(defn- upload-file
+  "A file of `n` zero bytes under `out-dir`, the body every upload posts."
+  ^File [out-dir n]
+  (let [f (io/file out-dir (str "upload-" n ".bin"))]
+    (when-not (= n (.length f))
+      (with-open [out (io/output-stream f)]
+        (let [chunk (byte-array (* 64 1024))]
+          (loop [left (long n)]
+            (when (pos? left)
+              (.write out chunk 0 (int (min left (alength chunk))))
+              (recur (- left (alength chunk))))))))
+    f))
+
+(defn- h2load-upload
+  "POSTs `file` to /upload for `secs` over one TLS h2 connection with
+  `streams` requests in flight."
+  [port secs streams ^File file]
+  (if-let [out (sh-out "h2load" "-D" (str secs) "-c" "1" "-m" (str streams) "-t" "1"
+                       "-d" (.getPath file) (str "https://127.0.0.1:" port "/upload"))]
+    (let [[_ done ok] (re-find #"requests: \d+ total, \d+ started, (\d+) done, (\d+) succeeded" out)
+          _ (when (not= done ok) (throw (ex-info (str "uploads failed: " ok " of " done " succeeded") {})))
+          [_ rps] (re-find #"finished in [0-9.]+s, ([0-9.]+) req/s" out)
+          [latency reported] (h2load-latency out)
+          mib (/ (.length file) 1048576.0)]
+      {:requests (Long/parseLong done)
+       :rps (Math/round (Double/parseDouble rps))
+       :mib-per-s (* mib (Double/parseDouble rps))
+       :latency-ms latency
+       :latency-model (str "h2load -c 1 -m " streams " POST of " (Math/round mib) " MiB, closed loop; "
+                           "h2load reports " reported)})
+    (throw (ex-info "h2load failed" {:port port}))))
+
+(defn- h2-upload-scenario [{:keys [ports duration-s warmup-s out-dir upload-bytes]} streams]
+  (if-not (sh-out "h2load" "--version")
+    {:skipped "h2load not found on PATH"}
+    (let [file (upload-file out-dir upload-bytes)
+          r (measured (:h1 ports)
+                      #(h2load-upload (:h2 ports) warmup-s streams file)
+                      #(h2load-upload (:h2 ports) duration-s streams file))]
+      (assoc r :alloc-bytes-per-mib (when-let [per-request (:alloc-bytes-per-request r)]
+                                      (Math/round (/ (* 1048576.0 (long per-request)) (long upload-bytes))))))))
+
 ;; ---- HTTP/3 via the batched quiche load client ----------------------------------------
 
 (defn- h3-run [{:keys [h3-connections h3-in-flight]} port secs]
@@ -389,6 +439,28 @@
     (not (:h3 ports)) {:skipped "enso_quiche shim not available"}
     :else (measured (:h1 ports) #(h3-run cfg (:h3 ports) warmup-s) #(h3-run cfg (:h3 ports) duration-s))))
 
+;; ---- HTTP/3 uploads via the quiche load client ------------------------------------------------
+
+(defn- h3-upload-run [port secs streams upload-bytes]
+  (let [upload (requiring-resolve 's-exp.h3-load/upload)
+        {:keys [requests rps hist]} (upload port {:streams streams :body-bytes upload-bytes
+                                                  :ms (* 1000 (long secs))})
+        mib (/ (long upload-bytes) 1048576.0)]
+    {:requests requests
+     :rps (Math/round (double rps))
+     :mib-per-s (* mib (double rps))
+     :latency-ms (percentiles-ms hist)
+     :latency-model (str "1 QUIC connection x " streams " POST of " (Math/round mib) " MiB in flight, closed loop")}))
+
+(defn- h3-upload-scenario [{:keys [ports duration-s warmup-s upload-bytes]} streams]
+  (if-not (:h3 ports)
+    {:skipped "enso_quiche shim not available"}
+    (let [r (measured (:h1 ports)
+                      #(h3-upload-run (:h3 ports) warmup-s streams upload-bytes)
+                      #(h3-upload-run (:h3 ports) duration-s streams upload-bytes))]
+      (assoc r :alloc-bytes-per-mib (when-let [per-request (:alloc-bytes-per-request r)]
+                                      (Math/round (/ (* 1048576.0 (long per-request)) (long upload-bytes))))))))
+
 ;; ---- output -----------------------------------------------------------------------------------
 
 (defn- json [x]
@@ -400,6 +472,17 @@
     (nil? x) "null"
     (ratio? x) (str (double x))
     :else (str x)))
+
+(defn- upload-report-md
+  "Throughput table of the upload scenarios in `scenarios`, empty without any."
+  [scenarios]
+  (let [uploads (filter (fn [[_ r]] (:mib-per-s r)) scenarios)]
+    (if (empty? uploads)
+      ""
+      (str "\n| upload | MiB/s | alloc B/MiB |\n|---|---:|---:|\n"
+           (str/join (for [[k r] uploads]
+                       (format "| %s | %.1f | %s |\n" (name k) (double (:mib-per-s r))
+                               (:alloc-bytes-per-mib r))))))))
 
 (defn- report-md [{:keys [meta config scenarios]}]
   (str "# enso perf run " (:timestamp meta) "\n\n"
@@ -417,7 +500,8 @@
               (str "| " (name k) " | " (:rps r) " | " (:alloc-bytes-per-request r)
                    " | " (fmt (:p50 l)) " | " (fmt (:p99 l)) " | " (fmt (:p999 l)) " | "
                    (fmt (:max l))
-                   " | " (:gc-count r) " | " (:latency-model r) " |\n")))))))
+                   " | " (:gc-count r) " | " (:latency-model r) " |\n")))))
+       (upload-report-md scenarios)))
 
 (defn- write-results! [{:keys [out-dir]} result]
   (let [stamp (str/replace (str (:timestamp (:meta result))) #"[:.]" "-")
@@ -436,7 +520,7 @@
   [opts]
   (let [cfg (merge defaults opts)
         _ (.mkdirs (io/file (:out-dir cfg)))
-        h3? (and (some #{:h3-get} (:scenarios cfg)) (support/shim-available?))
+        h3? (and (some #{:h3-get :h3-upload :h3-upload-4} (:scenarios cfg)) (support/shim-available?))
         server (start-server! cfg h3?)
         cfg (assoc cfg :ports (:ports server))
         n-conn (long (:connections cfg))]
@@ -459,6 +543,10 @@
                                                                ", latency per batch"))
                                :h2-get (h2-scenario cfg)
                                :h3-get (h3-scenario cfg)
+                               :h2-upload (h2-upload-scenario cfg 1)
+                               :h2-upload-4 (h2-upload-scenario cfg 4)
+                               :h3-upload (h3-upload-scenario cfg 1)
+                               :h3-upload-4 (h3-upload-scenario cfg 4)
                                :ws-echo (let [frame (ws-text-frame (:ws-message-bytes cfg))
                                               depth (long (:ws-depth cfg))]
                                           (h1-scenario cfg #(ws-echo-worker %1 depth frame %2 %3)

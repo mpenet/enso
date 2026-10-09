@@ -457,7 +457,10 @@
     :doc "SETTINGS_MAX_CONCURRENT_STREAMS."}
    {:key :http2-initial-window-bytes :group "HTTP/2" :default 262144 :field "http2InitialWindowBytes" :check check-int
     :set (fn [^Config$Builder b v] (.http2InitialWindowBytes b (int v)))
-    :doc "per-stream receive window, [65535, 2^31-1]; the connection window grows to 4x this (1 MiB by default) once request body bytes arrive, as far as `:max-buffered-bytes` pays for it. Credit returns as handlers read. Raise it for large uploads over long round trips."}
+    :doc "per-stream receive window a stream starts with, [65535, 2^31-1]; it doubles, up to `:http2-max-window-bytes`, while the handler reads half of it within two round trips. The connection window grows to 4x this (1 MiB by default) once request body bytes arrive, and doubles by the same rule up to twice `:http2-max-window-bytes`, every growth as far as `:max-buffered-bytes` pays for it. Credit returns as handlers read."}
+   {:key :http2-max-window-bytes :group "HTTP/2" :default 8388608 :field "http2MaxWindowBytes" :check check-int
+    :set (fn [^Config$Builder b v] (.http2MaxWindowBytes b (int v)))
+    :doc "most a stream's receive window grows to, [`:http2-initial-window-bytes`, 2^31-1]; the connection window grows to twice this. Equal to `:http2-initial-window-bytes`: fixed windows."}
    {:key :http2-max-frame-bytes :group "HTTP/2" :default 16384 :field "http2MaxFrameBytes" :check check-int
     :set (fn [^Config$Builder b v] (.http2MaxFrameBytes b (int v)))
     :doc "SETTINGS_MAX_FRAME_SIZE, [16384, 16777215]."}
@@ -481,12 +484,9 @@
    {:key :http3-key-path :group "HTTP/3 (QUIC via quiche)" :default nil :field "http3KeyPath" :check check-string
     :set (fn [^Config$Builder b v] (.http3KeyPath b ^String v))
     :doc "PEM private key."}
-   {:key :http3-initial-max-data-bytes :group "HTTP/3 (QUIC via quiche)" :default 1048576 :field "http3InitialMaxDataBytes" :check check-long
+   {:key :http3-initial-max-data-bytes :group "HTTP/3 (QUIC via quiche)" :default 524288 :field "http3InitialMaxDataBytes" :check check-long
     :set (fn [^Config$Builder b v] (.http3InitialMaxDataBytes b (long v)))
-    :doc "connection flow-control window, a hard bound (no autotuning past it); also bounds request-body bytes buffered per connection."}
-   {:key :http3-max-native-bytes :group "HTTP/3 (QUIC via quiche)" :default -1 :field "http3MaxNativeBytes" :check check-long
-    :set (fn [^Config$Builder b v] (.http3MaxNativeBytes b (long v)))
-    :doc "receive credit quiche may hold natively, a connection window per connection: new connections are refused past it; -1 = the `:max-buffered-bytes` limit (at least one window), 0 = unlimited."}
+    :doc "connection flow-control window, fixed (no autotuning); charged to `:max-buffered-bytes` while the connection reads a request body. Also bounds request-body bytes buffered per connection."}
    {:key :http3-initial-max-streams-bidi :group "HTTP/3 (QUIC via quiche)" :default 100 :field "http3InitialMaxStreamsBidi" :check check-int
     :set (fn [^Config$Builder b v] (.http3InitialMaxStreamsBidi b (int v)))
     :doc "concurrent request streams per connection; twice this many live handlers make new requests H3_REQUEST_REJECTED."}
@@ -522,13 +522,16 @@
     :doc "UDP socket send buffer requested (best effort); 0 = OS default."}
    {:key :http3-initial-max-stream-data-bidi-local-bytes :group "HTTP/3 (QUIC via quiche)" :default -1 :field "http3InitialMaxStreamDataBidiLocalBytes" :check check-long
     :set (fn [^Config$Builder b v] (.http3InitialMaxStreamDataBidiLocalBytes b (long v)))
-    :doc "per-stream window, -1 = a quarter of `:http3-initial-max-data-bytes` (256 KiB by default), so one unread stream can't stall the connection."}
+    :doc "per-stream window, -1 = half of `:http3-initial-max-data-bytes` (256 KiB by default), so one unread stream can't stall the connection."}
    {:key :http3-initial-max-stream-data-bidi-remote-bytes :group "HTTP/3 (QUIC via quiche)" :default -1 :field "http3InitialMaxStreamDataBidiRemoteBytes" :check check-long
     :set (fn [^Config$Builder b v] (.http3InitialMaxStreamDataBidiRemoteBytes b (long v)))
     :doc "same, for peer-initiated streams."}
    {:key :http3-initial-max-stream-data-uni-bytes :group "HTTP/3 (QUIC via quiche)" :default -1 :field "http3InitialMaxStreamDataUniBytes" :check check-long
     :set (fn [^Config$Builder b v] (.http3InitialMaxStreamDataUniBytes b (long v)))
     :doc "same, for unidirectional streams."}
+   {:key :http3-max-window-bytes :group "HTTP/3 (QUIC via quiche)" :default 8388608 :field "http3MaxWindowBytes" :check check-long
+    :set (fn [^Config$Builder b v] (.http3MaxWindowBytes b (long v)))
+    :doc "most a stream's receive window autotunes to, at least the per-stream initial windows; a connection's window grows to twice this as far as `:max-buffered-bytes` pays. Needs the patched libquiche of the release builds; ignored on a stock libquiche (fixed windows)."}
    {:key :http3-ack-delay-exponent :group "HTTP/3 (QUIC via quiche)" :default -1 :field "http3AckDelayExponent" :check check-int
     :set (fn [^Config$Builder b v] (.http3AckDelayExponent b (int v)))
     :doc "RFC 9000 ack_delay_exponent, [0, 20]; -1 = quiche default."}

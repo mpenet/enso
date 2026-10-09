@@ -436,11 +436,19 @@ final class Http2Writer {
 
     /** WINDOW_UPDATE from us; never fails (credit is bounded by the windows). */
     void windowUpdate(int streamId, int increment) {
+        windowUpdate(streamId, increment, null);
+    }
+
+    /** WINDOW_UPDATE from us, followed in the same write by a PING of {@code ping} when not null. */
+    void windowUpdate(int streamId, int increment, byte[] ping) {
         boolean flusher;
         lock.lock();
         try {
             // RFC 9113 §6.9: reserved (high) bit of the increment must be 0.
             appendControl(Http2.TYPE_WINDOW_UPDATE, 0, streamId, null, 0, 4, increment & 0x7FFFFFFF, false);
+            if (ping != null) {
+                appendControl(Http2.TYPE_PING, 0, 0, ping, 0, 8, 0, false);
+            }
             flusher = kickFromFramer(null);
         } catch (Http2.ConnectionError impossible) {
             // Only induced frames are capped.
@@ -1907,9 +1915,10 @@ final class Http2Writer {
     // Batches are kept with their ByteBuffer wrapper, so writing one wraps nothing.
     private static final AtomicReferenceArray<ByteBuffer> POOL = new AtomicReferenceArray<>(POOL_SLOTS);
     private static final AtomicReferenceArray<ByteBuffer> NET_POOL = new AtomicReferenceArray<>(POOL_SLOTS);
-    // Streamed-body rings of the largest size, given back once their last
-    // bytes are packed (or dropped): a ring is only held while its stream
-    // has bytes to send. Fewer kept than batches: a ring is held longer.
+    // Rings of the largest size, given back once their last bytes are
+    // packed (or dropped): a ring is only held while its stream has bytes
+    // to send, or, for a request body (RequestBody), bytes its handler
+    // hasn't read. Fewer kept than batches: a ring is held longer.
     private static final int RING_POOL_SLOTS = 32;
     private static final AtomicReferenceArray<byte[]> RING_POOL = new AtomicReferenceArray<>(RING_POOL_SLOTS);
 
@@ -1931,8 +1940,14 @@ final class Http2Writer {
         give(POOL, b);
     }
 
-    /** Keeps {@code ring} for another stream if it has the largest size. */
-    private static void recycleRing(byte[] ring) {
+    /** A ring of the largest size, pooled if one is free. */
+    static byte[] borrowRing() {
+        byte[] ring = take(RING_POOL);
+        return ring != null ? ring : new byte[RING_MAX];
+    }
+
+    /** Keeps {@code ring} for another stream if it has the largest size; its holder no longer refers to it. */
+    static void recycleRing(byte[] ring) {
         if (ring != null && ring.length == RING_MAX) {
             give(RING_POOL, ring);
         }

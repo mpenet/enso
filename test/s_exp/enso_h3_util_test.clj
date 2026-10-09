@@ -581,13 +581,16 @@
       (is (zero? (.getInt (view meta) (int com.s_exp.enso.quiche.Records/SEND_STATUS_DROPPED))))
       (is (zero? (.getInt (view meta) (int com.s_exp.enso.quiche.Records/SEND_STATUS_FLAGS)))))))
 
-(deftest quiche-config-pins-flow-control-windows
-  ;; Autotuning can't grow windows past what is configured: a handler
-  ;; that doesn't read bounds quiche's buffering at the configured windows.
+(deftest quiche-config-bounds-flow-control-windows
+  ;; quiche's autotuning can't grow windows past what is configured: the
+  ;; connection window starts capped at its initial size (a connection's
+  ;; cap is raised as its budget pays for it), stream windows are capped
+  ;; at :http3-max-window-bytes, or at their initial size on a stock
+  ;; libquiche.
   (let [build (fn [f] (.build (doto (com.s_exp.enso.api.Config/builder)
                                 (.http3 true) (.http3CertPath "c") (.http3KeyPath "k") f)))]
-    (is (= (* 1024 1024) (.-http3InitialMaxDataBytes ^com.s_exp.enso.api.Config (build identity)))
-        "default connection window 1 MiB")
+    (is (= (* 512 1024) (.-http3InitialMaxDataBytes ^com.s_exp.enso.api.Config (build identity)))
+        "default connection window 512 KiB")
     (let [[cert key] (let [d (java.nio.file.Files/createTempDirectory "enso-h3-cfg" (make-array java.nio.file.attribute.FileAttribute 0))
                            c (str (.resolve d "c.pem")) k (str (.resolve d "k.pem"))]
                        (.waitFor (.start (ProcessBuilder. ^java.util.List
@@ -601,14 +604,37 @@
           q (com.s_exp.enso.quiche.QuicheConfig/server cfg)]
       (try
         (is (= (* 8 1024 1024) (.connectionWindow q)))
-        (is (= (* 2 1024 1024) (.streamWindowBidiRemote q))
-            "derived: a quarter of the connection window, so one unread stream can't take all of it")
+        (is (= (* 4 1024 1024) (.streamWindowBidiRemote q))
+            "derived: half the connection window, so one unread stream can't take all of it")
         (finally (.close q)))
       (let [q (com.s_exp.enso.quiche.QuicheConfig/server (.build (doto (com.s_exp.enso.api.Config/builder)
                                                                    (.http3 true) (.http3CertPath cert) (.http3KeyPath key))))]
         (try
           (is (= (* 256 1024) (.streamWindowBidiRemote q)) "256 KiB by default, as HTTP/2's stream window")
+          (if com.s_exp.enso.quiche.Quiche/RECV_WINDOW_CONTROL
+            (is (= (* 8 1024 1024) (.maxStreamWindow q))
+                "with receive-window control stream windows autotune up to :http3-max-window-bytes")
+            (is (= (* 256 1024) (.maxStreamWindow q)) "on a stock libquiche they stay at the initial windows"))
+          (is (= (* 512 1024) (.maxConnectionWindow q))
+              "the connection window starts capped; each connection's cap is raised as its budget pays")
           (finally (.close q)))))))
+
+(deftest http3-max-window-bytes-option
+  (let [build (fn [f] (.build (doto (com.s_exp.enso.api.Config/builder)
+                                (.http3 true) (.http3CertPath "c") (.http3KeyPath "k") f)))]
+    (is (= (* 8 1024 1024) (.-http3MaxWindowBytes ^com.s_exp.enso.api.Config (build identity)))
+        "8 MiB, as :http2-max-window-bytes")
+    (is (thrown-with-msg? com.s_exp.enso.api.Config$InvalidOptionException #"http3-max-window-bytes"
+                          (build #(.http3MaxWindowBytes ^com.s_exp.enso.api.Config$Builder % (* 128 1024))))
+        "below the 256 KiB default stream window")
+    (is (thrown-with-msg? com.s_exp.enso.api.Config$InvalidOptionException #"http3-max-window-bytes"
+                          (build #(doto ^com.s_exp.enso.api.Config$Builder %
+                                    (.http3InitialMaxStreamDataBidiRemoteBytes (* 16 1024 1024))))))
+    (is (= (* 64 1024) (.-http3MaxWindowBytes ^com.s_exp.enso.api.Config
+                                              (build #(doto ^com.s_exp.enso.api.Config$Builder %
+                                                        (.http3InitialMaxDataBytes (* 128 1024))
+                                                        (.http3MaxWindowBytes (* 64 1024))))))
+        "at least the stream windows derived from the connection window")))
 
 (deftest stateless-close-reuses-its-crypto
   ;; Forged Retry tokens each get a stateless INVALID_TOKEN close: building

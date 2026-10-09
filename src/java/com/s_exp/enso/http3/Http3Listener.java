@@ -9,7 +9,6 @@ import com.s_exp.enso.api.ServerEvents;
 import com.s_exp.enso.core.ConnectionLimiter;
 import com.s_exp.enso.core.ConnectionRegistry;
 import com.s_exp.enso.core.LogLimiter;
-import com.s_exp.enso.core.MemoryBudget;
 import com.s_exp.enso.core.Service;
 import com.s_exp.enso.core.Timer;
 import com.s_exp.enso.http3.qpack.QpackFieldSection;
@@ -58,8 +57,8 @@ import java.util.logging.Logger;
  * {@code :max-connections-per-ip}, so per-address slots only count proven
  * addresses), so a spoofed flood can't make the server sign handshakes;
  * past {@code :http3-max-half-open} handshaking connections Initials are
- * dropped; every connection reserves its connection window of native
- * receive credit within {@code :http3-max-native-bytes} and takes a slot
+ * dropped; while {@code :max-buffered-bytes} is exhausted (the server is
+ * overloaded) every Initial is dropped; every connection takes a slot
  * of the server's {@link ConnectionLimiter} ({@code :max-connections},
  * {@code :max-connections-per-ip}) for its whole life, and beyond while
  * any of its handlers still runs (closing a connection doesn't free
@@ -105,10 +104,6 @@ public final class Http3Listener implements AutoCloseable {
     final ServerEvents events;
     final ThreadFactory handlerThreads = Thread.ofVirtual().factory();
     final Stats stats = new Stats();
-    // Receive credit quiche may hold natively: a connection window
-    // (:http3-initial-max-data-bytes) per live connection, reserved at
-    // admission within :http3-max-native-bytes.
-    private final MemoryBudget nativeCredit;
 
     /** The configuration new connections are accepted with; see {@link #acquireConfig}. */
     private volatile QuicheConfig currentConfig;
@@ -194,39 +189,6 @@ public final class Http3Listener implements AutoCloseable {
         this.limiter = limiter != null ? limiter
             : new ConnectionLimiter(config.maxConnections, config.maxConnectionsPerIp);
         this.events = service.events;
-        this.nativeCredit = new MemoryBudget(nativeLimit(config, service.budget));
-    }
-
-    /**
-     * {@code :http3-max-native-bytes} resolved: -1 is the
-     * {@code :max-buffered-bytes} limit, but at least one connection
-     * window (so a small budget still admits connections); 0 is unlimited.
-     */
-    private static long nativeLimit(Config config, MemoryBudget budget) {
-        if (config.http3MaxNativeBytes == 0) return Long.MAX_VALUE;
-        if (config.http3MaxNativeBytes > 0) return config.http3MaxNativeBytes;
-        return Math.max(budget.limit(), Math.max(1, config.http3InitialMaxDataBytes));
-    }
-
-    /**
-     * Bytes of request data quiche may buffer natively, off the Java heap
-     * and outside {@code :max-buffered-bytes}: the connection window
-     * ({@code :http3-initial-max-data-bytes}) of every live connection,
-     * at most {@link #maxNativeBytes}. The server reads request streams
-     * only while their pipes and the budget have room, so this much is
-     * reached only under pressure, by peers that keep sending.
-     */
-    public long nativeCreditBytes() {
-        return nativeCredit.used();
-    }
-
-    /**
-     * The cap on {@link #nativeCreditBytes} ({@code :http3-max-native-bytes}
-     * resolved; {@link Long#MAX_VALUE} when unlimited): a connection whose
-     * window would pass it is refused.
-     */
-    public long maxNativeBytes() {
-        return nativeCredit.limit();
     }
 
     /** Whether every event loop thread is alive (each is supervised: false means a fault). */
@@ -565,14 +527,16 @@ public final class Http3Listener implements AutoCloseable {
             return Admission.DROPPED;
         }
         InetAddress remote = peer.getAddress();
-        if (!nativeCredit.tryReserve(config.http3InitialMaxDataBytes)) {
+        // An exhausted budget is overload: a new connection could make no
+        // progress on a body, while its window is promised in the handshake
+        // and paid for only once one is read (see Http3Connection).
+        if (service.budget.exhausted()) {
             halfOpen.decrementAndGet();
-            refused("connection-limit", "h3 connection refused: :http3-max-native-bytes reached");
+            refused("connection-limit", "h3 connection refused: :max-buffered-bytes exhausted");
             return Admission.DROPPED;
         }
         if (!limiter.tryAcquire(remote)) {
             halfOpen.decrementAndGet();
-            nativeCredit.release(config.http3InitialMaxDataBytes);
             refused("connection-limit", "h3 connection refused: connection limit reached");
             return Admission.DROPPED;
         }
@@ -592,7 +556,6 @@ public final class Http3Listener implements AutoCloseable {
     /** Undoes a successful {@link #admit} whose connection couldn't be created. */
     void admissionFailed(InetAddress remote) {
         halfOpen.decrementAndGet();
-        nativeCredit.release(config.http3InitialMaxDataBytes);
         limiter.release(remote);
     }
 
@@ -629,7 +592,6 @@ public final class Http3Listener implements AutoCloseable {
      */
     void released(Http3Connection c) {
         if (!c.release()) return;
-        nativeCredit.release(config.http3InitialMaxDataBytes);
         limiter.release(c.remote);
         if (registry != null) registry.unregister(c);
         if (live.decrementAndGet() == 0) {

@@ -102,6 +102,8 @@ jobs:
       - name: Run tests (one JVM per namespace)
         env:
           ENSO_PROPERTY_TRIALS: '200'
+          # The shim links the patched libquiche: its tests must run, not skip.
+          ENSO_H3_REQUIRE_RECV_WINDOW_CONTROL: '1'
         run: script/test.sh
 
       - name: Upload test logs
@@ -173,6 +175,8 @@ jobs:
         run: sudo sysctl -w net.core.rmem_max=8388608
 
       - name: HTTP/3 namespaces under the sanitizers
+        env:
+          ENSO_H3_REQUIRE_RECV_WINDOW_CONTROL: '1'
         run: script/sanitizer-test.sh
 
       - name: Upload sanitizer reports and logs

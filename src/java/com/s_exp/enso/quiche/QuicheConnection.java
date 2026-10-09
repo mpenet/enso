@@ -127,6 +127,15 @@ public final class QuicheConnection {
     /** The smoothed round-trip time estimate in nanoseconds, -1 when unknown. */
     public long rttNanos() { return Quiche.connRttNanos(p()); }
 
+    /**
+     * Lets the connection window autotune up to {@code v} (never below its
+     * current size). No-op unless {@link Quiche#RECV_WINDOW_CONTROL}.
+     */
+    public void setMaxConnectionWindow(long v) { Quiche.connSetMaxConnectionWindow(p(), v); }
+
+    /** The connection-level receive window; -1 unless {@link Quiche#RECV_WINDOW_CONTROL}. */
+    public long connectionWindow() { return Quiche.connConnectionWindow(p()); }
+
     /** DER bytes of the certificate the peer presented, or null. */
     public byte[] peerCertificate() { return Quiche.connPeerCert(p()); }
 

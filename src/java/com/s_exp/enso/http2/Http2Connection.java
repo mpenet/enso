@@ -103,6 +103,10 @@ public final class Http2Connection implements Runnable, Drainable {
     private static final long LINGER_NANOS = 2_000_000_000L;
     private static final long LINGER_MAX_BYTES = 1 << 20;
     private static final byte[] DRAIN_PING = {'e', 'n', 's', 'o', 'd', 'r', 'a', 'i'};
+    // PING timing a round trip, sent with returned stream credit when the
+    // last sample is older than RTT_REFRESH_NANOS (never per request).
+    private static final byte[] RTT_PING = {'e', 'n', 's', 'o', 'r', 't', 't', 'p'};
+    private static final long RTT_REFRESH_NANOS = 1_000_000_000L;
     // Input buffer: allocated at this size, grown to hold a whole frame of
     // up to the default maximum size (larger ones are read past it).
     private static final int INPUT_INITIAL = 2048;
@@ -118,6 +122,7 @@ public final class Http2Connection implements Runnable, Drainable {
     private static final VarHandle LIVE_STREAMS;
     private static final VarHandle RETIRED;
     private static final VarHandle CREDIT_WAITER;
+    private static final VarHandle RTT_PROBE;
 
     static {
         try {
@@ -126,6 +131,7 @@ public final class Http2Connection implements Runnable, Drainable {
             LIVE_STREAMS = l.findVarHandle(Http2Connection.class, "liveStreams", int.class);
             RETIRED = l.findVarHandle(Http2Connection.class, "retired", Http2Stream.class);
             CREDIT_WAITER = l.findVarHandle(Http2Connection.class, "creditWaiter", MemoryBudget.Waiter.class);
+            RTT_PROBE = l.findVarHandle(Http2Connection.class, "rttProbeNanos", long.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -176,6 +182,8 @@ public final class Http2Connection implements Runnable, Drainable {
     private final long headerListSoftLimit;
     private final long headerListHardLimit;
     private final int recvCreditThreshold;
+    // Most a stream's receive window grows to (:http2-max-window-bytes).
+    private final long streamMaxWindow;
 
     // ---- Framer-confined ----
     private int peerInitialWindowSize = Http2.DEFAULT_INITIAL_WINDOW_SIZE;
@@ -224,10 +232,41 @@ public final class Http2Connection implements Runnable, Drainable {
     private final AtomicLong connRecvUncredited = new AtomicLong();
     private final AtomicLong reservedCredit = new AtomicLong();
     private final AtomicLong owedCredit = new AtomicLong();
+    // DATA octets that arrived and whose credit wasn't granted back yet
+    // (buffered, or read and batched): with connRecvWindow, the window the
+    // peer was given, which grants steer to the window's size.
+    private final AtomicLong connHeld = new AtomicLong();
     // The connection window this connection grows to once request body
     // bytes arrive (framer: grown once).
     private final long connRecvTarget;
     private boolean connRecvGrown;
+    // Receive window autotuning, connection level: the window credit is
+    // granted back up to (connRecvTarget, then doubled up to connMaxWindow
+    // by windowMayGrow's rule), and the epoch that rule measures: credit
+    // returned since connEpochNanos (0: no epoch started yet).
+    private final long connMaxWindow;
+    private final AtomicLong connWindowSize;
+    private final AtomicLong connEpochBytes = new AtomicLong();
+    private volatile long connEpochNanos;
+    // Request bodies the peer may still send on (from their first DATA to
+    // their end or abort). With none, the window goes back to
+    // connRecvTarget: credit the peer holds past it is not granted again.
+    private final AtomicInteger openBodies = new AtomicInteger();
+    // Of those, the ones without a Content-Length, and what the others
+    // declared and haven't sent yet: while every open body declares one,
+    // the peer gets no more credit than they can still use.
+    private final AtomicInteger undeclaredBodies = new AtomicInteger();
+    private final AtomicLong declaredLeft = new AtomicLong();
+    // Round trip, smoothed as TCP's SRTT (RFC 6298), 0 until the first
+    // sample: the SETTINGS acknowledgement, then RTT_PING. Written by the
+    // framer only.
+    private volatile long smoothedRttNanos;
+    private volatile long rttSampledNanos;
+    // When the RTT_PING in flight was sent, 0 for none (set through RTT_PROBE).
+    @SuppressWarnings("unused") // accessed through RTT_PROBE
+    private volatile long rttProbeNanos;
+    // When our SETTINGS went out, 0 once acknowledged (framer).
+    private long settingsSentNanos;
     // Set at teardown: credit is no longer granted nor paid for.
     private volatile boolean creditClosed;
 
@@ -275,6 +314,9 @@ public final class Http2Connection implements Runnable, Drainable {
         this.recvCreditThreshold = Math.max(1, ownInitialWindowSize / 2);
         this.connRecvTarget = Math.min((long) ownInitialWindowSize * CONN_WINDOW_STREAM_MULTIPLE,
                                        Http2.MAX_ALLOWED_WINDOW_SIZE);
+        this.streamMaxWindow = Math.max(ownInitialWindowSize, config.http2MaxWindowBytes);
+        this.connMaxWindow = Math.max(connRecvTarget, Math.min(2L * streamMaxWindow, Http2.MAX_ALLOWED_WINDOW_SIZE));
+        this.connWindowSize = new AtomicLong(connRecvTarget);
         this.account = service.budget.account();
         this.resetTokens = config.http2StreamResetLimit;
         this.idleTimeoutNanos = config.idleTimeoutMillis * 1_000_000L;
@@ -418,6 +460,7 @@ public final class Http2Connection implements Runnable, Drainable {
         // The connection window stays at the RFC's 65535 until request body
         // bytes arrive (growConnectionWindow): credit is paid for from the
         // memory budget, and a connection serving only GETs needs none.
+        settingsSentNanos = System.nanoTime();
         writer.initialSettings(payload, p, 0);
     }
 
@@ -650,6 +693,11 @@ public final class Http2Connection implements Runnable, Drainable {
                         throw new Http2.ConnectionError(
                             Http2.ERROR_FRAME_SIZE_ERROR, "SETTINGS ACK with payload");
                     }
+                    if (settingsSentNanos != 0) {
+                        long now = System.nanoTime();
+                        sampleRtt(now - settingsSentNanos, now);
+                        settingsSentNanos = 0;
+                    }
                 } else {
                     applySettings();
                 }
@@ -667,6 +715,13 @@ public final class Http2Connection implements Runnable, Drainable {
                     writer.ping(payload, payloadOff, true);
                 } else if (java.util.Arrays.equals(payload, payloadOff, payloadOff + 8, DRAIN_PING, 0, 8)) {
                     finalGoaway();
+                } else if (java.util.Arrays.equals(payload, payloadOff, payloadOff + 8, RTT_PING, 0, 8)) {
+                    long sent = rttProbeNanos;
+                    if (sent != 0) {
+                        long now = System.nanoTime();
+                        sampleRtt(now - sent, now);
+                        rttProbeNanos = 0;
+                    }
                 }
             }
             case Http2.TYPE_WINDOW_UPDATE -> {
@@ -955,7 +1010,7 @@ public final class Http2Connection implements Runnable, Drainable {
         Http2Stream stream = new Http2Stream(this, id, peerInitialWindowSize);
         if (!endStream) {
             stream.body = new RequestBody(this, stream, ownInitialWindowSize,
-                                          config.readTimeoutMillis, recvCreditThreshold);
+                                          config.readTimeoutMillis, streamMaxWindow);
         }
         // Ring: :body is present only when the request has one.
         Request request = exchange.buildRequest(stream.body);
@@ -977,6 +1032,9 @@ public final class Http2Connection implements Runnable, Drainable {
                     return;
                 }
                 stream.declaredContentLength = declared;
+                if (stream.body != null) {
+                    stream.body.declare(declared);
+                }
                 if (config.maxRequestBodyBytes > 0 && declared > config.maxRequestBodyBytes) {
                     // Answered 413 without running the handler; DATA that
                     // still arrives is discarded.
@@ -1133,6 +1191,7 @@ public final class Http2Connection implements Runnable, Drainable {
         if (connRecvWindow.addAndGet(-frameLen) < 0) {
             throw new Http2.ConnectionError(Http2.ERROR_FLOW_CONTROL_ERROR, "peer overran receive window");
         }
+        connHeld.addAndGet(frameLen);
         // And is held by the connection until it leaves (creditConnection):
         // paid for by credit reserved when it was granted, or charged when
         // it came within the RFC's initial window.
@@ -1173,7 +1232,7 @@ public final class Http2Connection implements Runnable, Drainable {
             streamError(st, Http2.ERROR_STREAM_CLOSED);
             return;
         }
-        if (!body.charge(frameLen)) {
+        if (!body.charge(frameLen, len)) {
             throw new Http2.ConnectionError(Http2.ERROR_FLOW_CONTROL_ERROR, "peer overran stream window");
         }
         if (len == 0 && !endStream) {
@@ -1246,7 +1305,12 @@ public final class Http2Connection implements Runnable, Drainable {
      * window at the RFC's initial 65535 octets is granted (what any
      * connection gets unasked, so it always makes progress), the rest is
      * given back and owed until the budget has room (backpressure, not an
-     * error). Any thread; never writes itself.
+     * error). Otherwise credit is granted so the window the peer was given
+     * (what it holds and what arrived uncredited) comes to the window's
+     * size, within {@link #declaredCreditCap}: credit past the bytes read is
+     * reserved from the account first (kept as it was when that fails),
+     * credit past the size is given back, not owed. Any thread; never
+     * writes itself.
      */
     void creditConnection(long n) {
         if (n <= 0) return;
@@ -1256,19 +1320,131 @@ public final class Http2Connection implements Runnable, Drainable {
             account.release(u);
             return;
         }
-        long keep = account.throttled()
-            ? Math.max(0, Math.min(u, Http2.DEFAULT_INITIAL_WINDOW_SIZE - connRecvWindow.get()))
-            : u;
-        if (keep > 0) {
-            reservedCredit.addAndGet(keep);
-            connRecvWindow.addAndGet(keep);
-            writer.windowUpdate(0, (int) keep);
+        long held = connHeld.addAndGet(-u);
+        if (account.throttled()) {
+            long keep = Math.max(0, Math.min(u, Http2.DEFAULT_INITIAL_WINDOW_SIZE - connRecvWindow.get()));
+            grantConnectionCredit(keep);
+            if (u > keep) {
+                account.release(u - keep);
+                owedCredit.addAndGet(u - keep);
+                grantOwedCredit();
+            }
+            return;
         }
-        if (u > keep) {
+        long cap = declaredCreditCap();
+        if (openBodies.get() > 0 && connWindowSize.get() < cap) {
+            autotuneConnectionWindow(u);
+        }
+        long window = connRecvWindow.get();
+        long want = Math.min(Math.min(connWindowSize.get(), cap) - window - held,
+                             Http2.MAX_ALLOWED_WINDOW_SIZE - window);
+        long keep;
+        if (want > u) {
+            keep = account.tryReserve(want - u) ? want : u;
+        } else {
+            keep = Math.max(0, want);
             account.release(u - keep);
-            owedCredit.addAndGet(u - keep);
-            grantOwedCredit();
         }
+        grantConnectionCredit(keep);
+    }
+
+    /**
+     * Most connection credit the peer may hold while every open body
+     * declares its length: what they have left to send (and a frame's
+     * padding each), at least the baseline window so new bodies start;
+     * unbounded otherwise. Any thread.
+     */
+    private long declaredCreditCap() {
+        int open = openBodies.get();
+        if (open == 0 || undeclaredBodies.get() > 0) return Long.MAX_VALUE;
+        return Math.max(connRecvTarget, declaredLeft.get() + (long) open * RequestBody.PADDING_ALLOWANCE);
+    }
+
+    /** Grants {@code n} octets of connection credit already paid for from the account (any thread). */
+    private void grantConnectionCredit(long n) {
+        if (n > 0) {
+            reservedCredit.addAndGet(n);
+            connRecvWindow.addAndGet(n);
+            writer.windowUpdate(0, (int) n);
+        }
+    }
+
+    /**
+     * Framer, under the body's lock: a request body got its first DATA,
+     * with {@code left} octets of its Content-Length still to come (-1:
+     * none declared).
+     */
+    void bodyOpened(long left) {
+        if (left < 0) {
+            undeclaredBodies.incrementAndGet();
+        } else {
+            declaredLeft.addAndGet(left);
+        }
+        openBodies.incrementAndGet();
+    }
+
+    /** Framer, under the body's lock: {@code n} declared octets of an open body arrived. */
+    void declaredArrived(long n) {
+        declaredLeft.addAndGet(-n);
+    }
+
+    /**
+     * A body the peer sent DATA on ended or was aborted (any thread, under
+     * the body's lock: atomics only). The last one takes the window back
+     * to its baseline and starts a fresh autotuning epoch with the next
+     * body. {@code left}: declared octets that never came (-1: none
+     * declared).
+     */
+    void bodyClosed(long left) {
+        if (left < 0) {
+            undeclaredBodies.decrementAndGet();
+        } else {
+            declaredLeft.addAndGet(-left);
+        }
+        if (openBodies.decrementAndGet() == 0) {
+            connWindowSize.set(connRecvTarget);
+            connEpochBytes.set(0);
+            connEpochNanos = 0;
+        }
+    }
+
+    /**
+     * {@code credited} octets of connection credit are being granted back:
+     * counts them into the autotuning epoch and, once more than half the
+     * window was returned in it, decides whether the window's size doubles
+     * ({@link #windowMayGrow}); the grant that follows reserves and grants
+     * the growth. Any thread.
+     */
+    private void autotuneConnectionWindow(long credited) {
+        long e = connEpochBytes.addAndGet(credited);
+        long size = connWindowSize.get();
+        if (e <= size >> 1 || !connEpochBytes.compareAndSet(e, 0)) return;
+        long now = System.nanoTime();
+        long start = connEpochNanos;
+        connEpochNanos = now;
+        if (start == 0 || size >= connMaxWindow || !windowMayGrow(now - start, e, size)) return;
+        connWindowSize.compareAndSet(size, size + Math.min(size, connMaxWindow - size));
+    }
+
+    /**
+     * Whether a receive window of {@code size} octets, {@code drained} of
+     * which its reader took {@code elapsedNanos} to read, doubles: when it
+     * reads faster than a quarter of the window per round trip (half of it
+     * within two, as quiche and quic-go: the sender, held to one window per
+     * round trip, is then what limits the upload), the round trip is known
+     * and the connection isn't throttled. Any thread.
+     */
+    boolean windowMayGrow(long elapsedNanos, long drained, long size) {
+        long rtt = smoothedRttNanos;
+        return rtt > 0 && (double) elapsedNanos * size < 4.0 * drained * rtt && !account.throttled();
+    }
+
+    /** Framer: a round-trip sample, taken at {@code now}. */
+    private void sampleRtt(long sample, long now) {
+        long rtt = Math.max(1, sample);
+        long srtt = smoothedRttNanos;
+        smoothedRttNanos = srtt == 0 ? rtt : srtt - (srtt >> 3) + (rtt >> 3);
+        rttSampledNanos = now;
     }
 
     /**
@@ -1281,6 +1457,13 @@ public final class Http2Connection implements Runnable, Drainable {
         while (!creditClosed) {
             long o = owedCredit.get();
             if (o <= 0) return;
+            long room = Math.min(connWindowSize.get(), declaredCreditCap()) - connRecvWindow.get() - connHeld.get();
+            if (o > room) {
+                // The window went back to its baseline meanwhile: what
+                // would take the peer's credit past it is no longer owed.
+                owedCredit.compareAndSet(o, Math.max(0, room));
+                continue;
+            }
             long least = Math.min(o, MIN_CREDIT_GRANT);
             long n = Math.min(o, Http2.MAX_ALLOWED_WINDOW_SIZE);
             boolean reserved = account.tryReserve(n);
@@ -1293,9 +1476,7 @@ public final class Http2Connection implements Runnable, Drainable {
                     account.release(n);
                     continue;
                 }
-                reservedCredit.addAndGet(n);
-                connRecvWindow.addAndGet(n);
-                writer.windowUpdate(0, (int) n);
+                grantConnectionCredit(n);
                 continue;
             }
             // Nothing affordable: told once usage falls below the low-water
@@ -1344,9 +1525,17 @@ public final class Http2Connection implements Runnable, Drainable {
         return account;
     }
 
-    /** Stream WINDOW_UPDATE for consumed body bytes. Any thread; never writes itself. */
-    void sendWindowUpdate(int streamId, int increment) {
-        writer.windowUpdate(streamId, increment);
+    /**
+     * Stream WINDOW_UPDATE for consumed body bytes, decided at {@code now}
+     * (System.nanoTime), with an RTT_PING when the round trip was last
+     * measured more than RTT_REFRESH_NANOS ago and none is in flight. Any
+     * thread; never writes itself.
+     */
+    void sendWindowUpdate(int streamId, int increment, long now) {
+        long sampled = rttSampledNanos;
+        boolean probe = sampled != 0 && now - sampled > RTT_REFRESH_NANOS
+            && (long) RTT_PROBE.getVolatile(this) == 0 && RTT_PROBE.compareAndSet(this, 0L, now);
+        writer.windowUpdate(streamId, increment, probe ? RTT_PING : null);
     }
 
     // ---- Stream errors and resets ---------------------------------------------------

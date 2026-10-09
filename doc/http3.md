@@ -215,10 +215,9 @@ an unknown connection id is answered statelessly or admitted:
 3. Past `:http3-max-half-open` (1024) handshaking connections, Initials are
    dropped (checked by taking the slot, so loops admitting at once can't
    overshoot it).
-4. Every connection reserves its connection window
-   (`:http3-initial-max-data-bytes`) of native receive credit within
-   `:http3-max-native-bytes`, until it is freed; past it the Initial is
-   dropped ("connection-limit"). See Limits below.
+4. While `:max-buffered-bytes` is exhausted (the server is overloaded)
+   the Initial is dropped ("connection-limit"). Nothing is reserved at
+   admission: an idle connection costs no budget. See Limits below.
 5. Every connection takes a slot of the server's connection limiter for
    its whole life: `:max-connections` and `:max-connections-per-ip` count
    TCP and QUIC connections together. Past either limit the Initial is
@@ -228,29 +227,38 @@ Handshaking connections are dropped at `:handshake-timeout`.
 
 ### Limits and timeouts
 
-- Flow control: `:http3-initial-max-data-bytes` (1 MiB, as HTTP/2's
-  connection window) is a hard bound on what quiche buffers per
-  connection, the per-stream windows (a quarter of it, 256 KiB by
-  default, as HTTP/2's) per stream: quiche's window autotuning is capped
-  at the configured values. A stream whose handler doesn't read can hold
-  only its stream window, so the connection's other requests still get
-  through. One stream uploads at most 256 KiB per round trip (about
-  5 MiB/s at 50 ms), a connection 1 MiB (about 20 MiB/s); on loopback
-  the windows are not the limit (a 32 MiB upload measured 200 to 370 MiB/s
-  with either the 1 MiB or a 4 MiB window, bound by the test client).
-  Raise them for large uploads over long round trips.
-- Native receive memory: what quiche buffers is native memory, outside
-  `:max-buffered-bytes`. `Http3Listener.nativeCreditBytes()` counts a
-  connection window per live connection, reserved at admission within
-  `:http3-max-native-bytes` (`maxNativeBytes()`); a connection whose
-  window would pass it is refused. By default the cap is the
-  `:max-buffered-bytes` limit (a quarter of the heap), so native receive
-  buffers are bounded like Java ones: with `-Xmx4g`, 1 GiB, 1024
-  connections at 1 MiB, whatever `:max-connections` allows. Unlimited
-  (0), the worst case is a window per connection: 10000 connections at
-  1 MiB is about 10 GiB. It is reached only by peers that keep sending
-  while the server stops reading their streams (bodies not read, budget
-  throttled), so size the window and the cap to the native memory
+- Flow control: connections start with `:http3-initial-max-data-bytes`
+  (512 KiB) of window, streams with half of it (256 KiB, HTTP/2's initial
+  stream window), so a stream whose handler doesn't read can't stall the
+  connection's other requests. With the patched libquiche of the release
+  builds (`native/enso_quiche/patches/`, `Quiche.RECV_WINDOW_CONTROL`),
+  windows autotune as quiche's do: a window doubles when the handler read
+  half of it within two round trips, a stream's up to
+  `:http3-max-window-bytes` (8 MiB, about 160 MiB/s at 50 ms), a
+  connection's up to twice that. On a stock libquiche (a distribution's
+  dynamic build) windows stay at their initial sizes: one stream uploads
+  at most 256 KiB per round trip (about 5 MiB/s at 50 ms), a connection
+  512 KiB.
+- Native receive memory: what quiche buffers is native memory, at most a
+  connection window of data per connection (plus its out-of-order
+  fragments' bookkeeping, at most about 1.5 MiB at the defaults with the
+  release builds' libquiche), charged to `:max-buffered-bytes` through
+  the connection's account. The initial window is charged while
+  the connection reads a request body (from the first body until no body
+  is being read). Each doubling of the connection window is reserved
+  before quiche may use it (once quiche autotuned the window to its
+  current bound and handlers read a window of body bytes since), skipped while the
+  account can't pay, and held until the connection goes, as HTTP/2's
+  connection credit. Stream windows need no reservation: the connection
+  window bounds what the peer may send on all streams. A connection
+  reading no body costs nothing: idle and GET-only connections don't limit
+  how many are admitted. The unpaid rest is the initial window, promised
+  in the handshake (as HTTP/2's initial 65535 octets), reachable only by a
+  peer sending data the server doesn't read while no body of the
+  connection is (out of order, or requests waiting for the connection's
+  buffered bodies to be read): at most 512 KiB per connection, 5 GiB for
+  the default 10000 connections (HTTP/2: 625 MiB), patched or not. Lower
+  the initial window or `:max-connections` where that native memory isn't
   available.
 - Header sections: `:max-header-bytes` (advertised as
   SETTINGS_MAX_FIELD_SECTION_SIZE) and `:max-header-fields`, as on the
@@ -390,10 +398,20 @@ make -C native/enso_quiche                  # → target/native/<os>-<arch>/libe
 clojure -T:build javac-bench                # optional: Netty+Jetty bench servers
 ```
 
+A stock libquiche lacks what the release builds add
+(`native/enso_quiche/patches/`): receive windows stay fixed, and the tests
+that need receive-window control are skipped. It also lacks the bound on
+out-of-order fragments (cloudflare/quiche#2814): a peer can make it hold
+about 75 times a connection's window (38 MiB at the default 512 KiB) with
+tiny gapped STREAM frames. Use it for development only; release shims
+link the patched libquiche (`check-shim.sh` refuses one without the
+patches). Build the shim as for a release (below) to run everything.
+
 ## Release / distributable build
 
-Static-link libquiche 0.29.3 into the shim so the resulting `.dylib`/`.so`
-has no runtime dep on system libquiche. Release CI
+Static-link libquiche 0.29.3, with the patches in
+`native/enso_quiche/patches/`, into the shim so the resulting
+`.dylib`/`.so` has no runtime dep on system libquiche. Release CI
 (`.github/workflows/release.yml`) does this across five platforms,
 packages each shim into its classifier jar (published with the core
 jar) and all of them into the fat jar (a run artifact only).

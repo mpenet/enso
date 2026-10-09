@@ -1,0 +1,250 @@
+ABOUTME: quiche patch applied by build-libquiche.sh: bound the fragments a stream buffers out of order
+ABOUTME: (cloudflare/quiche#2814; upstreamable as is, the diff starts below).
+
+Bound the out-of-order fragments a stream buffers
+
+RecvBuf keeps out-of-order stream data in one map entry per fragment,
+each costing about 100-150 bytes beyond its data. Fragments only count
+against flow control by the offsets they span, so a peer sending one-byte
+STREAM frames one byte apart, with the stream's first byte withheld, makes
+a receiver hold about 75 times its flow-control window, until the stream
+or connection goes: about 38 MiB for a 512 KiB connection window, from
+2 MiB of STREAM frames, measured with a counting allocator.
+
+Allow a stream MIN_FRAGMENTS (64) fragments, plus one per
+MIN_AVERAGE_FRAGMENT_LEN (256) bytes of the stream they span, gaps
+included; past that, a write fails with Error::FlowControl, closing the
+connection with FLOW_CONTROL_ERROR (the peer used more receive buffer than
+the advertised limits allow). Full-sized packets carry more than 1000
+bytes of stream data each, so a window buffered after any pattern of loss
+stays well within the bound. Past MIN_FRAGMENTS, small fragments that
+continue the previous one while earlier data is missing are coalesced
+into it, up to 2048 bytes, so a sender writing little at a time isn't
+refused after a loss.
+
+A stream's out-of-order buffer then costs at most its data plus
+(64 + span / 256) fragments, so a connection's at most its window plus
+(64 * streams + window / 256) fragments.
+
+diff --git a/quiche/src/stream/recv_buf.rs b/quiche/src/stream/recv_buf.rs
+index 738f2292..454073eb 100644
+--- a/quiche/src/stream/recv_buf.rs
++++ b/quiche/src/stream/recv_buf.rs
+@@ -41,6 +41,29 @@ use crate::flowcontrol;
+ 
+ use crate::range_buf::RangeBuf;
+ 
++/// Fragments a stream buffers whatever their size.
++///
++/// Out-of-order data is buffered in fragments that each cost memory beyond
++/// their bytes. Past this many, a stream may buffer one more fragment per
++/// `MIN_AVERAGE_FRAGMENT_LEN` bytes of the stream it spans (gaps included),
++/// so a peer sending tiny fragments separated by gaps can't make the
++/// buffer cost much more than its flow-control window.
++const MIN_FRAGMENTS: usize = 64;
++
++/// Stream bytes per fragment allowed past `MIN_FRAGMENTS`.
++///
++/// Frames of a full-sized packet carry more than 1000 bytes, so a window
++/// buffered after losses stays well within this.
++const MIN_AVERAGE_FRAGMENT_LEN: usize = 256;
++
++/// Largest fragment small contiguous fragments are coalesced into.
++///
++/// Past `MIN_FRAGMENTS`, small frames continuing the previous fragment
++/// while earlier data is missing (a sender writing little at a time, after
++/// a loss) are copied into it up to this size, so they don't count against
++/// `MIN_AVERAGE_FRAGMENT_LEN`.
++const MAX_COALESCED_LEN: usize = 2048;
++
+ /// Receive-side stream buffer.
+ ///
+ /// Stream data received by the peer is buffered in a list of data chunks
+@@ -188,16 +211,52 @@ impl RecvBuf {
+             self.len = cmp::max(self.len, buf.max_off());
+ 
+             if !self.drain {
+-                self.data.insert(buf.max_off(), buf);
++                self.insert(buf);
+             } else {
+                 // we are not storing any data, off == len
+                 self.off = self.len;
+             }
+         }
+ 
++        // Bound the memory fragments cost beyond their bytes.
++        let span = (self.len - self.off) as usize;
++        if self.data.len() > MIN_FRAGMENTS + span / MIN_AVERAGE_FRAGMENT_LEN {
++            return Err(Error::FlowControl);
++        }
++
+         Ok(())
+     }
+ 
++    /// Stores a buffer that doesn't overlap buffered data. Once the stream
++    /// holds `MIN_FRAGMENTS` fragments while earlier data is missing (nothing
++    /// can be read), it is coalesced into the previous fragment when both
++    /// are small and contiguous.
++    fn insert(&mut self, buf: RangeBuf) {
++        if self.data.len() >= MIN_FRAGMENTS &&
++            !buf.is_empty() &&
++            buf.len() < MAX_COALESCED_LEN / 2 &&
++            !self.ready()
++        {
++            // Fragments are keyed by their end offset.
++            if let Some(prev) = self.data.get(&buf.off()) {
++                if !prev.fin() && prev.len() + buf.len() <= MAX_COALESCED_LEN {
++                    let prev = self.data.remove(&buf.off()).unwrap();
++
++                    let mut data = Vec::with_capacity(prev.len() + buf.len());
++                    data.extend_from_slice(&prev);
++                    data.extend_from_slice(&buf);
++
++                    let merged = RangeBuf::from(&data, prev.off(), buf.fin());
++                    self.data.insert(merged.max_off(), merged);
++
++                    return;
++                }
++            }
++        }
++
++        self.data.insert(buf.max_off(), buf);
++    }
++
+     /// Reads contiguous data from the receive buffer.
+     ///
+     /// Data is written into the given `out` buffer, up to the length of `out`.
+@@ -489,6 +548,88 @@ mod tests {
+         assert_eq!(recv.emit_or_discard(action), Err(Error::Done));
+     }
+ 
++    #[test]
++    fn gapped_fragments_limited() {
++        let mut recv =
++            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++
++        // One-byte fragments, each followed by a one-byte gap, offset 0
++        // withheld: refused once there are more than MIN_FRAGMENTS of them.
++        for i in 0..MIN_FRAGMENTS as u64 {
++            let buf = RangeBuf::from(b"a", 1 + 2 * i, false);
++            assert_eq!(recv.write(buf), Ok(()));
++        }
++        assert_eq!(recv.data.len(), MIN_FRAGMENTS);
++
++        let buf = RangeBuf::from(b"a", 1 + 2 * MIN_FRAGMENTS as u64, false);
++        assert_eq!(recv.write(buf), Err(Error::FlowControl));
++    }
++
++    #[test]
++    fn gapped_fragments_allowed_by_span() {
++        let mut recv = RecvBuf::new(u64::MAX, 1 << 20, 1 << 20);
++
++        // Fragments covering MIN_AVERAGE_FRAGMENT_LEN bytes of stream each
++        // (gap included) are accepted however many there are.
++        let data = [42; MIN_AVERAGE_FRAGMENT_LEN - 1];
++        for i in 0..(4 * MIN_FRAGMENTS) as u64 {
++            let off = 1 + i * MIN_AVERAGE_FRAGMENT_LEN as u64;
++            assert_eq!(recv.write(RangeBuf::from(&data, off, false)), Ok(()));
++        }
++        assert_eq!(recv.data.len(), 4 * MIN_FRAGMENTS);
++    }
++
++    #[test]
++    fn heavy_reordering_accepted() {
++        let window = 8 * 1024 * 1024;
++        let mut recv = RecvBuf::new(window, window, window);
++
++        // A full window of 1200-byte frames, one in two lost, then the
++        // losses retransmitted.
++        let frame = [42; 1200];
++        let frames = window / 1200;
++        for i in (1..frames).step_by(2) {
++            let buf = RangeBuf::from(&frame, i * 1200, false);
++            assert_eq!(recv.write(buf), Ok(()));
++        }
++        for i in (0..frames).step_by(2) {
++            let buf = RangeBuf::from(&frame, i * 1200, false);
++            assert_eq!(recv.write(buf), Ok(()));
++        }
++
++        // A full window of 1200-byte frames buffered after a single loss.
++        let mut recv = RecvBuf::new(window, window, window);
++        for i in 1..frames {
++            let buf = RangeBuf::from(&frame, i * 1200, false);
++            assert_eq!(recv.write(buf), Ok(()));
++        }
++    }
++
++    #[test]
++    fn small_contiguous_fragments_coalesced() {
++        let mut recv =
++            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++
++        // After a loss, contiguous ten-byte frames are coalesced instead of
++        // each taking an entry, once MIN_FRAGMENTS are buffered.
++        let mut expected = vec![0; 10];
++        for i in 1..2000_u64 {
++            let data = [(i % 256) as u8; 10];
++            expected.extend_from_slice(&data);
++            assert_eq!(recv.write(RangeBuf::from(&data, i * 10, false)), Ok(()));
++        }
++        assert!(
++            recv.data.len() <=
++                MIN_FRAGMENTS + 20_000 / (MAX_COALESCED_LEN / 2) + 1
++        );
++
++        // The loss is recovered: everything reads back in order.
++        assert_eq!(recv.write(RangeBuf::from(&[0; 10], 0, false)), Ok(()));
++        let mut out = vec![0; 20_000];
++        assert_eq!(recv.emit(&mut out), Ok((20_000, false)));
++        assert_eq!(out, expected);
++    }
++
+     #[rstest]
+     fn empty_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+diff --git a/quiche/src/tests.rs b/quiche/src/tests.rs
+index b22be3a3..87f32906 100644
+--- a/quiche/src/tests.rs
++++ b/quiche/src/tests.rs
+@@ -1523,6 +1523,40 @@ fn flow_control_limit(
+     );
+ }
+ 
++#[rstest]
++/// Tests that a peer sending many tiny stream fragments separated by gaps is
++/// refused before they cost far more memory than their bytes.
++fn flow_control_gapped_fragments(
++    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
++) {
++    let mut buf = [0; 65535];
++
++    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
++    config.set_initial_max_data(1_000_000);
++    config.set_initial_max_stream_data_bidi_local(1_000_000);
++    config.set_initial_max_stream_data_bidi_remote(1_000_000);
++    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
++    assert_eq!(pipe.handshake(), Ok(()));
++
++    // One-byte fragments one byte apart, offset 0 withheld.
++    let mut off = 1;
++    let mut result = Ok(0);
++    while result.is_ok() && off < 10_000 {
++        let frames: Vec<frame::Frame> = (0..50)
++            .map(|i| frame::Frame::Stream {
++                stream_id: 0,
++                data: <RangeBuf>::from(b"a", off + 2 * i, false),
++            })
++            .collect();
++        off += 100;
++
++        result = pipe.send_pkt_to_server(Type::Short, &frames, &mut buf);
++    }
++
++    assert_eq!(result, Err(Error::FlowControl));
++    assert!(off < 1_000);
++}
++
+ #[rstest]
+ fn flow_control_limit_dup(
+     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,

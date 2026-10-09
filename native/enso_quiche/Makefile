@@ -8,7 +8,8 @@
 #                            # Requires QUICHE_LIB_DIR pointing at a directory
 #                            # containing libquiche.a (from `cargo build
 #                            # --release --lib --features ffi,pkg-config-meta`
-#                            # against cloudflare/quiche 0.29.3).
+#                            # against cloudflare/quiche 0.29.3, patched by
+#                            # build-libquiche.sh).
 #   make SANITIZE=1         # AddressSanitizer + UndefinedBehaviorSanitizer
 #                            # build for tests (combine with QUICHE_STATIC=1);
 #                            # see doc/testing.md for running a JVM against it.
@@ -108,7 +109,12 @@ WARN_CFLAGS := -Wall -Wextra -Wno-unused-parameter -Werror=format-security
 FORTIFY_CFLAGS := -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 HARDEN_CFLAGS = -fstack-protector-strong $(FORTIFY_CFLAGS) $(PLATFORM_CFLAGS) $(ARCH_CFLAGS)
 # JNIEXPORT marks the entry points visible; everything else stays hidden.
-SHIM_CFLAGS = -std=c11 -fPIC -fvisibility=hidden $(WARN_CFLAGS) $(HARDEN_CFLAGS) \
+# A libquiche built with patches/ declares the receive-window control
+# calls: linked directly then, looked up at run time otherwise (stock
+# libquiche, e.g. a distribution's dynamic build).
+RECV_WINDOW_CFLAGS := $(if $(shell grep -l quiche_conn_set_max_connection_window \
+  $(QUICHE_INCLUDE_DIR)/quiche.h 2>/dev/null),-DENSO_QUICHE_RECV_WINDOW)
+SHIM_CFLAGS = -std=c11 -fPIC -fvisibility=hidden $(WARN_CFLAGS) $(HARDEN_CFLAGS) $(RECV_WINDOW_CFLAGS) \
   -I$(JAVA_HOME)/include -I$(JNI_MD_INC) -I$(QUICHE_INCLUDE_DIR)
 
 ifdef SANITIZE
@@ -139,7 +145,7 @@ else
       -Wl,-rpath,$(QUICHE_LIB_DIR) -L$(QUICHE_LIB_DIR) -lquiche
   else
     SHIM_LDFLAGS := $(DYNAMIC_LINK_FLAG) $(EXPORT_FLAGS) $(HARDEN_LDFLAGS) -Wl,-rpath,'$$ORIGIN' \
-      -Wl,-rpath,$(QUICHE_LIB_DIR) -L$(QUICHE_LIB_DIR) -lquiche
+      -Wl,-rpath,$(QUICHE_LIB_DIR) -L$(QUICHE_LIB_DIR) -lquiche -ldl
   endif
 endif
 

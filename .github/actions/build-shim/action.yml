@@ -24,7 +24,7 @@ runs:
         # The whole checkout: build-libquiche.sh reuses it when its
         # .enso-build-key matches, and the header lives in the source tree.
         path: quiche-src
-        key: quiche-${{ steps.pins.outputs.QUICHE_COMMIT }}-${{ hashFiles('native/enso_quiche/quiche-Cargo.lock') }}-${{ steps.pins.outputs.RUST_TOOLCHAIN }}-${{ runner.os }}-${{ runner.arch }}
+        key: quiche-${{ steps.pins.outputs.QUICHE_COMMIT }}-${{ hashFiles('native/enso_quiche/quiche-Cargo.lock', 'native/enso_quiche/patches/*.patch') }}-${{ steps.pins.outputs.RUST_TOOLCHAIN }}-${{ runner.os }}-${{ runner.arch }}
 
     - name: Install Rust ${{ steps.pins.outputs.RUST_TOOLCHAIN }}
       if: steps.quiche-cache.outputs.cache-hit != 'true'

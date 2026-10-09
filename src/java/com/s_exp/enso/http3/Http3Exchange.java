@@ -90,6 +90,8 @@ final class Http3Exchange extends Http3Stream implements Runnable, SignalStack.N
     /** System.nanoTime the header section clock started (first request byte, or reading resumed), for :header-timeout. */
     long firstByteNanos;
     Http3BodyPipe pipe;
+    /** The body is being read: counted by the connection, which is charged its window meanwhile. */
+    boolean bodyInPlay;
     boolean readPaused;
 
     // ---- dispatch ----------------------------------------------------

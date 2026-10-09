@@ -61,7 +61,7 @@ public final class Quiche {
      * {@code target/native}, a classifier jar of another release) is
      * refused at load instead of failing on the first changed call.
      */
-    public static final int SHIM_ABI = 2;
+    public static final int SHIM_ABI = 3;
 
     /** System property naming the shim to load, bypassing every lookup. */
     static final String SHIM_PROPERTY = "enso.quiche.shim";
@@ -69,11 +69,21 @@ public final class Quiche {
     static final String TMPDIR_PROPERTY = "enso.quiche.tmpdir";
     static final String TMPDIR_ENV = "ENSO_QUICHE_TMPDIR";
 
+    /**
+     * Whether the loaded libquiche can raise a live connection's receive
+     * window ({@link QuicheConnection#setMaxConnectionWindow}) and report it
+     * ({@link QuicheConnection#connectionWindow}): added by the patches the
+     * release builds apply (native/enso_quiche/patches/), absent from a
+     * stock libquiche. Without it receive windows stay fixed.
+     */
+    public static final boolean RECV_WINDOW_CONTROL;
+
     static {
         loadLibrary();
         requireShimAbi(loadedShimAbi());
         requireLayout(loadedLayout());
         requireVersion(version());
+        RECV_WINDOW_CONTROL = recvWindowControl();
     }
 
     /**
@@ -456,6 +466,12 @@ public final class Quiche {
     static native byte[] connPeerCert(long conn);
     /** The path's smoothed round-trip time estimate, nanoseconds; -1 when unknown. */
     static native long connRttNanos(long conn);
+    /** Resolves the receive-window calls; see {@link #RECV_WINDOW_CONTROL}. */
+    static native boolean recvWindowControl();
+    /** Raises the connection window's autotuning bound; no-op without receive-window control. */
+    static native void connSetMaxConnectionWindow(long conn, long v);
+    /** The connection-level receive window; -1 without receive-window control. */
+    static native long connConnectionWindow(long conn);
 
     // -----------------------------------------------------------------
     // Streams

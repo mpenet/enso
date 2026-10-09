@@ -152,6 +152,11 @@
             #":port 0"]
            [#(doto ^com.s_exp.enso.api.Config$Builder % (.sslContext @ssl) (.http2 true) (.http2InitialWindowBytes 1000))
             #":http2-initial-window-bytes must be in \[65535, 2147483647\]"]
+           [#(doto ^com.s_exp.enso.api.Config$Builder % (.sslContext @ssl) (.http2 true) (.http2MaxWindowBytes 1000))
+            #":http2-max-window-bytes must be in \[65535, 2147483647\]"]
+           [#(doto ^com.s_exp.enso.api.Config$Builder % (.sslContext @ssl) (.http2 true) (.http2InitialWindowBytes 1048576)
+                   (.http2MaxWindowBytes 524288))
+            #":http2-max-window-bytes must be >= :http2-initial-window-bytes"]
            [#(doto ^com.s_exp.enso.api.Config$Builder % (.maxConnections 10) (.maxConnectionsPerIp 20))
             #":max-connections-per-ip must be <= :max-connections"]
            [#(.serverHeader ^com.s_exp.enso.api.Config$Builder % " enso")

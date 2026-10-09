@@ -33,7 +33,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@link MemoryBudget.Account}: under pressure a connection over its fair
  * share stops first). Buffered bytes are charged to both until read or
  * discarded. quiche itself holds at most a connection window more
- * (native memory, counted by {@code Http3Listener.nativeCreditBytes()}).
+ * (native memory), charged to the account while the connection reads a
+ * body ({@code Http3Connection.bodyStarted}).
  *
  * <p>Failures a reader sees: over {@code :max-request-body-bytes} a
  * {@link RequestBodyException} (413), no byte within {@code :read-timeout}

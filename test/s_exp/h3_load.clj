@@ -1,16 +1,16 @@
 ;; ABOUTME: Lean HTTP/3 load generator for the perf harness: one platform thread per QUIC connection,
-;; ABOUTME: batched UDP through the enso shim, a fixed number of GETs in flight per connection.
+;; ABOUTME: batched UDP through the enso shim, a fixed number of GETs (or uploads) in flight per connection.
 (ns s-exp.h3-load
   "Closed-loop HTTP/3 load: `connections` QUIC connections (quiche client
   through the enso JNI shim), each on its own platform thread, keeping
   `in-flight` requests open. A request is one HEADERS frame with FIN; it
   completes when the response stream's FIN arrives. Latency is measured
-  per request from its send to that FIN."
+  per request from its send to that FIN. `upload` POSTs bodies over one
+  connection instead."
   (:import (com.s_exp.enso.quiche NativeBuffer QuicheConfig QuicheConnection Quiche Records UdpSocket
                                   UdpSocket$Waker)
            (com.s_exp.enso.http3.qpack QpackFieldSection)
            (java.net InetAddress InetSocketAddress)
-           (java.nio ByteBuffer)
            (java.security SecureRandom)
            (java.util.concurrent.atomic AtomicBoolean AtomicLong)
            (org.HdrHistogram Histogram)))
@@ -181,27 +181,40 @@
        :rps (Math/round (/ (* 1e9 (.get done)) (double elapsed)))
        :hist hist})))
 
-;; ---- many idle connections ---------------------------------------------------
+;; ---- uploads -------------------------------------------------------------------
 
-(defn- dcid-key
-  "The destination connection id of the datagram at slab[off, off + len) as
-  a string key (client ids are 16 bytes)."
-  ^String [^ByteBuffer b ^long off ^long len]
-  (let [long-header (neg? (.get b (int off)))
-        start (if long-header (+ off 6) (+ off 1))
-        n (if long-header (bit-and (.get b (int (+ off 5))) 0xff) 16)
-        bs (byte-array n)]
-    (when (<= (+ start n) (+ off len))
-      (.get b (int start) bs)
-      (String. bs java.nio.charset.StandardCharsets/ISO_8859_1))))
+(defn- post-prefix
+  "HEADERS of a POST to `path` with a `n`-byte body, then the header of the
+  one DATA frame carrying it."
+  ^bytes [^String path ^long n]
+  (let [^bytes h (frame 0x01 (QpackFieldSection/encode ^Iterable (mapv #(into-array String %)
+                                                                       [[":method" "POST"] [":scheme" "https"]
+                                                                        [":authority" "localhost"] [":path" path]
+                                                                        ["content-length" (str n)]
+                                                                        ["user-agent" "enso-h3-load"]])))
+        ^bytes t (varint 0x00)
+        ^bytes l (varint n)
+        out (byte-array (+ (alength h) (alength t) (alength l)))]
+    (System/arraycopy h 0 out 0 (alength h))
+    (System/arraycopy t 0 out (alength h) (alength t))
+    (System/arraycopy l 0 out (+ (alength h) (alength t)) (alength l))
+    out))
 
-(defn storm
-  "Opens `n` QUIC connections to `port` from one UDP socket and one thread,
-  completing each handshake (`step` at a time); returns
-  {:established :close! (fn)} once done. The connections then stay idle."
-  [^long port ^long n {:keys [step] :or {step 200}}]
-  (let [cfg (QuicheConfig/client 0)
-        sock (UdpSocket/open (InetAddress/getByName "127.0.0.1") 0 0 (* 8 1024 1024) (* 8 1024 1024))
+(defn upload
+  "Closed-loop uploads over one QUIC connection to `port`: `streams` POSTs
+  of `body-bytes` zero bytes to `path` in flight, for `ms` milliseconds,
+  each body sent as fast as flow control allows. Returns {:requests :rps
+  :hist}; a request completes when its response's FIN arrives, its
+  latency measured from its first byte sent."
+  [^long port {:keys [streams body-bytes ms path] :or {streams 1 path "/upload"}}]
+  (let [streams (long streams)
+        body-bytes (long body-bytes)
+        ^bytes prefix (post-prefix path body-bytes)
+        total (+ (alength prefix) body-bytes)
+        ^bytes zeros (byte-array 65536)
+        hist (Histogram. 3600000000000 3)
+        cfg (QuicheConfig/client 30000)
+        sock (UdpSocket/open (InetAddress/getByName "127.0.0.1") 0 0 (* 4 1024 1024) (* 4 1024 1024))
         waker (UdpSocket$Waker.)
         local ^InetSocketAddress (.localAddress sock)
         server (InetSocketAddress. "127.0.0.1" (int port))
@@ -209,57 +222,108 @@
                 (Records/putAddress (.-buffer b) 0 local)
                 (Records/putAddress (.-buffer b) Records/ADDR_LEN server)
                 b)
-        rnd (SecureRandom.)
-        conns (java.util.HashMap.)
+        scid (let [b (byte-array 16)] (.nextBytes (SecureRandom.) b) b)
+        conn (QuicheConnection/connect cfg "localhost" scid addrs 0 Records/ADDR_LEN)
         rslab (NativeBuffer/allocate (* slot batch))
         rmeta (NativeBuffer/allocate (* Records/RECV_META_LEN (inc batch)))
         rm (.-buffer rmeta)
         sslab (NativeBuffer/allocate (* max-payload 64))
         smeta (NativeBuffer/allocate (+ Records/SEND_HEADER_LEN (* 64 Records/SEND_META_LEN)))
-        sm (.-buffer smeta)]
+        sm (.-buffer smeta)
+        scratch (byte-array 65536)
+        ;; stream id -> long-array [bytes sent, start nanos]
+        open (java.util.HashMap.)
+        next-sid (long-array 1)
+        done (AtomicLong.)]
     (.localAddress sock rmeta (* batch Records/RECV_META_LEN))
-    (letfn [(flush! [^QuicheConnection conn]
+    (letfn [(flush! []
               (loop [count 0 off 0]
-                (let [rec (+ Records/SEND_HEADER_LEN (* count Records/SEND_META_LEN))
-                      n (if (< count 64) (.send conn sslab off max-payload smeta rec) -1)]
+                (if (< count 64)
+                  (let [rec (+ Records/SEND_HEADER_LEN (* count Records/SEND_META_LEN))
+                        n (.send conn sslab off max-payload smeta rec)]
+                    (if (pos? n)
+                      (do (.putInt sm (int (+ rec Records/SEND_OFF)) (int off))
+                          (.putInt sm (int (+ rec Records/SEND_LEN)) (int n))
+                          (recur (inc count) (+ off n)))
+                      (when (pos? count) (.sendBatch sock sslab smeta count 0))))
+                  (do (.sendBatch sock sslab smeta count 0) (recur 0 0)))))
+            (receive! []
+              (loop [total 0]
+                (let [n (.recvBatch sock rslab slot batch rmeta)]
                   (if (pos? n)
-                    (do (.putInt sm (int (+ rec Records/SEND_OFF)) (int off))
-                        (.putInt sm (int (+ rec Records/SEND_LEN)) (int n))
-                        (recur (inc count) (+ off n)))
-                    (when (pos? count) (.sendBatch sock sslab smeta count 0))))))
-            (pump! [^long ms]
-              (let [deadline (+ (System/currentTimeMillis) ms)]
+                    (do (dotimes [i n]
+                          (let [rec (* i Records/RECV_META_LEN)]
+                            (.recv conn rslab (int (* i slot)) (.getInt rm (int (+ rec Records/RECV_LEN)))
+                                   rmeta (+ rec Records/RECV_PEER) (+ rec Records/RECV_LOCAL))))
+                        (if (= n batch) (recur (+ total n)) (+ total n)))
+                    total))))
+            (open! []
+              (while (< (.size open) streams)
+                (let [sid (aget next-sid 0)]
+                  (.put open sid (long-array [0 (System/nanoTime)]))
+                  (aset next-sid 0 (+ sid 4)))))
+            (push! []
+              ;; Sends what flow control allows of every body still being sent.
+              (doseq [[sid ^longs st] open]
                 (loop []
-                  (.poll waker sock nil false 5000000)
-                  (let [touched (java.util.HashSet.)]
+                  (let [sent (aget st 0)]
+                    (when (< sent total)
+                      (let [rc (if (< sent (alength prefix))
+                                 (.streamSend conn sid prefix (int sent) (int (- (alength prefix) sent)) false)
+                                 (let [n (min (alength zeros) (- total sent))]
+                                   (.streamSend conn sid zeros 0 (int n) (= (+ sent n) total))))]
+                        (when (pos? rc)
+                          (aset st 0 (+ sent rc))
+                          (recur))))))))
+            (read! []
+              (loop []
+                (let [sid (.readableNext conn)]
+                  (when (>= sid 0)
                     (loop []
-                      (let [k (.recvBatch sock rslab slot batch rmeta)]
-                        (when (pos? k)
-                          (dotimes [i k]
-                            (let [rec (* i Records/RECV_META_LEN)
-                                  len (.getInt rm (int (+ rec Records/RECV_LEN)))
-                                  key (dcid-key (.-buffer rslab) (* i slot) len)
-                                  ^QuicheConnection c (when key (.get conns key))]
-                              (when c
-                                (.recv c rslab (int (* i slot)) len rmeta (+ rec Records/RECV_PEER) (+ rec Records/RECV_LOCAL))
-                                (.add touched c))))
-                          (when (= k batch) (recur)))))
-                    (doseq [^QuicheConnection c touched] (flush! c)))
-                  (when (< (System/currentTimeMillis) deadline) (recur)))))]
-      (loop [opened 0]
-        (when (< opened n)
-          (let [k (min (long step) (- n opened))]
-            (dotimes [_ k]
-              (let [scid (let [b (byte-array 16)] (.nextBytes rnd b) b)
-                    c (QuicheConnection/connect cfg "localhost" scid addrs 0 Records/ADDR_LEN)]
-                (.put conns (String. scid java.nio.charset.StandardCharsets/ISO_8859_1) c)
-                (flush! c)))
-            (pump! 300)
-            (recur (+ opened k)))))
-      (pump! 1000)
-      {:established (count (filter #(.isEstablished ^QuicheConnection %) (vals conns)))
-       :close! (fn []
-                 (doseq [^QuicheConnection c (vals conns)]
-                   (when-not (.isClosed c) (.close c true 0x100 (byte-array 0)) (flush! c))
-                   (.free c))
-                 (.close cfg) (.close waker) (.close sock))})))
+                      (let [rc (.streamRecv conn sid scratch 0 (alength scratch))]
+                        (cond
+                          (and (>= rc 0) (odd? rc))
+                          (when-let [^longs st (.remove open sid)]
+                            (.incrementAndGet done)
+                            (.recordValue hist (max 1 (- (System/nanoTime) (aget st 1)))))
+                          (>= rc 0) (recur)
+                          (not= rc Quiche/QUICHE_ERR_DONE)
+                          (when (.remove open sid)
+                            (throw (ex-info "h3 upload: stream reset" {:stream sid}))))))
+                    (recur)))))]
+      (try
+        (flush!)
+        (let [deadline (+ (System/nanoTime) 5000000000)]
+          (while (and (not (.isEstablished conn)) (< (System/nanoTime) deadline))
+            (let [t (.timeoutNanos conn)]
+              (.poll waker sock nil false (if (neg? t) 10000000 (min t 10000000))))
+            (when (zero? (receive!)) (when (zero? (.timeoutNanos conn)) (.onTimeout conn)))
+            (flush!)))
+        (when-not (.isEstablished conn) (throw (ex-info "h3 upload: handshake failed" {:port port})))
+        (.streamSend conn 2 (byte-array [0x00 0x04 0x00]) 0 3 false)
+        (.streamSend conn 6 (byte-array [0x02]) 0 1 false)
+        (.streamSend conn 10 (byte-array [0x03]) 0 1 false)
+        (let [t0 (System/nanoTime)
+              end (+ t0 (* 1000000 (long ms)))]
+          (while (and (< (System/nanoTime) end) (not (.isClosed conn)))
+            (open!)
+            (push!)
+            (flush!)
+            (let [t (.timeoutNanos conn)]
+              (when (zero? (receive!))
+                (.poll waker sock nil false (if (neg? t) 1000000 (min t 1000000)))
+                (when (zero? (receive!))
+                  (when (zero? (.timeoutNanos conn)) (.onTimeout conn)))))
+            (read!))
+          (when (.isClosed conn) (throw (ex-info "h3 upload: connection closed" {:port port})))
+          {:requests (.get done)
+           :rps (/ (* 1e9 (.get done)) (double (- (System/nanoTime) t0)))
+           :hist hist})
+        (finally
+          (when-not (.isClosed conn)
+            (.close conn true 0x100 (byte-array 0))
+            (flush!))
+          (.free conn)
+          (.close cfg)
+          (.close waker)
+          (.close sock))))))

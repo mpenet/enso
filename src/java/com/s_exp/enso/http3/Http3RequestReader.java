@@ -226,11 +226,11 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
             conn.quiche.streamShutdown(ex.id, Quiche.QUICHE_SHUTDOWN_WRITE,
                 Http3ConnectionException.H3_REQUEST_INCOMPLETE);
             ex.sendClosed = true;
-            ex.readPhase = Http3Exchange.READ_DONE;
+            conn.readDone(ex);
             conn.finish(ex, now);
             return;
         }
-        ex.readPhase = Http3Exchange.READ_DONE;
+        conn.readDone(ex);
         if (ex.pipe != null) ex.pipe.signalTruncated();
         if (conn.quiche.streamCapacity(ex.id) < 0) {
             // STOP_SENDING too: the request is cancelled (RFC 9114 §4.1.1).
@@ -418,6 +418,7 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
         // No pipe: the request's body isn't consumed (a 501 answered without
         // a handler, or the response already went out).
         if (pipe == null || len == 0) return;
+        conn.bodyBytesRead += len;
         int r = pipe.offer(b, off, len);
         if (r == Http3BodyPipe.OVER_DECLARED_LENGTH) {
             throw malformed(ex, "body longer than content-length");
@@ -438,7 +439,7 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
             conn.quiche.streamShutdown(ex.id, Quiche.QUICHE_SHUTDOWN_WRITE,
                 Http3ConnectionException.H3_REQUEST_INCOMPLETE);
             ex.sendClosed = true;
-            ex.readPhase = Http3Exchange.READ_DONE;
+            conn.readDone(ex);
             conn.finish(ex, now);
             return;
         }
@@ -447,7 +448,7 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
             if (!pipe.matchesDeclaredLength()) throw malformed(ex, "body shorter than content-length");
             pipe.signalEnd();
         }
-        ex.readPhase = Http3Exchange.READ_DONE;
+        conn.readDone(ex);
         conn.maybeFinish(ex, now);
     }
 
@@ -595,6 +596,7 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
             ex.pipe = new Http3BodyPipe(maxBody, contentLength, conn.config.readTimeoutMillis,
                 conn.config.minDataRateBytes, conn.config.minDataRateGraceMillis,
                 conn.account(), conn.bodyBudget());
+            conn.bodyStarted(ex);
             body = continuePending ? new ContinueOnRead(ex, ex.pipe.inputStream()) : ex.pipe.inputStream();
             ex.continuePending = continuePending;
         }

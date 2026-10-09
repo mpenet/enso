@@ -97,6 +97,8 @@ public final class Config {
     public final boolean http2c;
     public final int http2MaxConcurrentStreams;
     public final int http2InitialWindowBytes;
+    /** Most a stream's receive window grows to; the connection's grows to twice this. */
+    public final int http2MaxWindowBytes;
     public final int http2MaxFrameBytes;
     /** RST_STREAM frames per connection per 30 s (CVE-2023-44487); 0 disables. */
     public final int http2StreamResetLimit;
@@ -109,21 +111,21 @@ public final class Config {
     public final String http3CertPath;
     public final String http3KeyPath;
     public final long http3InitialMaxDataBytes;
-    /**
-     * Receive credit quiche may hold natively across connections (a
-     * connection window each): a new connection is refused while its
-     * window would pass it. -1 → the {@link #maxBufferedBytes} limit (at
-     * least one window); 0 = unlimited.
-     */
-    public final long http3MaxNativeBytes;
     public final int http3InitialMaxStreamsBidi;
     public final int http3InitialMaxStreamsUni;
     public final int http3MaxUdpPayloadBytes;
     public final boolean http3StatelessRetry;
-    /** -1 → a quarter of the initial max data (the connection window). */
+    /** -1 → half the initial max data (the connection window). */
     public final long http3InitialMaxStreamDataBidiLocalBytes;
     public final long http3InitialMaxStreamDataBidiRemoteBytes;
     public final long http3InitialMaxStreamDataUniBytes;
+    /**
+     * Most a stream's receive window autotunes to; a connection's window
+     * grows to twice this, as far as {@link #maxBufferedBytes} pays. Needs
+     * a libquiche with receive-window control; windows stay at their
+     * initial sizes otherwise.
+     */
+    public final long http3MaxWindowBytes;
     /** -1 → quiche default. */
     public final int http3AckDelayExponent;
     /** -1 → quiche default. Milliseconds, as the transport parameter. */
@@ -222,6 +224,7 @@ public final class Config {
         this.http2c = b.http2c;
         this.http2MaxConcurrentStreams = b.http2MaxConcurrentStreams;
         this.http2InitialWindowBytes = b.http2InitialWindowBytes;
+        this.http2MaxWindowBytes = b.http2MaxWindowBytes;
         this.http2MaxFrameBytes = b.http2MaxFrameBytes;
         this.http2StreamResetLimit = b.http2StreamResetLimit;
         this.http2ContinuationLimit = b.http2ContinuationLimit;
@@ -230,7 +233,6 @@ public final class Config {
         this.http3CertPath = b.http3CertPath;
         this.http3KeyPath = b.http3KeyPath;
         this.http3InitialMaxDataBytes = b.http3InitialMaxDataBytes;
-        this.http3MaxNativeBytes = b.http3MaxNativeBytes;
         this.http3InitialMaxStreamsBidi = b.http3InitialMaxStreamsBidi;
         this.http3InitialMaxStreamsUni = b.http3InitialMaxStreamsUni;
         this.http3MaxUdpPayloadBytes = b.http3MaxUdpPayloadBytes;
@@ -238,6 +240,7 @@ public final class Config {
         this.http3InitialMaxStreamDataBidiLocalBytes = b.http3InitialMaxStreamDataBidiLocalBytes;
         this.http3InitialMaxStreamDataBidiRemoteBytes = b.http3InitialMaxStreamDataBidiRemoteBytes;
         this.http3InitialMaxStreamDataUniBytes = b.http3InitialMaxStreamDataUniBytes;
+        this.http3MaxWindowBytes = b.http3MaxWindowBytes;
         this.http3AckDelayExponent = b.http3AckDelayExponent;
         this.http3MaxAckDelay = b.http3MaxAckDelay;
         this.http3ActiveConnectionIdLimit = b.http3ActiveConnectionIdLimit;
@@ -313,6 +316,8 @@ public final class Config {
         // 256 KiB per stream, so a 1 MiB connection window (Go's and
         // Kestrel's): see :http2-initial-window-bytes.
         private int http2InitialWindowBytes = 256 * 1024;
+        // Windows grow from there as handlers keep up: see :http2-max-window-bytes.
+        private int http2MaxWindowBytes = 8 * 1024 * 1024;
         private int http2MaxFrameBytes = 1 << 14;        // 16 KiB
         // nginx's post-CVE-2023-44487 default.
         private int http2StreamResetLimit = 400;
@@ -321,10 +326,9 @@ public final class Config {
         private int http3Port = 0;
         private String http3CertPath;
         private String http3KeyPath;
-        // Connection window: also bounds the unread request-body bytes
-        // quiche buffers per connection (its autotuning is capped at it).
-        private long http3InitialMaxDataBytes = 1L << 20; // 1 MiB
-        private long http3MaxNativeBytes = -1;
+        // Initial connection window: also bounds the unread request-body
+        // bytes a connection's pipes hold; growth past it is paid for.
+        private long http3InitialMaxDataBytes = 512L * 1024;
         private int http3InitialMaxStreamsBidi = 100;
         private int http3InitialMaxStreamsUni = 8;
         private int http3MaxUdpPayloadBytes = 1350;
@@ -332,6 +336,7 @@ public final class Config {
         private long http3InitialMaxStreamDataBidiLocalBytes = -1;
         private long http3InitialMaxStreamDataBidiRemoteBytes = -1;
         private long http3InitialMaxStreamDataUniBytes = -1;
+        private long http3MaxWindowBytes = 8L * 1024 * 1024;
         private int http3AckDelayExponent = -1;
         private int http3MaxAckDelay = -1;
         private int http3ActiveConnectionIdLimit = -1;
@@ -390,6 +395,7 @@ public final class Config {
         public Builder http2c(boolean v) { this.http2c = v; return this; }
         public Builder http2MaxConcurrentStreams(int v) { this.http2MaxConcurrentStreams = v; return this; }
         public Builder http2InitialWindowBytes(int v) { this.http2InitialWindowBytes = v; return this; }
+        public Builder http2MaxWindowBytes(int v) { this.http2MaxWindowBytes = v; return this; }
         public Builder http2MaxFrameBytes(int v) { this.http2MaxFrameBytes = v; return this; }
         public Builder http2StreamResetLimit(int v) { this.http2StreamResetLimit = v; return this; }
         public Builder http2ContinuationLimit(int v) { this.http2ContinuationLimit = v; return this; }
@@ -398,7 +404,6 @@ public final class Config {
         public Builder http3CertPath(String v) { this.http3CertPath = v; return this; }
         public Builder http3KeyPath(String v) { this.http3KeyPath = v; return this; }
         public Builder http3InitialMaxDataBytes(long v) { this.http3InitialMaxDataBytes = v; return this; }
-        public Builder http3MaxNativeBytes(long v) { this.http3MaxNativeBytes = v; return this; }
         public Builder http3InitialMaxStreamsBidi(int v) { this.http3InitialMaxStreamsBidi = v; return this; }
         public Builder http3InitialMaxStreamsUni(int v) { this.http3InitialMaxStreamsUni = v; return this; }
         public Builder http3MaxUdpPayloadBytes(int v) { this.http3MaxUdpPayloadBytes = v; return this; }
@@ -406,6 +411,7 @@ public final class Config {
         public Builder http3InitialMaxStreamDataBidiLocalBytes(long v) { this.http3InitialMaxStreamDataBidiLocalBytes = v; return this; }
         public Builder http3InitialMaxStreamDataBidiRemoteBytes(long v) { this.http3InitialMaxStreamDataBidiRemoteBytes = v; return this; }
         public Builder http3InitialMaxStreamDataUniBytes(long v) { this.http3InitialMaxStreamDataUniBytes = v; return this; }
+        public Builder http3MaxWindowBytes(long v) { this.http3MaxWindowBytes = v; return this; }
         public Builder http3AckDelayExponent(int v) { this.http3AckDelayExponent = v; return this; }
         public Builder http3MaxAckDelay(int v) { this.http3MaxAckDelay = v; return this; }
         public Builder http3ActiveConnectionIdLimit(int v) { this.http3ActiveConnectionIdLimit = v; return this; }
@@ -558,6 +564,12 @@ public final class Config {
             // RFC 9113 §6.9.2 caps windows at 2^31-1. Below the 65535
             // default a peer's first request body would stall on credit.
             requireRange(":http2-initial-window-bytes", http2InitialWindowBytes, 65_535, Integer.MAX_VALUE);
+            requireRange(":http2-max-window-bytes", http2MaxWindowBytes, 65_535, Integer.MAX_VALUE);
+            if (http2MaxWindowBytes < http2InitialWindowBytes) {
+                throw invalid(":http2-max-window-bytes", http2MaxWindowBytes,
+                              ":http2-max-window-bytes must be >= :http2-initial-window-bytes ("
+                                  + http2InitialWindowBytes + "), got " + http2MaxWindowBytes);
+            }
             // RFC 9113 §4.2 / §6.5.2: SETTINGS_MAX_FRAME_SIZE ∈ [16384, 16777215].
             requireRange(":http2-max-frame-bytes", http2MaxFrameBytes, 16_384, 16_777_215);
             requireAtLeast(":http2-stream-reset-limit", http2StreamResetLimit, 0);
@@ -590,16 +602,6 @@ public final class Config {
                 throw invalid(":http3-initial-max-data-bytes", http3InitialMaxDataBytes,
                               ":http3-initial-max-data-bytes must be >= 0, got " + http3InitialMaxDataBytes);
             }
-            if (http3MaxNativeBytes < -1) {
-                throw invalid(":http3-max-native-bytes", http3MaxNativeBytes,
-                              ":http3-max-native-bytes must be >= -1, got " + http3MaxNativeBytes);
-            }
-            if (http3MaxNativeBytes > 0 && http3MaxNativeBytes < http3InitialMaxDataBytes) {
-                throw invalid(":http3-max-native-bytes", http3MaxNativeBytes,
-                              ":http3-max-native-bytes must hold one connection window"
-                                  + " (:http3-initial-max-data-bytes " + http3InitialMaxDataBytes + "), got "
-                                  + http3MaxNativeBytes);
-            }
             requireAtLeast(":http3-initial-max-streams-bidi", http3InitialMaxStreamsBidi, 1);
             // Control + QPACK encoder + QPACK decoder.
             requireAtLeast(":http3-initial-max-streams-uni", http3InitialMaxStreamsUni, 3);
@@ -612,6 +614,14 @@ public final class Config {
                                         http3InitialMaxStreamDataBidiRemoteBytes);
             requireDerivedOrNonNegative(":http3-initial-max-stream-data-uni-bytes",
                                         http3InitialMaxStreamDataUniBytes);
+            long streamWindows = Math.max(http3StreamWindow(http3InitialMaxStreamDataBidiLocalBytes),
+                Math.max(http3StreamWindow(http3InitialMaxStreamDataBidiRemoteBytes),
+                         http3StreamWindow(http3InitialMaxStreamDataUniBytes)));
+            if (http3MaxWindowBytes < streamWindows) {
+                throw invalid(":http3-max-window-bytes", http3MaxWindowBytes,
+                              ":http3-max-window-bytes must be >= the per-stream initial windows ("
+                                  + streamWindows + "), got " + http3MaxWindowBytes);
+            }
             // RFC 9000 §18.2 transport parameter ranges.
             if (http3AckDelayExponent != -1) {
                 requireRange(":http3-ack-delay-exponent", http3AckDelayExponent, 0, 20);
@@ -634,6 +644,10 @@ public final class Config {
         /** {@code option}: the option's keyword as written, e.g. ":port". */
         private static InvalidOptionException invalid(String option, Object value, String message) {
             return new InvalidOptionException(option.substring(1), value, message);
+        }
+
+        private long http3StreamWindow(long configured) {
+            return configured >= 0 ? configured : http3InitialMaxDataBytes / 2;
         }
 
         private static void requireDerivedOrNonNegative(String option, long v) {

@@ -336,10 +336,17 @@
 
 (defn- write-frame! [{:keys [^java.io.OutputStream out]} type flags sid ^bytes payload]
   (let [len (alength payload)
-        hdr (raw-bytes [(bit-shift-right len 16) (bit-shift-right len 8) len
-                        type flags
-                        (bit-shift-right sid 24) (bit-shift-right sid 16)
-                        (bit-shift-right sid 8) sid])]
+        sid (long sid)
+        hdr (byte-array 9)]
+    (aset hdr 0 (unchecked-byte (bit-shift-right len 16)))
+    (aset hdr 1 (unchecked-byte (bit-shift-right len 8)))
+    (aset hdr 2 (unchecked-byte len))
+    (aset hdr 3 (unchecked-byte (long type)))
+    (aset hdr 4 (unchecked-byte (long flags)))
+    (aset hdr 5 (unchecked-byte (bit-shift-right sid 24)))
+    (aset hdr 6 (unchecked-byte (bit-shift-right sid 16)))
+    (aset hdr 7 (unchecked-byte (bit-shift-right sid 8)))
+    (aset hdr 8 (unchecked-byte sid))
     (locking out
       (.write out hdr)
       (.write out payload)
@@ -2882,6 +2889,12 @@
         (is (some? s) "the finished stream, not yet forgotten")
         (is (nil? (some-> s (field-of "ring"))) "its ring is gone")))))
 
+(defn- body-capacity
+  "Bytes of buffer a request body holds: its own ring and its pooled segments."
+  [body]
+  (+ (if-let [^bytes ring (field-of body "ring")] (alength ring) 0)
+     (* 65536 (long (field-of body "segmentCount")))))
+
 (deftest h2-drained-request-body-gives-back-its-buffer
   ;; The request body ring grows with what the peer sends ahead of the
   ;; handler (up to the stream window, 1 MiB here). Once the handler
@@ -2906,8 +2919,8 @@
         (is (.await drained 5 TimeUnit/SECONDS))
         (let [streams (field-of (server-h2-connection srv) "streams")
               s (first (filter some? (field-of streams "values")))
-              ring (field-of (field-of s "body") "ring")]
-          (is (or (nil? ring) (>= 16384 (alength ^bytes ring))) "the grown ring was given back"))
+              capacity (body-capacity (field-of s "body"))]
+          (is (>= 16384 capacity) "the burst's buffers were given back"))
         (.countDown finish)
         (send-data! conn 1 1000 true)
         (is (= "1000" (body-on (let [seen (atom [])] (read-until conn (end-stream-on 1) seen) @seen) 1))
@@ -3113,6 +3126,288 @@
                 (let [seen (atom [])]
                   (read-until conn #(pos? (conn-credit [%])) seen 3000)
                   (is (pos? (conn-credit @seen)) "more once the other connection's bodies were read"))))))))))
+
+;; ---- Receive window autotuning ---------------------------------------------------
+
+(defn- ack-settings-after!
+  "Waits for the server's SETTINGS and acknowledges it `delay-ms` later:
+  the round trip the server measures first."
+  [conn delay-ms]
+  (read-until conn #(and (= frame-settings (:type %)) (zero? (bit-and 0x1 (:flags %)))))
+  (Thread/sleep (long delay-ms))
+  (write-frame! conn frame-settings 0x1 0 (byte-array 0)))
+
+(def ^:private zero-frame (byte-array 16384))
+
+(defn- send-within-credit!
+  "Sends `body` (a byte array, or nil for `n` zero bytes) on `sid` as DATA
+  frames, the last one with END_STREAM when `end-stream`, never past the
+  credit the server granted: the stream window from `stream-window`, the
+  connection's from `conn-window`. Returns the most credit each window
+  held at once (:stream, :conn), the credit left at the end (:stream-left,
+  :conn-left) and the frames seen."
+  [conn sid ^bytes body n stream-window conn-window end-stream]
+  (let [seen (atom [])
+        n (long (if body (alength body) n))]
+    (loop [left n sw (long stream-window) cw (long conn-window) max-sw sw max-cw cw]
+      (if (zero? left)
+        {:stream max-sw :conn max-cw :stream-left sw :conn-left cw :frames @seen}
+        (let [chunk (min left 16384 sw cw)]
+          (if (pos? chunk)
+            (let [off (- n left)
+                  payload (cond body (java.util.Arrays/copyOfRange body (int off) (int (+ off chunk)))
+                                (= chunk 16384) zero-frame
+                                :else (byte-array chunk))]
+              (write-frame! conn frame-data (if (and end-stream (= chunk left)) flag-end-stream 0) sid payload)
+              (recur (- left chunk) (- sw chunk) (- cw chunk) max-sw max-cw))
+            (let [f (or (read-frame conn 5000) (throw (ex-info "no credit" {:left left})))
+                  credit (if (= frame-window-update (:type f)) (u32 (:payload f) 0) 0)
+                  sw (if (= sid (:sid f)) (+ sw credit) sw)
+                  cw (if (zero? (:sid f)) (+ cw credit) cw)]
+              (swap! seen conj f)
+              (recur left sw cw (max max-sw sw) (max max-cw cw)))))))))
+
+(defn- upload-within-credit!
+  "Sends `n` zero bytes on `sid` as DATA frames, the last one with
+  END_STREAM, within the credit granted (see send-within-credit!); the
+  connection credit starts at `conn-window` (default 65535, a fresh
+  connection's)."
+  ([conn sid n stream-window] (upload-within-credit! conn sid n stream-window 65535))
+  ([conn sid n stream-window conn-window]
+   (send-within-credit! conn sid nil n stream-window conn-window true)))
+
+(defn- draining-handler
+  "Reads the whole body, then delivers the stream's receive window size to `window`."
+  [window]
+  (fn [req]
+    (let [^java.io.InputStream body (:body req)
+          n (.transferTo body (java.io.OutputStream/nullOutputStream))]
+      (deliver window (field-of body "windowSize"))
+      {:status 200 :body (str n)})))
+
+(defn- conn-window-size [srv]
+  (.get ^java.util.concurrent.atomic.AtomicLong (field-of (server-h2-connection srv) "connWindowSize")))
+
+(deftest h2-receive-windows-grow-while-the-handler-keeps-up
+  ;; A handler that reads half its window well within two round trips
+  ;; earns a doubled window each time, up to :http2-max-window-bytes; the
+  ;; connection window follows, up to twice that.
+  (let [window (promise)]
+    (with-server-instance [srv (draining-handler window)
+                           {:http2-initial-window-bytes 65536 :http2-max-window-bytes 262144}]
+      (with-conn [conn]
+        (ack-settings-after! conn 200)
+        (send-request! conn 1 (request-headers "POST" "/") false)
+        (let [r (upload-within-credit! conn 1 (* 4 1024 1024) 65536)]
+          (is (= "200" (get (response-on conn 1) ":status")))
+          (is (= 262144 (deref window 5000 nil)) "doubled up to the max")
+          (is (<= (:stream r) 262144) "never granted past it")
+          (is (< 262144 (:conn r) (inc 524288)) "the connection window doubled up to twice the max")
+          (is (= 262144 (conn-window-size srv)) "and went back to four stream windows once the body ended"))))))
+
+(deftest h2-receive-windows-do-not-grow-while-throttled
+  ;; Under memory pressure no window grows, however fast the handler reads.
+  (let [window (promise)]
+    (with-server-instance [srv (draining-handler window)
+                           {:http2-initial-window-bytes 65536 :http2-max-window-bytes 262144}]
+      (let [budget (budget-of srv)
+            hog (.account budget)]
+        (.charge hog (.limit budget))
+        (try
+          (with-conn [conn]
+            (ack-settings-after! conn 200)
+            (send-request! conn 1 (request-headers "POST" "/") false)
+            (let [r (upload-within-credit! conn 1 (* 1024 1024) 65536)]
+              (is (= "200" (get (response-on conn 1) ":status")))
+              (is (= 65536 (deref window 5000 nil)) "the stream window stayed as it started")
+              (is (= 262144 (conn-window-size srv)) "the connection window never grew past four stream windows")
+              (is (<= (:conn r) 65535) "nor past the RFC's initial window, with the budget exhausted")))
+          (finally (.close hog)))))))
+
+(deftest h2-slow-reader-keeps-its-receive-window
+  ;; A handler reading slower than a quarter of its window per round trip
+  ;; is not what holds the upload back: its window stays as it started.
+  (let [window (promise)]
+    (with-server-instance [srv (fn [req]
+                                 (let [^java.io.InputStream body (:body req)
+                                       buf (byte-array 8192)]
+                                   (loop [n 0]
+                                     (let [k (.read body buf)]
+                                       (if (neg? k)
+                                         (do (deliver window (field-of body "windowSize"))
+                                             {:status 200 :body (str n)})
+                                         (do (Thread/sleep 25) (recur (+ n k))))))))
+                           {:http2-initial-window-bytes 65536 :http2-max-window-bytes 262144}]
+      (with-conn [conn]
+        (ack-settings-after! conn 20)
+        (send-request! conn 1 (request-headers "POST" "/") false)
+        (let [r (upload-within-credit! conn 1 (* 512 1024) 65536)]
+          (is (= "200" (get (response-on conn 1) ":status")))
+          (is (= 65536 (deref window 5000 nil)))
+          (is (<= (:stream r) 65536)))))))
+
+(deftest h2-grown-windows-are-paid-for-and-given-back
+  ;; Connection credit past the RFC's initial window, grown or not, is
+  ;; paid for while the peer holds it; uploads, resets and the
+  ;; connection's end give every byte back.
+  (let [window (promise)]
+    (with-server-instance [srv (draining-handler window)
+                           {:http2-initial-window-bytes 65536 :http2-max-window-bytes 262144}]
+      (let [budget (budget-of srv)]
+        (with-conn [conn]
+          (ack-settings-after! conn 200)
+          (send-request! conn 1 (request-headers "POST" "/") false)
+          (let [r (upload-within-credit! conn 1 (* 2 1024 1024) 65536)
+                seen (atom [])]
+            (read-until conn (end-stream-on 1) seen)
+            (swap! seen into (drain-frames conn 300))
+            (is (= 262144 (deref window 5000 nil)))
+            (let [promised (+ (:conn-left r) (conn-credit @seen))]
+              (is (< 262144 promised) "the grown connection window")
+              (is (<= (- promised 65535) (.used budget)) "paid for, past the RFC's initial window")))
+          (send-request! conn 3 (request-headers "POST" "/") false)
+          (send-data! conn 3 30000 false)
+          (write-frame! conn frame-rst 0 3 (u32-bytes 0x8))
+          (ping-round-trip! conn))
+        (is (support/await-condition #(zero? (.used budget)) 3000 10) "given back when the connection closes")))))
+
+(deftest h2-connection-window-shrinks-back-once-no-body-is-open
+  ;; Once no request body is open, read bytes earn connection credit only
+  ;; up to the baseline window (four initial stream windows): the grown
+  ;; window's reservation goes back to the budget as the peer uses what it
+  ;; holds, and the next upload grows the window again.
+  (let [hold (CountDownLatch. 1)
+        baseline 262144]
+    (with-server-instance [srv (fn [req]
+                                 (when (= "/hold" (:uri req)) (.await hold 10 TimeUnit/SECONDS))
+                                 (let [n (.transferTo ^java.io.InputStream (:body req) (java.io.OutputStream/nullOutputStream))]
+                                   {:status 200 :body (str n)}))
+                           {:http2-initial-window-bytes 65536 :http2-max-window-bytes 262144}]
+      (let [budget (budget-of srv)
+            credit (atom 65535)]
+        (with-conn [conn]
+          (ack-settings-after! conn 200)
+          (let [upload! (fn [sid]
+                          (send-request! conn sid (request-headers "POST" "/") false)
+                          (let [r (upload-within-credit! conn sid (* 4 1024 1024) 65536 @credit)
+                                seen (atom [])]
+                            (read-until conn (end-stream-on sid) seen)
+                            (swap! seen into (drain-frames conn 300))
+                            (reset! credit (+ (:conn-left r) (conn-credit @seen)))
+                            r))]
+            (is (< baseline (:conn (upload! 1))) "the connection window grew past the baseline")
+            (is (< baseline @credit) "and the peer holds more than the baseline")
+            ;; The peer spends what it holds on bodies whose handlers read
+            ;; only once every body has ended.
+            (let [sids (loop [left @credit sid 3 sids []]
+                         (if (pos? left)
+                           (let [n (min left 65536)]
+                             (send-request! conn sid (request-headers "POST" "/hold") false)
+                             (send-data! conn sid n true)
+                             (recur (- left n) (+ sid 2) (conj sids sid)))
+                           sids))]
+              (ping-round-trip! conn)
+              (reset! credit 0)
+              (.countDown hold)
+              (let [seen (atom [])]
+                (doseq [sid sids]
+                  (or (some (end-stream-on sid) @seen) (read-until conn (end-stream-on sid) seen)))
+                (swap! seen into (drain-frames conn 300))
+                (reset! credit (conn-credit @seen))))
+            (ping-round-trip! conn)
+            (is (<= @credit baseline) "credit granted back only up to the baseline")
+            (is (<= (.used budget) (+ baseline 32768)) (str "the reservation went back, used " (.used budget)))
+            (is (< baseline (:conn (upload! 101))) "the next upload grows the window again")))
+        (is (support/await-condition #(zero? (.used budget)) 3000 10) "given back when the connection closes")))))
+
+(deftest h2-declared-body-is-granted-no-more-than-it-has-left
+  ;; A body declaring its length never gets credit past what it has left
+  ;; to send (plus a frame's padding), on its stream nor, while every open
+  ;; body declares one, on the connection: once it is sent the peer holds
+  ;; no grown window, and the budget only the baseline.
+  (let [n (* 4 1024 1024)
+        baseline 262144
+        window (promise)]
+    (with-server-instance [srv (draining-handler window)
+                           {:http2-initial-window-bytes 65536 :http2-max-window-bytes 262144}]
+      (let [budget (budget-of srv)]
+        (with-conn [conn]
+          (ack-settings-after! conn 200)
+          (send-request! conn 1 (request-headers "POST" "/" [["content-length" (str n)]]) false)
+          (let [r (upload-within-credit! conn 1 n 65536)
+                seen (atom [])]
+            (read-until conn (end-stream-on 1) seen)
+            (swap! seen into (drain-frames conn 300))
+            (ping-round-trip! conn)
+            (is (< 65536 (deref window 5000 nil)) "the stream window still grew")
+            (is (<= (+ (:stream-left r) (reduce + 0 (map #(u32 (:payload %) 0) (window-updates @seen 1)))) 256)
+                "no stream credit left past the declared length")
+            (is (<= (+ (:conn-left r) (conn-credit @seen)) (+ baseline 256))
+                "nor connection credit past the baseline")
+            (is (<= (.used budget) (+ baseline 32768)) (str "used " (.used budget)))))
+        (is (support/await-condition #(zero? (.used budget)) 3000 10) "given back when the connection closes")))))
+
+(deftest h2-connection-window-recovers-after-declared-bodies-near-their-end
+  ;; While the open bodies have little left to send, the connection grants
+  ;; no more than that; once a new body opens, the window comes back to
+  ;; its grown size rather than staying at what the cap left it.
+  (let [baseline 262144
+        n (* 4 1024 1024)
+        tail 65536]
+    (with-server-instance [srv (fn [req]
+                                 {:status 200
+                                  :body (str (.transferTo ^java.io.InputStream (:body req)
+                                                          (java.io.OutputStream/nullOutputStream)))})
+                           {:http2-initial-window-bytes 65536 :http2-max-window-bytes 262144}]
+      (with-conn [conn]
+        (ack-settings-after! conn 200)
+        (send-request! conn 1 (request-headers "POST" "/" [["content-length" (str n)]]) false)
+        (let [r1 (send-within-credit! conn 1 nil (- n tail) 65536 65535 false)
+              seen (atom [])]
+          (is (< baseline (:conn r1)) "the window grew")
+          ;; Body 1 has 64 KiB left: credit for what its handler reads now
+          ;; is held to the baseline.
+          (swap! seen into (drain-frames conn 300))
+          (send-request! conn 3 (request-headers "POST" "/" [["content-length" (str n)]]) false)
+          (let [credit (+ (:conn-left r1) (conn-credit @seen))
+                r3 (send-within-credit! conn 3 nil n 65536 credit true)]
+            (is (< baseline (:conn r3)) "the window came back once another body opened")
+            (send-within-credit! conn 1 nil tail (+ (:stream-left r1)
+                                                    (reduce + 0 (map #(u32 (:payload %) 0)
+                                                                     (window-updates (concat @seen (:frames r3)) 1))))
+                                 (:conn-left r3) true)
+            (is (= "200" (get (response-on conn 3) ":status")))))))))
+
+(deftest h2-round-trip-is-measured-without-a-ping-per-request
+  ;; The SETTINGS acknowledgement gives the first round trip; while
+  ;; windows are returned a PING refreshes it, at most once a second.
+  (with-server-instance [srv (draining-handler (promise)) {}]
+    (with-conn [conn]
+      (ack-settings-after! conn 100)
+      (ping-round-trip! conn)
+      (let [h2 (server-h2-connection srv)
+            first-rtt (long (field-of h2 "smoothedRttNanos"))]
+        (is (<= 100000000 first-rtt 1000000000) (str first-rtt))
+        (let [credit (atom 65535)
+              upload! (fn [sid]
+                        (send-request! conn sid (request-headers "POST" "/") false)
+                        (let [r (upload-within-credit! conn sid (* 1024 1024) 262144 @credit)
+                              seen (atom (:frames r))]
+                          (read-until conn (end-stream-on sid) seen)
+                          (swap! seen into (drain-frames conn 200))
+                          (reset! credit (+ (:conn-left r) (conn-credit (drop (count (:frames r)) @seen))))
+                          @seen))]
+          (doseq [sid [1 3]]
+            (is (not-any? #(= frame-ping (:type %)) (upload! sid)) "no PING within the first second"))
+          (Thread/sleep 1100)
+          (let [seen (atom (upload! 7))]
+          (read-until conn (end-stream-on 7) seen)
+          (let [pings (filter #(and (= frame-ping (:type %)) (zero? (bit-and 0x1 (:flags %)))) @seen)]
+            (is (= 1 (count pings)) "one PING with the returned credit")
+            (Thread/sleep 400)
+            (write-frame! conn frame-ping 0x1 0 (:payload (first pings)))
+            (ping-round-trip! conn)
+            (is (< first-rtt (long (field-of h2 "smoothedRttNanos"))) "the slower round trip counts"))))))))
 
 (deftest h2-response-rings-are-charged-to-the-memory-budget
   ;; Streamed response bytes waiting in a stream's ring are held for a peer
@@ -3461,10 +3756,10 @@
     (let [^com.s_exp.enso.core.ConnectionRegistry registry (field-of srv "registry")]
       (is (.awaitEmpty registry (+ (System/nanoTime) 3000000000)) "connection gone"))))
 
-(deftest h2-request-body-ring-shrinks-as-it-is-read
-  ;; A body ring grown by a burst is cut down as the handler reads it, not
-  ;; only once read empty: a handler leaving a few bytes unread can't keep
-  ;; a burst-sized ring per stream (only buffered bytes are charged to
+(deftest h2-request-body-gives-back-segments-as-it-is-read
+  ;; A burst's buffers go back as the handler reads them, not only once
+  ;; read empty: a handler leaving a few bytes unread can't keep a
+  ;; burst-sized buffer per stream (only buffered bytes are charged to
   ;; :max-buffered-bytes).
   (let [go (CountDownLatch. 1)
         body (promise)
@@ -3472,7 +3767,7 @@
     (with-server (fn [req]
                    (let [^java.io.InputStream in (:body req)]
                      (.await go 5 TimeUnit/SECONDS)
-                     (.readNBytes in (- 65536 100))
+                     (.readNBytes in (- 262144 100))
                      (deliver body in)
                      (.await release 5 TimeUnit/SECONDS)
                      (slurp in)
@@ -3480,12 +3775,12 @@
       {}
       (with-conn [conn]
         (send-request! conn 1 (request-headers "POST" "/") false)
-        (send-data! conn 1 65536 false)
+        (send-data! conn 1 262144 false)
         (ping-round-trip! conn)
         (.countDown go)
         (let [in (deref body 5000 nil)]
           (is (some? in))
-          (is (>= 16384 (alength ^bytes (field-of in "ring"))) "100 bytes left in a small ring"))
+          (is (>= 65536 (body-capacity in)) "100 bytes left hold one segment at most"))
         (.countDown release)
         (write-frame! conn frame-data flag-end-stream 1 (byte-array 0))
         (is (= "200" (get (response-on conn 1) ":status")))))))
@@ -3732,3 +4027,86 @@
       (ping-round-trip! conn)
       (write-frame! conn frame-window-update 0 1 (u32-bytes 0))
       (is (= 0x1 (some-> (read-until conn (frame-on 1 frame-rst)) rst-code)) "RST_STREAM(PROTOCOL_ERROR)"))))
+
+;; ---- Request body rings ----------------------------------------------------------
+
+(deftest h2-upload-allocates-little-per-mib
+  ;; Request body rings come from the server-wide pool of full-size rings
+  ;; and go back once the handler reads them empty, so a long upload costs
+  ;; no heap per burst. Cleartext, so no TLS cost is counted; measured over
+  ;; every thread of this JVM, client included.
+  (let [mib 16
+        srv (h2c-server (fn [req]
+                          {:status 200
+                           :body (str (.transferTo ^java.io.InputStream (:body req)
+                                                   (java.io.OutputStream/nullOutputStream)))})
+                        #(.maxRequestBodyBytes ^com.s_exp.enso.api.Config$Builder % 0))]
+    (try
+      (binding [*port* (.port srv)]
+        (let [conn (h2-connect-on! (plain-socket) [])]
+          (try
+            (ack-settings-after! conn 0)
+            (let [credit (atom 65535)
+                  upload! (fn [sid]
+                            (send-request! conn sid [[":method" "POST"] [":scheme" "http"] [":path" "/"]
+                                                     [":authority" "localhost"]] false)
+                            (let [r (upload-within-credit! conn sid (* mib 1024 1024) 262144 @credit)
+                                  seen (atom [])]
+                              (read-until conn (end-stream-on sid) seen)
+                              (swap! seen into (drain-frames conn 100))
+                              (reset! credit (+ (:conn-left r) (conn-credit @seen)))))]
+              (doseq [sid [1 3 5]] (upload! sid))
+              (let [per-mib (apply min (for [sid [7 9 11]]
+                                         (let [before (total-allocated)]
+                                           (upload! sid)
+                                           (/ (double (- (total-allocated) before)) mib))))]
+                (println "h2 upload:" per-mib "bytes/MiB")
+                (is (< per-mib 65536) (str per-mib " bytes per MiB uploaded"))))
+            (finally (close-conn! conn)))))
+      (finally (.close srv)))))
+
+(deftest h2-request-bodies-stay-intact-across-resets
+  ;; Request body rings are pooled, shared with streamed responses, and go
+  ;; back as soon as a handler reads one empty or its stream is reset:
+  ;; uploads on several connections at once, each body its own pattern,
+  ;; some reset mid-way, must reach their handlers whole and unmixed while
+  ;; later ones reuse the rings.
+  (let [n (* 600 1024)
+        body-of (fn [sid] (let [b (byte-array n)]
+                            (dotimes [i n] (aset b i (unchecked-byte (+ (* 7 i) sid))))
+                            b))
+        bodies (into {} (map (fn [sid] [sid (body-of sid)])) (range 1 41 2))
+        reset? #(zero? (mod % 5))
+        handler (fn [req]
+                  (let [^bytes want (get bodies (parse-long (subs (:uri req) 1)))
+                        ^java.io.InputStream in (:body req)
+                        got (java.io.ByteArrayOutputStream.)
+                        buf (byte-array 7001)]
+                    (loop []
+                      (let [k (.read in buf)]
+                        (when (pos? k) (.write got buf 0 k) (recur))))
+                    {:status 200 :body (if (java.util.Arrays/equals want (.toByteArray got)) "ok" "bad")}))
+        run-uploads (fn [conn]
+                      (ack-settings-after! conn 50)
+                      (let [credit (atom 65535)]
+                        (doall
+                         (for [sid (sort (keys bodies))]
+                           (do
+                             (send-request! conn sid (request-headers "POST" (str "/" sid)) false)
+                             (if (reset? sid)
+                               (let [half (java.util.Arrays/copyOf ^bytes (get bodies sid) (int (/ n 2)))
+                                     r (send-within-credit! conn sid half 0 262144 @credit false)]
+                                 (write-frame! conn frame-rst 0 sid (u32-bytes 0x8))
+                                 (reset! credit (:conn-left r))
+                                 [sid true])
+                               (let [r (send-within-credit! conn sid (get bodies sid) 0 262144 @credit true)
+                                     seen (atom (:frames r))]
+                                 (read-until conn (end-stream-on sid) seen 30000)
+                                 (reset! credit (+ (:conn-left r) (conn-credit (drop (count (:frames r)) @seen))))
+                                 [sid (= "ok" (body-on @seen sid))])))))))]
+    (with-server handler {}
+      (let [conns (vec (repeatedly 3 h2-connect!))]
+        (try
+          (doseq [[sid ok] (apply concat (mapv deref (mapv #(future (run-uploads %)) conns)))]
+            (is ok (str "stream " sid)))
+          (finally (run! close-conn! conns)))))))

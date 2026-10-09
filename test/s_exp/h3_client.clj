@@ -10,9 +10,10 @@
                                  Http3FrameType Http3FrameWriter Http3Listener
                                  Http3Varint)
            (com.s_exp.enso.http3.qpack QpackFieldSection)
-           (com.s_exp.enso.quiche NativeBuffer Quiche QuicheConfig QuicheConnection Records)
+           (com.s_exp.enso.quiche NativeBuffer Quiche QuicheConfig QuicheConnection Records UdpSocket
+                                  UdpSocket$Waker)
            (java.io ByteArrayOutputStream)
-           (java.net DatagramPacket InetSocketAddress SocketTimeoutException
+           (java.net DatagramPacket InetAddress InetSocketAddress SocketTimeoutException
                      StandardProtocolFamily StandardSocketOptions)
            (java.nio ByteBuffer)
            (java.nio.channels DatagramChannel)
@@ -602,3 +603,86 @@
   (pump-until! c #(peer-error c) ms))
 
 (defn body-str [r] (String. ^bytes (:body r) "UTF-8"))
+
+;; ---- many idle connections ---------------------------------------------------
+
+(defn- dcid-key
+  "The destination connection id of the datagram at slab[off, off + len) as
+  a string key (client ids are 16 bytes)."
+  ^String [^ByteBuffer b ^long off ^long len]
+  (let [long-header (neg? (.get b (int off)))
+        start (if long-header (+ off 6) (+ off 1))
+        n (if long-header (bit-and (.get b (int (+ off 5))) 0xff) 16)
+        bs (byte-array n)]
+    (when (<= (+ start n) (+ off len))
+      (.get b (int start) bs)
+      (String. bs java.nio.charset.StandardCharsets/ISO_8859_1))))
+
+(defn storm
+  "Opens `n` QUIC connections to `port` from one UDP socket and one thread,
+  completing each handshake (`step` at a time); returns
+  {:established :close! (fn)} once done. The connections then stay idle."
+  [^long port ^long n {:keys [step] :or {step 200}}]
+  (let [cfg (QuicheConfig/client 0)
+        sock (UdpSocket/open (InetAddress/getByName "127.0.0.1") 0 0 (* 8 1024 1024) (* 8 1024 1024))
+        waker (UdpSocket$Waker.)
+        local ^InetSocketAddress (.localAddress sock)
+        server (InetSocketAddress. "127.0.0.1" (int port))
+        addrs (let [b (NativeBuffer/allocate (* 2 Records/ADDR_LEN))]
+                (Records/putAddress (.-buffer b) 0 local)
+                (Records/putAddress (.-buffer b) Records/ADDR_LEN server)
+                b)
+        rnd (SecureRandom.)
+        conns (java.util.HashMap.)
+        rslab (NativeBuffer/allocate (* 2048 32))
+        rmeta (NativeBuffer/allocate (* Records/RECV_META_LEN 33))
+        rm (.-buffer rmeta)
+        sslab (NativeBuffer/allocate (* 1350 64))
+        smeta (NativeBuffer/allocate (+ Records/SEND_HEADER_LEN (* 64 Records/SEND_META_LEN)))
+        sm (.-buffer smeta)]
+    (.localAddress sock rmeta (* 32 Records/RECV_META_LEN))
+    (letfn [(flush! [^QuicheConnection conn]
+              (loop [count 0 off 0]
+                (let [rec (+ Records/SEND_HEADER_LEN (* count Records/SEND_META_LEN))
+                      n (if (< count 64) (.send conn sslab off 1350 smeta rec) -1)]
+                  (if (pos? n)
+                    (do (.putInt sm (int (+ rec Records/SEND_OFF)) (int off))
+                        (.putInt sm (int (+ rec Records/SEND_LEN)) (int n))
+                        (recur (inc count) (+ off n)))
+                    (when (pos? count) (.sendBatch sock sslab smeta count 0))))))
+            (pump! [^long ms]
+              (let [deadline (+ (System/currentTimeMillis) ms)]
+                (loop []
+                  (.poll waker sock nil false 5000000)
+                  (let [touched (java.util.HashSet.)]
+                    (loop []
+                      (let [k (.recvBatch sock rslab 2048 32 rmeta)]
+                        (when (pos? k)
+                          (dotimes [i k]
+                            (let [rec (* i Records/RECV_META_LEN)
+                                  len (.getInt rm (int (+ rec Records/RECV_LEN)))
+                                  key (dcid-key (.-buffer rslab) (* i 2048) len)
+                                  ^QuicheConnection c (when key (.get conns key))]
+                              (when c
+                                (.recv c rslab (int (* i 2048)) len rmeta (+ rec Records/RECV_PEER) (+ rec Records/RECV_LOCAL))
+                                (.add touched c))))
+                          (when (= k 32) (recur)))))
+                    (doseq [^QuicheConnection c touched] (flush! c)))
+                  (when (< (System/currentTimeMillis) deadline) (recur)))))]
+      (loop [opened 0]
+        (when (< opened n)
+          (let [k (min (long step) (- n opened))]
+            (dotimes [_ k]
+              (let [scid (let [b (byte-array 16)] (.nextBytes rnd b) b)
+                    c (QuicheConnection/connect cfg "localhost" scid addrs 0 Records/ADDR_LEN)]
+                (.put conns (String. scid java.nio.charset.StandardCharsets/ISO_8859_1) c)
+                (flush! c)))
+            (pump! 300)
+            (recur (+ opened k)))))
+      (pump! 1000)
+      {:established (count (filter #(.isEstablished ^QuicheConnection %) (vals conns)))
+       :close! (fn []
+                 (doseq [^QuicheConnection c (vals conns)]
+                   (when-not (.isClosed c) (.close c true 0x100 (byte-array 0)) (flush! c))
+                   (.free c))
+                 (.close cfg) (.close waker) (.close sock))})))

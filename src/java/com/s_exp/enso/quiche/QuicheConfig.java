@@ -15,10 +15,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>Flow control: quiche autotunes a receive window upwards (doubling,
  * when the application drains it within two RTTs) until
  * {@code max_connection_window} / {@code max_stream_window}, 24 MiB and
- * 16 MiB by default. Those bounds are what a peer can make quiche buffer
- * for a connection whose handler doesn't read, so they are pinned to the
- * configured initial windows: {@code :http3-initial-max-data-bytes} is a
- * hard per-connection bound, the per-stream windows a hard per-stream one.
+ * 16 MiB by default. The connection bound is what a peer can make quiche
+ * buffer for a connection whose handlers don't read, so it starts at
+ * {@code :http3-initial-max-data-bytes}; with
+ * {@link Quiche#RECV_WINDOW_CONTROL} each connection raises its own as its
+ * memory budget pays for it ({@code Http3Connection}), and stream windows
+ * autotune up to {@code :http3-max-window-bytes} (the connection window
+ * bounds what all streams may hold). On a stock libquiche both stay at
+ * the configured initial windows.
  *
  * <p>Thread-safety: configure on one thread, then hand to the event
  * loops. Lifetime is reference counted: the creator holds one reference,
@@ -40,6 +44,8 @@ public final class QuicheConfig implements AutoCloseable {
     private long streamWindowBidiRemote;
     private long streamWindowBidiLocal;
     private long streamWindowUni;
+    private long maxConnectionWindow;
+    private long maxStreamWindow;
 
     private QuicheConfig(long ptr) {
         this.ptr = ptr;
@@ -133,6 +139,12 @@ public final class QuicheConfig implements AutoCloseable {
 
     public long streamWindowUni() { return streamWindowUni; }
 
+    /** What quiche autotunes a connection window to at most, until the connection raises it. */
+    public long maxConnectionWindow() { return maxConnectionWindow; }
+
+    /** What quiche autotunes a stream window to at most. */
+    public long maxStreamWindow() { return maxStreamWindow; }
+
     private void loadCertKey(Config cfg) throws IOException {
         int rc = Quiche.configLoadCertChainFromPemFile(handle(), cfg.http3CertPath);
         if (rc < 0) {
@@ -169,11 +181,12 @@ public final class QuicheConfig implements AutoCloseable {
         Quiche.configSetInitialMaxData(p, cfg.http3InitialMaxDataBytes);
         Quiche.configSetMaxConnectionWindow(p, cfg.http3InitialMaxDataBytes);
         connectionWindow = cfg.http3InitialMaxDataBytes;
-        // Per-stream windows: explicit config when set, otherwise a quarter
-        // of the connection window (as HTTP/2's 256 KiB to 1 MiB), so a
-        // stream whose handler doesn't read can't take the whole window
-        // and stall the connection's other requests.
-        long derived = cfg.http3InitialMaxDataBytes / 4;
+        maxConnectionWindow = cfg.http3InitialMaxDataBytes;
+        // Per-stream windows: explicit config when set, otherwise half the
+        // connection window (256 KiB by default, HTTP/2's initial stream
+        // window), so a stream whose handler doesn't read can't take the
+        // whole window and stall the connection's other requests.
+        long derived = cfg.http3InitialMaxDataBytes / 2;
         streamWindowBidiLocal = cfg.http3InitialMaxStreamDataBidiLocalBytes >= 0
             ? cfg.http3InitialMaxStreamDataBidiLocalBytes : derived;
         streamWindowBidiRemote = cfg.http3InitialMaxStreamDataBidiRemoteBytes >= 0
@@ -183,10 +196,12 @@ public final class QuicheConfig implements AutoCloseable {
         Quiche.configSetInitialMaxStreamDataBidiLocal(p, streamWindowBidiLocal);
         Quiche.configSetInitialMaxStreamDataBidiRemote(p, streamWindowBidiRemote);
         Quiche.configSetInitialMaxStreamDataUni(p, streamWindowUni);
-        // One autotuning bound for every stream type: the largest window
-        // configured, so no stream's initial window is cut.
-        Quiche.configSetMaxStreamWindow(p,
-            Math.max(streamWindowBidiRemote, Math.max(streamWindowBidiLocal, streamWindowUni)));
+        // One autotuning bound for every stream type: :http3-max-window-bytes
+        // with receive-window control, else the largest window configured,
+        // so no stream's initial window is cut.
+        long largest = Math.max(streamWindowBidiRemote, Math.max(streamWindowBidiLocal, streamWindowUni));
+        maxStreamWindow = Quiche.RECV_WINDOW_CONTROL ? Math.max(cfg.http3MaxWindowBytes, largest) : largest;
+        Quiche.configSetMaxStreamWindow(p, maxStreamWindow);
         Quiche.configSetInitialMaxStreamsBidi(p, cfg.http3InitialMaxStreamsBidi);
         // Peer needs 3 uni streams (control + QPACK enc/dec) plus any
         // grease uni streams they may open (RFC 9114 §7.2.8). Default 8

@@ -17,11 +17,15 @@ import java.util.concurrent.locks.ReentrantLock;
  * frame. The ring grows on demand and never beyond what the receive
  * window lets the peer send: the framer charges every frame against
  * {@link #recvWindow} before copying it, and credit only goes back (a
- * WINDOW_UPDATE) once the handler has read the bytes. A ring grown large
- * is dropped once read empty, and halved while it is at most a quarter
- * full, so a long upload keeps only what is buffered: past
- * {@link #RETAINED_CAPACITY} a ring is never more than four times the bytes
- * it holds, which are what the connection's memory account is charged.
+ * WINDOW_UPDATE) once the handler has read the bytes. Up to
+ * {@link #SMALL_MAX} buffered bytes (a small body) live in a ring of the
+ * stream's own; past it, in a chain of full-size rings
+ * ({@link Http2Writer#RING_MAX}) from the pool streamed responses use,
+ * each given back as soon as the handler has read it, so a long upload
+ * costs no allocation per burst however far the handler falls behind (up
+ * to the stream window) and a stream holds less than one full-size ring
+ * beyond its bytes, which are what the connection's memory account is
+ * charged.
  *
  * <p>One producer (the framer) and one consumer (the handler thread),
  * under a lock of their own; the consumer parks with
@@ -39,15 +43,25 @@ import java.util.concurrent.locks.ReentrantLock;
 final class RequestBody extends InputStream {
 
     private static final int INITIAL_CAPACITY = 1024;
-    // A ring grown past this (a burst the handler fell behind on, up to the
-    // stream window) is dropped once read empty, and shrunk as it is read;
-    // the next DATA regrows it.
-    private static final int RETAINED_CAPACITY = 16 * 1024;
+    // Most bytes the stream's own ring holds; more go to pooled segments.
+    private static final int SMALL_MAX = 8 * 1024;
+    private static final int SEGMENT = Http2Writer.RING_MAX;
 
     private static final int OPEN = 0;
     private static final int ENDED = 1;
     private static final int TOO_LARGE = 2;
     private static final int ABORTED = 3;
+
+    private static final int RECEIVING = 1;
+    private static final int RECEIVED = 2;
+
+    /**
+     * Credit granted past a declared body's remaining octets: one frame's
+     * padding (pad-length octet and up to 255 octets), which counts
+     * against flow control, so a peer that pads can always send its next
+     * frame.
+     */
+    static final int PADDING_ALLOWANCE = 256;
 
     private final Http2Connection conn;
     private final Http2Stream stream;
@@ -56,11 +70,17 @@ final class RequestBody extends InputStream {
     // :min-data-rate-bytes (0 = off) and its grace period.
     private final long minDataRate;
     private final long minDataRateGraceNanos;
-    // Credit returned in one WINDOW_UPDATE once this much was read.
-    private final int creditThreshold;
+    // Most windowSize grows to.
+    private final long maxWindow;
 
-    // All guarded by lock.
+    // All guarded by lock. Bytes are in ring (circular, from head) while
+    // segmentCount is 0, else in the segmentCount pooled segments from
+    // segments[firstSegment] on (a circular array), from offset head of
+    // the first.
     private byte[] ring;
+    private byte[][] segments;
+    private int firstSegment;
+    private int segmentCount;
     private int head;
     private int count;
     private int end = OPEN;
@@ -69,8 +89,20 @@ final class RequestBody extends InputStream {
     private long recvWindow;
     // Read bytes not yet credited back to the stream window.
     private long uncredited;
+    // The window credit is granted back up to, returned in one
+    // WINDOW_UPDATE once half of it was read; doubled up to maxWindow when
+    // that took less than Http2Connection#windowMayGrow allows since the
+    // previous one, at epochNanos (0: none yet).
+    private long windowSize;
+    private long epochNanos;
     // The stream is gone (reset, connection closed): nobody reads any more.
     private boolean abandoned;
+    // Counted in the connection's open bodies: from the first DATA
+    // (RECEIVING) to the end or abort (RECEIVED).
+    private int receiving;
+    // Content-Length octets still to come, -1 when none was declared:
+    // stream credit never goes past them (and PADDING_ALLOWANCE).
+    private long declaredLeft = -1;
 
     // Handler side, for :min-data-rate-bytes: bytes read and time spent
     // waiting for them.
@@ -83,30 +115,59 @@ final class RequestBody extends InputStream {
     private final byte[] one = new byte[1];
 
     RequestBody(Http2Connection conn, Http2Stream stream, long recvWindow,
-                long readTimeoutMillis, int creditThreshold) {
+                long readTimeoutMillis, long maxWindow) {
         this.conn = conn;
         this.stream = stream;
         this.recvWindow = recvWindow;
+        this.windowSize = recvWindow;
+        this.maxWindow = maxWindow;
         this.readTimeoutNanos = readTimeoutMillis * 1_000_000L;
         this.minDataRate = conn.service().config.minDataRateBytes;
         this.minDataRateGraceNanos = conn.service().config.minDataRateGraceMillis * 1_000_000L;
-        this.creditThreshold = creditThreshold;
     }
 
     // ---- Framer side --------------------------------------------------------------
 
-    /**
-     * Charges a DATA frame of {@code frameLen} octets (padding included,
-     * §6.9.1) against the stream window. False when the peer overran it.
-     */
-    boolean charge(int frameLen) {
+    /** Framer, before any DATA: the request declared a Content-Length of {@code length}. */
+    void declare(long length) {
         lock.lock();
         try {
+            declaredLeft = length;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Charges a DATA frame of {@code frameLen} octets (padding included,
+     * §6.9.1), {@code len} of them body, against the stream window. False
+     * when the peer overran it.
+     */
+    boolean charge(int frameLen, int len) {
+        lock.lock();
+        try {
+            if (receiving == 0) {
+                receiving = RECEIVING;
+                conn.bodyOpened(declaredLeft);
+            }
+            if (declaredLeft > 0 && receiving == RECEIVING) {
+                long n = Math.min(len, declaredLeft);
+                declaredLeft -= n;
+                conn.declaredArrived(n);
+            }
             recvWindow -= frameLen;
             return recvWindow >= 0;
         } finally {
             lock.unlock();
         }
+    }
+
+    /** Lock held: the peer sends no more on this body. */
+    private void receivedLocked() {
+        if (receiving == RECEIVING) {
+            conn.bodyClosed(declaredLeft);
+        }
+        receiving = RECEIVED;
     }
 
     /**
@@ -120,16 +181,28 @@ final class RequestBody extends InputStream {
             if (abandoned || end != OPEN) {
                 return false;
             }
-            if (ring == null || count + len > ring.length) {
-                grow(count + len);
+            if (segmentCount == 0 && count + len <= SMALL_MAX) {
+                if (ring == null || count + len > ring.length) {
+                    grow(count + len);
+                }
+                int tail = (head + count) % ring.length;
+                int first = Math.min(len, ring.length - tail);
+                System.arraycopy(src, off, ring, tail, first);
+                if (first < len) {
+                    System.arraycopy(src, off + first, ring, 0, len - first);
+                }
+                count += len;
+            } else {
+                if (segmentCount == 0 && count > 0) {
+                    // The small ring's bytes move to the first segment.
+                    byte[] seg = addSegment();
+                    int first = Math.min(count, ring.length - head);
+                    System.arraycopy(ring, head, seg, 0, first);
+                    System.arraycopy(ring, 0, seg, first, count - first);
+                    head = 0;
+                }
+                appendSegments(src, off, len);
             }
-            int tail = (head + count) % ring.length;
-            int first = Math.min(len, ring.length - tail);
-            System.arraycopy(src, off, ring, tail, first);
-            if (first < len) {
-                System.arraycopy(src, off + first, ring, 0, len - first);
-            }
-            count += len;
             wake();
             return true;
         } finally {
@@ -137,6 +210,7 @@ final class RequestBody extends InputStream {
         }
     }
 
+    /** Lock held: the small ring grown to hold {@code need} (at most SMALL_MAX) bytes. */
     private void grow(int need) {
         int cap = ring == null ? INITIAL_CAPACITY : ring.length;
         while (cap < need) {
@@ -152,20 +226,47 @@ final class RequestBody extends InputStream {
         head = 0;
     }
 
-    /**
-     * Halves the ring while it is at most a quarter full and larger than
-     * {@link #RETAINED_CAPACITY}: one copy, of the bytes it holds.
-     */
-    private void shrink() {
-        int cap = ring.length;
-        while (cap > RETAINED_CAPACITY && count <= cap / 4) {
-            cap >>= 1;
+    /** Lock held: copies {@code src[off, off+len)} past the last buffered byte, taking segments as needed. */
+    private void appendSegments(byte[] src, int off, int len) {
+        while (len > 0) {
+            long pos = (long) head + count;
+            int index = (int) (pos / SEGMENT);
+            byte[] seg = index == segmentCount
+                ? addSegment()
+                : segments[(firstSegment + index) & (segments.length - 1)];
+            int at = (int) (pos - (long) index * SEGMENT);
+            int n = Math.min(len, SEGMENT - at);
+            System.arraycopy(src, off, seg, at, n);
+            off += n;
+            len -= n;
+            count += n;
         }
-        byte[] smaller = new byte[cap];
-        int first = Math.min(count, ring.length - head);
-        System.arraycopy(ring, head, smaller, 0, first);
-        System.arraycopy(ring, 0, smaller, first, count - first);
-        ring = smaller;
+    }
+
+    /** Lock held: a pooled segment appended to the chain. */
+    private byte[] addSegment() {
+        if (segments == null) {
+            segments = new byte[4][];
+        } else if (segmentCount == segments.length) {
+            byte[][] bigger = new byte[segments.length * 2][];
+            for (int i = 0; i < segmentCount; i++) {
+                bigger[i] = segments[(firstSegment + i) & (segments.length - 1)];
+            }
+            segments = bigger;
+            firstSegment = 0;
+        }
+        byte[] seg = Http2Writer.borrowRing();
+        segments[(firstSegment + segmentCount) & (segments.length - 1)] = seg;
+        segmentCount++;
+        return seg;
+    }
+
+    /** Lock held: the first segment goes back to the pool. */
+    private void dropFirstSegment() {
+        Http2Writer.recycleRing(segments[firstSegment]);
+        segments[firstSegment] = null;
+        firstSegment = (firstSegment + 1) & (segments.length - 1);
+        segmentCount--;
         head = 0;
     }
 
@@ -186,6 +287,9 @@ final class RequestBody extends InputStream {
                 end = how;
                 wake();
             }
+            if (how == ENDED) {
+                receivedLocked();
+            }
         } finally {
             lock.unlock();
         }
@@ -202,6 +306,7 @@ final class RequestBody extends InputStream {
             if (end == OPEN || end == TOO_LARGE) {
                 end = ABORTED;
             }
+            receivedLocked();
             return dropLocked();
         } finally {
             lock.unlock();
@@ -212,7 +317,11 @@ final class RequestBody extends InputStream {
         abandoned = true;
         int dropped = count;
         count = 0;
+        while (segmentCount > 0) {
+            dropFirstSegment();
+        }
         ring = null;
+        head = 0;
         wake();
         return dropped;
     }
@@ -296,22 +405,27 @@ final class RequestBody extends InputStream {
                 }
             }
             n = Math.min(len, count);
-            int first = Math.min(n, ring.length - head);
-            System.arraycopy(ring, head, b, off, first);
-            if (first < n) {
-                System.arraycopy(ring, 0, b, off + first, n - first);
-            }
-            head = (head + n) % ring.length;
-            count -= n;
-            readBytes += n;
-            if (ring.length > RETAINED_CAPACITY) {
-                if (count == 0) {
-                    ring = null;
-                    head = 0;
-                } else if (count <= ring.length / 4) {
-                    shrink();
+            if (segmentCount == 0) {
+                int first = Math.min(n, ring.length - head);
+                System.arraycopy(ring, head, b, off, first);
+                if (first < n) {
+                    System.arraycopy(ring, 0, b, off + first, n - first);
+                }
+                head = (head + n) % ring.length;
+                count -= n;
+            } else {
+                for (int done = 0; done < n; ) {
+                    int k = Math.min(n - done, SEGMENT - head);
+                    System.arraycopy(segments[firstSegment], head, b, off + done, k);
+                    done += k;
+                    head += k;
+                    count -= k;
+                    if (head == SEGMENT || count == 0) {
+                        dropFirstSegment();
+                    }
                 }
             }
+            readBytes += n;
         } finally {
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
@@ -346,16 +460,30 @@ final class RequestBody extends InputStream {
      * or padding): hands their credit back, the stream's share only while
      * the peer may still send on it, the connection's through
      * {@link Http2Connection#creditConnection} (which pays for it again or
-     * holds it back). WINDOW_UPDATEs are batched, one per half window.
+     * holds it back). WINDOW_UPDATEs are batched, one per half window,
+     * and carry the window's growth when the handler keeps up.
      */
     void credit(int n) {
         int increment = 0;
+        long now = 0;
         lock.lock();
         try {
             if (!abandoned && !stream.remoteEnded()) {
                 uncredited += n;
-                if (uncredited >= creditThreshold) {
-                    increment = (int) uncredited;
+                if (uncredited >= windowSize >> 1) {
+                    now = System.nanoTime();
+                    long grow = 0;
+                    if (windowSize < maxWindow && epochNanos != 0
+                        && conn.windowMayGrow(now - epochNanos, uncredited, windowSize)) {
+                        grow = Math.min(windowSize, maxWindow - windowSize);
+                        windowSize += grow;
+                    }
+                    epochNanos = now;
+                    long credit = uncredited + grow;
+                    if (declaredLeft >= 0) {
+                        credit = Math.max(0, Math.min(credit, declaredLeft + PADDING_ALLOWANCE - recvWindow));
+                    }
+                    increment = (int) credit;
                     uncredited = 0;
                     recvWindow += increment;
                 }
@@ -364,7 +492,7 @@ final class RequestBody extends InputStream {
             lock.unlock();
         }
         if (increment > 0) {
-            conn.sendWindowUpdate(stream.id, increment);
+            conn.sendWindowUpdate(stream.id, increment, now);
         }
         conn.creditConnection(n);
     }

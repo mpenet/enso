@@ -177,6 +177,22 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
     // This connection's share of the server's :max-buffered-bytes, created
     // with its first request body; closed when it is destroyed.
     private MemoryBudget.Account account;
+    // Request bodies being read; while any is, the connection window is
+    // charged to the account (see bodyStarted).
+    private int bodiesInPlay;
+    // What quiche may autotune the connection window to; raised by
+    // growConnectionWindow, the growth past the initial window reserved
+    // from the account until the connection goes.
+    private long connectionWindowMax;
+    // How far connectionWindowMax may be raised: twice
+    // :http3-max-window-bytes with receive-window control, else the
+    // initial window (fixed).
+    private final long connectionWindowLimit;
+    // Request-body bytes read from quiche (loop thread), and how many of
+    // them had left the pipes (read by handlers, or dropped) when
+    // connectionWindowMax was last raised.
+    long bodyBytesRead;
+    private long bodyBytesDrainedAtGrowth;
     int bufferedHeaderBytes;
     final int headerBudget;
     private double resetTokens;
@@ -210,6 +226,9 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
         // sections of one connection may buffer up to the hard ceiling.
         int fieldCap = config.maxHeaderBytes;
         this.headerBudget = Http3RequestReader.hardCap(fieldCap);
+        this.connectionWindowMax = config.http3InitialMaxDataBytes;
+        this.connectionWindowLimit = Quiche.RECV_WINDOW_CONTROL
+            ? Math.max(connectionWindowMax, 2 * config.http3MaxWindowBytes) : connectionWindowMax;
         this.resetTokens = config.http3StreamResetLimit;
         this.resetTokensAt = now;
         this.control = new Http3ControlStreams(this, fieldCap);
@@ -460,6 +479,7 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
         }
         if (packets && !closing) reader.readStreams(now);
         handleSignals(now);
+        if (bodiesInPlay > 0 && connectionWindowMax < connectionWindowLimit && !closing) growConnectionWindow();
         if (packets && blockedStreams > 0 && !closing) drainWritable(now);
         appTimers(now, packets);
         if (finalGoawayAt != NONE && now - finalGoawayAt >= 0 && !closing) {
@@ -725,7 +745,7 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
         // collect the stream and hand the peer its credit back.
         if (ex.readPhase != Http3Exchange.READ_DONE) {
             quiche.streamShutdown(ex.id, Quiche.QUICHE_SHUTDOWN_READ, Http3ConnectionException.H3_NO_ERROR);
-            ex.readPhase = Http3Exchange.READ_DONE;
+            readDone(ex);
         }
         if (!ex.sendClosed) {
             quiche.streamShutdown(ex.id, Quiche.QUICHE_SHUTDOWN_WRITE,
@@ -747,6 +767,53 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
         writer.completed(ex);
     }
 
+    /**
+     * {@code ex}'s request body starts being read. quiche holds, or was
+     * promised, up to a connection window of request data natively: the
+     * initial window is charged to the account while any body of the
+     * connection is read, so the budget pays for what peers sending
+     * bodies may make quiche hold (growth past it is reserved apart, see
+     * growConnectionWindow). A connection without one costs nothing; its
+     * initial window, promised in the handshake, is the one unpaid
+     * exposure. Charged, not reserved: the credit is already granted.
+     */
+    void bodyStarted(Http3Exchange ex) {
+        ex.bodyInPlay = true;
+        if (bodiesInPlay++ == 0) account().charge(config.http3InitialMaxDataBytes);
+    }
+
+    /**
+     * Lets quiche double the connection window once it autotuned it to its
+     * bound while bodies are read, and handlers read at least a window of
+     * body bytes since the bound was set (they keep up): the doubling is
+     * reserved from the account first, as HTTP/2's connection credit, and
+     * skipped while the account can't pay (throttled: the window stays).
+     * The reservation is held until the connection goes, as the window
+     * quiche grows never shrinks. Stream windows need no reservation: the
+     * connection window bounds what the peer may send on all of them.
+     */
+    private void growConnectionWindow() {
+        // Handlers that read less than a window gain nothing from a larger
+        // one (a slow handler's bytes would only wait in quiche instead).
+        long drained = bodyBytesRead - (bodyBudget == null ? 0 : bodyBudget.used());
+        if (drained - bodyBytesDrainedAtGrowth < connectionWindowMax) return;
+        if (quiche.connectionWindow() < connectionWindowMax) return;
+        long next = Math.min(connectionWindowLimit, 2 * connectionWindowMax);
+        if (!account().tryReserve(next - connectionWindowMax)) return;
+        quiche.setMaxConnectionWindow(next);
+        connectionWindowMax = next;
+        bodyBytesDrainedAtGrowth = drained;
+    }
+
+    /** {@code ex}'s read side is over: quiche holds nothing more for it. */
+    void readDone(Http3Exchange ex) {
+        ex.readPhase = Http3Exchange.READ_DONE;
+        if (ex.bodyInPlay) {
+            ex.bodyInPlay = false;
+            if (--bodiesInPlay == 0) account.release(config.http3InitialMaxDataBytes);
+        }
+    }
+
     /** Ends an exchange whose read and send sides are both complete. */
     void maybeFinish(Http3Exchange ex, long now) {
         if (!ex.finished && ex.sendClosed && !ex.hasPending()
@@ -764,7 +831,7 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
         quiche.streamShutdown(ex.id, Quiche.QUICHE_SHUTDOWN_WRITE, code);
         ex.sendClosed = true;
         discardPending(ex);
-        ex.readPhase = Http3Exchange.READ_DONE;
+        readDone(ex);
         ex.abandon();
         finish(ex, now);
     }
