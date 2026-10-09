@@ -1,423 +1,364 @@
 # HTTP/3
 
-HTTP/3 rides Cloudflare `libquiche` over UDP via a small JNI shim
-(`native/enso_quiche/enso_quiche.c`). Pure-Java QPACK + H3 framing on top
-of quiche's transport primitives. Same Ring handler contract as h1/h2 —
-`:protocol` becomes `"HTTP/3.0"`, `:scheme` is `:https` — except that
-WebSocket is not available (a WebSocket response is answered 501).
+HTTP/3 runs on Cloudflare's libquiche over UDP, through a small JNI shim
+(`native/enso_quiche/enso_quiche.c`). quiche provides the QUIC transport;
+HTTP/3 framing and QPACK are implemented in Java on top of it.
 
-## From a release jar (zero libquiche install)
+Handlers see the same Ring request as on HTTP/1.1 and HTTP/2, with
+`:protocol` `"HTTP/3.0"` and `:scheme` `:https`. WebSocket isn't available:
+a WebSocket response is answered 501.
 
-Every release publishes the core and per-classifier jars to Clojars. The
-fat jar exceeds Clojars' file-size limit; it is built by release CI as a
-workflow artifact and locally with `clojure -T:build jar-all`.
-Three consumption patterns.
+## Installation
 
-### Core only, no h3 (~450 KB)
-
-```clojure
-{:deps {com.s-exp/enso {:mvn/version "1.0.0-alphaN"}}}
-```
-
-### Per-platform classifier (~3.5 MB for darwin-arm64)
-
-Add core plus the classifier matching your deploy target. `tools.deps`
-resolves the classifier artifact via the `$<classifier>` coord suffix.
+The core jar has no native code. HTTP/3 needs a classifier jar for each
+platform you deploy to, which contains the shim with libquiche statically
+linked in:
 
 ```clojure
-{:deps {com.s-exp/enso                 {:mvn/version "1.0.0-alphaN"}
-        com.s-exp/enso$darwin-arm64    {:mvn/version "1.0.0-alphaN"}}}
+{:deps {com.s-exp/enso              {:mvn/version "1.0.0-alphaN"}
+        com.s-exp/enso$darwin-arm64 {:mvn/version "1.0.0-alphaN"}}}
 ```
 
-Available classifiers:
+| Classifier | Platform |
+|---|---|
+| `darwin-arm64` | macOS 11+ on Apple Silicon |
+| `linux-amd64`, `linux-arm64` | Linux with glibc 2.28+ (the shims are built on AlmaLinux 8) |
+| `linux-musl-amd64`, `linux-musl-arm64` | Alpine, Wolfi, Chimera and other musl distributions |
 
-- `darwin-arm64`
-- `linux-amd64`, `linux-arm64`
-- `linux-musl-amd64`, `linux-musl-arm64`
-
-On musl (Alpine, Wolfi, Chimera; detected from the libc mapped into the
-JVM, `/proc/self/maps`, so a glibc host with the musl package installed
-isn't mistaken for one) only the musl shim is loaded: a glibc build can't
-run there, so it is never tried as a fallback and a missing musl
-classifier is a clear load error.
-
-Minimums: the glibc shims need glibc 2.28 or later (they are built on
-AlmaLinux 8), the darwin shim macOS 11 or later.
-
-For multi-platform uber-jars, declare multiple classifier deps side by side:
+The core jar is about 450 KB, a classifier jar about 3.5 MB
+(darwin-arm64). For an uberjar that runs on several platforms, list several
+classifiers side by side; the right shim is picked at load time:
 
 ```clojure
-{:deps {com.s-exp/enso                    {:mvn/version "1.0.0-alphaN"}
-        com.s-exp/enso$darwin-arm64       {:mvn/version "1.0.0-alphaN"}
-        com.s-exp/enso$linux-amd64        {:mvn/version "1.0.0-alphaN"}
-        com.s-exp/enso$linux-musl-amd64   {:mvn/version "1.0.0-alphaN"}}}
+{:deps {com.s-exp/enso                  {:mvn/version "1.0.0-alphaN"}
+        com.s-exp/enso$darwin-arm64     {:mvn/version "1.0.0-alphaN"}
+        com.s-exp/enso$linux-amd64      {:mvn/version "1.0.0-alphaN"}
+        com.s-exp/enso$linux-musl-amd64 {:mvn/version "1.0.0-alphaN"}}}
 ```
 
-`Quiche.java` picks the matching shim from the classpath at load time.
+On musl only the musl shim is loaded. musl is detected from the libc
+mapped into the JVM (`/proc/self/maps`, else `/lib/ld-musl-*.so.1`), so a
+glibc host that merely has the musl package installed isn't mistaken for
+one. A glibc shim can't run on musl, so it is never tried as a fallback,
+and a missing musl classifier gives a clear load error.
+
+Intel Macs have no classifier jar; build the shim locally (see
+[Development builds](#development-builds)).
+
+A jar with every shim (`enso-<version>-all.jar`) is too large for Clojars.
+Release CI keeps it as a workflow artifact, and `clojure -T:build jar-all`
+builds it locally.
 
 ### Native access (JDK 24+)
 
-The shim is loaded with `System.load`, a restricted method: JDK 24 and
-later warn (and a future release will refuse) unless native access is
-enabled for the code loading it. Add `--enable-native-access=ALL-UNNAMED`
-to the JVM options (`--enable-native-access=com.s_exp.enso`, the jar's
-`Automatic-Module-Name`, when enso runs as a named module);
-with the Clojure CLI `clojure -J--enable-native-access=ALL-UNNAMED ...` or
-`:jvm-opts` in an alias. JDK 21 needs nothing.
+The shim is loaded with `System.load`, a restricted method. JDK 24 and
+later print a warning (and a future release will refuse) unless native
+access is enabled for the code loading it. Add this JVM option:
 
-## Enabling h3
+```
+--enable-native-access=ALL-UNNAMED
+```
+
+Use `--enable-native-access=com.s_exp.enso` (the jar's
+`Automatic-Module-Name`) if enso runs as a named module. With the Clojure
+CLI, pass `-J--enable-native-access=ALL-UNNAMED` or add it to `:jvm-opts`
+in an alias. JDK 21 needs nothing.
+
+## Enabling HTTP/3
 
 ```clojure
 (enso/run-server handler
   {:port 8443
-   :ssl-context ctx                 ;; for h1/h2 on the TCP port
+   :ssl-context ctx       ; for HTTP/1.1 and HTTP/2 on the TCP port
    :http2 true
    :http3 true
    :http3-cert-path "/path/cert.pem"
    :http3-key-path  "/path/key.pem"})
 ```
 
-- Uses its own UDP socket(s); can co-exist with h1/h2 on the same port number.
-- `Alt-Svc` auto-advertised on h1/h2 responses when h3 enabled.
-- See [options.md](options.md#http3) for full knob list.
-- Prefer an ECDSA (P-256) certificate: the TLS handshake signs once per
-  connection, on the connection's event loop thread, and an ECDSA
-  signature costs a small fraction of an RSA-2048 one, which matters most
-  under a connection flood.
-- Certificate rotation: every `:http3-cert-reload-interval` (10 s by
-  default, 0 disables) the certificate and key files are checked
-  (modification time, size, inode, so a symlink swap as Kubernetes does
-  for secrets is seen too). A changed pair is loaded and new connections
-  are accepted with it; existing connections keep the configuration they
-  were accepted with, which is freed with the last of them. A pair that
-  doesn't load (a file half written, a key that doesn't match the
-  certificate) is logged at WARNING (rate-limited) and the current one
-  kept; it is
-  retried when the files change again. Replace the two files atomically
-  (write elsewhere, then rename) so a check never sees a mixed pair.
-  `Http3Listener.reloadCertificates()` forces a reload.
+HTTP/3 uses its own UDP sockets and can share the port number with the
+TCP listener. When it is on, HTTP/1.1 and HTTP/2 responses carry an
+`Alt-Svc` header so clients find it. All options are listed in
+[options.md](options.md#http3).
+
+### Certificates
+
+quiche reads the PEM certificate and key itself, from disk. Prefer an
+ECDSA (P-256) certificate. The handshake signs once per connection, on the
+connection's event loop thread, and an ECDSA signature costs a small
+fraction of an RSA-2048 one, which matters most under a connection flood.
 
 ```
 openssl ecparam -name prime256v1 -genkey -noout -out key.pem
 openssl req -new -x509 -key key.pem -out cert.pem -days 365 -subj /CN=example.org
 ```
 
+Every `:http3-cert-reload-interval` (10 s by default, 0 disables) the
+files are checked for a change in modification time, size or inode, so a
+symlink swap like the one Kubernetes does for secrets is noticed. A changed
+pair is loaded and used for new connections. Existing connections keep the
+configuration they were accepted with, which is freed with the last of
+them. A pair that doesn't load (a half-written file, a key that doesn't
+match the certificate) is logged at WARNING, rate-limited, and the current
+one is kept until the files change again. Replace both files atomically
+(write elsewhere, then rename) so a check never sees a mixed pair.
+`Http3Listener.reloadCertificates()` forces a reload.
+
 ## How it runs
 
 ### Event loops and sharding
 
-QUIC connections are served by `N` event loops (`:http3-event-loops`;
-by default one per core on Linux, at most 64, one elsewhere). A loop is a platform
-thread that owns a shard of connections: every quiche call for a
-connection happens on its loop, so quiche (not thread-safe) needs no
-locking. Handlers run on virtual threads, one per request, as on HTTP/2.
+QUIC connections are served by event loops, one per core on Linux by
+default (at most 64) and one elsewhere (`:http3-event-loops`). A loop is a
+platform thread that owns a shard of connections. Every quiche call for a
+connection happens on its loop, so quiche, which isn't thread-safe, needs
+no locking. Handlers run on virtual threads, one per request, as on
+HTTP/2.
 
-The server picks the connection ids its clients address it with (16
-bytes); the first byte names the owning loop (its index modulo `N`, plus
-a random multiple of `N`).
+The server chooses the 16-byte connection ids clients use to address it.
+The first byte names the owning loop: its index modulo the loop count,
+plus a random multiple of the count.
 
-- **Linux**: every loop has its own `SO_REUSEPORT` socket bound to the
-  port, and a classic BPF program (`SO_ATTACH_REUSEPORT_CBPF`) makes the
-  kernel deliver each datagram to the socket of the loop named by the
-  first byte of its destination connection id (offset 1 in a short
-  header, 6 in a long one). Initial and 0-RTT packets are the exception:
-  their id is the client's choice, which must not pick the loop (a client
-  could aim every handshake at one loop, and ids spread unevenly when 256
-  isn't a multiple of the loop count), so the program hands them to the
-  kernel's 4-tuple hash and the loop that receives one accepts it; its
-  retransmissions, and the Initial after a Retry, come from the same
-  4-tuple to the same loop (one that doesn't, addressed to an id another
-  loop generated for its Retry, is handed to that loop). Packets never
-  change threads. If the program can't be attached the 4-tuple hash
-  applies to every datagram, and the rare one that lands elsewhere (after
-  a NAT rebinding) is copied to its owner's inbox.
-- **Elsewhere** (macOS, dev): one socket; loop 0 receives every datagram
-  and hands those of other loops' connections to their inbox. With the
-  default single loop nothing is handed over. This is a development
-  setup: one thread receives, runs TLS handshakes and serves every
-  connection. Giving each connection its own connected UDP socket after
-  its handshake would spread receiving, but needs a descriptor per
-  connection, kqueue registrations instead of one `poll` per loop, and a
-  fallback to the shared socket whenever a peer's address changes (NAT
-  rebinding), so it isn't done: run production servers on Linux.
+On Linux each loop has its own `SO_REUSEPORT` socket on the port, and a
+classic BPF program (`SO_ATTACH_REUSEPORT_CBPF`) makes the kernel deliver
+each datagram to the socket of the loop named by its destination
+connection id (byte 1 of a short header, byte 6 of a long one). Initial
+and 0-RTT packets are the exception. Their id is chosen by the client, and
+must not pick the loop: a client could aim every handshake at one loop,
+and ids would spread unevenly when 256 isn't a multiple of the loop count.
+The program leaves those to the kernel's 4-tuple hash, and the loop that
+receives one accepts it. Retransmissions, and the Initial after a Retry,
+come from the same 4-tuple and reach the same loop; one addressed to an
+id another loop generated for its Retry is handed to that loop. Packets
+never change threads otherwise. If the BPF program can't be attached, the
+4-tuple hash applies to every datagram, and the rare one that lands on the
+wrong loop (after a NAT rebinding) is copied to its owner's inbox.
 
-### Per iteration
+Elsewhere (macOS, development) there is one socket. Loop 0 receives every
+datagram and hands other loops' datagrams to their inboxes; with the
+default single loop nothing is handed over. One thread then receives, runs
+TLS handshakes and serves every connection. Giving each connection its own
+connected UDP socket would spread the work, but needs a descriptor per
+connection, kqueue registrations instead of one `poll` per loop, and a
+fallback to the shared socket whenever a peer's address changes. That
+isn't done; run production servers on Linux.
 
-A loop receives a batch of datagrams (`recvmmsg` on Linux) straight into
-a direct-memory slab, routes each by connection id, and feeds it to
-quiche in place: no copy per datagram, no Java object per datagram. It
-then takes datagrams other loops handed over and the connections that
-handler threads signalled (a lock-free push plus one write to the loop's
-wake-up eventfd/pipe when it is parked), fires expired timers (a binary
-heap of connections by deadline: quiche's timer, pacing, handshake, idle,
-header and write timeouts), and processes each connection that had any
-of this: request streams are read straight from the receive buffer
-(`quiche_conn_stream_readable_next`), responses encoded (QPACK, HEADERS
-with a minimal length, small bodies inline in the same `stream_send` as
-the FIN), streams that were waiting for flow-control credit resumed as
-quiche reports them writable (`quiche_conn_stream_writable_next`), and
-quiche's packets written into the send slab and sent in batches: on
-Linux one `sendmmsg` per batch (up to 64 messages), each message a single
-datagram or, when the kernel supports UDP GSO, a run of equal-size
-packets to the same peer (up to 64 segments) that the kernel segments; a
-device that refuses GSO turns it off for the socket. One `sendmsg` per
-packet elsewhere. Receive offload (GRO) isn't used. Then it parks in
-`poll` until the socket is readable, it is woken, or the next deadline; a
-wake-up that found the socket not readable skips the receive call.
+### The event loop
 
-- Pacing: when quiche's pacer (`send_info.at`, Linux) wants a packet more
-  than 1 ms later, that packet is held back and the connection resumes
-  sending at its release time. macOS has no pacing: quiche doesn't report
-  release times there.
-- Acknowledgements: quiche acknowledges a request at once. After starting
-  handlers the connection's packets wait up to 0.5 ms (well within the
-  `max_ack_delay` it advertises, 25 ms unless `:http3-max-ack-delay`
-  sets it) so a quick response carries that
-  ACK: one datagram per request instead of two.
-- Sending: a datagram the kernel refuses for a transient reason (buffer
-  exhaustion, firewall, unreachable peer) is counted as lost; quiche's
-  loss recovery resends what matters. A full socket buffer pauses sending
-  until it is writable.
-- Bound to a wildcard address on Linux, each datagram's destination
-  address is recorded (`IP_PKTINFO` / `IPV6_PKTINFO`) and the reply leaves
-  from it, so a multi-homed host answers from the address the client used.
-  Elsewhere bind a specific address on multi-homed hosts.
-- Socket buffers: `:http3-so-rcv-buf-bytes` / `:http3-so-snd-buf-bytes`
-  (4 MiB requested by default, best effort: on Linux a process with
-  CAP_NET_ADMIN gets it outright (`SO_RCVBUFFORCE`), otherwise Linux
-  clamps to `net.core.rmem_max` / `wmem_max` and a smaller grant is logged
-  at INFO; raise those for high-throughput servers. macOS halves the
-  request until the kernel accepts it).
+Each iteration, a loop:
+
+1. Receives a batch of datagrams (`recvmmsg` on Linux) into a direct-memory slab, routes each by connection id and feeds it to quiche in place, with no copy and no Java object per datagram.
+2. Takes datagrams handed over by other loops, and connections signalled by handler threads (a lock-free push, plus a write to the loop's wake-up eventfd or pipe when it is parked).
+3. Fires expired deadlines from a binary heap of connections: quiche's timer, pacing, handshake, idle, header and write timeouts.
+4. Processes each connection that had any of the above. Request streams are read straight from the receive buffer (`quiche_conn_stream_readable_next`). Responses are encoded: QPACK, HEADERS with a minimal length, and small bodies inline in the same `stream_send` as the FIN. Streams that were waiting for flow-control credit resume as quiche reports them writable (`quiche_conn_stream_writable_next`).
+5. Writes quiche's packets into the send slab and sends them in batches. On Linux that is one `sendmmsg` per batch of up to 64 messages, each a single datagram or, when the kernel supports UDP GSO, a run of up to 64 equal-size packets to the same peer that the kernel segments. A device that refuses GSO turns it off for the socket. Elsewhere it is one `sendmsg` per packet. Receive offload (GRO) isn't used.
+6. Parks in `poll` until the socket is readable, it is woken, or the next deadline. A wake-up that finds the socket not readable skips the receive call.
+
+Details:
+
+- Pacing: on Linux, when quiche's pacer (`send_info.at`) wants a packet sent more than 1 ms later, the packet is held and the connection resumes sending at its release time. macOS has no pacing, because quiche doesn't report release times there.
+- Acknowledgements: quiche acknowledges a request at once. After starting handlers, a connection's packets wait up to 0.5 ms so that a quick response carries the ACK, giving one datagram per request instead of two. That is well within the `max_ack_delay` it advertises (25 ms unless `:http3-max-ack-delay` is set).
+- A datagram the kernel refuses for a transient reason (buffer exhaustion, firewall, unreachable peer) is counted as lost, and quiche's loss recovery resends what matters. A full socket buffer pauses sending until it is writable.
+- Bound to a wildcard address on Linux, the server records each datagram's destination address (`IP_PKTINFO` / `IPV6_PKTINFO`) and replies from it, so a multi-homed host answers from the address the client used. On other systems, bind a specific address on multi-homed hosts.
+- Socket buffers (`:http3-so-rcv-buf-bytes`, `:http3-so-snd-buf-bytes`, 4 MiB by default) are best effort. On Linux a process with CAP_NET_ADMIN gets them outright (`SO_RCVBUFFORCE`); otherwise the kernel clamps them to `net.core.rmem_max` / `wmem_max` and a smaller grant is logged at INFO, so raise those on high-throughput servers. macOS halves the request until the kernel accepts it.
 
 ### Admission
 
-Datagrams shorter than 1200 bytes never create state or get an answer.
-A long header of an unsupported version gets Version Negotiation from
-whichever loop receives it, whatever its connection ids (0 to 255 bytes,
-RFC 8999) and the rest of its first byte, built in Java without quiche
-(never for a Version Negotiation packet, version 0). A client Initial for
-an unknown connection id is answered statelessly or admitted:
+Datagrams shorter than 1200 bytes never create state or get an answer. A
+long header with an unsupported version gets Version Negotiation from
+whichever loop receives it, whatever its connection id lengths (0 to 255
+bytes, RFC 8999) and the rest of its first byte. It is built in Java,
+without quiche, and never sent in reply to a Version Negotiation packet.
 
-0. An Initial whose Destination Connection ID is shorter than 8 bytes is
-   dropped (RFC 9000 §7.2).
-1. A token that verifies (our Retry token, bound to the client address
-   and its family, the original and the Retry connection ids, 10 s
-   lifetime) skips the Retry. An expired or misdirected token of ours gets
-   CONNECTION_CLOSE(INVALID_TOKEN) in a small server Initial built without
-   any state (RFC 9000 §8.1.2); another server's token counts as absent.
-2. Without a valid token, a stateless Retry is required while
-   `:http3-retry-threshold` (256) or more connections are handshaking,
-   always with `:http3-stateless-retry`, and always when
-   `:max-connections-per-ip` is set (a per-address slot taken for a
-   spoofed source address would lock that address out, so the address is
-   proven first). A spoofed flood therefore can't make the server
-   allocate connections or sign handshakes beyond the threshold.
-3. Past `:http3-max-half-open` (1024) handshaking connections, Initials are
-   dropped (checked by taking the slot, so loops admitting at once can't
-   overshoot it).
-4. While `:max-buffered-bytes` is exhausted (the server is overloaded)
-   the Initial is dropped ("connection-limit"). Nothing is reserved at
-   admission: an idle connection costs no budget. See Limits below.
-5. Every connection takes a slot of the server's connection limiter for
-   its whole life: `:max-connections` and `:max-connections-per-ip` count
-   TCP and QUIC connections together. Past either limit the Initial is
-   dropped ("connection-limit").
+A client Initial for an unknown connection id goes through these checks,
+in order:
 
-Handshaking connections are dropped at `:handshake-timeout`.
+1. A Destination Connection ID shorter than 8 bytes: dropped (RFC 9000 §7.2).
+2. A token that verifies (our Retry token, bound to the client address and its family, the original and the Retry connection ids, valid 10 s) skips the Retry. An expired or misdirected token of ours gets CONNECTION_CLOSE(INVALID_TOKEN) in a small server Initial built without any state (RFC 9000 §8.1.2). Another server's token counts as no token.
+3. Without a valid token, a stateless Retry is required when `:http3-retry-threshold` (256) or more connections are handshaking, always with `:http3-stateless-retry`, and always when `:max-connections-per-ip` is set (a per-address slot taken for a spoofed address would lock that address out, so the address is proven first). A spoofed flood therefore can't make the server allocate connections or sign handshakes beyond the threshold.
+4. Past `:http3-max-half-open` (1024) handshaking connections, the Initial is dropped. The check takes the slot, so loops admitting at the same time can't overshoot it.
+5. While `:max-buffered-bytes` is exhausted, the Initial is dropped ("connection-limit"). Nothing is reserved at admission, so an idle connection costs no budget.
+6. Each connection holds a slot of the server's connection limiter for its whole life. `:max-connections` and `:max-connections-per-ip` count TCP and QUIC connections together. Past either, the Initial is dropped ("connection-limit").
+
+Connections still handshaking at `:handshake-timeout` are dropped.
+
+### Flow control and memory
+
+Connections start with a 512 KiB window (`:http3-initial-max-data-bytes`)
+and streams with half of that, 256 KiB, the same as HTTP/2's initial
+stream window. A stream whose handler doesn't read therefore can't stall
+the connection's other requests.
+
+Release builds link libquiche with two patches
+(`native/enso_quiche/patches/`, see [build.md](build.md#http3-shim)).
+With them (`Quiche.RECV_WINDOW_CONTROL`), windows autotune as quiche's do:
+a window doubles when the handler has read half of it within two round
+trips. A stream's window grows up to `:http3-max-window-bytes` (8 MiB,
+about 160 MiB/s at 50 ms), a connection's up to twice that. The second
+patch bounds the out-of-order fragments quiche buffers per stream, so the
+data it holds stays within the connection window plus a small overhead
+(about 1.5 MiB in all at the defaults).
+
+With a stock libquiche (a distribution's build, used for development)
+windows keep their initial sizes: one stream uploads at most 256 KiB per
+round trip (about 5 MiB/s at 50 ms), a connection 512 KiB. Stock libquiche
+also doesn't bound out-of-order buffering. Use it for development only.
+
+quiche's buffers are native memory, charged to `:max-buffered-bytes`
+through the connection's account:
+
+- The initial window is charged while the connection reads a request body, from its first body until no body is being read.
+- Each doubling of the connection window is reserved before quiche may use it, once quiche has grown the window to its current bound and handlers have read a window of body bytes since. It is skipped while the account can't pay, and held until the connection goes, like HTTP/2's grown connection window.
+- Stream windows need no reservation, because the connection window bounds what the peer may send across its streams.
+- A connection reading no body costs nothing, so idle and GET-only connections don't limit how many are admitted.
+
+The unpaid part is the initial window, promised in the handshake like
+HTTP/2's initial 65535 octets. A peer can only fill it by sending data the
+server isn't reading while no body on its connection is being read
+(out-of-order data, or requests waiting for the connection's buffered
+bodies to be read). That is at most 512 KiB per connection, about 5 GiB
+for the default 10000 connections (HTTP/2: 625 MiB), with or without the
+patches. Lower the initial window or `:max-connections` where that much
+native memory isn't available.
+
+Request bodies waiting for their handler are buffered in Java: at most
+64 KiB per request and, together, at most the connection window per
+connection, however many streams are open. Past either, the loop stops
+reading those streams until handlers read, and QUIC flow control pushes
+back on the client. Moving bytes into these buffers is what returns the
+client's credit, so they, not quiche's windows, are the bound; quiche holds
+at most one window more. These bytes also count against
+`:max-buffered-bytes` through the connection's fair share. While the
+connection is throttled (the budget exhausted, or past its low-water mark
+with this connection over its share) the loop stops reading its request
+streams until handlers catch up.
+
+Response bytes held for the client's flow control count too: writes quiche
+hasn't taken yet (a copy, or the handler's body array kept alive for them)
+and the part of a streamed body waiting to be sent. They are released as
+they are sent, when the stream is reset or stopped, and when the
+connection goes. A closed connection releases whatever its requests still
+held.
 
 ### Limits and timeouts
 
-- Flow control: connections start with `:http3-initial-max-data-bytes`
-  (512 KiB) of window, streams with half of it (256 KiB, HTTP/2's initial
-  stream window), so a stream whose handler doesn't read can't stall the
-  connection's other requests. With the patched libquiche of the release
-  builds (`native/enso_quiche/patches/`, `Quiche.RECV_WINDOW_CONTROL`),
-  windows autotune as quiche's do: a window doubles when the handler read
-  half of it within two round trips, a stream's up to
-  `:http3-max-window-bytes` (8 MiB, about 160 MiB/s at 50 ms), a
-  connection's up to twice that. On a stock libquiche (a distribution's
-  dynamic build) windows stay at their initial sizes: one stream uploads
-  at most 256 KiB per round trip (about 5 MiB/s at 50 ms), a connection
-  512 KiB.
-- Native receive memory: what quiche buffers is native memory, at most a
-  connection window of data per connection (plus its out-of-order
-  fragments' bookkeeping, at most about 1.5 MiB at the defaults with the
-  release builds' libquiche), charged to `:max-buffered-bytes` through
-  the connection's account. The initial window is charged while
-  the connection reads a request body (from the first body until no body
-  is being read). Each doubling of the connection window is reserved
-  before quiche may use it (once quiche autotuned the window to its
-  current bound and handlers read a window of body bytes since), skipped while the
-  account can't pay, and held until the connection goes, as HTTP/2's
-  connection credit. Stream windows need no reservation: the connection
-  window bounds what the peer may send on all streams. A connection
-  reading no body costs nothing: idle and GET-only connections don't limit
-  how many are admitted. The unpaid rest is the initial window, promised
-  in the handshake (as HTTP/2's initial 65535 octets), reachable only by a
-  peer sending data the server doesn't read while no body of the
-  connection is (out of order, or requests waiting for the connection's
-  buffered bodies to be read): at most 512 KiB per connection, 5 GiB for
-  the default 10000 connections (HTTP/2: 625 MiB), patched or not. Lower
-  the initial window or `:max-connections` where that native memory isn't
-  available.
-- Header sections: `:max-header-bytes` (advertised as
-  SETTINGS_MAX_FIELD_SECTION_SIZE) and `:max-header-fields`, as on the
-  other protocols: a decoded section over either is answered 431 without
-  the handler; a HEADERS frame over the hard ceiling (4x, at least 64 KiB)
-  is reset with H3_EXCESSIVE_LOAD before anything is buffered. Bytes of
-  incomplete sections buffered across a connection's streams are bounded
-  by that ceiling (further streams get H3_REQUEST_REJECTED); a section not
-  complete within `:header-timeout` gets H3_REQUEST_REJECTED. Time the
-  server spent not reading a stream (its connection's body buffers full)
-  doesn't count: the clock restarts when reading resumes.
-- `:max-request-body-bytes`: a larger Content-Length is answered 413
-  without the handler; a body growing past it fails the handler's reads
-  with a 413 (`RequestBodyException`), answered as such, and the rest of
-  the stream is no longer read.
-- `Expect: 100-continue` gets a 100 interim response on the handler's
-  first body read; any other expectation 417.
-- Request bodies waiting for their handler: at most 64 KiB per request
-  and, together, at most the connection window
-  (`:http3-initial-max-data-bytes`) per connection, whatever the number
-  of streams; past either, the loop stops reading those streams (QUIC flow
-  control pushes back) until handlers read. Bytes moved into these
-  buffers give the client its flow-control credit back, so this, not
-  quiche's windows, is the bound (quiche holds at most a window more).
-- `:max-buffered-bytes`: request-body bytes buffered for handlers count
-  against the server-wide budget too, through the connection's fair
-  share; while the connection is throttled (the budget exhausted, or past
-  its low-water mark with this connection over its share) the loop stops
-  reading its request streams until handlers read. So do response bytes
-  held for the client's flow control: writes quiche didn't take yet (a
-  copy, or the handler's body array kept alive for them) and the part of
-  a streamed body's slice waiting to be sent; they are given back as they
-  are sent, when the stream is reset or stopped, and when the connection
-  goes. A closed connection gives back what its requests still held, read
-  or not.
-- `:read-timeout`: a handler waiting longer for body bytes gets a
-  `RequestBodyTimeoutException` (a `SocketTimeoutException`); 408. So does
-  a body arriving slower than `:min-data-rate-bytes` once
-  `:min-data-rate-grace` of waiting is spent ("min-data-rate").
-- `:write-timeout`: a response whose bytes make no progress (the client
-  stopped reading) for that long is reset (H3_REQUEST_CANCELLED) and its
-  streamed body's producer fails. Progress is 16 KiB sent: a client
-  handing out credit a few bytes at a time makes none.
-- `:idle-timeout`: quiche's `max_idle_timeout`, and a connection with no
-  request in flight for that long sends GOAWAY and closes, even when the
-  client keeps it alive with PINGs.
-- `:http3-stream-reset-limit` (400 per 30 s): peer stream resets beyond
-  it close the connection with H3_EXCESSIVE_LOAD (rapid reset).
-- Handlers running per connection are capped at twice
-  `:http3-initial-max-streams-bidi` (handlers of reset requests that
-  ignore interrupts included); past it, requests get H3_REQUEST_REJECTED.
-  A request reset before its handler started never runs it. A closed
-  connection keeps its `:max-connections` slot (and its place in the
-  server's registry) until its last handler returns, so closing
-  connections can't leave unbounded handlers running.
-- Event loops contain failures: one connection's failure closes it
-  (H3_INTERNAL_ERROR) and nothing else; a failure escaping the loop is
-  logged at SEVERE, reported as the protocol error "event-loop-failure",
-  closes and frees that loop's connections (each teardown step guarded,
-  so a broken timer or table entry can't keep one alive) and restarts the
-  loop on fresh tables, timers and send batch. A handler thread that
-  fails to start is answered 503 and not counted as running.
-- A request stream that ends or is reset before its header section is
-  complete gets H3_REQUEST_INCOMPLETE, releasing the stream.
-- A request whose HEADERS frame ends the stream has no `:body`. When the
-  client ends the stream separately (a FIN in a later packet), the
-  handler, started on the header section, gets a body stream at EOF.
-- Response header sections: one larger than the client's
-  SETTINGS_MAX_FIELD_SECTION_SIZE isn't sent; the response becomes a 500,
-  or the stream is reset (H3_INTERNAL_ERROR) when even that doesn't fit.
-- Control streams (RFC 9114 §6.2.1, §7.2): a first frame other than
-  SETTINGS (a reserved type included) is H3_MISSING_SETTINGS; CANCEL_PUSH
-  (the server never pushes) and a decreasing MAX_PUSH_ID are H3_ID_ERROR;
-  STOP_SENDING on one of our control or QPACK streams is
-  H3_CLOSED_CRITICAL_STREAM (checked at most every 100 ms while packets
-  arrive).
+- Header sections: `:max-header-bytes` (advertised as SETTINGS_MAX_FIELD_SECTION_SIZE) and `:max-header-fields` apply as on the other protocols. A decoded section over either gets 431 without running the handler. A HEADERS frame over the hard ceiling (4×, at least 64 KiB) is reset with H3_EXCESSIVE_LOAD before anything is buffered. Bytes of incomplete sections across a connection's streams are bounded by that ceiling, and further streams get H3_REQUEST_REJECTED. A section not complete within `:header-timeout` gets H3_REQUEST_REJECTED. Time the server spends not reading a stream (because its connection's body buffers are full) doesn't count: the clock restarts when reading resumes.
+- `:max-request-body-bytes`: a larger Content-Length gets 413 without running the handler. A body that grows past it fails the handler's reads with a 413, and the rest of the stream isn't read.
+- `Expect: 100-continue` gets a 100 interim response on the handler's first body read. Any other expectation gets 417.
+- `:read-timeout`: a handler waiting longer for body bytes gets a `SocketTimeoutException`, answered 408. So does a body slower than `:min-data-rate-bytes` once `:min-data-rate-grace` of waiting has passed.
+- `:write-timeout`: a response that makes no progress for that long (the client stopped reading) is reset with H3_REQUEST_CANCELLED and its streamed body's producer fails. Progress means 16 KiB sent, so a client handing out credit a few bytes at a time makes none.
+- `:idle-timeout`: sets quiche's `max_idle_timeout`. A connection with no request in flight for that long also sends GOAWAY and closes, even if the client keeps it alive with PINGs.
+- `:http3-stream-reset-limit` (400 per 30 s): peer stream resets beyond it close the connection with H3_EXCESSIVE_LOAD.
+- Running handlers per connection are capped at twice `:http3-initial-max-streams-bidi`, counting handlers of reset requests that ignore their interrupt. Past it, requests get H3_REQUEST_REJECTED. A request reset before its handler started never runs it. A closed connection keeps its `:max-connections` slot, and its place in the server's registry, until its last handler returns, so closing connections can't leave an unbounded number of handlers running.
+- A request stream that ends or is reset before its header section is complete gets H3_REQUEST_INCOMPLETE.
+- A request whose HEADERS frame ends the stream has a nil `:body`. When the client ends the stream separately (a FIN in a later packet), the handler, already started, gets a body stream at EOF.
+- A response header section larger than the client's SETTINGS_MAX_FIELD_SECTION_SIZE isn't sent. The response becomes a 500, or the stream is reset (H3_INTERNAL_ERROR) when even that doesn't fit.
+- Control streams (RFC 9114 §6.2.1, §7.2): a first frame other than SETTINGS, a reserved type included, is H3_MISSING_SETTINGS. CANCEL_PUSH (the server never pushes) and a decreasing MAX_PUSH_ID are H3_ID_ERROR. STOP_SENDING on one of our control or QPACK streams is H3_CLOSED_CRITICAL_STREAM, checked at most every 100 ms while packets arrive.
+
+Failures are contained. A failure in one connection closes only that
+connection, with H3_INTERNAL_ERROR. A failure escaping the loop itself is
+logged at SEVERE and reported as the protocol error
+"event-loop-failure"; the loop's connections are closed and freed (each
+teardown step guarded, so a broken timer or table entry can't keep one
+alive) and the loop restarts with fresh tables, timers and send batch. A
+handler thread that fails to start is answered 503 and not counted as
+running.
 
 ### Shutdown
 
-On server close every QUIC connection (registered with the server like a
-TCP one) drains in two GOAWAYs (RFC 9114 §5.2): the first carries the
-largest stream id, so requests the client sent before learning of it are
-still served; one round trip later (twice the RTT estimate, between 10 ms
-and 1 s) the second names the first request it won't process, and newer
-ones are refused (H3_REQUEST_REJECTED). In-flight requests finish; the
-connection also waits for requests below the GOAWAY id still on their way
-(a reordered or lost and resent stream), then (up to 2 s in all) for the
-responses to be acknowledged, then closes with H3_NO_ERROR. A connection
-closed by `:idle-timeout` drains the same way. For the last part of
-`:shutdown-timeout` (a quarter, at most a second) connections still open
-are closed, interrupting their handlers, which are waited for until the
-deadline. The loops are stopped then and joined until the deadline (plus
-0.1 s); the quiche configurations and sockets are freed only once every
-loop exited (a loop that didn't is left holding them, and logged,
-rather than risk a use-after-free), so `close` returns at `:shutdown-timeout` either way.
-`:server-events` callbacks never run on a loop: they are delivered from
-their own thread.
+On server close every QUIC connection drains in two GOAWAYs (RFC 9114
+§5.2). The first carries the largest stream id, so requests the client
+sent before seeing it are still served. One round trip later (twice the
+RTT estimate, between 10 ms and 1 s), the second names the first request
+that won't be processed, and newer ones are refused with
+H3_REQUEST_REJECTED. Requests in flight finish. The connection also waits
+for requests below the GOAWAY id that are still on their way (reordered,
+or lost and resent), then, up to 2 s in all, for the responses to be
+acknowledged, and closes with H3_NO_ERROR. A connection closed by
+`:idle-timeout` drains the same way.
+
+In the last quarter of `:shutdown-timeout` (at most a second),
+connections still open are closed and their handlers interrupted, and
+waited for until the deadline. The loops are then stopped and joined until
+the deadline plus 0.1 s. quiche configurations and sockets are freed only
+once every loop has exited; a loop that didn't is left holding them, and
+logged, rather than risk a use-after-free. Either way `close` returns at
+`:shutdown-timeout`.
 
 ### Observability
 
-`:server-events` and JFR receive connection open/close (protocol "h3"),
-completed requests (method, status, body bytes each way, duration) and
-protocol errors: `bad-request`, `body-too-large`, `header-too-large`,
-`read-timeout`, `min-data-rate`, `handler-timeout`, `protocol-error`, `rapid-reset`,
-`header-timeout`, `write-timeout`, `handshake-timeout`,
-`connection-limit`, `handshake-limit`, `event-loop-failure`. Peer-caused failures log at FINE through rate limiters.
+`:server-events` and JFR report connections opening and closing (protocol
+"h3"), completed requests and protocol errors: "bad-request",
+"body-too-large", "header-too-large", "read-timeout", "min-data-rate",
+"handler-timeout", "protocol-error", "rapid-reset", "header-timeout",
+"write-timeout", "handshake-timeout", "connection-limit",
+"handshake-limit" and "event-loop-failure". Event callbacks never run on
+an event loop. Peer-caused failures log at FINE, rate-limited.
 
 ## Native shim
 
-`native/enso_quiche/enso_quiche.c` wraps libquiche and the UDP socket
-I/O. Its natives are package-private in `com.s_exp.enso.quiche`;
-`QuicheConfig`, `QuicheConnection` and `UdpSocket` own the raw handles
-and refuse use after free; `NativeBuffer` hands the shim a direct
-buffer's address and keeps the buffer reachable for the call. Packets and per-datagram
-metadata live in direct memory passed as (address, capacity) and
-range-checked by the shim; stream payloads cross as `byte[]` in critical
-regions that span exactly one quiche call (a copy, never the handshake).
-Loading checks that the shim implements the JNI contract of the classes
-loading it (`Quiche.SHIM_ABI`, the shim's `ENSO_SHIM_ABI`, bumped whenever
-a native or a record layout changes), so a stale build is refused with a
-clear error; that the record sizes, field offsets and flag values the
-shim was compiled with (its `LAYOUT` table, also checked against each
-other by `_Static_assert`s) equal `Records` / `UdpSocket`'s, so a layout
-edited on one side only is refused by name; and that libquiche is the
-release the shim's header came from (`Quiche.QUICHE_VERSION`), since
-struct layouts change between releases.
-Only `Java_*` symbols are exported; builds use `-fstack-protector-strong`,
+`native/enso_quiche/enso_quiche.c` wraps libquiche and the UDP socket I/O.
+Its natives are package-private in `com.s_exp.enso.quiche`. `QuicheConfig`,
+`QuicheConnection` and `UdpSocket` own the raw handles and refuse use after
+free. `NativeBuffer` passes the shim a direct buffer's address and keeps
+the buffer reachable during the call. Packets and per-datagram metadata
+live in direct memory, passed as (address, capacity) and range-checked by
+the shim. Stream payloads cross as `byte[]` in critical regions that span
+exactly one quiche call (a copy, never the handshake).
+
+When it loads the shim, the Java side checks that:
+
+- the shim implements the JNI contract of the classes loading it (`Quiche.SHIM_ABI` against the shim's `ENSO_SHIM_ABI`, bumped whenever a native or a record layout changes), so a stale build is refused with a clear error;
+- the record sizes, field offsets and flag values the shim was compiled with (its `LAYOUT` table, also cross-checked by `_Static_assert`s) match `Records` and `UdpSocket`, so a layout edited on one side only is refused by name;
+- libquiche is the release the shim's header came from (`Quiche.QUICHE_VERSION`), since struct layouts change between releases.
+
+Only `Java_*` symbols are exported. Builds use `-fstack-protector-strong`,
 `-D_FORTIFY_SOURCE=2`, stack-clash protection, full RELRO and a
-non-executable stack on Linux, CET (x86-64 Linux) or PAC/BTI (arm64); see
-[build.md](build.md#http3-shim).
+non-executable stack on Linux, and CET (x86-64 Linux) or PAC/BTI (arm64);
+see [build.md](build.md#http3-shim).
 
-## Dev build (dynamic-link against system libquiche)
+### Loading
+
+The shim is bundled at `META-INF/native/<os>-<arch>/`. At load time it is
+extracted to a per-JVM directory with a random name, so several JVMs on a
+host don't collide, then loaded with `System.load`. The directory is
+created under the `enso.quiche.tmpdir` system property, else the
+`ENSO_QUICHE_TMPDIR` environment variable, else `java.io.tmpdir`. Set one
+of them if the temp directory is mounted `noexec`.
+
+Candidates are tried in order, and if none loads the error lists each one
+and why it failed:
+
+1. `-Denso.quiche.shim=/abs/path/to/libenso_quiche.dylib`, alone, when set;
+2. the classpath resource for the platform;
+3. in a development checkout, `target/native/<os>-<arch>/` next to the `target/classes` directory the classes were loaded from (never a path relative to the working directory, and never when running from a jar);
+4. `java.library.path`.
+
+### Development builds
+
+For development the shim can link the system libquiche dynamically:
 
 ```
-brew install cloudflare-quiche              # macOS (must be 0.29.3: checked at load)
-make -C native/enso_quiche                  # → target/native/<os>-<arch>/libenso_quiche.<ext>
-clojure -T:build javac-bench                # optional: Netty+Jetty bench servers
+brew install cloudflare-quiche   # macOS; must be 0.29.3, checked at load
+make -C native/enso_quiche       # -> target/native/<os>-<arch>/libenso_quiche.<ext>
 ```
 
-A stock libquiche lacks what the release builds add
-(`native/enso_quiche/patches/`): receive windows stay fixed, and the tests
-that need receive-window control are skipped. It also lacks the bound on
-out-of-order fragments (cloudflare/quiche#2814): a peer can make it hold
-about 75 times a connection's window (38 MiB at the default 512 KiB) with
-tiny gapped STREAM frames. Use it for development only; release shims
-link the patched libquiche (`check-shim.sh` refuses one without the
-patches). Build the shim as for a release (below) to run everything.
+A stock libquiche lacks the patches the release builds apply. Receive
+windows stay fixed, the tests that need receive-window control are
+skipped, and out-of-order buffering is unbounded. Use it for development
+only. Release shims always link the patched libquiche, and
+`check-shim.sh` refuses one without the patches. To run everything
+locally, build the shim the release way.
 
-## Release / distributable build
+### Release builds
 
-Static-link libquiche 0.29.3, with the patches in
-`native/enso_quiche/patches/`, into the shim so the resulting
-`.dylib`/`.so` has no runtime dep on system libquiche. Release CI
-(`.github/workflows/release.yml`) does this across five platforms,
-packages each shim into its classifier jar (published with the core
-jar) and all of them into the fat jar (a run artifact only).
-
-To reproduce locally (pinned commit, lockfile and toolchain; see
-[build.md](build.md#http3-shim)):
+Release shims link libquiche 0.29.3 statically, with the patches in
+`native/enso_quiche/patches/`, so they have no runtime dependency on a
+system libquiche. Release CI (`.github/workflows/release.yml`) builds them
+for five platforms, packages each into its classifier jar (published with
+the core jar) and all of them into the all-platform jar (kept as a run
+artifact). To reproduce one locally from the pinned commit, lockfile and
+toolchain:
 
 ```
 native/enso_quiche/build-libquiche.sh /tmp/quiche
@@ -425,47 +366,13 @@ make -C native/enso_quiche QUICHE_STATIC=1 \
      QUICHE_INCLUDE_DIR=/tmp/quiche/include QUICHE_LIB_DIR=/tmp/quiche/lib
 ```
 
-The built shim is bundled at `META-INF/native/<os>-<arch>/`. At load time
-`Quiche.java` extracts the shim into a per-JVM directory (unique random
-name — safe for multi-JVM hosts) then `System.load`s it. The directory is
-created under the `enso.quiche.tmpdir` system property, else the
-`ENSO_QUICHE_TMPDIR` environment variable, else `java.io.tmpdir`: set one
-where the temp directory is mounted `noexec`.
+More in [build.md](build.md#http3-shim).
 
-Candidates are tried in order, each failure recorded and the next tried;
-when none loads, the error lists every candidate and why it failed:
-`-Denso.quiche.shim` (alone, when set), the classpath resource of the
-platform, in a development checkout `target/native/<os>-<arch>/` next to
-the `target/classes` directory the classes were loaded from (never a path
-relative to the working directory, and never when running from a jar),
-then `java.library.path`.
-
-## Platform classifier resolution
-
-- macOS → `darwin-arm64` (Apple Silicon only; Intel Macs need a
-  dev/dynamic build via `make -C native/enso_quiche`)
-- Linux glibc → `linux-arm64` / `linux-amd64`
-- Linux musl (Alpine, Wolfi, Chimera) → `linux-musl-*` only. Detection:
-  the libc mapped into the JVM (`/proc/self/maps`), else
-  `/lib/ld-musl-*.so.1`.
-
-Override for local dev:
-`-Denso.quiche.shim=/abs/path/to/libenso_quiche.dylib`.
-
-## Notes on the JNI vs FFM choice
+### Why JNI
 
 An FFM binding was tried first and showed heap corruption reported by
-libmalloc on macOS. The cause was in that binding, not in FFM or the
-JDK: it allocated 64 bytes for `quiche_send_info`, a 288-byte struct
-(two `sockaddr_storage`, their lengths and a `timespec`), so every
-`quiche_conn_send` wrote past the allocation. The move to the JNI shim
-fixed it as a side effect: the shim declares the struct in C, so its
-size comes from quiche's own header.
-
-## Tuning
-
-- Each request runs on its own virtual thread. While
-  `jdk.trackAllThreads` is on (the JDK default) every virtual thread is
-  also recorded in a thread container for thread dumps, a node allocated
-  and removed per request; `-Djdk.trackAllThreads=false` saves that, at
-  the cost of those threads missing from `jcmd Thread.dump_to_file`.
+libmalloc on macOS. The bug was in that binding, not in FFM or the JDK: it
+allocated 64 bytes for `quiche_send_info`, a 288-byte struct (two
+`sockaddr_storage`, their lengths and a `timespec`), so every
+`quiche_conn_send` wrote past the allocation. Moving to a C shim fixed it,
+since the shim takes the struct's size from quiche's own header.
