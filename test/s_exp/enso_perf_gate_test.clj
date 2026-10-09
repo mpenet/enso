@@ -1,5 +1,5 @@
 ;; ABOUTME: Verdicts of the allocation regression gate (s-exp.enso-perf-gate) on synthetic runs:
-;; ABOUTME: within tolerance, regression, skipped scenario, and a platform without a baseline.
+;; ABOUTME: within tolerance, regression, skipped scenario, and a platform without a baseline (fails).
 (ns s-exp.enso-perf-gate-test
   (:require [clojure.test :refer [deftest is]]
             [s-exp.enso-perf-gate :as gate]))
@@ -13,10 +13,12 @@
    :scenarios (into {} (map (fn [[k v]] [k (if (map? v) v {:alloc-bytes-per-request v})])) allocs)})
 
 (defn- check
-  "The gate's verdict on `results`, its report discarded."
+  "The gate's verdict on `results`, its report discarded (kept out of
+  the CI job summary too: these runs are synthetic)."
   [results]
   (let [verdict (volatile! nil)]
-    (with-out-str (vreset! verdict (gate/check baseline results)))
+    (with-redefs [gate/summary! println]
+      (with-out-str (vreset! verdict (gate/check baseline results))))
     @verdict))
 
 (deftest within-tolerance-passes
@@ -32,5 +34,6 @@
 (deftest unbaselined-scenario-is-not-gated
   (is (true? (check (run "Linux amd64" {:h1-get 400 :h2-get 1100 :ws-echo 99999})))))
 
-(deftest platform-without-baseline-passes
-  (is (true? (check (run "Mac OS X aarch64" {:h1-get 99999})))))
+(deftest platform-without-baseline-fails
+  ;; A gate that passes where nothing is recorded gates nothing.
+  (is (false? (check (run "Mac OS X aarch64" {:h1-get 99999})))))

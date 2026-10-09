@@ -33,6 +33,10 @@
   ;; Allocation-per-request gate over a perf run (see doc/testing.md).
   :perf-gate {:extra-paths ["test"]
               :main-opts ["-m" "s-exp.enso-perf-gate"]}
+  ;; JaCoCo agent + report CLI for script/coverage.sh; only their jar
+  ;; paths are used (`clojure -Spath -A:coverage`), never a classpath.
+  :coverage {:extra-deps {org.jacoco/org.jacoco.agent$runtime {:mvn/version "0.8.15"}
+                          org.jacoco/org.jacoco.cli$nodeps {:mvn/version "0.8.15"}}}
   ;; Coverage-guided fuzzing (Jazzer); run through script/fuzz.sh.
   :fuzz {:extra-deps {com.code-intelligence/jazzer {:mvn/version "0.30.0"}}
          :extra-paths ["target/fuzz-classes"]}

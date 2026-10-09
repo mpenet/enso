@@ -1,6 +1,10 @@
-# ABOUTME: Nightly/manual non-gating CI: soak/leak test, deep property and frame fuzz run, Jazzer
-# ABOUTME: coverage-guided fuzzing, and the perf harness with its allocation-per-request gate.
+# ABOUTME: Nightly/manual non-gating CI: soak/leak test, deep property and frame fuzz run, Jazzer fuzzing,
+# ABOUTME: the perf allocation gate, QUIC interop (quic-interop-runner) and a RustSec audit of the shim's crates.
 name: nightly
+
+# Non-gating means no pull request waits on it; every job still fails on
+# a regression, uploads what it produced, and a failed scheduled run opens
+# (or comments on) a "nightly failure" issue.
 
 on:
   schedule:
@@ -19,6 +23,9 @@ on:
       fuzz-seconds:
         description: Seconds per Jazzer target
         default: '900'
+      interop-clients:
+        description: quic-interop-runner clients (comma-separated)
+        default: 'quiche,ngtcp2,quic-go,neqo,quinn'
 
 permissions:
   contents: read
@@ -54,6 +61,7 @@ jobs:
           script/test.sh s-exp.enso-soak-test
 
       - name: Deep property / fuzz run
+        if: ${{ !cancelled() }}
         env:
           ENSO_PROPERTY_TRIALS: ${{ inputs.property-trials || '2000' }}
           ENSO_TEST_LOG_DIR: target/soak-logs
@@ -73,7 +81,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [HpackDecoderFuzz, QpackDecoderFuzz, Http1RequestFuzz, WebSocketFrameFuzz]
+        target: [HpackDecoderFuzz, QpackDecoderFuzz, Http1RequestFuzz, WebSocketFrameFuzz, Http2ConnectionFuzz,
+                 Http3StreamFuzz]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -84,9 +93,10 @@ jobs:
       - name: Compile Java sources
         run: clojure -T:build javac
 
-      # The corpus grows run after run: restore the latest, save a new one.
+      # The corpus grows run after run: restore the latest, save a new one
+      # (also when the run found something: the inputs it reached stay).
       - name: Restore corpus
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -100,12 +110,20 @@ jobs:
           FUZZ_SECONDS: ${{ inputs.fuzz-seconds || '900' }}
         run: script/fuzz.sh "$TARGET" "$FUZZ_SECONDS" --keep_going=20
 
+      - name: Save corpus
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: target/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
       - name: Upload findings
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fuzz-findings-${{ matrix.target }}
           path: target/fuzz/findings/${{ matrix.target }}/
+          if-no-files-found: error
           retention-days: 30
 
   perf:
@@ -125,9 +143,14 @@ jobs:
       - name: Compile Java sources
         run: clojure -T:build javac
 
+      # The HTTP/3 load client asks for 8 MiB socket buffers (see test.yml).
+      - name: Raise UDP receive buffer limit
+        run: sudo sysctl -w net.core.rmem_max=8388608
+
       # Shared CI runners are noisy neighbours: req/s and latency are a
       # trend line, not a benchmark. Allocation per request is stable and
-      # gated against bench/perf/baseline.edn.
+      # gated against bench/perf/baseline.edn ("Linux amd64" entry; a
+      # platform without an entry fails the gate).
       - name: Throughput / latency / allocation harness
         env:
           PERF_OPTS: '{:duration-s ${{ inputs.perf-duration-s || ''20'' }}}'
@@ -136,6 +159,7 @@ jobs:
           cat target/perf/latest.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Allocation-per-request gate
+        if: ${{ !cancelled() }}
         run: clojure -M:perf-gate
 
       - name: Upload results
@@ -145,3 +169,114 @@ jobs:
           name: perf-results
           path: target/perf/
           retention-days: 90
+
+  # Official quic-interop-runner, enso as the HTTP/3 server: only the
+  # http3 test case negotiates h3 (the transport cases use the hq-interop
+  # ALPN, which enso does not implement). Results are checked against
+  # bench/quic-interop-runner/expected-results.txt.
+  interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The runner's compose file needs Docker Engine >= 28.1.
+      - name: Set up Docker Engine
+        uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70 # v5.5.0
+        with:
+          version: version=v28.3.0
+
+      - name: Enable IPv6 filtering for the simulator networks
+        run: sudo modprobe ip6table_filter
+
+      # The runner dissects QUIC captures with tshark >= 4.5 (Ubuntu
+      # 24.04 ships 4.2).
+      - name: Install tshark and python venv
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo add-apt-repository -y ppa:wireshark-dev/stable
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tshark python3-venv
+          tshark --version | head -1
+
+      - name: quic-interop-runner (enso server)
+        env:
+          CLIENTS: ${{ inputs.interop-clients || 'quiche,ngtcp2,quic-go,neqo,quinn' }}
+        run: bench/quic-interop-runner/run.sh "$CLIENTS"
+
+      - name: Upload interop logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quic-interop
+          path: target/conformance/quic-interop/
+          retention-days: 14
+
+  # RustSec advisories against every crate locked for the shim's libquiche
+  # build (the whole quiche workspace lockfile, a superset of what is
+  # linked). Vulnerabilities fail the job; unmaintained / unsound notices
+  # are listed but do not. See SECURITY.md for the response process.
+  cargo-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_AUDIT_VERSION: 0.22.2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Cache cargo-audit
+        id: cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cargo-audit
+          key: cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-audit
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-audit --version "$CARGO_AUDIT_VERSION" --root ~/.cargo-audit
+
+      - name: cargo audit (native/enso_quiche/quiche-Cargo.lock)
+        run: |
+          set -o pipefail
+          ~/.cargo-audit/bin/cargo-audit audit --file native/enso_quiche/quiche-Cargo.lock 2>&1 | tee cargo-audit.txt
+          {
+            echo "### cargo audit (quiche-Cargo.lock)"
+            echo
+            echo '```'
+            grep -E '^(Crate|Version|Warning|Title|ID):|vulnerabilit|warning' cargo-audit.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cargo-audit
+          path: cargo-audit.txt
+          retention-days: 30
+
+  # A failed scheduled run is easy to miss in the Actions tab: keep one
+  # open issue per failure streak, commented on by every failed night.
+  report-failure:
+    needs: [soak, fuzz, perf, interop, cargo-audit]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the nightly failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly workflow failing"
+          body="Failed run: $RUN_URL (commit $GITHUB_SHA)"
+          number=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

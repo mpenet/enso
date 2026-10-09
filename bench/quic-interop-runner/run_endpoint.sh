@@ -43,6 +43,11 @@ KEY=/certs/priv.key
 ip route add 193.167.0.0/24 via 193.167.100.2 || true
 ip -6 route add fd00:cafe:cafe:0::/64 via fd00:cafe:cafe:100::2 || true
 
+# Checksum offload off, as the standard endpoint image's setup.sh does:
+# with it on, the server's packets cross the ns-3 simulator but never
+# reach the client's socket.
+ethtool -K eth0 tx off || true
+
 # Emit the readiness marker the sim expects.
 echo "server-side listening on 443/udp for testcase=$TESTCASE" >&2
 

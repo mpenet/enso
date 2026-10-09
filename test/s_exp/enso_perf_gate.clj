@@ -11,7 +11,8 @@
   `baseline * ratio + slack-bytes` (`:tolerance` in the baseline file),
   or when a scenario with a baseline was skipped. Baselines are kept per
   platform (`os.name os.arch` as recorded in the run); a platform without
-  one passes with a notice and prints the entry to add.
+  one fails, printing the entry to add: a gate with nothing to compare
+  against gates nothing.
 
   `update` replaces the current platform's entry with the run's numbers."
   (:require [clojure.edn :as edn]
@@ -94,10 +95,10 @@
         allocs (run-allocations results)]
     (summary! (str "### Allocation gate (" platform ", java " (get-in results [:meta :java]) ")\n"))
     (if-not entry
-      (do (summary! (str "No baseline for platform `" platform "`: passing. To gate it, add under `:platforms` in `"
-                         baseline-file "` (or run `clojure -M:perf-gate update`):\n\n```\n"
+      (do (summary! (str "**No baseline for platform `" platform "`: failing.** Record one under `:platforms` in `"
+                         baseline-file "` (or run `clojure -M:perf-gate update` on that platform):\n\n```\n"
                          (pr-str {platform (platform-entry results)}) "\n```\n"))
-          true)
+          false)
       (let [vs (verdicts (:alloc-bytes-per-request entry) allocs tolerance)
             failed (filter #(#{:missing :regression} (:status %)) vs)]
         (when (not= (:java entry) (get-in results [:meta :java]))

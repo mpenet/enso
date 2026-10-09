@@ -38,6 +38,6 @@ runs:
     - name: Resolve classpaths
       shell: bash
       run: |
-        for aliases in -T:build -X:test -M:test-server -M:perf -M:perf-gate -A:fuzz; do
+        for aliases in -T:build -X:test -M:test-server -M:perf -M:perf-gate -A:fuzz -A:coverage; do
           clojure -Sthreads 1 -P "$aliases"
         done

@@ -11,4 +11,14 @@
     :h1-pipelined 235,
     :h2-get 1125,
     :h3-get 791,
+    :ws-echo 332}},
+  "Linux amd64"
+  {:java "25.0.4.1+1-LTS",
+   :git "94e5c2b",
+   :alloc-bytes-per-request
+   {:h1-get 381,
+    :h1-get-rate 409,
+    :h1-pipelined 237,
+    :h2-get 1949,
+    :h3-get 776,
     :ws-echo 332}}}}

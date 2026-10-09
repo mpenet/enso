@@ -1,9 +1,14 @@
+# ABOUTME: quic-interop-runner endpoint image for enso as an HTTP/3 server: builds the static shim and
+# ABOUTME: jar from the pinned native inputs, runs run_endpoint.sh on a JDK 25 runtime.
+#
 # Interop-runner image for enso h3.
 #
-# Builds a self-contained Linux image with libquiche 0.29.3, JDK 25, the
-# enso jar + JNI shim, and a run_endpoint.sh entry that speaks the
-# quic-interop-runner contract (port 443 UDP, /certs/priv.key + cert.pem,
-# /www files, TESTCASE env var).
+# Builds a self-contained Linux image with JDK 25, the enso jar and the JNI
+# shim statically linked against the pinned libquiche (as released: pins
+# from native/enso_quiche/pins.env, built by build-libquiche.sh), and a
+# run_endpoint.sh entry that speaks the quic-interop-runner contract (port
+# 443 UDP, /certs/priv.key + cert.pem, /www files, TESTCASE env var).
+# bench/quic-interop-runner/run.sh builds it and runs the runner.
 #
 # Build (from repo root):
 #   docker buildx build --platform linux/amd64 \
@@ -15,7 +20,7 @@
 #     -v /tmp/certs:/certs -v /tmp/www:/www -v /tmp/logs:/logs \
 #     enso-interop:latest
 
-# ---- stage 1: build libquiche + our JNI shim + Java jar --------------------
+# ---- stage 1: build static libquiche + our JNI shim + Java jar -------------
 FROM debian:trixie-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,11 +30,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openjdk-25-jdk-headless \
  && rm -rf /var/lib/apt/lists/*
 
-# quiche 0.29.3 needs rustc >= 1.88; Debian trixie ships older. Use rustup
-# to pin a recent stable toolchain.
+# The Rust toolchain pinned for release builds (Debian's is older than
+# quiche needs).
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+COPY native/enso_quiche/pins.env /tmp/pins.env
+RUN . /tmp/pins.env \
+ && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal --no-modify-path
 
 # Resolve JAVA_HOME per-arch (Debian's openjdk drops different arch dirs).
 RUN if [ -d /usr/lib/jvm/java-25-openjdk-arm64 ]; then \
@@ -45,34 +52,29 @@ RUN curl -sSLO https://github.com/clojure/brew-install/releases/latest/download/
  && bash ./posix-install.sh \
  && rm posix-install.sh
 
-# Build libquiche 0.29.3 with C FFI + BoringSSL vendor.
-RUN git clone --depth 1 --branch 0.29.3 https://github.com/cloudflare/quiche.git /tmp/quiche \
- && cd /tmp/quiche \
- && cargo build --release --lib --features ffi,pkg-config-meta \
- && mkdir -p /opt/quiche/lib /opt/quiche/include \
- && cp target/release/libquiche.so /opt/quiche/lib/ \
- && cp quiche/include/quiche.h /opt/quiche/include/ \
- && rm -rf /tmp/quiche
-
 # Copy enso sources.
 WORKDIR /build
-COPY deps.edn build.clj ./
+COPY deps.edn build.clj LICENSE NOTICE THIRD-PARTY-NOTICES ./
 COPY src ./src
 COPY native ./native
 
-# Build the JNI shim against the freshly compiled libquiche.
+# Static libquiche (with BoringSSL) at the pinned commit and lockfile.
+RUN native/enso_quiche/build-libquiche.sh /tmp/quiche
+
+# Build the JNI shim against it.
 RUN JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac)))) \
-    QUICHE_PREFIX=/opt/quiche \
-    make -C native/enso_quiche
+    make -C native/enso_quiche QUICHE_STATIC=1 \
+      QUICHE_INCLUDE_DIR=/tmp/quiche/include QUICHE_LIB_DIR=/tmp/quiche/lib
 
 # Build the enso jar (includes shim under META-INF/native/linux-<arch>).
-RUN clj -T:build jar
+# No git history in the build context: name the version explicitly.
+RUN ENSO_VERSION=0.0.0-interop clj -T:build jar
 
 # ---- stage 2: runtime image ------------------------------------------------
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash ca-certificates curl iproute2 rlwrap \
+    bash ca-certificates curl ethtool iproute2 rlwrap \
     openjdk-25-jre-headless \
  && rm -rf /var/lib/apt/lists/*
 
@@ -89,14 +91,13 @@ RUN echo '{:paths ["."] :deps {org.clojure/clojure {:mvn/version "1.12.3"}}}' > 
  && cd /root && clj -Sdeps '{}' -M -e ':ok' >/dev/null 2>&1 || true \
  && rm /root/deps.edn
 
-COPY --from=builder /opt/quiche/lib/libquiche.so /usr/lib/
 COPY --from=builder /build/target/*.jar /opt/enso.jar
 COPY --from=builder /build/target/native /opt/native
 COPY bench/quic-interop-runner/deps.edn /opt/deps.edn
 COPY bench/quic-interop-runner/run_endpoint.sh /run_endpoint.sh
 COPY bench/quic-interop-runner/server.clj /opt/server.clj
 
-RUN ldconfig && chmod +x /run_endpoint.sh
+RUN chmod +x /run_endpoint.sh
 
 # quic-network-simulator waits on 4433 for readiness signal on stderr; we
 # emit the standard "Listening" line from server.clj to unblock it.

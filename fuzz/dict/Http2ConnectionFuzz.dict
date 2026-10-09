@@ -1,0 +1,50 @@
+# ABOUTME: libFuzzer dictionary for Http2ConnectionFuzz: whole operations of its input encoding
+# ABOUTME: (requests, DATA, SETTINGS, credit, resets) and raw frame headers, preface and HPACK bytes.
+# request: fresh stream, END_STREAM, GET /
+"\x00\x00\x01\x00\x00"
+# request: fresh stream, body follows, POST /big, content-length 5
+"\x00\x00\x00\x09\x01\x00\x01"
+# request: split over CONTINUATION frames
+"\x00\x00\x30\x01\x00"
+# request: padded with priority
+"\x00\x00\x06\x01\x00\x03"
+# request: expect 100-continue
+"\x00\x00\x00\x01\x01\x01\x04"
+# DATA on the last stream, END_STREAM, 5 bytes
+"\x03\x01\x01\x00\x05"
+# DATA, padded
+"\x03\x01\x09\x00\x10\x04"
+# DATA 16384 bytes
+"\x03\x01\x00\x40\x00"
+# SETTINGS: initial window 0, max frame 16384, table size 0
+"\x04\x00\x01\x04\x00"
+"\x04\x00\x01\x05\x06"
+"\x04\x00\x01\x01\x00"
+# SETTINGS ACK
+"\x04\x01\x00"
+# WINDOW_UPDATE: connection 1 MiB, last stream 65535, increment 0
+"\x05\x03\x05"
+"\x05\x01\x04"
+"\x05\x01\x00"
+# RST_STREAM CANCEL on the last stream
+"\x06\x01\x08"
+# PRIORITY self-dependent
+"\x07\x01\x01\x10\x00"
+# PING
+"\x08\x00enso-fz!"
+# GOAWAY last stream, NO_ERROR
+"\x09\x01\x00\x00"
+# trailers ending the stream
+"\x0e\x01\x00\x01\x0c\x09"
+# burst of 20 GETs, each reset
+"\x0f\x14\x01"
+# raw frame headers: SETTINGS, HEADERS END_HEADERS stream 1, CONTINUATION, DATA
+"\x0c\x09\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+"\x0c\x09\x00\x00\x00\x01\x04\x00\x00\x00\x01"
+"\x0c\x09\x00\x00\x00\x09\x04\x00\x00\x00\x01"
+"PRI * HTTP/2.0\x0d\x0a\x0d\x0aSM\x0d\x0a\x0d\x0a"
+# HPACK: :method GET, :scheme http, :path /, dynamic table size update 0
+"\x82"
+"\x86"
+"\x84"
+"\x20"

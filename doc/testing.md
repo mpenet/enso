@@ -25,6 +25,49 @@ it), and exits non-zero if any namespace failed. `ENSO_TEST_EXCLUDE`
 overrides the namespaces skipped by default (the soak test). Do not run
 the whole suite in a single JVM.
 
+### Flaky-test quarantine
+
+A test with evidence of intermittent failure (a CI run where it failed
+and then passed on the same commit, or on one matrix leg only) can be
+quarantined while the cause is investigated, by tagging it `^:flaky`:
+
+```clojure
+(deftest ^:flaky h2-something-timing-dependent ...)
+```
+
+`script/test.sh` then runs that namespace's other tests as usual and the
+quarantined ones in a second JVM (`:includes [:flaky]`). A quarantined
+test that fails is rerun once. Passing on the rerun prints `FLAKY` (a
+`::warning` annotation and a "Flaky" section in the job summary, with the
+first run's log kept as `target/test-logs/<ns>.flaky.log`): the run
+passes but the flake is visible. Failing twice fails the run like any
+other test. Quarantine is a stopgap, not a fix: open an issue for every
+tagged test, and remove the tag in the change that fixes the cause.
+Nothing is quarantined unless CI history shows the flake.
+
+## Coverage
+
+```
+clojure -T:build javac
+script/coverage.sh                          # the default namespaces, with coverage
+script/coverage.sh s-exp.enso-http2-test    # selected namespaces
+```
+
+`script/coverage.sh` runs the same namespaces as `script/test.sh` (or the
+ones given as arguments) with the JaCoCo agent attached to every test JVM
+through `JDK_JAVA_OPTIONS`, so enso itself stays dependency-free and the
+agent is only resolved through the `:coverage` alias. All JVMs append to
+`target/coverage/jacoco.exec` (`ENSO_COVERAGE_APPEND=1` keeps adding to a
+previous run), then the script writes HTML
+(`target/coverage/html/index.html`), XML and CSV reports for the Java
+core compiled from `src/java` (fuzz harnesses excluded), and a
+per-package line and branch table, printed and, on GitHub Actions, added
+to the job summary. The exit status is the test run's; the report is
+written even when tests fail. Only Java is measured, not the Clojure
+namespaces in `src/clj`. Agent overhead is within run-to-run noise (the
+suite is bound by timeouts, not CPU). The `coverage` job in `test.yml`
+runs it on every push and pull request without gating.
+
 ## Property-based and fuzz tests
 
 | Namespace | What it checks |
@@ -46,7 +89,7 @@ Knobs (environment variables):
 
 ## Coverage-guided fuzzing (Jazzer)
 
-Four [Jazzer](https://github.com/CodeIntelligenceTesting/jazzer) targets
+Six [Jazzer](https://github.com/CodeIntelligenceTesting/jazzer) targets
 live in `fuzz/java/com/s_exp/enso/fuzz/`, instrumenting `com.s_exp.enso.**`:
 
 | Target | What it drives | Fails on |
@@ -55,6 +98,8 @@ live in `fuzz/java/com/s_exp/enso/fuzz/`, instrumenting `com.s_exp.enso.**`:
 | `QpackDecoderFuzz` | the production `QpackDecoder` (one warm instance), against `QpackFieldSection.decode` | any exception but `QpackException`; the two decoders disagreeing on fields or error code/level; a warm-cache decode differing from the first |
 | `Http1RequestFuzz` | `HttpConnection.run()` in-process over an in-memory socket (pipelined requests, bodies, chunked framing, WebSocket upgrades); the handler drains bodies and never fails | an exception out of `run()`; output not starting with an HTTP/1.1 status line; any `500` (the server failing on client input); a hang (Jazzer's 10 s per-input timeout) |
 | `WebSocketFrameFuzz` | `WebSocketConnection.run()` in-process over an in-memory socket, with and without permessage-deflate, echoing messages | an exception out of `run()`; `onClose` not called exactly once; the socket left open; server output that is not a sequence of valid unmasked frames |
+| `Http2ConnectionFuzz` | `Http2Connection.run()` (cleartext, prior knowledge) in-process over an in-memory socket, from structured client frame sequences (input decoded as operations, see the class doc): requests with HPACK / CONTINUATION / padding / priority, DATA, SETTINGS, WINDOW_UPDATE, RST_STREAM bursts, PING, GOAWAY, PUSH_PROMISE, unknown and mis-sized frames, raw bytes; low limits so edge cases are reachable; the handler drains bodies and answers 200 (text, bytes, streamed, InputStream) or 204 | an exception out of `run()`; any WARNING log or uncaught exception; the socket left open; writer or handler threads still running after `run()`; output that isn't whole, well-formed frames (SETTINGS first, valid ids, lengths, error codes, PING / SETTINGS ACKs answering the client's); header blocks interleaved or not decoding to one `:status`; any `500`; DATA before the head, after END_STREAM, after our RST_STREAM, past Content-Length or past the client's flow-control windows; HEADERS / DATA above a GOAWAY last-stream-id or a rising last-stream-id; a hang |
+| `Http3StreamFuzz` | client HTTP/3 stream bytes, delivered both in fuzz-chosen chunks and whole: peer unidirectional streams (types, SETTINGS / GOAWAY / MAX_PUSH_ID / CANCEL_PUSH / reserved frames, QPACK instructions, resets) into `Http3ControlStreams`; request streams into `Http3FrameReader`, their HEADERS into `QpackDecoder` and DATA into `Http3BodyPipe` | control streams raising anything but `Http3ConnectionException` with an RFC 9114 / 9204 code; frame readers raising anything but `IllegalStateException`; QPACK raising anything but `QpackException`; the two deliveries disagreeing on whether and where a stream fails, on control-stream state or on the frames read; the body pipe losing, reordering or inventing bytes, ending wrongly or leaving memory budget charged |
 
 ```
 clojure -T:build javac
@@ -64,13 +109,21 @@ script/fuzz.sh QpackDecoderFuzz 0 target/fuzz/findings/QpackDecoderFuzz/crash-<s
 
 New coverage-reaching inputs accumulate in `target/fuzz/corpus/<target>/`
 and are reused by the next run; seed inputs are checked in under
-`fuzz/corpus/<target>/` and the HTTP/1.1 target has a dictionary in
-`fuzz/dict/`. A finding writes the crashing input and a standalone Java
+`fuzz/corpus/<target>/`, dictionaries in `fuzz/dict/<target>.dict`. A finding writes the crashing input and a standalone Java
 reproducer to `target/fuzz/findings/<target>/`; extra arguments after the
 duration go to Jazzer / libFuzzer (e.g. `--keep_going=20`). The connection
 targets borrow the config and timer of a started server (on an ephemeral
 loopback port); the fuzzed connections are driven directly, never
 accepted.
+
+`Http3RequestReader` (the production request-stream reader) is not
+fuzzed at this level: it reads through `QuicheConnection.streamRecv` and
+dispatches through an `Http3Connection`, which only a live quiche
+connection (JNI shim) can create. `Http3StreamFuzz` drives the same
+building blocks (frame reader, QPACK decoder, body pipe) with its own
+model of a request stream; the real reader's own checks (DATA before
+HEADERS, a stream ending mid-frame) are covered by the h3spec suite and
+`s-exp.enso-h3-e2e-test`.
 
 ## Sanitizer run
 
@@ -161,6 +214,65 @@ Current results (default server options):
 - h3spec: 49 cases, 2 expected failures (reserved header bits, checked
   only inside libquiche; see `doc/h3-conformance.md`).
 
+### QUIC interop (quic-interop-runner)
+
+`bench/quic-interop-runner/run.sh [CLIENTS]` builds the enso endpoint
+image (`bench/quic-interop-runner/Dockerfile`: static shim from the
+pinned native inputs, as released), fetches the official
+[quic-interop-runner](https://github.com/quic-interop/quic-interop-runner)
+at a pinned commit, registers enso as a server-only implementation and
+runs it against the given clients (default
+`quiche,ngtcp2,quic-go,neqo,quinn`) through the network simulator. The
+results are checked against `bench/quic-interop-runner/expected-results.txt`
+(`check_results.py`: exit 1 when nothing ran, 2 on any difference,
+including a listed failure that now passes). Logs, pcaps and
+`results.json` land in `target/conformance/quic-interop/`. The nightly
+`interop` job runs it on `ubuntu-24.04`.
+
+Only the `http3` test case applies to enso as a server. The runner's
+other cases (handshake, transfer, retry, multiconnect, chacha20,
+resumption, zerortt, keyupdate, ...) are run by every client over the
+`hq-interop` ALPN (HTTP/0.9 over QUIC), which enso does not speak: its
+endpoint answers them with exit 127 ("unsupported"). Serving
+`hq-interop` from the test endpoint would open those cases.
+
+Needs Docker with Compose, Python >= 3.10 and tshark >= 4.5; on Linux
+also `sudo modprobe ip6table_filter`. On macOS the runner can't run
+natively (Docker Desktop does not share `/tmp`, where it creates the
+directories it mounts into the simulator, and the system `openssl` is
+LibreSSL), so run it from a Linux container talking to the host daemon:
+
+```
+docker build -t enso-qir-host -f bench/quic-interop-runner/runner.Dockerfile bench/quic-interop-runner
+docker build -t enso-interop:latest -f bench/quic-interop-runner/Dockerfile .
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v /tmp:/tmp \
+  -v "$PWD:$PWD" -w "$PWD" -e INTEROP_IMAGE=enso-interop:latest \
+  enso-qir-host bench/quic-interop-runner/run.sh quic-go,ngtcp2
+```
+
+(`-v /tmp:/tmp` mounts the Docker VM's `/tmp`, which is what the
+simulator containers see.) Apple Silicon runs arm64 images natively;
+quiche's client image is amd64-only and runs emulated.
+
+Current result: every client fails `http3` before any QUIC exchange.
+The simulator waits for the server to answer its readiness probe (an
+unknown-version long header, 1207 bytes, zero-length DCID) with Version
+Negotiation, and `Http3Loop.onDatagram` drops long-header datagrams with
+a DCID length of 0 or above 20 before looking at the version. RFC 9000
+§5.2.2 / §17.2 and RFC 8999 ask a server to answer unknown versions
+(DCIDs up to 255 bytes) with Version Negotiation. The expectations file
+records these failures until that is fixed. With that check relaxed
+locally (accepting a zero-length DCID), quic-go, ngtcp2, neqo and quinn
+pass `http3`; quiche's client (amd64 image, emulated on Apple Silicon)
+gets no answer to its Initial, cause not yet known: confirm on a native
+x86-64 run before recording it.
+
+The endpoint turns off checksum offload on its interface
+(`ethtool -K eth0 tx off` in `run_endpoint.sh`, as the runner's standard
+endpoint images do): without it the server's packets cross the
+simulator but never reach the client's socket (ngtcp2 counts zero
+received packets), with it the transfers above pass.
+
 ## Performance and allocation harness
 
 See [performance.md](performance.md#methodology). In short:
@@ -187,30 +299,107 @@ clojure -M:perf-gate update             # record this run as the platform's base
 A scenario fails above `baseline * ratio + slack-bytes` (`:tolerance`,
 1.2 and 48 bytes) or when it was skipped; a result far below the baseline
 is reported as an improvement to record. Baselines are per platform
-(`os.name os.arch` of the run); a platform without one passes and prints
-the entry to add. Only "Mac OS X aarch64" is recorded, so the nightly
-gate on Linux only prints its entry until one is added. Raise a baseline only for an allocation that is
-intended, in the same change that introduces it.
+(`os.name os.arch` of the run); a platform without one fails the gate
+and prints the entry to add. "Mac OS X aarch64" (development machines)
+and "Linux amd64" (the nightly job) are recorded. Raise a baseline only
+for an allocation that is intended, in the same change that introduces
+it.
+
+Allocation per request depends on the code path, but also on how much
+work each wake-up batches, so on the platform and the number of CPUs:
+HTTP/2 allocates about 40% more per request on a 2-CPU JVM than on an
+8-CPU one (1150 vs 1640 B/req on the same Mac with
+`-XX:ActiveProcessorCount=2`), and Linux and macOS differ by a few
+percent elsewhere. Record a baseline on hardware shaped like where the
+gate runs. The Linux entry comes from a container run:
+
+```
+bench/perf/linux-baseline.sh                  # linux/amd64 (emulated on Apple Silicon), Ubuntu 24.04 + Temurin 25 + h2load
+clojure -M:perf-gate update target/perf-linux-amd64/latest.edn
+```
+
+Emulated with 2 CPUs it can only be an upper bound for the 4-vCPU
+`ubuntu-24.04` runner, so the nightly gate may first report
+"improved": then record the nightly run's own numbers instead (download
+the `perf-results` artifact and run
+`clojure -M:perf-gate update perf-results/latest.edn`).
 
 ## CI
 
 - `.github/workflows/test.yml` (push to main, pull requests, and called by
   `release.yml` so nothing is published unless it passes): builds the
-  static shim once (libquiche cached per pinned inputs) and checks
-  THIRD-PARTY-NOTICES against the lockfile; runs every test namespace in
-  its own JVM with HTTP/3 enabled on JDK 21 and on JDK 25; runs the
-  HTTP/3 namespaces against an ASan/UBSan shim (built in that job); runs
-  the conformance suites as separate jobs with their reports uploaded
-  (h2spec over TLS and h2c, preceded by the verdict-logic self-test
-  `bench/conformance-lib-test.sh`; Autobahn; h3spec).
+  static shim natively on x86-64 and on arm64 (libquiche cached per
+  pinned inputs and architecture) and checks THIRD-PARTY-NOTICES against
+  the lockfile; runs every test namespace in its own JVM with HTTP/3
+  enabled on JDK 21 and JDK 25 (x86-64) and on JDK 25 (arm64,
+  `ubuntu-24.04-arm`, against the arm64 shim); runs the same namespaces
+  with JaCoCo for the coverage report (`coverage`, informational, never
+  fails the workflow); runs the HTTP/3 namespaces against an ASan/UBSan
+  shim (built in that job); runs the conformance suites as separate jobs
+  with their reports uploaded (h2spec over TLS and h2c, preceded by the
+  verdict-logic self-test `bench/conformance-lib-test.sh`; Autobahn;
+  h3spec). The conformance suites run on x86-64 only: neither h2spec
+  2.6.0 nor h3spec ships a Linux arm64 binary, and what they check is
+  protocol logic in Java, the same on every architecture (the arm64
+  native path is exercised by the HTTP/3 namespaces).
 - `.github/workflows/release.yml`: builds the five shims (Linux ones in
   AlmaLinux 8 / Alpine containers), each checked and load-tested in a JVM
   where it was built (`native/enso_quiche/check-shim.sh`, see
   [build.md](build.md#http3-shim)), runs the HTTP/3 end-to-end namespaces
   on macOS against the darwin shim being shipped, then packages and
   publishes.
-- `.github/workflows/nightly.yml` (scheduled + manual, non-gating): soak
-  test; deep property/fuzz run (2000 trials, HTTP/2 frame fuzzing
-  included); each Jazzer target for 15 minutes with its corpus carried
-  over between runs and findings uploaded; perf harness with the report
-  in the run summary and the allocation gate.
+- `.github/workflows/nightly.yml` (03:17 UTC daily and manual
+  `workflow_dispatch` with knobs; non-gating): soak test, then the deep
+  property/fuzz run (2000 trials, HTTP/2 frame fuzzing included) even if
+  the soak failed; each Jazzer target for 15 minutes with its corpus
+  carried over between runs (saved even when the run found something)
+  and findings uploaded; the perf harness with the report in the run
+  summary and the allocation gate (a missing "Linux amd64" baseline
+  fails); the QUIC interop run (below); `cargo audit` of the quiche
+  lockfile. Every job fails on a regression and uploads its logs or
+  reports; when a scheduled run fails, a last job opens (or comments on)
+  a "Nightly workflow failing" issue so the failure does not go unseen.
+- `.github/dependabot.yml`: weekly grouped updates of the SHA-pinned
+  Actions (workflows and composite actions). Dependabot has no ecosystem
+  for `deps.edn` or for a bare `Cargo.lock`: Clojure/Maven test
+  dependencies are bumped by hand, and the shim's crates are covered by
+  the nightly `cargo audit` (see `SECURITY.md`).
+
+## Recommended GitHub settings
+
+Branch protection and repository security settings can only be applied
+by a repository admin (Settings → Branches / Rules, Settings → Code
+security). Recommended for `main`:
+
+- Require a pull request before merging (direct pushes off; admins
+  included, so release tags always point at reviewed, tested commits).
+  One approval when there is more than one maintainer.
+- Require status checks to pass, and branches to be up to date before
+  merging. Required checks (job names of `test.yml`):
+  - `shim (amd64)`, `shim (arm64)`
+  - `test (JDK 21)`, `test (JDK 25)`, `test (JDK 25, arm64)`
+  - `sanitizer`
+  - `h2spec`, `autobahn`, `h3spec`
+
+  Not required: `coverage` (informational) and everything in
+  `nightly.yml` (scheduled, it reports through a "Nightly workflow
+  failing" issue instead).
+- Require linear history; block force pushes and branch deletion.
+- Tag protection (a ruleset on `v*`): only admins may create or delete
+  release tags, since a `v*` tag publishes to Clojars.
+- Environments: put the Clojars credentials in a `release` environment
+  restricted to `v*` tags instead of repository-wide secrets (the
+  `package` job in `release.yml` would then declare
+  `environment: release`).
+- Code security: enable private vulnerability reporting (referenced by
+  `SECURITY.md`), Dependabot alerts and Dependabot security updates
+  (`.github/dependabot.yml` covers version updates of the Actions).
+- Actions: "Allow actions and reusable workflows" limited to the ones
+  pinned in the workflows (GitHub-owned, `DeLaGuardo/setup-clojure`,
+  `dtolnay/rust-toolchain`, `docker/setup-docker-action`), and default
+  `GITHUB_TOKEN` permissions set to read-only (the workflows request
+  more per job where needed).
+
+When a job is renamed or a matrix leg added, update the required-checks
+list in the same change, or pull requests wait forever for a check that
+no longer exists.

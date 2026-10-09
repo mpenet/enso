@@ -1,0 +1,7 @@
+# ABOUTME: Build context filter for bench/quic-interop-runner/Dockerfile (the repository root): only
+# ABOUTME: sources go in, never build outputs, caches or the libquiche checkout.
+.git
+.cpcache
+.claude
+target
+quiche-src

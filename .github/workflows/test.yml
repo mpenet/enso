@@ -1,5 +1,5 @@
-# ABOUTME: Gating CI: every test namespace in its own JVM on JDK 21 and 25 (HTTP/3 via the JNI shim), the
-# ABOUTME: HTTP/3 namespaces against an ASan/UBSan shim, and the h2spec, Autobahn and h3spec suites.
+# ABOUTME: Gating CI: every test namespace in its own JVM on JDK 21 and 25, x86-64 and arm64 (HTTP/3 via the
+# ABOUTME: JNI shim), the HTTP/3 namespaces against an ASan/UBSan shim, and the h2spec, Autobahn and h3spec suites.
 name: test
 
 # Each conformance job checks the suite ran its full case count and
@@ -25,8 +25,15 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # One shim per test architecture, built natively on that runner.
   shim:
-    runs-on: ubuntu-24.04
+    name: shim (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-24.04}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -43,6 +50,7 @@ jobs:
       # The notices list every crate the lockfile links into the shim:
       # regenerate them whenever the lockfile or the quiche pin changes.
       - name: THIRD-PARTY-NOTICES matches the locked crates
+        if: matrix.arch == 'amd64'
         run: |
           python3 native/enso_quiche/third_party_notices.py quiche-src > /tmp/THIRD-PARTY-NOTICES
           diff -u THIRD-PARTY-NOTICES /tmp/THIRD-PARTY-NOTICES
@@ -50,21 +58,25 @@ jobs:
       - name: Upload shim
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: test-libenso_quiche-linux-amd64
-          path: target/native/linux-amd64/libenso_quiche.so
+          name: test-libenso_quiche-linux-${{ matrix.arch }}
+          path: target/native/linux-${{ matrix.arch }}/libenso_quiche.so
           if-no-files-found: error
           retention-days: 1
 
   test:
     needs: shim
-    name: test (JDK ${{ matrix.java }})
+    name: test (JDK ${{ matrix.java }}${{ matrix.arch == 'arm64' && ', arm64' || '' }})
     strategy:
       fail-fast: false
       matrix:
         # 21 is the oldest supported release (javac --release 21), 25 the
-        # current LTS; both run every namespace.
-        java: ['21', '25']
-    runs-on: ubuntu-24.04
+        # current LTS; both run every namespace. arm64 (a shipped
+        # classifier) runs every namespace on 25 against its own shim.
+        include:
+          - {java: '21', arch: amd64, runner: ubuntu-24.04}
+          - {java: '25', arch: amd64, runner: ubuntu-24.04}
+          - {java: '25', arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -76,8 +88,8 @@ jobs:
       - name: Download shim
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: test-libenso_quiche-linux-amd64
-          path: target/native/linux-amd64
+          name: test-libenso_quiche-linux-${{ matrix.arch }}
+          path: target/native/linux-${{ matrix.arch }}
 
       - name: Compile Java sources
         run: clojure -T:build javac
@@ -96,9 +108,50 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: test-logs-jdk${{ matrix.java }}
+          name: test-logs-jdk${{ matrix.java }}-${{ matrix.arch }}
           path: target/test-logs/
           retention-days: 7
+
+  # Line / branch coverage of the Java core (JaCoCo agent on every test
+  # JVM, see script/coverage.sh): per-package table in the job summary,
+  # reports uploaded. Informational: never fails the workflow (gating
+  # test failures are reported by the test jobs).
+  coverage:
+    needs: shim
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/setup-clojure
+
+      - name: Download shim
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: test-libenso_quiche-linux-amd64
+          path: target/native/linux-amd64
+
+      - name: Compile Java sources
+        run: clojure -T:build javac
+
+      - name: Raise UDP receive buffer limit
+        run: sudo sysctl -w net.core.rmem_max=8388608
+
+      - name: Tests with coverage
+        run: script/coverage.sh
+
+      - name: Upload coverage report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage
+          path: |
+            target/coverage/html/
+            target/coverage/jacoco.xml
+            target/coverage/jacoco.csv
+            target/coverage/jacoco.exec
+          retention-days: 14
 
   sanitizer:
     runs-on: ubuntu-24.04

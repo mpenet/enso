@@ -14,7 +14,9 @@ import java.net.SocketAddress;
 /**
  * A connected-looking socket whose peer sent {@code input} and then
  * half-closed: reads drain the array and then return EOF, so a
- * connection loop driven by it always terminates.
+ * connection loop driven by it always terminates. An optional
+ * {@code atEof} hook runs once, on the reading thread, before the first
+ * EOF is returned (a harness waits there for work the input started).
  */
 final class FakeSocket extends Socket {
 
@@ -24,11 +26,19 @@ final class FakeSocket extends Socket {
     private boolean outputShutdown;
 
     FakeSocket(byte[] input) {
-        this.in = new ByteArrayInputStream(input);
+        this(input, null);
+    }
+
+    FakeSocket(byte[] input, Runnable atEof) {
+        this.in = atEof == null ? new ByteArrayInputStream(input) : new HookedInput(input, atEof);
     }
 
     byte[] written() {
         return out.toByteArray();
+    }
+
+    int writtenLength() {
+        return out.size();
     }
 
     @Override
@@ -49,6 +59,11 @@ final class FakeSocket extends Socket {
     @Override
     public SocketAddress getRemoteSocketAddress() {
         return new InetSocketAddress(InetAddress.getLoopbackAddress(), 40000);
+    }
+
+    @Override
+    public SocketAddress getLocalSocketAddress() {
+        return new InetSocketAddress(InetAddress.getLoopbackAddress(), 8080);
     }
 
     @Override
@@ -100,5 +115,34 @@ final class FakeSocket extends Socket {
     @Override
     public synchronized void close() {
         closed = true;
+    }
+
+    private static final class HookedInput extends ByteArrayInputStream {
+        private Runnable atEof;
+
+        HookedInput(byte[] input, Runnable atEof) {
+            super(input);
+            this.atEof = atEof;
+        }
+
+        @Override
+        public synchronized int read() {
+            int b = super.read();
+            if (b < 0) eof();
+            return b;
+        }
+
+        @Override
+        public synchronized int read(byte[] b, int off, int len) {
+            int n = super.read(b, off, len);
+            if (n < 0) eof();
+            return n;
+        }
+
+        private void eof() {
+            Runnable hook = atEof;
+            atEof = null;
+            if (hook != null) hook.run();
+        }
     }
 }

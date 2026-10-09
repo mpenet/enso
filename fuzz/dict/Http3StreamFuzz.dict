@@ -1,0 +1,36 @@
+# ABOUTME: libFuzzer dictionary for Http3StreamFuzz: whole operations of its input encoding (stream
+# ABOUTME: types, frames, QPACK instructions) and raw HTTP/3 frame and QPACK field-line bytes.
+# control stream type on uni stream 2
+"\x00\x00\x00\x00"
+# QPACK encoder and decoder stream types
+"\x00\x01\x00\x02"
+"\x00\x02\x00\x03"
+# SETTINGS frame on uni stream 2: QPACK capacity 0, field section 4096
+"\x01\x00\x00\x02\x02\x00\x00\x01\x03"
+# GOAWAY, MAX_PUSH_ID, CANCEL_PUSH frames
+"\x01\x00\x00\x03\x02"
+"\x01\x00\x00\x04\x04"
+"\x01\x00\x00\x05\x00"
+# request HEADERS GET https://localhost/ with FIN
+"\x04\x00\x80\x01\x04\x00\x0c\x10\x29\x05"
+# request DATA, 5 bytes in 3-byte reads
+"\x04\x00\x03\x00\x00\x05"
+# FIN on request stream 0, reset of uni stream 2
+"\x07\x80"
+"\x03\x00"
+# raw frames: SETTINGS empty, GOAWAY 0, DATA empty, HEADERS empty section, grease type
+"\x04\x00"
+"\x07\x01\x00"
+"\x00\x00"
+"\x01\x02\x00\x00"
+"\x21\x00"
+# raw QPACK field lines: :method GET, :path /, :scheme https, :authority localhost
+"\xd1"
+"\xc1"
+"\xd7"
+"\x50\x09localhost"
+# QPACK encoder / decoder instructions: capacity 0, section ack, increment, cancellation
+"\x20"
+"\x81"
+"\x01"
+"\x41"

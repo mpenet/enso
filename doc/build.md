@@ -133,6 +133,10 @@ shim for `script/sanitizer-test.sh` (see [testing.md](testing.md#sanitizer-run))
    different BoringSSL (its commit is the `boring-sys/deps/boringssl`
    submodule of the matching cloudflare/boring tag). The `shim` CI job
    fails while THIRD-PARTY-NOTICES is out of date.
+4. Check the lockfile against the RustSec database
+   (`cargo audit --file native/enso_quiche/quiche-Cargo.lock`, also run
+   nightly). A bump made for a security advisory follows the process in
+   [SECURITY.md](../SECURITY.md#native-dependency-advisories).
 
 ## Bench sources
 

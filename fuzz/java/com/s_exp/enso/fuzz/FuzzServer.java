@@ -7,6 +7,7 @@ import com.s_exp.enso.api.Config;
 import com.s_exp.enso.api.RingHandler;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.function.UnaryOperator;
 
 final class FuzzServer {
 
@@ -14,12 +15,17 @@ final class FuzzServer {
 
     /** Starts a server on an ephemeral loopback port; it stays up until the JVM exits. */
     static EnsoServer start(RingHandler handler) {
-        Config config = Config.builder()
+        return start(handler, UnaryOperator.identity());
+    }
+
+    /** {@link #start(RingHandler)} with {@code tune} applied to the shared configuration. */
+    static EnsoServer start(RingHandler handler, UnaryOperator<Config.Builder> tune) {
+        Config config = tune.apply(Config.builder()
             .host("127.0.0.1")
             .port(0)
             .maxRequestBodyBytes(1 << 20)
             .wsMaxMessageBytes(1 << 20)
-            .wsCompression(true)
+            .wsCompression(true))
             .build();
         EnsoServer server = new EnsoServer(handler, config);
         try {

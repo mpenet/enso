@@ -8,6 +8,7 @@
 #   script/fuzz.sh QpackDecoderFuzz 0 target/fuzz/findings/QpackDecoderFuzz/crash-<sha>   # replay
 #
 # Targets: HpackDecoderFuzz QpackDecoderFuzz Http1RequestFuzz WebSocketFrameFuzz
+#          Http2ConnectionFuzz Http3StreamFuzz
 # SECONDS defaults to 60; 0 with an input file argument replays that input.
 # Needs compiled Java sources (clojure -T:build javac).
 #
