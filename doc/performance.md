@@ -224,14 +224,21 @@ on each. One request is one message echoed.
 
 | Server | msg/s | range | alloc B/msg | p50 ms | p99 ms |
 |---|---:|---:|---:|---:|---:|
-| http-kit | 534,943 | 531,429–536,908 | 847 | 0.93 | 1.68 |
-| Ensō | 422,721 | 421,004–425,475 | 334 | 1.15 | 2.31 |
+| Ensō | 1,024,862 | 1,009,962–1,026,881 | 334 | 0.47 | 0.98 |
+| http-kit | 533,613 | 531,403–536,963 | 892 | 0.93 | 1.68 |
 | Jetty | 379,908 | 379,723–380,306 | 5,229 | 0.81 | 6.84 |
 | Jetty, virtual threads | 373,828 | 372,964–374,610 | 5,290 | 1.02 | 8.92 |
 | Aleph | 48,292 | 45,444–48,942 | 2,655 | 8.33 | 49.84 |
 
-http-kit echoes 27% more messages per second than Ensō, with lower
-latency. Ensō allocates less per message.
+Ensō echoes 1.9 times as many messages per second as http-kit, at half
+the latency, and allocates less per message. The Ensō and http-kit rows
+come from a separate run of the same harness, 3 rounds.
+
+Most of the cost here is in the kernel, one write per TCP segment. Ensō
+writes the replies to the messages it has read in one write. http-kit
+writes each reply on its own but leaves Nagle's algorithm on, so the
+kernel joins its small writes into fewer segments. Ensō sets
+`TCP_NODELAY` (`:so-nodelay`).
 
 The echo handlers differ by server. Ensō uses its `WebSocketSocket` send
 methods, Jetty the Ring WebSocket API (`ring.websocket/send`), http-kit

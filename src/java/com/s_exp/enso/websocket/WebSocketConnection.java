@@ -51,6 +51,9 @@ import com.s_exp.enso.core.TlsSocket;
  * writes what is queued before its own frame, so frames leave in call
  * order. The read loop never waits on a writer: its pongs queue, and the
  * CLOSE it sends waits for the lock at most {@code :ws-close-timeout}.
+ * Replies a listener sends while more of the client's frames are already
+ * read wait in the output buffer to share one write with the replies to
+ * those frames (see {@link #holdsOutput}).
  */
 public final class WebSocketConnection {
 
@@ -123,6 +126,9 @@ public final class WebSocketConnection {
     // After this long without anything to do the writer thread ends (the
     // next asynchronous send starts another).
     private static final long WRITER_LINGER_NANOS = TimeUnit.SECONDS.toNanos(1);
+    // How long a held reply may wait in the output buffer for the next
+    // ones: one timer tick.
+    private static final int HELD_FLUSH_DELAY_MILLIS = 10;
     // What a queued frame costs besides its payload (the queue node, the
     // frame header), counted against :ws-max-queued-bytes and the memory
     // budget so empty frames can't queue without bound.
@@ -207,6 +213,17 @@ public final class WebSocketConnection {
             Thread.ofVirtual().name("enso-ws-close-timeout").start(WebSocketConnection.this::forceClose);
         }
     };
+    // Writes held replies a listener left waiting longer than
+    // HELD_FLUSH_DELAY_MILLIS.
+    private final Timer.Task heldFlush = new Timer.Task() {
+        @Override
+        protected void onTimeout() {
+            if (outputHeld) {
+                // Writing may block: off the timer thread.
+                Thread.ofVirtual().name("enso-ws-flush").start(WebSocketConnection.this::flushHeldLate);
+            }
+        }
+    };
     private final WebSocketSocket socketApi;
 
     // ---- Send state ----
@@ -229,6 +246,12 @@ public final class WebSocketConnection {
     // direct ByteBuffer payloads; allocated on first use.
     private byte[] gatherOut;
     private byte[] deflateOut = EMPTY;
+    // The output buffer holds frames the read loop wrote without flushing
+    // (see holdsOutput). Set under writeLock; cleared under it by a flush
+    // of the held frames. Volatile for the hold timer and the read loop's
+    // check before a read. Any flush writes the held frames too, so a
+    // stale true only costs a flush with nothing to write.
+    private volatile boolean outputHeld;
 
     // ---- Send queue, guarded by queueLock (never held across I/O) ----
     private final ReentrantLock queueLock = new ReentrantLock();
@@ -633,6 +656,7 @@ public final class WebSocketConnection {
         reader.releaseBudget();
         // retire: the wheel drops this connection on the next tick.
         timer.retire(closeTimer);
+        timer.retire(heldFlush);
         Outgoing left;
         Thread w;
         long dropped;
@@ -670,7 +694,7 @@ public final class WebSocketConnection {
                 try {
                     deflate.releaseDeflater();
                 } finally {
-                    writeLock.unlock();
+                    unlockWrites();
                 }
             }
         }
@@ -705,6 +729,9 @@ public final class WebSocketConnection {
      * message deadline (a SocketTimeoutException, like a read).
      */
     private void awaitBudget() throws IOException {
+        if (outputHeld) {
+            flushHeld();
+        }
         MemoryBudget.Waiter w = budgetWaiter;
         if (w == null) {
             w = new MemoryBudget.Waiter() {
@@ -937,7 +964,7 @@ public final class WebSocketConnection {
                     tls.tls().releaseIdleBuffers();
                 }
             } finally {
-                writeLock.unlock();
+                unlockWrites();
             }
         }
     }
@@ -950,6 +977,11 @@ public final class WebSocketConnection {
      * {@code :read-timeout}.
      */
     private int fill(byte[] dst, int off, int len, int timeout) throws IOException {
+        // Replies held for the frames read so far go out before waiting
+        // for more.
+        if (outputHeld) {
+            flushHeld();
+        }
         if (timeout != soTimeout) {
             socket.setSoTimeout(timeout);
             soTimeout = timeout;
@@ -1315,7 +1347,8 @@ public final class WebSocketConnection {
 
     /**
      * Synchronous send of one data frame: writes what is queued, then this
-     * frame, on the caller's thread. Bounded by {@code :write-timeout}
+     * frame, on the caller's thread, and flushes unless the frame may be
+     * held ({@link #holdsOutput}). Bounded by {@code :write-timeout}
      * through the connection's write watchdog.
      */
     private void send(int opcode, byte[] a, int off, int len, ByteBuffer direct) throws IOException {
@@ -1331,7 +1364,15 @@ public final class WebSocketConnection {
             }
             try {
                 writeFrameLocked(opcode, a, off, len, direct);
-                out.flush();
+                if (holdsOutput()) {
+                    if (!outputHeld) {
+                        outputHeld = true;
+                        timer.schedule(heldFlush, HELD_FLUSH_DELAY_MILLIS);
+                    }
+                } else {
+                    out.flush();
+                    outputHeld = false;
+                }
             } catch (IOException | RuntimeException e) {
                 // A partial frame can't be followed by anything.
                 forceClose();
@@ -1340,6 +1381,71 @@ public final class WebSocketConnection {
         } finally {
             writeLock.unlock();
             complete(written);
+        }
+    }
+
+    /**
+     * Whether a frame just written may wait in the output buffer instead
+     * of being flushed: the read loop sent it from a listener while more
+     * of the client's frames are already read, so the replies to those can
+     * share its write (one syscall, TCP segment and TLS record for a batch
+     * of messages, not one each). The read loop writes held frames before
+     * it waits for input ({@link #fill}, {@link #awaitBudget}), any other
+     * holder of the lock writes them before releasing it, and
+     * {@link #heldFlush} writes them when a listener takes longer than a
+     * timer tick. Caller holds {@link #writeLock}.
+     */
+    private boolean holdsOutput() {
+        return Thread.currentThread() == readThread && rpos < rlim;
+    }
+
+    /**
+     * The read loop writes the frames it held. When another thread holds
+     * the lock it doesn't wait: that holder writes them before releasing
+     * it, with its own frames or in {@link #unlockWrites}.
+     */
+    private void flushHeld() throws IOException {
+        if (!writeLock.tryLock()) {
+            return;
+        }
+        try {
+            if (outputHeld) {
+                outputHeld = false;
+                out.flush();
+            }
+        } catch (IOException | RuntimeException e) {
+            forceClose();
+            throw e;
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /** The hold timer's flusher: writes held frames a listener left waiting. */
+    private void flushHeldLate() {
+        writeLock.lock();
+        unlockWrites();
+    }
+
+    /**
+     * Releases {@link #writeLock} for a holder that may not have flushed
+     * (the writer thread finding its queue empty, buffer release), first
+     * writing frames the read loop held: its {@link #flushHeld} doesn't
+     * wait for the lock, so they go out with the holder. The flag is set
+     * under the lock, so a holder always sees frames held before it took
+     * it, and held frames never wait past one holder's turn.
+     */
+    private void unlockWrites() {
+        try {
+            if (outputHeld) {
+                outputHeld = false;
+                out.flush();
+            }
+        } catch (IOException | RuntimeException e) {
+            // The read loop sees the closed socket.
+            forceClose();
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -1472,7 +1578,7 @@ public final class WebSocketConnection {
             try {
                 written = writeQueued(true);
             } finally {
-                writeLock.unlock();
+                unlockWrites();
             }
             if (written != null) {
                 complete(written);

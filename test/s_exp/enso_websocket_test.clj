@@ -12,15 +12,17 @@
             [s-exp.enso-test-support :as support])
   (:import (com.s_exp.enso.api Config Response WebSocketException WebSocketListener WebSocketSocket
                                WebSocketSocket$SendCallback)
-           (com.s_exp.enso.core MemoryBudget)
+           (com.s_exp.enso.core MemoryBudget Timer)
            (com.s_exp.enso.websocket PerMessageDeflate Utf8 WebSocketConnection ZlibPool)
            (java.io ByteArrayInputStream ByteArrayOutputStream DataInputStream EOFException
-                    FilterInputStream InputStream)
+                    FilterInputStream InputStream SequenceInputStream)
            (java.lang.management ManagementFactory)
+           (java.lang.reflect Method)
            (java.net Socket SocketTimeoutException)
            (java.nio ByteBuffer)
            (java.nio.charset StandardCharsets)
-           (java.util.concurrent CountDownLatch TimeUnit)))
+           (java.util.concurrent CountDownLatch TimeUnit)
+           (java.util.concurrent.locks ReentrantLock)))
 
 (def ^:dynamic *server* nil)
 
@@ -1151,6 +1153,101 @@
                          :on-message (fn [_ _] (reset! armed false) (.countDown gate))})]
     (is (= [[0x1 "stalled"] [0xA "p199"] [0x8 nil]]
            (mapv (fn [f] [(:opcode f) (when-not (= 0x8 (:opcode f)) (frame-text f))]) (:frames r))))))
+
+(defn- flush-counting-output
+  "An OutputStream into `sink` that calls `on-flush` on every flush."
+  ^java.io.OutputStream [^ByteArrayOutputStream sink on-flush]
+  (proxy [java.io.OutputStream] []
+    (write
+      ([b] (if (bytes? b) (.write sink ^bytes b) (.write sink (int b))))
+      ([b off len] (.write sink ^bytes b (int off) (int len))))
+    (flush [] (on-flush))))
+
+(deftest ws-replies-to-buffered-messages-share-a-flush
+  ;; Replies sent from onMessage while more of the client's frames are
+  ;; already read join one write: a batch of messages costs one flush
+  ;; (one syscall, one TCP segment), not one per message.
+  (let [sink (ByteArrayOutputStream.)
+        flushes (atom 0)
+        msgs (mapv #(str "m" %) (range 8))
+        r (run-ws-bytes (apply frames (map #(vector 0x1 true (utf8 %)) msgs))
+                        {:out (flush-counting-output sink #(swap! flushes inc))
+                         :sink sink
+                         :on-message (fn [^WebSocketSocket s m] (.sendText s ^String m))})]
+    (is (= msgs (mapv frame-text (:frames r))))
+    (is (= 1 @flushes))))
+
+(deftest ws-held-reply-does-not-wait-for-the-next-listener
+  ;; A reply held for the next message's company goes out on its own
+  ;; within about a timer tick when that message's listener takes long.
+  (let [sink (ByteArrayOutputStream.)
+        flushed (CountDownLatch. 1)
+        seen (promise)
+        r (run-ws-bytes (frames [0x1 true (utf8 "a")] [0x1 true (utf8 "b")])
+                        {:out (flush-counting-output sink #(.countDown flushed))
+                         :sink sink
+                         :on-message (fn [^WebSocketSocket s m]
+                                       (if (= "a" m)
+                                         (.sendText s "a")
+                                         (deliver seen (.await flushed 2 TimeUnit/SECONDS))))})]
+    (is (true? @seen) "the reply to a was flushed while b's listener ran")
+    (is (= ["a"] (mapv frame-text (:frames r))))))
+
+(deftest ws-held-reply-goes-out-when-the-lock-holder-releases
+  ;; The read loop doesn't wait for the write lock to write the replies it
+  ;; held. A holder with nothing of its own to write (the writer thread
+  ;; finding its queue empty) writes them as it releases the lock, not
+  ;; the hold timer, which never fires here. The test plays that holder:
+  ;; the window is too short to hit through the public API.
+  (let [timer (Timer. "ws-test-slow-timer" 60000 2)
+        sink (ByteArrayOutputStream.)
+        flushed (CountDownLatch. 1)
+        lock-now (CountDownLatch. 1)
+        locked (CountDownLatch. 1)
+        reading (CountDownLatch. 1)
+        release-now (CountDownLatch. 1)
+        end (CountDownLatch. 1)
+        blocking (proxy [InputStream] []
+                   (read
+                     ([] -1)
+                     ([b off len] (.countDown reading) (.await end) -1)))
+        in (SequenceInputStream. (ByteArrayInputStream. (frames [0x1 true (utf8 "a")] [0x1 true (utf8 "b")]))
+                                 ^InputStream blocking)
+        listener (reify WebSocketListener
+                   (onOpen [_ _])
+                   (onMessage [_ s m]
+                     (if (= "a" m)
+                       (.sendText s "a")
+                       (do (.countDown lock-now) (.await locked))))
+                   (onError [_ _ _])
+                   (onClose [_ _ _ _]))
+        conn (WebSocketConnection. (Socket.) in (flush-counting-output sink #(.countDown flushed)) listener
+                                   (ws-config {}) nil timer (MemoryBudget. Long/MAX_VALUE))
+        ^ReentrantLock lock (.get (doto (.getDeclaredField WebSocketConnection "writeLock")
+                                    (.setAccessible true))
+                                  conn)
+        ^Method unlock-writes (doto (.getDeclaredMethod WebSocketConnection "unlockWrites" (make-array Class 0))
+                                (.setAccessible true))
+        holder (Thread/startVirtualThread
+                (fn []
+                  (.await lock-now)
+                  (.lock lock)
+                  (.countDown locked)
+                  (.await release-now)
+                  (.invoke unlock-writes conn (object-array 0))))
+        done (future (.run conn))]
+    (try
+      (is (.await reading 2 TimeUnit/SECONDS) "read loop waits for input")
+      (is (= 1 (.getCount flushed)) "the reply is held while the lock is taken")
+      (.countDown release-now)
+      (is (.await flushed 1 TimeUnit/SECONDS) "the holder wrote the held reply")
+      (is (= ["a"] (mapv frame-text (parse-frames (.toByteArray sink)))))
+      (finally
+        (.countDown release-now)
+        (.countDown end)
+        (deref done 2000 nil)
+        (.join holder 2000)
+        (.close timer)))))
 
 (deftest ws-queued-frames-count-their-overhead
   ;; Every queued frame counts against :ws-max-queued-bytes, empty ones

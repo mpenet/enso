@@ -22,13 +22,20 @@ public interface WebSocketSocket {
      * Sends a text message and returns once it is written. Blocks while a
      * peer that stopped reading holds the connection up, at most about
      * {@code :write-timeout}, after which the connection is dropped.
+     *
+     * <p>Called from {@link WebSocketListener#onMessage} while more of the
+     * client's frames are already read, the message waits in the
+     * connection's buffer so the replies to those frames share its write.
+     * It goes out before the server waits for more input, or after about
+     * 10 ms if a listener takes longer. A failure of that write closes the
+     * connection and is reported to {@link WebSocketListener#onError}.
      */
     void sendText(CharSequence message) throws IOException;
 
     /**
      * Sends the remaining bytes of {@code message} as a binary message and
      * returns once they are written; {@code message}'s position is not
-     * moved. Blocks like {@link #sendText}.
+     * moved. Blocks, and may wait in the buffer, like {@link #sendText}.
      */
     void sendBinary(ByteBuffer message) throws IOException;
 

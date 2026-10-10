@@ -30,6 +30,11 @@
   :perf {:extra-deps {org.hdrhistogram/HdrHistogram {:mvn/version "2.2.2"}}
          :extra-paths ["test"]
          :main-opts ["-m" "s-exp.enso-perf"]}
+  ;; Multi-hour soak/chaos run (see doc/testing.md); the driver starts
+  ;; s-exp.enso-soak-server in its own JVM.
+  :soak {:extra-deps {org.hdrhistogram/HdrHistogram {:mvn/version "2.2.2"}}
+         :extra-paths ["test"]
+         :main-opts ["-m" "s-exp.enso-soak"]}
   ;; Allocation-per-request gate over a perf run (see doc/testing.md).
   :perf-gate {:extra-paths ["test"]
               :main-opts ["-m" "s-exp.enso-perf-gate"]}

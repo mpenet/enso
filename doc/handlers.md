@@ -207,7 +207,11 @@ must arrive within `:read-timeout` of its first frame. Past either the
 connection fails with 1009 or 1008.
 
 Sends may come from any thread and go out in call order. A synchronous
-send writes on the calling thread, bounded by `:write-timeout`. An
+send writes on the calling thread, bounded by `:write-timeout`. A
+synchronous send from `:on-message`, made while more of the client's
+messages are already read, waits in the buffer so the replies to them
+share one write. It goes out before the server waits for more input, or
+after about 10 ms if a handler takes longer. An
 asynchronous send (`ring.websocket/send` with callbacks, `.sendTextAsync`,
 `.sendBinaryAsync`) queues the message and returns at once. A writer
 virtual thread sends it and calls the success callback. Once
