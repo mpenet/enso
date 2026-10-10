@@ -21,27 +21,37 @@
       (throw (ex-info (str "command failed: " (first cmd) "\n" out) {:cmd cmd})))
     out))
 
-(defn server-ssl-context
-  "SSLContext holding a fresh self-signed RSA certificate for localhost /
-  127.0.0.1, generated with keytool."
-  ^SSLContext []
-  (let [pass "changeit"
-        ks-file (File/createTempFile "enso-support" ".p12")]
+(def keystore-password "changeit")
+
+(defn self-signed-keystore
+  "A fresh PKCS12 keystore file holding a self-signed RSA certificate for
+  localhost / 127.0.0.1, generated with keytool, password
+  `keystore-password`. The caller deletes it."
+  ^File []
+  (let [ks-file (File/createTempFile "enso-support" ".p12")]
     (.delete ks-file)
     (sh! ["keytool" "-genkeypair" "-alias" "enso" "-keyalg" "RSA" "-keysize" "2048"
           "-storetype" "PKCS12" "-keystore" (.getPath ks-file)
-          "-storepass" pass "-validity" "365"
+          "-storepass" keystore-password "-validity" "365"
           "-dname" "CN=localhost, OU=test, O=enso, L=x, S=x, C=US"
           "-ext" "SAN=DNS:localhost,IP:127.0.0.1"])
-    (let [ks (KeyStore/getInstance "PKCS12")
-          _ (with-open [in (FileInputStream. ks-file)]
-              (.load ks in (.toCharArray pass)))
-          kmf (doto (KeyManagerFactory/getInstance (KeyManagerFactory/getDefaultAlgorithm))
-                (.init ks (.toCharArray pass)))
-          ctx (SSLContext/getInstance "TLS")]
-      (.init ctx (.getKeyManagers kmf) nil nil)
-      (.delete ks-file)
-      ctx)))
+    ks-file))
+
+(defn server-ssl-context
+  "SSLContext holding a fresh self-signed RSA certificate for localhost /
+  127.0.0.1 (see `self-signed-keystore`)."
+  ^SSLContext []
+  (let [pass (.toCharArray ^String keystore-password)
+        ks-file (self-signed-keystore)
+        ks (KeyStore/getInstance "PKCS12")
+        _ (with-open [in (FileInputStream. ks-file)]
+            (.load ks in pass))
+        kmf (doto (KeyManagerFactory/getInstance (KeyManagerFactory/getDefaultAlgorithm))
+              (.init ks pass))
+        ctx (SSLContext/getInstance "TLS")]
+    (.init ctx (.getKeyManagers kmf) nil nil)
+    (.delete ks-file)
+    ctx))
 
 (defn pem-cert-pair
   "[cert-path key-path] of a fresh self-signed PEM pair (openssl), as

@@ -486,7 +486,7 @@
     :doc "PEM private key."}
    {:key :http3-initial-max-data-bytes :group "HTTP/3 (QUIC via quiche)" :default 524288 :field "http3InitialMaxDataBytes" :check check-long
     :set (fn [^Config$Builder b v] (.http3InitialMaxDataBytes b (long v)))
-    :doc "connection flow-control window, fixed (no autotuning); charged to `:max-buffered-bytes` while the connection reads a request body. Also bounds request-body bytes buffered per connection."}
+    :doc "initial connection flow-control window (it autotunes up to twice `:http3-max-window-bytes` on release shims, stays fixed on a stock libquiche); charged to `:max-buffered-bytes` while the connection reads a request body. Also bounds request-body bytes buffered per connection."}
    {:key :http3-initial-max-streams-bidi :group "HTTP/3 (QUIC via quiche)" :default 100 :field "http3InitialMaxStreamsBidi" :check check-int
     :set (fn [^Config$Builder b v] (.http3InitialMaxStreamsBidi b (int v)))
     :doc "concurrent request streams per connection; twice this many live handlers make new requests H3_REQUEST_REJECTED."}
@@ -578,7 +578,7 @@
     :doc "`Server` response header value; nil or empty omits it. A handler-supplied `Server` wins."}
    {:key :server-events :group "Handler and observability" :default nil :check check-server-events
     :set (fn [^Config$Builder b v] (.serverEvents b ^ServerEvents v))
-    :doc "map of fns `{:connection-opened (fn [protocol remote-addr]) :connection-closed (fn [protocol remote-addr nanos]) :request-completed (fn [protocol method status request-bytes response-bytes nanos]) :protocol-error (fn [protocol kind])}`, or a `com.s_exp.enso.api.ServerEvents`. `remote-addr` is formatted as `:remote-addr`. `method` is nil for a head refused before it was parsed. Protocols: \"http/1.1\", \"h2\", \"h2c\", \"h3\"; \"websocket\" for an upgraded connection's open / close; \"tcp\" (connection refused at accept) and \"tls\" (handshake failures) for protocol errors. Delivered in order from one dedicated thread, never from a server thread; past 8192 queued events (a listener that fell behind) new ones are dropped and counted (`EnsoServer.droppedEvents`, a log warning, a JFR event). Exceptions are logged and ignored. No cost when absent."}])
+    :doc "map of fns `{:connection-opened (fn [protocol remote-addr]) :connection-closed (fn [protocol remote-addr nanos]) :request-completed (fn [protocol method status request-bytes response-bytes nanos]) :protocol-error (fn [protocol kind])}`, or a `com.s_exp.enso.api.ServerEvents`. `remote-addr` is formatted as `:remote-addr`. A request head refused before it was parsed is reported only as a protocol error. Protocols: \"http/1.1\", \"h2\", \"h2c\", \"h3\"; \"websocket\" for an upgraded connection's open / close; \"tcp\" (connection refused at accept) and \"tls\" (handshake failures) for protocol errors. Delivered in order from one dedicated thread, never from a server thread; past 8192 queued events (a listener that fell behind) new ones are dropped and counted (`EnsoServer.droppedEvents`, a log warning, a JFR event). Exceptions are logged and ignored. No cost when absent."}])
 
 (def ^:private options-by-key
   (into {} (map (juxt :key identity)) options))

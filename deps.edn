@@ -55,4 +55,31 @@
           :jvm-opts ["-Djdk.attach.allowAttachSelf"
                      "-XX:+UnlockDiagnosticVMOptions"
                      "-XX:+DebugNonSafepoints"]
-          :main-opts ["-m" "nrepl.cmdline"]}}}
+          :main-opts ["-m" "nrepl.cmdline"]}
+  ;; Cross-server comparison (see doc/performance.md). The driver runs the
+  ;; load; each peer server runs in its own JVM from its own alias, so
+  ;; Aleph's Netty 4.1 and the Netty 4.2 HTTP/3 codec never share a
+  ;; classpath.
+  :bench/compare {:extra-deps {org.hdrhistogram/HdrHistogram {:mvn/version "2.2.2"}}
+                  :extra-paths ["test" "bench"]
+                  :main-opts ["-m" "enso.compare"]}
+  :bench/http-kit {:extra-deps {http-kit/http-kit {:mvn/version "2.8.1"}}
+                   :extra-paths ["test" "bench"]
+                   :main-opts ["-m" "enso.peer.http-kit"]}
+  :bench/jetty {:extra-deps {info.sunng/ring-jetty9-adapter {:mvn/version "0.40.5"}
+                             info.sunng/ring-jetty9-adapter-http2 {:mvn/version "0.2.11"}
+                             info.sunng/ring-jetty9-adapter-http3 {:mvn/version "0.7.11"}
+                             org.eclipse.jetty.quic/jetty-quic-quiche-foreign {:mvn/version "12.1.14"}
+                             ring/ring-core {:mvn/version "1.15.5"}}
+                :extra-paths ["test" "bench"]
+                :main-opts ["-m" "enso.peer.jetty"]}
+  :bench/aleph {:extra-deps {aleph/aleph {:mvn/version "0.9.11"}}
+                :extra-paths ["test" "bench"]
+                :main-opts ["-m" "enso.peer.aleph"]}
+  :bench/netty {:extra-deps {io.netty/netty-codec-http3 {:mvn/version "4.2.19.Final"}
+                             io.netty/netty-codec-native-quic$osx-aarch_64 {:mvn/version "4.2.19.Final"}
+                             io.netty/netty-codec-native-quic$osx-x86_64 {:mvn/version "4.2.19.Final"}
+                             io.netty/netty-codec-native-quic$linux-x86_64 {:mvn/version "4.2.19.Final"}
+                             io.netty/netty-codec-native-quic$linux-aarch_64 {:mvn/version "4.2.19.Final"}}
+                :extra-paths ["test" "bench"]
+                :main-opts ["-m" "enso.peer.netty"]}}}

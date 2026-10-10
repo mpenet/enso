@@ -17,19 +17,13 @@
   `/upload` reads the request body to its end and answers its length.
   Every other request is answered `200 text/plain \"Hello, World!\"`.
   Prints `READY ...` on stdout once every listener is bound."
-  (:require [clojure.edn :as edn]
-            [s-exp.enso :as enso]
-            [s-exp.enso-test-support :as support])
+  (:require [s-exp.enso :as enso]
+            [s-exp.enso-test-support :as support]
+            [s-exp.perf-target :as target])
   (:import (com.s_exp.enso.api WebSocketSocket)
-           (java.lang.management GarbageCollectorMXBean ManagementFactory)
            (java.nio ByteBuffer)))
 
 (set! *warn-on-reflection* true)
-
-(def ^:private hello-response
-  {:status 200
-   :headers {"content-type" "text/plain"}
-   :body "Hello, World!"})
 
 (def ^:private echo-listener
   {:on-message (fn [^WebSocketSocket socket message]
@@ -37,22 +31,10 @@
                    (.sendText socket ^CharSequence message)
                    (.sendBinary socket ^ByteBuffer message)))})
 
-(defn- websocket-upgrade? [request]
-  (some-> ^String (get-in request [:headers "upgrade"]) .toLowerCase (= "websocket")))
-
-(defn- stats []
-  (let [gcs (ManagementFactory/getGarbageCollectorMXBeans)]
-    {:allocated-bytes (.getTotalThreadAllocatedBytes
-                       ^com.sun.management.ThreadMXBean (ManagementFactory/getThreadMXBean))
-     :gc-count (reduce + 0 (map #(.getCollectionCount ^GarbageCollectorMXBean %) gcs))
-     :gc-ms (reduce + 0 (map #(.getCollectionTime ^GarbageCollectorMXBean %) gcs))}))
-
 (defn handler [request]
   (cond
-    (websocket-upgrade? request) {:ring.websocket/listener echo-listener}
-    (= "/__stats" (:uri request)) {:status 200
-                                   :headers {"content-type" "application/edn"}
-                                   :body (pr-str (stats))}
+    (target/websocket-upgrade? request) {:ring.websocket/listener echo-listener}
+    (= "/__stats" (:uri request)) (target/stats-response)
     (= "/upload" (:uri request)) {:status 200
                                   :headers {"content-type" "text/plain"}
                                   :body (str (if-let [^java.io.InputStream body (:body request)]
@@ -62,18 +44,8 @@
     ;; need the server still reading the stream when the bad frames arrive
     ;; (an answer before them resets the stream, and later frames on it are
     ;; ignored, RFC 9113 §5.1).
-    :else (do (when-let [^java.io.InputStream body (:body request)]
-                (try
-                  (.transferTo body (java.io.OutputStream/nullOutputStream))
-                  (catch java.io.IOException _)))
-              hello-response)))
-
-(defn- parse-args [args]
-  (into {}
-        (map (fn [[k v]]
-               (let [k (keyword k)]
-                 [k (if (= :opts k) (edn/read-string v) (Integer/parseInt v))])))
-        (partition 2 args)))
+    :else (do (target/drain! (:body request))
+              target/hello-response)))
 
 (defn start!
   "Starts the listeners named in `ports` ({:h1 n :h2c n :h2 n :h3 n :opts m});
@@ -98,10 +70,6 @@
     (remove nil? [plain cleartext-h2 tls])))
 
 (defn -main [& args]
-  (let [ports (parse-args args)
+  (let [ports (target/parse-args args)
         servers (start! ports)]
-    (.addShutdownHook (Runtime/getRuntime)
-                      (Thread. ^Runnable (fn [] (run! enso/stop servers))))
-    (println "READY" (pr-str ports))
-    (flush)
-    @(promise)))
+    (target/serve! ports (fn [] (run! enso/stop servers)))))

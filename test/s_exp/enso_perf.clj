@@ -8,7 +8,10 @@
   - `:scenarios` subset of [:h1-get :h1-get-rate :h1-pipelined :h2-get :h3-get :ws-echo],
     plus the upload scenarios, run only when named: :h2-upload (one
     stream) and :h2-upload-4 (four concurrent streams on one connection),
-    :h3-upload and :h3-upload-4 (the same over HTTP/3)
+    :h3-upload and :h3-upload-4 (the same over HTTP/3), and the wrk
+    scenarios, also run only when named: :h1-wrk (`:connections`
+    connections) and :h1-wrk-pipelined (16 connections, `:pipeline-depth`
+    requests per batch)
   - `:upload-bytes` request body size for the upload scenarios (default 16 MiB)
   - `:duration-s` measured seconds per scenario (default 10)
   - `:warmup-s` unmeasured seconds before each scenario (default 5)
@@ -22,22 +25,32 @@
   - `:server-jvm-opts` JVM options for the server process (default [\"-Xmx1g\"])
   - `:server-opts` run-server options for the server (default unlimited
     keep-alive requests, as load generators expect, and no request body cap)
+  - `:server-alias` deps alias whose main starts the server process
+    (default \"test-server\"); any process following `s-exp.perf-target`
+    works, which is how bench/enso/compare.clj drives other servers
   - `:out-dir` (default \"target/perf\")
 
   Allocation per request is measured inside the server process: the
   difference of its total allocated bytes (all threads, carriers of
   virtual threads included) across the measured window, divided by the
   requests completed in it. Warm-up traffic is excluded. For :ws-echo a
-  request is one message echoed (read, dispatched, written back)."
+  request is one message echoed (read, dispatched, written back).
+
+  Before measuring, each scenario checks one response from the server
+  (status 200 and the hello body, over the scenario's protocol) and
+  records it under `:verified`. `:errors` and `:non-2xx` count failed
+  requests and other statuses where the load client reports them."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [s-exp.enso-test-support :as support])
+            [s-exp.enso-test-support :as support]
+            [s-exp.perf-target :as target])
   (:import (java.io File InputStream OutputStream)
-           (java.net InetSocketAddress ServerSocket Socket)
+           (java.net InetSocketAddress ServerSocket Socket URI)
+           (java.net.http HttpClient HttpClient$Version HttpRequest HttpResponse HttpResponse$BodyHandlers)
            (java.nio.charset StandardCharsets)
            (java.time Instant)
-           (java.util.concurrent ExecutorService Executors Future)
+           (java.util.concurrent ExecutorService Executors Future TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean AtomicLong)
            (java.util.concurrent.locks LockSupport)
            (org.HdrHistogram Histogram)))
@@ -59,6 +72,7 @@
    :server-jvm-opts ["-Xmx1g"]
    ;; No body cap: the upload scenarios post more than the default 10 MiB.
    :server-opts {:max-keep-alive-requests 0 :max-request-body-bytes 0}
+   :server-alias "test-server"
    :out-dir "target/perf"})
 
 ;; ---- process helpers ---------------------------------------------------------------
@@ -77,11 +91,11 @@
 
 (defn- start-server!
   "Starts the test server JVM; returns {:process :log :ports}."
-  [{:keys [server-jvm-opts server-opts out-dir]} h3?]
+  [{:keys [server-jvm-opts server-opts server-alias out-dir]} h3?]
   (let [ports (cond-> {:h1 (free-tcp-port) :h2 (free-tcp-port)}
                 h3? (assoc :h3 (support/free-udp-port)))
         log (io/file out-dir "server.log")
-        cmd (concat ["clojure"] (map #(str "-J" %) server-jvm-opts) ["-M:test-server"]
+        cmd (concat ["clojure"] (map #(str "-J" %) server-jvm-opts) [(str "-M:" server-alias)]
                     (mapcat (fn [[k v]] [(name k) (str v)]) ports)
                     ["opts" (pr-str server-opts)])
         proc (.start (doto (ProcessBuilder. ^java.util.List (vec cmd))
@@ -277,12 +291,16 @@
           (ensure! total)
           (aset state 0 (+ (aget state 0) total)))))))
 
+(def ^:private ws-connect-lock (Object.))
+
 (defn- ws-echo-worker
   "Keeps `depth` text messages in flight on one WebSocket and waits for
-  their echoes; records each batch's latency (closed loop)."
+  their echoes; records each batch's latency (closed loop). Upgrades run
+  one at a time: 64 simultaneous connects overflow a listen backlog of 50
+  (the JDK default, which http-kit keeps) and macOS resets the excess."
   [port depth ^bytes frame ^Histogram hist ^AtomicLong done]
   (fn [_ ^AtomicBoolean stop]
-    (with-open [sock (ws-connect port)]
+    (with-open [^Socket sock (locking ws-connect-lock (ws-connect port))]
       (let [^OutputStream out (.getOutputStream sock)
             read! (ws-frame-reader (.getInputStream sock))
             depth (long depth)
@@ -298,6 +316,102 @@
               (locking hist (.recordValue hist (max 1 lat))))
             (.addAndGet done depth)))))))
 
+;; ---- response checks ----------------------------------------------------------------------
+
+(defn- check!
+  "Returns `seen` when `status` is 200 and `body` the hello body, throws
+  otherwise."
+  [protocol status body seen]
+  (when-not (and (= 200 status) (= target/hello-body body))
+    (throw (ex-info (str protocol " check failed: status " status ", body " (pr-str body)) {:seen seen})))
+  seen)
+
+(defn- dechunk
+  "Body of a chunked HTTP/1.1 message."
+  [^String s]
+  (loop [i 0 acc (StringBuilder.)]
+    (let [eol (long (str/index-of s "\r\n" i))
+          n (Long/parseLong (str/trim (first (str/split (subs s i eol) #";"))) 16)]
+      (if (zero? n)
+        (str acc)
+        (recur (+ eol 2 n 2) (.append acc (subs s (+ eol 2) (+ eol 2 n))))))))
+
+(defn- verify-h1
+  "One GET over HTTP/1.1; returns the response head lines."
+  [port]
+  (with-open [sock (connect port)]
+    (let [^OutputStream out (.getOutputStream sock)]
+      (.write out (.getBytes "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                             StandardCharsets/ISO_8859_1))
+      (.flush out)
+      (let [resp (slurp (.getInputStream sock) :encoding "ISO-8859-1")
+            i (str/index-of resp "\r\n\r\n")
+            head (subs resp 0 i)
+            body (cond-> (subs resp (+ 4 i))
+                   (re-find #"(?i)transfer-encoding:\s*chunked" head) dechunk)]
+        (check! "HTTP/1.1" (some-> (re-find #"^HTTP/1\.1 (\d{3})" head) second Long/parseLong)
+                body (str/split-lines head))))))
+
+(defn- verify-h2
+  "One GET over HTTP/2 with TLS (JDK client); returns the response headers."
+  [port]
+  (with-open [client (-> (HttpClient/newBuilder)
+                         (.version HttpClient$Version/HTTP_2)
+                         (.sslContext (support/trust-all-ssl-context))
+                         (.build))]
+    (let [^HttpResponse resp (.send client (.build (HttpRequest/newBuilder (URI. (str "https://127.0.0.1:" port "/"))))
+                                    (HttpResponse$BodyHandlers/ofString))]
+      (when-not (= HttpClient$Version/HTTP_2 (.version resp))
+        (throw (ex-info (str "HTTP/2 check failed: negotiated " (.version resp)) {})))
+      (check! "HTTP/2" (.statusCode resp) (.body resp)
+              (into (sorted-map) (map (fn [[k v]] [k (str/join "," v)])) (.map (.headers resp)))))))
+
+(defn- verify-h3
+  "One GET over HTTP/3 with quiche-client; returns the response headers,
+  or a note when quiche-client isn't on PATH."
+  [port]
+  (if-not (sh-out "sh" "-c" "command -v quiche-client")
+    {:skipped "quiche-client not found on PATH"}
+    (let [p (.start (doto (ProcessBuilder. ^java.util.List (list "quiche-client" "--no-verify" "--dump-json"
+                                                                 (str "https://127.0.0.1:" port "/")))
+                      (.redirectErrorStream true)))
+          out (future (slurp (.getInputStream p)))]
+      (when-not (.waitFor p 20 TimeUnit/SECONDS)
+        (.destroyForcibly p)
+        (throw (ex-info "HTTP/3 check failed: no response in 20 s" {})))
+      (let [^String out @out
+            resp (subs out (or (str/index-of out "\"response\"") (count out)))
+            headers (into (sorted-map)
+                          (map (fn [[_ k v]] [k v]))
+                          (re-seq #"\"name\":\s*\"([^\"]+)\",\s*\"value\":\s*\"([^\"]*)\"" resp))
+            body (some->> (re-find #"\"body\":\s*\[([0-9,\s]*)\]" resp) second (re-seq #"\d+")
+                          (map #(char (Long/parseLong %))) (apply str))]
+        (check! "HTTP/3" (some-> (get headers ":status") Long/parseLong) body headers)))))
+
+(defn- verify-ws
+  "Echoes one 5-byte text message; returns the echoed text."
+  [port]
+  (with-open [sock (ws-connect port)]
+    (let [^OutputStream out (.getOutputStream sock)
+          in (.getInputStream sock)]
+      (.write out ^bytes (ws-text-frame 5))
+      (.flush out)
+      (let [b0 (.read in)
+            b1 (.read in)
+            text (String. (.readNBytes in (bit-and b1 0x7F)) StandardCharsets/ISO_8859_1)]
+        (when-not (and (= 0x81 b0) (= "xxxxx" text))
+          (throw (ex-info (str "WebSocket check failed: frame " b0 " " (pr-str text)) {})))
+        {:echo text}))))
+
+(defn- verify
+  "Checks one response over `scenario`'s protocol before it is measured."
+  [scenario {:keys [ports]}]
+  (case scenario
+    (:h1-get :h1-get-rate :h1-pipelined :h1-wrk :h1-wrk-pipelined) (verify-h1 (:h1 ports))
+    (:h2-get :h2-upload :h2-upload-4) (verify-h2 (:h2 ports))
+    (:h3-get :h3-upload :h3-upload-4) (when (:h3 ports) (verify-h3 (:h3 ports)))
+    :ws-echo (verify-ws (:h1 ports))))
+
 ;; ---- server stats -------------------------------------------------------------------------
 
 (defn- server-stats [^long h1-port]
@@ -306,8 +420,10 @@
       (.write out (.getBytes "GET /__stats HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
                              StandardCharsets/ISO_8859_1))
       (.flush out)
-      (let [resp (slurp (.getInputStream sock))]
-        (edn/read-string (subs resp (+ 4 (str/index-of resp "\r\n\r\n"))))))))
+      (let [resp (slurp (.getInputStream sock))
+            body (subs resp (+ 4 (str/index-of resp "\r\n\r\n")))]
+        ;; Skips a chunk-size line if the server chunked the body.
+        (edn/read-string (subs body (str/index-of body "{")))))))
 
 (defn- measured
   "Runs `(warmup)` then `(run)` (returning {:requests n ...}), reading
@@ -360,22 +476,78 @@
     (let [[_ _ mx mean] (re-find #"time for request:\s+(\S+)\s+(\S+)\s+(\S+)" out)]
       [{:max (some-> mx duration-ms) :mean (some-> mean duration-ms)} "min/max/mean only"])))
 
+(defn- h2load-failures
+  "Failed requests and non-2xx responses from h2load output."
+  [^String out]
+  (let [[_ failed] (re-find #"requests: .* (\d+) failed" out)
+        [_ & codes] (re-find #"status codes: \d+ 2xx, (\d+) 3xx, (\d+) 4xx, (\d+) 5xx" out)]
+    {:errors (Long/parseLong failed)
+     :non-2xx (reduce + (map #(Long/parseLong %) codes))}))
+
 (defn- h2load [port secs]
   (if-let [out (sh-out "h2load" "-D" (str secs) "-c" "8" "-m" "32" "-t" "2"
                        (str "https://127.0.0.1:" port "/"))]
     (let [[_ rps] (re-find #"finished in [0-9.]+s, ([0-9.]+) req/s" out)
           [_ done] (re-find #"requests: \d+ total, \d+ started, (\d+) done" out)
           [latency reported] (h2load-latency out)]
-      {:requests (Long/parseLong done)
-       :rps (Math/round (Double/parseDouble rps))
-       :latency-ms latency
-       :latency-model (str "h2load -c 8 -m 32 closed loop (not CO-corrected); h2load reports " reported)})
+      (merge
+       (h2load-failures out)
+       {:requests (Long/parseLong done)
+        :rps (Math/round (Double/parseDouble rps))
+        :latency-ms latency
+        :latency-model (str "h2load -c 8 -m 32 closed loop (not CO-corrected); h2load reports " reported)}))
     (throw (ex-info "h2load failed" {:port port}))))
 
 (defn- h2-scenario [{:keys [ports duration-s warmup-s]}]
   (if-not (sh-out "h2load" "--version")
     {:skipped "h2load not found on PATH"}
     (measured (:h1 ports) #(h2load (:h2 ports) warmup-s) #(h2load (:h2 ports) duration-s))))
+
+;; ---- HTTP/1.1 via wrk ------------------------------------------------------------------------
+
+(defn- wrk-pipeline-script
+  "A wrk script sending `depth` pipelined GETs per batch; returns its path."
+  ^String [out-dir depth]
+  (let [f (io/file out-dir (str "pipeline-" depth ".lua"))]
+    (spit f (str "init = function(args)\n"
+                 "  local r = {}\n"
+                 "  for i = 1, " depth " do r[i] = wrk.format(\"GET\", \"/\") end\n"
+                 "  req = table.concat(r)\n"
+                 "end\n"
+                 "request = function() return req end\n"))
+    (.getPath f)))
+
+(defn- wrk
+  "Runs wrk (4 threads) for `secs` with `connections`, through `script`
+  when given."
+  [port secs connections script]
+  (if-let [out (apply sh-out "wrk" "-t" "4" "-c" (str connections) "-d" (str secs "s") "--latency"
+                      (concat (when script ["-s" script]) [(str "http://127.0.0.1:" port "/")]))]
+    (let [[_ n] (re-find #"(\d+) requests in" out)
+          [_ rps] (re-find #"Requests/sec:\s+([0-9.]+)" out)
+          pct (fn [p] (some-> (re-find (re-pattern (str "(?m)^\\s+" p "%\\s+([0-9.]+(?:us|ms|s))")) out)
+                              second
+                              duration-ms))
+          [_ non-2xx] (re-find #"Non-2xx or 3xx responses: (\d+)" out)
+          socket-errors (re-find #"Socket errors: connect (\d+), read (\d+), write (\d+), timeout (\d+)" out)]
+      {:requests (Long/parseLong n)
+       :rps (Math/round (Double/parseDouble rps))
+       :latency-ms {:p50 (pct "50") :p90 (pct "90") :p99 (pct "99")}
+       :errors (reduce + 0 (map #(Long/parseLong %) (rest socket-errors)))
+       :non-2xx (if non-2xx (Long/parseLong non-2xx) 0)})
+    (throw (ex-info "wrk failed" {:port port}))))
+
+(defn- wrk-scenario [{:keys [ports duration-s warmup-s out-dir]} connections depth latency-model]
+  (if-not (sh-out "sh" "-c" "command -v wrk")
+    {:skipped "wrk not found on PATH"}
+    (let [script (when (> (long depth) 1) (wrk-pipeline-script out-dir depth))]
+      (cond-> (assoc (measured (:h1 ports)
+                               #(wrk (:h1 ports) warmup-s connections script)
+                               #(wrk (:h1 ports) duration-s connections script))
+                     :latency-model latency-model)
+        ;; wrk's percentiles are unreliable with a pipelining script
+        ;; (it prints a p99 of 0).
+        script (dissoc :latency-ms)))))
 
 ;; ---- HTTP/2 uploads via h2load -----------------------------------------------------------------
 
@@ -425,11 +597,13 @@
 
 (defn- h3-run [{:keys [h3-connections h3-in-flight]} port secs]
   (let [run! (requiring-resolve 's-exp.h3-load/run)
-        {:keys [requests rps hist]} (run! port {:connections h3-connections
-                                                :in-flight h3-in-flight
-                                                :ms (* 1000 (long secs))})]
+        {:keys [requests rps hist errors non-2xx]} (run! port {:connections h3-connections
+                                                               :in-flight h3-in-flight
+                                                               :ms (* 1000 (long secs))})]
     {:requests requests
      :rps rps
+     :errors errors
+     :non-2xx non-2xx
      :latency-ms (percentiles-ms hist)
      :latency-model (str h3-connections " QUIC connections x " h3-in-flight
                          " requests in flight, closed loop (not CO-corrected)")}))
@@ -489,18 +663,18 @@
        "git " (:git meta) ", " (:java meta) ", " (:os meta) ", " (:cpus meta) " CPUs\n"
        "duration " (:duration-s config) "s (warm-up " (:warmup-s config) "s), server JVM opts "
        (pr-str (:server-jvm-opts config)) "\n\n"
-       "| scenario | req/s | alloc B/req | p50 ms | p99 ms | p99.9 ms | max ms | GCs | latency model |\n"
-       "|---|---:|---:|---:|---:|---:|---:|---:|---|\n"
+       "| scenario | req/s | alloc B/req | p50 ms | p99 ms | p99.9 ms | max ms | GCs | errors | non-2xx | latency model |\n"
+       "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n"
        (str/join
         (for [[k r] scenarios]
           (if (:skipped r)
-            (str "| " (name k) " | skipped: " (:skipped r) " ||||||||\n")
+            (str "| " (name k) " | skipped: " (:skipped r) " ||||||||||\n")
             (let [l (:latency-ms r)
                   fmt #(if (number? %) (format "%.2f" (double %)) "")]
               (str "| " (name k) " | " (:rps r) " | " (:alloc-bytes-per-request r)
                    " | " (fmt (:p50 l)) " | " (fmt (:p99 l)) " | " (fmt (:p999 l)) " | "
                    (fmt (:max l))
-                   " | " (:gc-count r) " | " (:latency-model r) " |\n")))))
+                   " | " (:gc-count r) " | " (:errors r) " | " (:non-2xx r) " | " (:latency-model r) " |\n")))))
        (upload-report-md scenarios)))
 
 (defn- write-results! [{:keys [out-dir]} result]
@@ -530,29 +704,35 @@
                   (for [s (:scenarios cfg)]
                     (do (println "running" s)
                         [s (try
-                             (case s
-                               :h1-get (h1-scenario cfg #(h1-closed-loop-worker %1 1 %2 %3)
-                                                    (str n-conn " connections, closed loop (not CO-corrected)"))
-                               :h1-get-rate (let [interval (long (/ (* 1e9 n-conn) (double (:rate cfg))))]
-                                              (h1-scenario cfg #(h1-rate-worker %1 interval %2 %3)
-                                                           (str "open model at " (:rate cfg) " req/s over "
-                                                                n-conn " connections, CO-corrected")))
-                               :h1-pipelined (h1-scenario (update cfg :connections #(min 16 (long %)))
-                                                          #(h1-closed-loop-worker %1 (:pipeline-depth cfg) %2 %3)
-                                                          (str "pipelined depth " (:pipeline-depth cfg)
-                                                               ", latency per batch"))
-                               :h2-get (h2-scenario cfg)
-                               :h3-get (h3-scenario cfg)
-                               :h2-upload (h2-upload-scenario cfg 1)
-                               :h2-upload-4 (h2-upload-scenario cfg 4)
-                               :h3-upload (h3-upload-scenario cfg 1)
-                               :h3-upload-4 (h3-upload-scenario cfg 4)
-                               :ws-echo (let [frame (ws-text-frame (:ws-message-bytes cfg))
-                                              depth (long (:ws-depth cfg))]
-                                          (h1-scenario cfg #(ws-echo-worker %1 depth frame %2 %3)
-                                                       (str n-conn " WebSocket connections × " depth " "
-                                                            (:ws-message-bytes cfg) "-byte text messages, "
-                                                            "per batch (req = message)"))))
+                             (let [verified (verify s cfg)]
+                               (assoc
+                                (case s
+                                  :h1-get (h1-scenario cfg #(h1-closed-loop-worker %1 1 %2 %3)
+                                                       (str n-conn " connections, closed loop (not CO-corrected)"))
+                                  :h1-get-rate (let [interval (long (/ (* 1e9 n-conn) (double (:rate cfg))))]
+                                                 (h1-scenario cfg #(h1-rate-worker %1 interval %2 %3)
+                                                              (str "open model at " (:rate cfg) " req/s over "
+                                                                   n-conn " connections, CO-corrected")))
+                                  :h1-pipelined (h1-scenario (update cfg :connections #(min 16 (long %)))
+                                                             #(h1-closed-loop-worker %1 (:pipeline-depth cfg) %2 %3)
+                                                             (str "pipelined depth " (:pipeline-depth cfg)
+                                                                  ", latency per batch"))
+                                  :h2-get (h2-scenario cfg)
+                                  :h3-get (h3-scenario cfg)
+                                  :h2-upload (h2-upload-scenario cfg 1)
+                                  :h2-upload-4 (h2-upload-scenario cfg 4)
+                                  :h3-upload (h3-upload-scenario cfg 1)
+                                  :h3-upload-4 (h3-upload-scenario cfg 4)
+                                  :h1-wrk (wrk-scenario cfg n-conn 1 (str "wrk -t4 -c" n-conn ", closed loop (not CO-corrected)"))
+                                  :h1-wrk-pipelined (wrk-scenario cfg 16 (:pipeline-depth cfg)
+                                                                  (str "wrk -t4 -c16, pipelined depth " (:pipeline-depth cfg)))
+                                  :ws-echo (let [frame (ws-text-frame (:ws-message-bytes cfg))
+                                                 depth (long (:ws-depth cfg))]
+                                             (h1-scenario cfg #(ws-echo-worker %1 depth frame %2 %3)
+                                                          (str n-conn " WebSocket connections × " depth " "
+                                                               (:ws-message-bytes cfg) "-byte text messages, "
+                                                               "per batch (req = message)"))))
+                                :verified verified))
                              (catch Exception e
                                {:skipped (str "failed: " (.getMessage e))}))])))]
         (let [result {:meta {:timestamp (str (Instant/now))

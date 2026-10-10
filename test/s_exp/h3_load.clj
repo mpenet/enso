@@ -5,8 +5,9 @@
   through the enso JNI shim), each on its own platform thread, keeping
   `in-flight` requests open. A request is one HEADERS frame with FIN; it
   completes when the response stream's FIN arrives. Latency is measured
-  per request from its send to that FIN. `upload` POSTs bodies over one
-  connection instead."
+  per request from its send to that FIN. Responses whose status isn't
+  200 count as `:non-2xx`, reset streams as `:errors`. `upload` POSTs
+  bodies over one connection instead."
   (:import (com.s_exp.enso.quiche NativeBuffer QuicheConfig QuicheConnection Quiche Records UdpSocket
                                   UdpSocket$Waker)
            (com.s_exp.enso.http3.qpack QpackFieldSection)
@@ -42,10 +43,23 @@
                                                          [":authority" "localhost"] [":path" path]
                                                          ["user-agent" "enso-h3-load"]]))))
 
+(defn- status-200?
+  "True when the first `n` bytes of a response stream in `buf` start with
+  a HEADERS frame whose first field line is `:status 200` from the QPACK
+  static table (index 25, byte 0xD9). The client allows no dynamic table,
+  so the field section prefix is two zero bytes."
+  [^bytes buf ^long n]
+  (and (> n 1)
+       (= 0x01 (aget buf 0))
+       (let [i (+ 1 (bit-shift-left 1 (bit-shift-right (bit-and (aget buf 1) 0xC0) 6)) 2)]
+         (and (< i n) (= (unchecked-byte 0xD9) (aget buf i))))))
+
 (defn- connection-loop
-  "Runs one connection until `stop`; adds completions to `done` and
-  latencies (ns) to `hist` (locked)."
-  [port in-flight ^bytes request ^AtomicBoolean stop ^AtomicLong done ^Histogram hist]
+  "Runs one connection until `stop`; adds completions to `done`, latencies
+  (ns) to `hist` (locked), non-200 responses to `non-2xx` and reset
+  streams to `errors`."
+  [port in-flight ^bytes request ^AtomicBoolean stop ^AtomicLong done ^Histogram hist
+   ^AtomicLong non-2xx ^AtomicLong errors]
   (let [port (long port)
         in-flight (long in-flight)
         cfg (QuicheConfig/client 30000)
@@ -69,6 +83,8 @@
         started (long-array 1)
         ;; stream id -> send time; ids advance by 4
         sent-at (java.util.HashMap.)
+        ;; streams whose response status has been checked
+        checked (java.util.HashSet.)
         state (long-array 2)] ; [next-stream-id open]
     (.localAddress sock rmeta (* batch Records/RECV_META_LEN))
     (letfn [(flush! []
@@ -106,9 +122,13 @@
                     (when (zero? (bit-and sid 3))
                       (loop []
                         (let [rc (.streamRecv conn sid scratch 0 (alength scratch))]
+                          (when (and (pos? rc) (pos? (bit-shift-right rc 1)) (.add checked sid)
+                                     (not (status-200? scratch (bit-shift-right rc 1))))
+                            (.incrementAndGet non-2xx))
                           (cond
                             (and (>= rc 0) (odd? rc))
                             (let [t0 (.remove sent-at sid)]
+                              (when-not (.remove checked sid) (.incrementAndGet non-2xx))
                               (aset state 1 (dec (aget state 1)))
                               (.incrementAndGet done)
                               (when t0
@@ -116,7 +136,10 @@
                                   (locking hist (.recordValue hist (max 1 lat))))))
                             (>= rc 0) (recur)
                             (not= rc Quiche/QUICHE_ERR_DONE)
-                            (do (.remove sent-at sid) (aset state 1 (dec (aget state 1))))))))
+                            (do (.remove sent-at sid)
+                                (.remove checked sid)
+                                (.incrementAndGet errors)
+                                (aset state 1 (dec (aget state 1))))))))
                     (when-not (zero? (bit-and sid 3))
                       ;; server uni streams: drain
                       (loop []
@@ -157,17 +180,21 @@
           (.close sock))))))
 
 (defn run
-  "Drives `port` for `ms` milliseconds; returns {:requests :rps :hist}."
+  "Drives `port` for `ms` milliseconds; returns {:requests :rps :hist
+  :non-2xx :errors}."
   [^long port {:keys [connections in-flight ms path] :or {connections 4 in-flight 32 path "/"}}]
   (let [stop (AtomicBoolean.)
         done (AtomicLong.)
+        non-2xx (AtomicLong.)
+        reset-streams (AtomicLong.)
         hist (Histogram. 3600000000000 3)
         request (get-frame path)
         errors (atom [])
         threads (mapv (fn [i]
                         (doto (.unstarted (.name (Thread/ofPlatform) (str "h3-load-" i))
                                           ^Runnable (fn []
-                                                      (try (connection-loop port in-flight request stop done hist)
+                                                      (try (connection-loop port in-flight request stop done hist
+                                                                            non-2xx reset-streams)
                                                            (catch Throwable t (swap! errors conj t)))))
                           (.start)))
                       (range connections))
@@ -179,7 +206,9 @@
     (let [elapsed (- (System/nanoTime) t0)]
       {:requests (.get done)
        :rps (Math/round (/ (* 1e9 (.get done)) (double elapsed)))
-       :hist hist})))
+       :hist hist
+       :non-2xx (.get non-2xx)
+       :errors (.get reset-streams)})))
 
 ;; ---- uploads -------------------------------------------------------------------
 
