@@ -150,7 +150,8 @@
 (defn- stream-body [^long chunks ^long size ^long delay]
   (fn [^ChunkedWriter w]
     (dotimes [i chunks]
-      (.write w pattern-block 0 (int size))
+      ;; Each chunk continues the pattern where the previous one ended.
+      (.write w pattern-block (int (rem (* i size) 91)) (int size))
       (.flush w)
       (when (pos? delay) (Thread/sleep delay)))))
 
@@ -172,7 +173,7 @@
       "/stream" {:status 200
                  :headers {"content-type" "application/octet-stream"}
                  :body (stream-body (query-long request "chunks" 16)
-                                    (min (alength ^bytes pattern-block) (query-long request "size" 4096))
+                                    (min (- (alength ^bytes pattern-block) 91) (query-long request "size" 4096))
                                     (query-long request "delay" 0))}
       "/sse" {:status 200
               :headers {"content-type" "text/event-stream" "cache-control" "no-cache"}

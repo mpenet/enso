@@ -1249,6 +1249,77 @@
         (.join holder 2000)
         (.close timer)))))
 
+(deftest ws-deferred-write-failure-is-reported-once-with-its-cause
+  ;; A held reply whose write fails (here on the hold timer's flusher,
+  ;; while the next listener runs) fails the connection: later sends throw
+  ;; with that failure as cause, onError gets it once, the close is 1006.
+  (let [boom (java.io.IOException. "boom")
+        failed (CountDownLatch. 1)
+        out (proxy [java.io.OutputStream] []
+              (write ([_]) ([_ _ _]))
+              (flush [] (.countDown failed) (throw boom)))
+        later (promise)
+        r (run-ws-bytes (frames [0x1 true (utf8 "a")] [0x1 true (utf8 "b")])
+                        {:out out
+                         :on-message (fn [^WebSocketSocket s m]
+                                       (if (= "a" m)
+                                         (.sendText s "a")
+                                         (do (.await failed 2 TimeUnit/SECONDS)
+                                             (while (.isOpen s) (Thread/sleep 1))
+                                             (deliver later (try (.sendText s "x") nil
+                                                                 (catch java.io.IOException e e))))))})
+        errors (keep #(when (= :error (first %)) (second %)) (:events r))]
+    (is (instance? java.io.IOException (deref later 0 nil)) "a send after the failure throws")
+    (is (identical? boom (some-> ^Throwable (deref later 0 nil) .getCause)) "with the failure as cause")
+    (is (= 1 (count errors)) "onError is called once")
+    (is (identical? boom (first errors)) "with the original failure")
+    (is (= 1006 (second (close-event r))))
+    (testing "written by the read loop before its next read"
+      (let [r (run-ws-bytes (frames [0x1 true (utf8 "a")] [0x1 true (utf8 "b")])
+                            {:out out
+                             :on-message (fn [^WebSocketSocket s m] (when (= "a" m) (.sendText s "a")))})
+            errors (keep #(when (= :error (first %)) (second %)) (:events r))]
+        (is (= [boom] errors))
+        (is (identical? boom (first errors)))
+        (is (= 1006 (second (close-event r))))))))
+
+(deftest ws-held-replies-go-out-before-the-close
+  ;; Replies held in the output buffer are written ahead of the CLOSE,
+  ;; whether a listener closes or the server fails the connection.
+  (let [summary (fn [r] (mapv (fn [f] (if (= 0x8 (:opcode f)) [0x8 (close-code f)] [(:opcode f) (frame-text f)]))
+                              (:frames r)))]
+    (testing "close from a listener"
+      (let [r (run-ws-bytes (frames [0x1 true (utf8 "a")] [0x1 true (utf8 "b")])
+                            {:on-message (fn [^WebSocketSocket s m]
+                                           (when (= "a" m)
+                                             (.sendText s "a")
+                                             (.close s 1000 "bye")))})]
+        (is (= [[0x1 "a"] [0x8 1000]] (summary r)))))
+    (testing "failing the connection"
+      (let [unmasked (byte-array [(unchecked-byte 0x81) (byte 0x02) (byte 0x61) (byte 0x62)])
+            r (run-ws-bytes (byte-array (concat (frames [0x1 true (utf8 "a")]) unmasked))
+                            {:on-message (fn [^WebSocketSocket s m] (.sendText s ^String m))})]
+        (is (= [[0x1 "a"] [0x8 1002]] (summary r)))))))
+
+(deftest ws-async-callbacks-run-after-their-frames-are-flushed
+  ;; An asynchronous send succeeds once its frame left the connection's
+  ;; buffer, even when a synchronous reply is held right behind it.
+  (let [sink (ByteArrayOutputStream.)
+        flushed (atom [])
+        seen (promise)
+        r (run-ws-bytes (frames [0x1 true (utf8 "a")] [0x1 true (utf8 "b")])
+                        {:out (flush-counting-output
+                               sink #(reset! flushed (mapv frame-text (parse-frames (.toByteArray sink)))))
+                         :sink sink
+                         :on-message (fn [^WebSocketSocket s m]
+                                       (when (= "a" m)
+                                         (.sendTextAsync s "q" (reify WebSocketSocket$SendCallback
+                                                                 (onSuccess [_] (deliver seen @flushed))
+                                                                 (onFailure [_ t] (deliver seen t)))))
+                                       (.sendText s ^String m))})]
+    (is (some #{"q"} (deref seen 2000 nil)) "q was flushed when its callback ran")
+    (is (= #{"q" "a" "b"} (set (mapv frame-text (:frames r)))))))
+
 (deftest ws-queued-frames-count-their-overhead
   ;; Every queued frame counts against :ws-max-queued-bytes, empty ones
   ;; included, so a flood of empty sends can't queue without bound.

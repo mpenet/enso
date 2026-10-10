@@ -176,6 +176,63 @@ script/test.sh s-exp.enso-soak-test
 
 On macOS raise the file descriptor limit first (`ulimit -n 10240`).
 
+## Soak and chaos run
+
+`s-exp.enso-soak` runs the server for hours under a mixed, partly hostile
+load and checks that nothing leaks or drifts. The server
+(`s-exp.enso-soak-server`) runs in its own JVM, so its process is measured
+alone. Before the run starts, the driver copies the compiled classes, the
+shim and the sources into the output directory, so edits to the working
+tree during a run don't reach the server.
+
+```
+clojure -T:build javac
+clojure -M:soak                                    # 120 min main phase
+clojure -M:soak '{:duration-m 10 :warmup-m 2}'     # shakedown
+clojure -M:soak '{:analyze "target/soak/<run>"}'   # analyse a recorded run again
+```
+
+The load runs on every protocol at the same time, throttled so a laptop
+stays usable (`:rate-scale` multiplies every rate):
+
+- steady requests over HTTP/1.1 (keep-alive, pipelined, one per
+  connection, TLS), HTTP/2 over TLS, h2c, HTTP/3 and WebSocket echo with
+  and without permessage-deflate, each response checked;
+- uploads (Content-Length, chunked, HTTP/2, HTTP/3), some to a handler
+  that never reads its body;
+- streamed responses (ChunkedWriter, SSE, InputStream bodies), slow
+  readers and clients that leave mid-response;
+- chaos: TCP resets, half-closed and idle connections, slowloris heads,
+  trickled bodies, HTTP/2 reset bursts below and above the rapid-reset
+  limit, malformed and oversized requests, abandoned TLS and QUIC
+  handshakes, WebSocket and QUIC clients that vanish, uploads that fill
+  the memory budget (`:max-buffered-bytes` is 4 MiB), and an HTTP/3
+  certificate replaced every 5 minutes.
+
+Every client operation ends in an outcome. Each kind of client lists the
+outcomes it expects (a slowloris client expects 408); any other outcome
+is unexpected, and its first occurrences save a server thread dump under
+`incidents/`.
+
+Phases: warm-up, a quiet period ending in the baseline sample, the main
+phase, a quiet period ending in the final sample, then a stop of the
+servers while load is running. A sample every 30 s records post-GC heap,
+RSS, NMT committed memory, fds, threads by name, live virtual threads
+(JFR), budget use, connections, GC, server log warnings, and outcome
+counts and latency per kind.
+
+Results go to `target/soak/<timestamp>/`: `timeseries.edn` and `.csv`,
+`summary.md` and `.edn`, the server and GC logs, and jcmd output (thread
+dumps, class histograms, NMT). The summary fits a line to each resource
+over the main phase and flags growth above a floor with r² over 0.5. It
+also compares the final sample with the baseline, compares p99 latency
+at the start and end of the main phase, and reports how long the stop
+took.
+
+`bench/soak/linux.sh` runs the same driver in a Linux container with 2
+CPUs and netem loss, delay and reordering on loopback UDP, so only QUIC
+is impaired. Its results go to `target/soak-linux/`.
+
 ## Conformance suites
 
 | Suite | Runner | Expectations | Needs |

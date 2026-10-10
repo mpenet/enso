@@ -252,6 +252,10 @@ public final class WebSocketConnection {
     // check before a read. Any flush writes the held frames too, so a
     // stale true only costs a flush with nothing to write.
     private volatile boolean outputHeld;
+    // The first failure of a write before our CLOSE, recorded under
+    // writeLock: the connection ends with 1006 reporting it to onError,
+    // and later sends fail with it as cause.
+    private volatile Throwable writeFailure;
 
     // ---- Send queue, guarded by queueLock (never held across I/O) ----
     private final ReentrantLock queueLock = new ReentrantLock();
@@ -404,7 +408,9 @@ public final class WebSocketConnection {
             } catch (IOException e) {
                 // After our CLOSE the peer may drop TCP instead of answering,
                 // or the close timer fires: an expected end, not an error.
-                if (!failed && !closeSent) {
+                // After a failed write the read fails on the closed socket:
+                // finish reports the write's failure instead.
+                if (!failed && !closeSent && writeFailure == null) {
                     notifyError(e);
                     closeCode = CLOSE_ABNORMAL;
                     closeReason = e.getMessage() == null ? "" : e.getMessage();
@@ -586,9 +592,13 @@ public final class WebSocketConnection {
      * listener's own I/O is not this connection's. Frames were consumed
      * whole, so the stream is intact: fail with 1011, drop a message in
      * progress and keep reading (discarding) until the peer's CLOSE.
+     * Nothing to fail once a write failed: TCP is already dropped.
      */
     private void listenerFailed(Throwable t) {
-        if (failed) {
+        // After a failed write, a send in the listener throws with that
+        // failure as cause: the connection ends with the write's failure
+        // (see finish), not 1011.
+        if (failed || writeFailure != null) {
             return;
         }
         failConnection(CLOSE_INTERNAL_ERROR, INTERNAL_ERROR, t);
@@ -676,7 +686,7 @@ public final class WebSocketConnection {
         // Outside the lock, which stays short.
         budget.release(dropped);
         if (left != null) {
-            IOException closed = new SendRejected(CLOSED);
+            IOException closed = new SendRejected(CLOSED, writeFailure);
             for (Outgoing o = left; o != null; o = o.next) {
                 o.failure = closed;
             }
@@ -698,10 +708,42 @@ public final class WebSocketConnection {
                 }
             }
         }
+        // A write failed while the connection wasn't failing for another
+        // reason: reported once, with the write's own exception.
+        Throwable wf = writeFailure;
+        if (wf != null && !failed) {
+            closeCode = CLOSE_ABNORMAL;
+            closeReason = wf.getMessage() == null ? "" : wf.getMessage();
+            notifyError(wf);
+        }
         try {
             listener.onClose(socketApi, closeCode, closeReason);
         } catch (Throwable ignored) {
         }
+    }
+
+    /**
+     * A write failed: TCP is dropped, since a partial frame can't be
+     * followed by anything. The first failure before our CLOSE is kept
+     * for finish to report and as the cause of later sends' failures; a
+     * failure writing the CLOSE itself ends a closing connection and isn't
+     * reported. Caller holds {@link #writeLock}.
+     */
+    private void writeFailed(Throwable e) {
+        if (writeFailure == null && !closeSent) {
+            writeFailure = e;
+        }
+        forceClose();
+    }
+
+    /** What a send on a connection that is closed throws. */
+    private IOException closed() {
+        return new IOException(CLOSED, writeFailure);
+    }
+
+    /** A refused send; a closed connection's carries its write failure. */
+    private IOException rejection(String why) {
+        return why == CLOSED ? new SendRejected(CLOSED, writeFailure) : new SendRejected(why);
     }
 
     /**
@@ -1148,6 +1190,10 @@ public final class WebSocketConnection {
             super(message);
         }
 
+        SendRejected(String message, Throwable cause) {
+            super(message, cause);
+        }
+
         @Override
         public synchronized Throwable fillInStackTrace() {
             return this;
@@ -1317,7 +1363,7 @@ public final class WebSocketConnection {
             }
             out.flush();
         } catch (IOException | RuntimeException e) {
-            forceClose();
+            writeFailed(e);
             for (Outgoing o = chain; o != null; o = o.next) {
                 o.failure = e;
             }
@@ -1356,11 +1402,11 @@ public final class WebSocketConnection {
         writeLock.lock();
         try {
             if (!open) {
-                throw new IOException(CLOSED);
+                throw closed();
             }
             written = writeQueued(false);
             if (!open) {
-                throw new IOException(CLOSED);
+                throw closed();
             }
             try {
                 writeFrameLocked(opcode, a, off, len, direct);
@@ -1374,8 +1420,7 @@ public final class WebSocketConnection {
                     outputHeld = false;
                 }
             } catch (IOException | RuntimeException e) {
-                // A partial frame can't be followed by anything.
-                forceClose();
+                writeFailed(e);
                 throw e;
             }
         } finally {
@@ -1402,9 +1447,11 @@ public final class WebSocketConnection {
     /**
      * The read loop writes the frames it held. When another thread holds
      * the lock it doesn't wait: that holder writes them before releasing
-     * it, with its own frames or in {@link #unlockWrites}.
+     * it, with its own frames or in {@link #unlockWrites}. A failure
+     * closes the socket, so the read that follows fails and the read loop
+     * ends reporting the write's failure (see {@link #finish}).
      */
-    private void flushHeld() throws IOException {
+    private void flushHeld() {
         if (!writeLock.tryLock()) {
             return;
         }
@@ -1414,8 +1461,7 @@ public final class WebSocketConnection {
                 out.flush();
             }
         } catch (IOException | RuntimeException e) {
-            forceClose();
-            throw e;
+            writeFailed(e);
         } finally {
             writeLock.unlock();
         }
@@ -1442,8 +1488,7 @@ public final class WebSocketConnection {
                 out.flush();
             }
         } catch (IOException | RuntimeException e) {
-            // The read loop sees the closed socket.
-            forceClose();
+            writeFailed(e);
         } finally {
             writeLock.unlock();
         }
@@ -1464,11 +1509,11 @@ public final class WebSocketConnection {
             Outgoing written = null;
             try {
                 if (!open) {
-                    throw new IOException(CLOSED);
+                    throw closed();
                 }
                 written = writeQueued(false);
                 if (!open) {
-                    throw new IOException(CLOSED);
+                    throw closed();
                 }
                 try {
                     if (len > 0) {
@@ -1478,7 +1523,7 @@ public final class WebSocketConnection {
                     out.write(controlOut, 0, len);
                     out.flush();
                 } catch (IOException | RuntimeException e) {
-                    forceClose();
+                    writeFailed(e);
                     throw e;
                 }
             } finally {
@@ -1493,7 +1538,7 @@ public final class WebSocketConnection {
         }
         String rejected = enqueue(new Outgoing(opcode, copy, 0, len, null, null));
         if (rejected != null) {
-            throw new SendRejected(rejected);
+            throw rejection(rejected);
         }
     }
 
@@ -1501,7 +1546,7 @@ public final class WebSocketConnection {
         String rejected = enqueue(o);
         if (rejected != null) {
             try {
-                o.callback.onFailure(new SendRejected(rejected));
+                o.callback.onFailure(rejection(rejected));
             } catch (Throwable ignored) {
             }
         }
@@ -1619,7 +1664,8 @@ public final class WebSocketConnection {
     /**
      * Sends this endpoint's single CLOSE frame: {@code code} plus
      * {@code reason}, or an empty payload when {@code code} is negative.
-     * Stops all further sends; frames queued before it go out first.
+     * Stops all further sends; frames queued or held before it go out
+     * first.
      * Waits for a writer in progress at most {@code :ws-close-timeout}.
      * Returns true if this call put the CLOSE on the wire; false if one was
      * already sent or it couldn't be written, in which case TCP is dropped.
@@ -1640,8 +1686,15 @@ public final class WebSocketConnection {
             if (closeSent) {
                 return false;
             }
-            closeSent = true;
+            // Frames queued or held before the CLOSE go out ahead of it. A
+            // failure writing them is a write failure like any other; one
+            // writing the CLOSE itself only ends a closing connection.
             written = writeQueued(false);
+            if (outputHeld) {
+                outputHeld = false;
+                out.flush();
+            }
+            closeSent = true;
             int len = 0;
             if (code >= 0) {
                 controlOut[0] = (byte) ((code >>> 8) & 0xFF);
@@ -1654,7 +1707,7 @@ public final class WebSocketConnection {
             out.flush();
             return true;
         } catch (IOException e) {
-            forceClose();
+            writeFailed(e);
             return false;
         } finally {
             writeLock.unlock();

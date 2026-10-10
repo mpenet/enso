@@ -207,18 +207,26 @@ must arrive within `:read-timeout` of its first frame. Past either the
 connection fails with 1009 or 1008.
 
 Sends may come from any thread and go out in call order. A synchronous
-send writes on the calling thread, bounded by `:write-timeout`. A
-synchronous send from `:on-message`, made while more of the client's
+send writes on the calling thread, bounded by `:write-timeout`. It
+returns once the message is accepted for sending, like a write into a
+socket's buffer: the message is on its way, not yet received. A send on a
+closed connection throws at once. If a failed write closed it, that
+failure is the exception's cause.
+
+A synchronous send from `:on-message`, made while more of the client's
 messages are already read, waits in the buffer so the replies to them
-share one write. It goes out before the server waits for more input, or
-after about 10 ms if a handler takes longer. An
-asynchronous send (`ring.websocket/send` with callbacks, `.sendTextAsync`,
-`.sendBinaryAsync`) queues the message and returns at once. A writer
-virtual thread sends it and calls the success callback. Once
-`:ws-max-queued-bytes` are queued, further sends fail at once. Don't modify
-a `ByteBuffer` sent asynchronously until its callback has run. The writer
-thread only exists while there is something to write and ends after a
-second idle.
+share one write. It goes out before the server waits for more input,
+ahead of any later message and of the server's CLOSE, or after about
+10 ms if a handler takes longer. If that write fails, the connection
+closes with 1006 and `:on-error` gets the write's exception once.
+
+An asynchronous send (`ring.websocket/send` with callbacks,
+`.sendTextAsync`, `.sendBinaryAsync`) queues the message and returns at
+once. A writer virtual thread hands it to the socket, then calls the
+success callback. Once `:ws-max-queued-bytes` are queued, further sends
+fail at once. Don't modify a `ByteBuffer` sent asynchronously until its
+callback has run. The writer thread only exists while there is something
+to write and ends after a second idle.
 
 After the server sent CLOSE, or once the connection is gone, every send
 throws `IOException` "WebSocket closed", and asynchronous sends call their

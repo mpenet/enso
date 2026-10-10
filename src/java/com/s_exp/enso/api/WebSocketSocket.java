@@ -11,7 +11,8 @@ import java.nio.ByteBuffer;
  *
  * <p>Once the server's CLOSE is out (or the connection is gone), sends
  * throw {@link IOException} "WebSocket closed" and asynchronous sends call
- * {@link SendCallback#onFailure}.
+ * {@link SendCallback#onFailure}. When the connection ended because a
+ * write failed, that failure is the exception's cause.
  */
 public interface WebSocketSocket {
 
@@ -19,30 +20,38 @@ public interface WebSocketSocket {
     boolean isOpen();
 
     /**
-     * Sends a text message and returns once it is written. Blocks while a
-     * peer that stopped reading holds the connection up, at most about
-     * {@code :write-timeout}, after which the connection is dropped.
+     * Sends a text message. Returns once the message is accepted for
+     * sending, in call order, like a write into a socket's buffer: it is on
+     * its way to the client, not yet received. Blocks while a peer that
+     * stopped reading holds the connection up, at most about
+     * {@code :write-timeout}, after which the connection is dropped. Throws
+     * at once when the connection is closed, with the failure of an
+     * earlier write as cause when that is what closed it.
      *
      * <p>Called from {@link WebSocketListener#onMessage} while more of the
      * client's frames are already read, the message waits in the
      * connection's buffer so the replies to those frames share its write.
-     * It goes out before the server waits for more input, or after about
-     * 10 ms if a listener takes longer. A failure of that write closes the
-     * connection and is reported to {@link WebSocketListener#onError}.
+     * It goes out before the server waits for more input, ahead of any
+     * later frame and of the server's CLOSE, or after about 10 ms if a
+     * listener takes longer. If that write fails, the connection closes
+     * with 1006 and {@link WebSocketListener#onError} gets the write's
+     * exception, once.
      */
     void sendText(CharSequence message) throws IOException;
 
     /**
-     * Sends the remaining bytes of {@code message} as a binary message and
-     * returns once they are written; {@code message}'s position is not
-     * moved. Blocks, and may wait in the buffer, like {@link #sendText}.
+     * Sends the remaining bytes of {@code message} as a binary message;
+     * {@code message}'s position is not moved. Returns, blocks, waits in
+     * the buffer and fails like {@link #sendText}.
      */
     void sendBinary(ByteBuffer message) throws IOException;
 
     /**
      * Queues a text message and returns at once; a writer thread sends it,
-     * then calls {@code callback}. Fails immediately (through the callback)
-     * when the queue already holds {@code :ws-max-queued-bytes}.
+     * then calls {@code callback}. Success means the message was handed to
+     * the socket, never that it still waits in the connection's buffer.
+     * Fails immediately (through the callback) when the queue already
+     * holds {@code :ws-max-queued-bytes}.
      */
     void sendTextAsync(CharSequence message, SendCallback callback);
 
@@ -54,7 +63,7 @@ public interface WebSocketSocket {
 
     /** Outcome of an asynchronous send, called once, on the writer thread or the caller's. */
     interface SendCallback {
-        /** The message was written. */
+        /** The message was handed to the socket. */
         void onSuccess();
 
         /** The message could not be sent (closed, queue full, write failure). */
