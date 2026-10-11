@@ -1780,9 +1780,15 @@
            [{} "HTTP://127.0.0.1" "101"]
            [{} "http://evil.example" "403"]
            [{} "null" "403"]
+           ;; A plaintext connection's origin is http, not https (RFC 6454).
+           [{} "https://127.0.0.1" "403"]
+           ;; An explicit allowlist is a hard gate: a handshake with no Origin
+           ;; (a non-browser client) is refused, not waved through.
+           [{:ws-allowed-origins ["http://127.0.0.1"]} nil "403"]
            [{:ws-allowed-origins ["http://evil.example"]} "http://evil.example" "101"]
            [{:ws-allowed-origins ["http://evil.example"]} "http://127.0.0.1" "403"]
            [{:ws-allowed-origins ["*"]} "http://evil.example" "101"]
+           [{:ws-allowed-origins ["*"]} nil "403"]
            [{:ws-allowed-origins #(= % "http://fn.example")} "http://fn.example" "101"]
            [{:ws-allowed-origins #(= % "http://fn.example")} "http://evil.example" "403"]]]
     (with-server echo-handler opts

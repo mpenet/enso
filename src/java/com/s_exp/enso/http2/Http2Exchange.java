@@ -11,7 +11,6 @@ import com.s_exp.enso.api.Response;
 import com.s_exp.enso.api.RingHandler;
 import com.s_exp.enso.core.ChunkedWriters;
 import com.s_exp.enso.core.Exchange;
-import com.s_exp.enso.core.HttpFields;
 import com.s_exp.enso.core.HttpStatus;
 import com.s_exp.enso.core.LogLimiter;
 import com.s_exp.enso.core.RequestHead;
@@ -161,7 +160,7 @@ final class Http2Exchange implements Hpack.FieldSink {
             if (!name.isEmpty() && name.charAt(0) == ':') {
                 pseudoInTrailers = true;
                 malformedTrailers = true;
-            } else if (!malformedTrailers && !isTrailerField(name, value)) {
+            } else if (!malformedTrailers && !RequestHead.isTrailerField(name, value)) {
                 malformedTrailers = true;
             }
             return;
@@ -184,15 +183,6 @@ final class Http2Exchange implements Hpack.FieldSink {
             fields[fieldLen++] = name;
             fields[fieldLen++] = value;
         }
-    }
-
-    private static boolean isTrailerField(String name, String value) {
-        if (!HttpFields.isLowercaseToken(name, 0) || !RequestHead.isFieldValue(value)) return false;
-        return switch (name) {
-            case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" -> false;
-            case "te" -> value.equalsIgnoreCase("trailers");
-            default -> true;
-        };
     }
 
     /** The request's Content-Length, -1 if none (valid once {@link #buildRequest} succeeded). */

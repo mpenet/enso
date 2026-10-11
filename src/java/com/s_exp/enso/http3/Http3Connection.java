@@ -864,11 +864,12 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
     }
 
     /**
-     * The peer reset the sending side of a request stream. Counted against
-     * the rapid-reset budget; over it, the connection closes with
-     * H3_EXCESSIVE_LOAD.
+     * Charges one stream reset against the rapid-reset budget, whether the
+     * peer reset a request stream or the server reset one after dispatching
+     * its handler (RFC 9114 analog of HTTP/2's rapid reset). Over the budget
+     * the connection closes with H3_EXCESSIVE_LOAD and false is returned.
      */
-    boolean peerReset() {
+    boolean chargeReset() {
         int cap = config.http3StreamResetLimit;
         if (cap <= 0) return true;
         long now = System.nanoTime();

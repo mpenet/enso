@@ -15,14 +15,16 @@ public final class RingHeaders {
 
     private RingHeaders() {}
 
-    // Clojure's own threshold (PersistentArrayMap.HASHTABLE_THRESHOLD):
-    // array maps hold at most 8 entries.
-    private static final int ARRAY_MAP_MAX_LENGTH = 16;
+    // Header maps up to this many fields (32) are array maps over the parsed
+    // array; larger ones hash maps. Clojure's own array maps stop at 8, but a
+    // browser sends 10 to 20 fields, and a hash map of those costs several
+    // times more to build than a lookup scanning them does.
+    private static final int ARRAY_MAP_MAX_LENGTH = 64;
 
     /**
      * The header map over {@code kv}, an exact-fit array of unique names
      * and their values as {@link #mergeDuplicates} returns it (taken over,
-     * not copied). Up to 8 fields an array map over the array itself (no
+     * not copied). Up to 32 fields an array map over the array itself (no
      * duplicate scan: the names are already unique), beyond a hash map,
      * so building and looking up stay linear in the field count.
      */

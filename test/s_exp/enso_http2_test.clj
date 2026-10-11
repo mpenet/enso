@@ -2364,19 +2364,30 @@
   [[":method" "GET"] [":scheme" "https"] [":path" "/"] [":authority" "localhost"]
    ["user-agent" "h2load"] ["accept" "*/*"]])
 
+;; A browser-like GET: more fields than an array map's 8, so the head's
+;; shape (array map vs hash map) is exercised. 14 fields, as h1's.
+(def ^:private alloc-browser-block
+  [[":method" "GET"] [":scheme" "https"] [":path" "/app/page?id=42"] [":authority" "localhost"]
+   ["user-agent" "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/131.0"]
+   ["accept" "text/html,application/xhtml+xml"] ["accept-language" "en-US,en;q=0.5"]
+   ["accept-encoding" "gzip, deflate, br"] ["cookie" "session=abc123; theme=dark"]
+   ["sec-fetch-dest" "document"] ["sec-fetch-mode" "navigate"] ["sec-gpc" "1"]
+   ["x-request-id" "7d1c2e7a"] ["x-csrf-token" "t0k3n"]])
+
 (defn- h2-alloc-input
   "Preface, SETTINGS and `n` GET HEADERS frames (END_STREAM) as one array."
-  ^bytes [n]
-  (let [enc (com.s_exp.enso.http2.Hpack$Encoder. 4096)
-        block (fn [] (let [l (java.util.ArrayList.)]
-                       (doseq [[k v] alloc-get-block] (.add l (com.s_exp.enso.http2.Hpack$HeaderField. k v)))
-                       (.encode enc l)))
-        out (java.io.ByteArrayOutputStream.)]
-    (.write out (.getBytes "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" StandardCharsets/ISO_8859_1))
-    (.write out (frame-bytes frame-settings 0 0 (byte-array 0)))
-    (dotimes [i n]
-      (.write out (frame-bytes frame-headers (bit-or flag-end-headers flag-end-stream) (inc (* 2 i)) (block))))
-    (.toByteArray out)))
+  (^bytes [n] (h2-alloc-input n alloc-get-block))
+  (^bytes [n fields]
+   (let [enc (com.s_exp.enso.http2.Hpack$Encoder. 4096)
+         block (fn [] (let [l (java.util.ArrayList.)]
+                        (doseq [[k v] fields] (.add l (com.s_exp.enso.http2.Hpack$HeaderField. k v)))
+                        (.encode enc l)))
+         out (java.io.ByteArrayOutputStream.)]
+     (.write out (.getBytes "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" StandardCharsets/ISO_8859_1))
+     (.write out (frame-bytes frame-settings 0 0 (byte-array 0)))
+     (dotimes [i n]
+       (.write out (frame-bytes frame-headers (bit-or flag-end-headers flag-end-stream) (inc (* 2 i)) (block))))
+     (.toByteArray out))))
 
 (defn- h2-connection-alloc-bytes
   "Bytes allocated by every thread while one in-memory Http2Connection,
@@ -2433,6 +2444,34 @@
       (let [per-request (/ (double (apply min (repeatedly 3 #(h2-connection-alloc-bytes srv handler input n current)))) n)]
         (println "h2 GET:" per-request "bytes/request")
         (is (< per-request 1000) (str per-request " bytes/request")))
+      (finally (enso/stop srv)))))
+
+(deftest h2-browser-head-allocation-budget
+  ;; A browser-like GET (14 request fields): the head is built as an array
+  ;; map, not a hash map, so more fields than Clojure's array-map cutoff of
+  ;; 8 don't pull in a hash map's nodes per request. Same harness as
+  ;; h2-get-allocation-budget.
+  (let [current (atom nil)
+        ->response @#'enso/->response
+        resp {:status 200 :headers {"content-type" "text/plain"} :body "Hello, World!"}
+        handler (reify com.s_exp.enso.api.RingHandler
+                  (handle [_ req]
+                    ;; Touch fields past the array-map cutoff, as middleware does.
+                    (get (.headers req) "user-agent")
+                    (get (.headers req) "x-csrf-token")
+                    (->response resp)))
+        events (reify com.s_exp.enso.api.ServerEvents
+                 (requestCompleted [_ _ _ _ _ _ _] (.countDown ^CountDownLatch @current)))
+        n 2000
+        input (h2-alloc-input n alloc-browser-block)
+        srv (enso/run-server (fn [_] resp) {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
+                                            :http2-max-concurrent-streams 4096
+                                            :server-events events})]
+    (try
+      (dotimes [_ 20] (h2-connection-alloc-bytes srv handler input n current))
+      (let [per-request (/ (double (apply min (repeatedly 3 #(h2-connection-alloc-bytes srv handler input n current)))) n)]
+        (println "h2 GET, 14-field browser head:" per-request "bytes/request")
+        (is (< per-request 1400) (str per-request " bytes/request")))
       (finally (enso/stop srv)))))
 
 (deftest h2-small-stream-body-allocation-budget

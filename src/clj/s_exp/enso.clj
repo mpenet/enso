@@ -569,7 +569,7 @@
     :doc "ms without a frame from the client after which the server sends a ping (and again at that interval), 0 = never. The client's pongs count as frames, so a live but silent client outlasts `:idle-timeout`; less than `:idle-timeout`."}
    {:key :ws-allowed-origins :group "WebSocket" :default nil :check check-origins
     :set (fn [^Config$Builder b v] (.wsAllowedOrigins b ^Predicate v))
-    :doc "origins allowed to open a WebSocket (cross-site WebSocket hijacking protection): a collection of origins such as \"https://app.example.com\" (\"*\" for any) or a fn of the `Origin` value. nil = same origin: the `Origin` host must equal the `Host` header. A handshake without `Origin` (not from a browser) is allowed; a refused one gets 403."}
+    :doc "origins allowed to open a WebSocket (cross-site WebSocket hijacking protection): a collection of origins such as \"https://app.example.com\" (\"*\" for any) or a fn of the `Origin` value. nil = same origin: the `Origin` scheme and host must match the connection and the `Host` header. A configured allowlist is a hard gate: a handshake without `Origin` (not from a browser) is refused. With no allowlist a handshake without `Origin` is allowed. A refused handshake gets 403."}
 
    ;; Handler and observability
    {:key :async :group "Handler and observability" :default false :check check-bool

@@ -233,6 +233,20 @@ public final class RequestHead {
         return name.charAt(0) == ':' || HttpFields.isLowercaseToken(name, 0);
     }
 
+    /**
+     * Whether a trailer field is allowed (HTTP/2 RFC 9113 §8.1, HTTP/3 RFC
+     * 9114 §4.2): a lowercase-token name with a valid value, no pseudo-header
+     * and no connection-specific field, and {@code te} only as "trailers".
+     */
+    public static boolean isTrailerField(String name, String value) {
+        if (!HttpFields.isLowercaseToken(name, 0) || !isFieldValue(value)) return false;
+        return switch (name) {
+            case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" -> false;
+            case "te" -> value.equalsIgnoreCase("trailers");
+            default -> true;
+        };
+    }
+
     // ---- Grammar shared with HTTP/1.1 ---------------------------------------
 
     /**

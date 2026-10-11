@@ -216,6 +216,11 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
                 if (e.errorCode() == Http3ConnectionException.H3_MESSAGE_ERROR) {
                     conn.listener.protocolError("bad-request");
                 }
+                // A reset after the handler was dispatched (malformed trailer,
+                // oversized body) cost a QPACK decode and a handler thread; a
+                // peer inducing these is a rapid-reset analog, so it is charged
+                // against the same budget. Over it the connection closes.
+                if (ex.request != null && !conn.chargeReset()) return;
                 conn.resetStream(ex, e.errorCode(), now);
                 return;
             }
@@ -231,7 +236,7 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
      * §3.2), unless the peer also stopped it.
      */
     private void peerReset(Http3Exchange ex, long now) {
-        if (!conn.peerReset()) return;
+        if (!conn.chargeReset()) return;
         if (ex.request == null && ex.fixedStatus == 0) {
             conn.quiche.streamShutdown(ex.id, Quiche.QUICHE_SHUTDOWN_WRITE,
                 Http3ConnectionException.H3_REQUEST_INCOMPLETE);
@@ -467,8 +472,9 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
     @Override
     public void field(String name, String value) {
         if (trailers) {
-            // RFC 9114 §4.1.2 / §4.3: no pseudo-headers, valid names and values.
-            if (!Http3RequestReader.validName(name) || !RequestHead.isFieldValue(value)) {
+            // RFC 9114 §4.1.2 / §4.2 / §4.3: no pseudo-headers, valid names and
+            // values, no connection-specific fields, te only as "trailers".
+            if (!RequestHead.isTrailerField(name, value)) {
                 throw new Http3StreamException(Http3ConnectionException.H3_MESSAGE_ERROR,
                     "invalid trailer field '" + name + "'");
             }
@@ -498,10 +504,6 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
             kv[kvLen++] = name;
             kv[kvLen++] = value;
         }
-    }
-
-    static boolean validName(String s) {
-        return com.s_exp.enso.core.HttpFields.isLowercaseToken(s, 0);
     }
 
     private void decode(Http3Exchange ex, byte[] b, int off, int len) {

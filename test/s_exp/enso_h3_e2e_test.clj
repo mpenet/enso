@@ -384,12 +384,64 @@
       (testing "pseudo-header in trailers is malformed"
         (is (message-error? c 4 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
                                                  (h3/headers-frame [[":path" "/x"]])))))
+      (testing "connection-specific field in trailers is malformed"
+        (is (message-error? c 52 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                                  (h3/headers-frame [["connection" "close"]])))))
+      (testing "te other than trailers in trailers is malformed"
+        (is (message-error? c 56 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                                  (h3/headers-frame [["te" "gzip"]])))))
+      (testing "te: trailers in trailers is accepted"
+        (h3/send! c 60 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                        (h3/data-frame (.getBytes "body"))
+                                        (h3/headers-frame [["te" "trailers"]]))
+                  true)
+        (h3/pump-until! c #(h3/stream-done? c 60) 3000)
+        (is (= "body" (h3/body-str (h3/response c 60))))
+        (is (nil? (h3/peer-error c))))
       (testing "DATA after trailers is a frame sequence error"
         (h3/send! c 8 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
                                        (h3/headers-frame [["x-t" "1"]])
                                        (h3/data-frame (.getBytes "late")))
                   true)
         (is (= [true 0x105] (h3/await-peer-error c 3000)) "H3_FRAME_UNEXPECTED")))))
+
+(deftest server-induced-resets-count-against-the-reset-budget
+  ;; RFC 9114 analog of HTTP/2 rapid reset: a peer that makes the server
+  ;; reset streams after their handler is dispatched (a malformed trailer
+  ;; here, which costs a QPACK decode and a handler thread) is charged
+  ;; against the stream-reset budget. Below it the streams are reset but
+  ;; the connection survives; past it the connection closes.
+  (h3/with-server [srv echo-handler
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3StreamResetLimit b 5))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (let [bad-request (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                         (h3/data-frame (.getBytes "body"))
+                                         (h3/headers-frame [["connection" "close"]]))]
+        (doseq [sid (map #(* 4 %) (range 3))]
+          (h3/send! c sid bad-request true)
+          (h3/pump-until! c #(h3/stream-done? c sid) 3000)
+          (is (= 0x10e (:reset (h3/response c sid))) "stream reset below the budget"))
+        (is (nil? (h3/peer-error c)) "connection open below the budget")
+        (doseq [sid (map #(* 4 %) (range 3 12))]
+          (h3/send! c sid bad-request true))
+        (is (= [true 0x107] (h3/await-peer-error c 3000)) "H3_EXCESSIVE_LOAD past the budget")))))
+
+(deftest legitimate-traffic-does-not-trip-the-reset-budget
+  ;; A valid request that happens to carry trailers isn't a reset: a long
+  ;; run of them leaves the budget untouched and the connection open.
+  (h3/with-server [srv echo-handler
+                   (fn [^com.s_exp.enso.api.Config$Builder b] (.http3StreamResetLimit b 5))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (let [good (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/"))
+                                  (h3/data-frame (.getBytes "body"))
+                                  (h3/headers-frame [["x-checksum" "abc"]]))]
+        (doseq [sid (map #(* 4 %) (range 20))]
+          (h3/send! c sid good true)
+          (h3/pump-until! c #(h3/stream-done? c sid) 3000)
+          (is (= "body" (h3/body-str (h3/response c sid)))))
+        (is (nil? (h3/peer-error c)) "connection open: valid requests aren't resets")))))
 
 (defn- conn-error-after
   "Opens the client control/QPACK streams, runs `f`, returns the server's
@@ -1756,6 +1808,34 @@
         ;; thread-container node), the Exchange, the Ring request and header
         ;; map, the handler's Response.
         (is (< per-request (if (compressed-oops?) 900 1300)) (str per-request " bytes per request"))))))
+
+(deftest h3-browser-head-allocation-budget
+  ;; A browser-like GET (14 request fields): the head is built as an array
+  ;; map, not a hash map, so more fields than Clojure's array-map cutoff of
+  ;; 8 don't pull in a hash map's nodes per request. Same harness as
+  ;; h3-get-allocation-budget.
+  (h3/with-server [srv (fn [_] (ok "Hello, World!"))]
+    (h3/with-client [c (.port srv)]
+      (h3/open-control! c)
+      (let [frame (h3/headers-frame
+                   (h3/request-headers "GET" "/app/page?id=42"
+                                       ["user-agent" "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/131.0"]
+                                       ["accept" "text/html,application/xhtml+xml"]
+                                       ["accept-language" "en-US,en;q=0.5"]
+                                       ["accept-encoding" "gzip, deflate, br"]
+                                       ["cookie" "session=abc123; theme=dark"]
+                                       ["sec-fetch-dest" "document"]
+                                       ["sec-fetch-mode" "navigate"]
+                                       ["sec-gpc" "1"]
+                                       ["x-request-id" "7d1c2e7a"]
+                                       ["x-csrf-token" "t0k3n"]))
+            sid (reduce (fn [sid _] (get-batch! c sid 50 frame)) 0 (range 40))
+            before (server-thread-allocated-bytes)
+            n 2000
+            _ (reduce (fn [sid _] (get-batch! c sid 50 frame)) sid (range (quot n 50)))
+            per-request (quot (- (server-thread-allocated-bytes) before) n)]
+        (println "h3 GET, 14-field browser head, server allocation per request:" per-request "bytes")
+        (is (< per-request (if (compressed-oops?) 1300 1700)) (str per-request " bytes per request"))))))
 
 (deftest small-stream-bodies-get-small-buffers
   ;; A streamed body's producer buffer is sized to what the body can need

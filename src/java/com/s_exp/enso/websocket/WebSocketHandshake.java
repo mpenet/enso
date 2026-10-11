@@ -11,9 +11,11 @@ import java.util.function.Predicate;
  * and WebSockets are not subject to CORS, so a page on another site could
  * open an authenticated socket (cross-site WebSocket hijacking). A browser
  * always sends {@code Origin} on a WebSocket handshake; without a policy
- * the server accepts only its own origin, whose host must equal the
- * {@code Host} header (as gorilla/websocket and Spring do). A handshake
- * without {@code Origin} doesn't come from a browser and is accepted.
+ * the server accepts only its own origin, whose scheme and host must match
+ * the connection's and the {@code Host} header (as gorilla/websocket and
+ * Spring do). A handshake without {@code Origin} doesn't come from a
+ * browser; with no policy it is accepted, but a configured allowlist is a
+ * hard gate that refuses it.
  */
 public final class WebSocketHandshake {
 
@@ -21,31 +23,43 @@ public final class WebSocketHandshake {
 
     /**
      * Whether {@code origin} (the {@code Origin} header, null when absent)
-     * may open a WebSocket on a request whose {@code Host} is {@code host}.
-     * {@code allowed} is the configured policy, null for same origin.
+     * may open a WebSocket on a request whose {@code Host} is {@code host}
+     * over a {@code secure} (TLS) connection or not. {@code allowed} is the
+     * configured policy, null for same origin. A configured allowlist is a
+     * hard gate: a missing or opaque Origin is refused.
      */
-    public static boolean originAllowed(String origin, String host, Predicate<String> allowed) {
+    public static boolean originAllowed(String origin, String host, boolean secure,
+                                        Predicate<String> allowed) {
+        if (allowed != null) {
+            return origin != null && allowed.test(origin);
+        }
         if (origin == null) {
             return true;
         }
-        if (allowed != null) {
-            return allowed.test(origin);
-        }
-        return host != null && host.equalsIgnoreCase(originAuthority(origin));
+        return sameOrigin(origin, host, secure);
     }
 
     /**
-     * The host[:port] of a serialised origin ({@code scheme://host[:port]}),
-     * or null for an opaque origin ("null") or anything else. Compared as
-     * sent: browsers omit default ports, as clients do in {@code Host}.
+     * Whether a serialised origin ({@code scheme://host[:port]}) is the
+     * connection's own: its scheme matches the transport (https when
+     * {@code secure}, else http) and its host[:port] equals {@code host}.
+     * Compared as sent: browsers omit default ports, as clients do in
+     * {@code Host}. False for an opaque origin ("null") or anything else.
      */
-    static String originAuthority(String origin) {
+    static boolean sameOrigin(String origin, String host, boolean secure) {
         int sep = origin.indexOf("://");
         if (sep <= 0) {
-            return null;
+            return false;
+        }
+        String scheme = origin.substring(0, sep);
+        if (!scheme.equalsIgnoreCase(secure ? "https" : "http")) {
+            return false;
         }
         String authority = origin.substring(sep + 3);
-        return authority.isEmpty() || authority.indexOf('/') >= 0 ? null : authority;
+        if (authority.isEmpty() || authority.indexOf('/') >= 0) {
+            return false;
+        }
+        return host != null && host.equalsIgnoreCase(authority);
     }
 
     /**

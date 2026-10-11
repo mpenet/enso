@@ -732,7 +732,7 @@ public final class HttpConnection implements Runnable, Drainable {
             return;
         }
         if (!WebSocketHandshake.originAllowed(request.header("origin"), request.header("host"),
-                                              config.wsAllowedOrigins)) {
+                                              request.scheme == Request.K_HTTPS, config.wsAllowedOrigins)) {
             writeError(request, 403, "Forbidden");
             return;
         }

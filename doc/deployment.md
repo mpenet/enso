@@ -16,10 +16,10 @@ the server already protects against. To report a vulnerability, see
   balancer or NAT, where clients share addresses, and limit per client
   there instead.
 - WebSocket handshakes are accepted only from the server's own origin: the
-  `Origin` host must equal `Host`. Behind a proxy that rewrites `Host`, or
-  for cross-origin clients, list the allowed origins in
-  `:ws-allowed-origins`. Authenticate in the handler before returning the
-  listener.
+  `Origin` scheme and host must match the connection and `Host`. Behind a
+  proxy that rewrites `Host`, or for cross-origin clients, list the allowed
+  origins in `:ws-allowed-origins`, which then refuses a handshake with no
+  `Origin`. Authenticate in the handler before returning the listener.
 - Check the [default limits](#default-limits) against your traffic, in
   particular the 10 MiB request body limit.
 - For HTTP/3, see [below](#http3).

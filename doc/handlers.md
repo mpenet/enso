@@ -302,11 +302,13 @@ again.
 ### Origin and authentication
 
 Browsers attach cookies to cross-site WebSocket handshakes, and WebSockets
-aren't covered by CORS. By default only the server's own origin (its
-`Host`) may open a WebSocket. List others in `:ws-allowed-origins`: a
-collection of origins, `["*"]` for public cookie-less endpoints, or a
-predicate fn. A handshake without `Origin` doesn't come from a browser and
-is accepted.
+aren't covered by CORS. By default only the server's own origin may open a
+WebSocket: the `Origin` scheme and host must match the connection and the
+`Host` header. List others in `:ws-allowed-origins`: a collection of
+origins, `["*"]` for public cookie-less endpoints, or a predicate fn. A
+handshake without `Origin` doesn't come from a browser. With no allowlist
+it is accepted. A configured allowlist is a hard gate: it refuses a
+handshake without `Origin`.
 
 Authenticate in the handler before returning the listener. The upgrade
 request carries the cookies and headers.
