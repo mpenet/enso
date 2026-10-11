@@ -15,6 +15,7 @@ import com.s_exp.enso.core.HttpFields;
 import com.s_exp.enso.core.HttpStatus;
 import com.s_exp.enso.core.LogLimiter;
 import com.s_exp.enso.core.RequestHead;
+import com.s_exp.enso.core.ResponseEmission;
 import com.s_exp.enso.core.ResponseHead;
 import com.s_exp.enso.util.RingHeaders;
 import java.io.ByteArrayInputStream;
@@ -283,18 +284,9 @@ final class Http2Exchange implements Hpack.FieldSink {
         int status = 0;
         boolean handedOver = false;
         try {
-            if (response.webSocketListener != null) {
-                // RFC 9113 §8.6: no 101 / Upgrade over HTTP/2, and Extended
-                // CONNECT (RFC 8441) isn't offered.
-                Exchange.closeBody(response.body);
-                response = HttpStatus.error(501);
-            }
-            try {
-                rh.prepare(response, headRequest, ResponseHead.MULTIPLEXED);
-            } catch (RuntimeException e) {
-                INVALID_RESPONSES.log("invalid HTTP/2 response from handler, sending 500", e);
-                Exchange.closeBody(response.body);
-                rh.prepare(HttpStatus.error(500), headRequest, ResponseHead.MULTIPLEXED);
+            int err = ResponseEmission.prepareMultiplexed(rh, response, headRequest, INVALID_RESPONSES);
+            if (err != 0) {
+                rh.prepare(HttpStatus.error(err), headRequest, ResponseHead.MULTIPLEXED);
             }
             status = rh.status();
             s.status = status;

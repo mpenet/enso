@@ -8,6 +8,7 @@ import com.s_exp.enso.api.StreamingBody;
 import com.s_exp.enso.core.ChunkedWriters;
 import com.s_exp.enso.core.Exchange;
 import com.s_exp.enso.core.LogLimiter;
+import com.s_exp.enso.core.ResponseEmission;
 import com.s_exp.enso.core.ResponseHead;
 import com.s_exp.enso.core.Service;
 import java.io.IOException;
@@ -239,23 +240,11 @@ final class Http3Exchange extends Http3Stream implements Runnable, SignalStack.N
         // the claim against the timeout and abandons (null: lost).
         Response response = serve(conn.handler());
         if (response == null) return;
-        ResponseHead h = null;
-        int fixed = 0;
-        if (response.webSocketListener != null) {
-            // HTTP/3 has no 101 / Upgrade (RFC 9114 §4.5).
-            closeBody(response.body);
-            fixed = 501;
-        } else {
-            h = conn.heads().acquire();
-            try {
-                h.prepare(response, headRequest, ResponseHead.MULTIPLEXED);
-            } catch (RuntimeException e) {
-                INVALID_RESPONSES.log("invalid response from handler, sending 500: " + e.getMessage());
-                closeBody(response.body);
-                conn.heads().release(h);
-                h = null;
-                fixed = 500;
-            }
+        ResponseHead h = conn.heads().acquire();
+        int fixed = ResponseEmission.prepareMultiplexed(h, response, headRequest, INVALID_RESPONSES);
+        if (fixed != 0) {
+            conn.heads().release(h);
+            h = null;
         }
         FileChannel file = null;
         InputStream in = null;

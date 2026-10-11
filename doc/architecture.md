@@ -191,7 +191,11 @@ into reusable storage that drivers serialise from. Use
 `prepare(response, headRequest, mode)` then `release()`, or
 `disownBody()` before streaming a body the driver closes. `prepare`
 throws `IllegalArgumentException` for a handler error; the driver
-answers 500.
+answers 500. The multiplexed drivers (HTTP/2, HTTP/3) share that
+mapping through `core.ResponseEmission.prepareMultiplexed`, which also
+turns a WebSocket listener into 501 (no 101/Upgrade on HTTP/2 or
+HTTP/3), closing the discarded body; only the byte-framing that follows
+is the driver's.
 
 It validates status, names and values (see
 [handlers.md](handlers.md#responses)), owns framing (drops
