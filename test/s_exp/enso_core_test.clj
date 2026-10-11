@@ -723,12 +723,27 @@
         (is (some? drainer))
         (is (> 1.0 (bytes-per-op 100000 produce)) "on the calling thread")
         (is (support/await-condition #(zero? (- (* 4 100000) (.get n) (.droppedEvents ev))) 5000 1))
-        (let [before (drained)
-              accounted #(+ (.get n) (.droppedEvents ev))
-              start (accounted)]
-          (dotimes [_ 10000] (produce))
-          (is (support/await-condition #(= (+ start (* 2 10000)) (accounted)) 5000 1))
-          (is (> 1.0 (/ (double (- (drained) before)) 20000)) "on the delivering thread"))))))
+        ;; Pace production so the delivering thread keeps up and the bounded
+        ;; queue never overflows: this isolates the steady-state delivery path
+        ;; (the drop-reporting path logs and emits a JFR event, so it allocates
+        ;; by design). One pass warms the drain path, the next is measured.
+        (let [batch 250
+              batches 40
+              run (fn []
+                    (let [n0 (.get n)]
+                      (dotimes [b batches]
+                        (dotimes [_ batch] (produce))
+                        (is (support/await-condition
+                             #(= (+ n0 (* 2 batch (inc b))) (.get n)) 5000 1)))))
+              dropped-before (.droppedEvents ev)]
+          (run)
+          (let [before (drained)]
+            (run)
+            (is (= dropped-before (.droppedEvents ev)) "no overflow during the measured window")
+            ;; A real per-event allocation is at least one 16-byte object
+            ;; header; below that is one-off JIT / safepoint noise.
+            (is (> 16.0 (/ (double (- (drained) before)) (* 2 batch batches)))
+                "on the delivering thread")))))))
 
 ;; ---- JFR -------------------------------------------------------------------
 
