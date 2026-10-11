@@ -67,7 +67,7 @@ Where each applies:
 | `:idle-timeout` | yes | yes | yes | yes (QUIC max_idle_timeout) |
 | `:handler-timeout` | yes | no | yes | yes |
 
-- `:handshake-timeout` (10000): time allowed for the TLS handshake, plus the HTTP/2 preface and first SETTINGS, or the QUIC handshake. The connection is closed when it runs out.
+- `:handshake-timeout` (10000): time allowed for the TLS handshake, plus the HTTP/2 preface and first SETTINGS, or the QUIC handshake. The connection is closed when it runs out. It and `:idle-timeout` must not both be 0. That would leave a half-open connection with no bound at all.
 - `:header-timeout` (10000): time allowed to receive a complete request head, counted from its first byte. Protects against slowloris. Answered with 408.
 - `:read-timeout` (30000): longest time without progress while reading a request body. The read fails (408 unless the handler catches it) and the connection is not reused. Time the server holds the client back doesn't count, see [Memory budget](#memory-budget). Also bounds head reads when `:header-timeout` is 0. On a WebSocket it is a deadline: a message must arrive whole within this time of its first frame, or the connection is closed with 1008 "message timeout". Time the server doesn't read the message for the budget doesn't count.
 - `:min-data-rate-bytes` (240): least request body bytes per second while a handler waits for them, once `:min-data-rate-grace` of waiting has passed. 0 turns it off. Time the server holds the client back doesn't count. See [Minimum data rate](#minimum-data-rate).

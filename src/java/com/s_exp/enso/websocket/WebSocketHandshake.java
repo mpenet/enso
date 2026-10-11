@@ -31,12 +31,32 @@ public final class WebSocketHandshake {
     public static boolean originAllowed(String origin, String host, boolean secure,
                                         Predicate<String> allowed) {
         if (allowed != null) {
-            return origin != null && allowed.test(origin);
+            // An allowlist (even match-anything "*") gates on an attributable
+            // origin: a missing or opaque / non-serialised Origin (the string
+            // "null" from a sandboxed iframe or a privacy-stripped request)
+            // is refused regardless, as CORS's Access-Control-Allow-Origin: *
+            // deliberately does not match the null origin.
+            return origin != null && isSerializedOrigin(origin) && allowed.test(origin);
         }
         if (origin == null) {
             return true;
         }
         return sameOrigin(origin, host, secure);
+    }
+
+    /**
+     * Whether {@code origin} is a single serialised origin
+     * ({@code scheme://host[:port]}): a non-empty scheme, a non-empty
+     * authority and no path. False for an opaque origin ("null") or anything
+     * else that isn't a serialised origin.
+     */
+    static boolean isSerializedOrigin(String origin) {
+        int sep = origin.indexOf("://");
+        if (sep <= 0) {
+            return false;
+        }
+        String authority = origin.substring(sep + 3);
+        return !authority.isEmpty() && authority.indexOf('/') < 0;
     }
 
     /**
@@ -47,18 +67,15 @@ public final class WebSocketHandshake {
      * {@code Host}. False for an opaque origin ("null") or anything else.
      */
     static boolean sameOrigin(String origin, String host, boolean secure) {
-        int sep = origin.indexOf("://");
-        if (sep <= 0) {
+        if (!isSerializedOrigin(origin)) {
             return false;
         }
+        int sep = origin.indexOf("://");
         String scheme = origin.substring(0, sep);
         if (!scheme.equalsIgnoreCase(secure ? "https" : "http")) {
             return false;
         }
         String authority = origin.substring(sep + 3);
-        if (authority.isEmpty() || authority.indexOf('/') >= 0) {
-            return false;
-        }
         return host != null && host.equalsIgnoreCase(authority);
     }
 

@@ -199,6 +199,59 @@
         (when ms
           (is (< ms 3000) (str "took " ms "ms")))))))
 
+(deftest tls-stalled-handshake-write-bounded-by-handshake-timeout
+  ;; The peer completes the TCP connect, sends a ClientHello, then stops
+  ;; reading with a shrunken receive window while the server's send buffer is
+  ;; small: the server's blocking handshake write (channel.write ignores
+  ;; SO_TIMEOUT) wedges with its flight half-sent. Only the handshake
+  ;; deadline can abandon it. Observed through the "handshake-timeout"
+  ;; protocol error the server reports, which must arrive near the deadline.
+  ;;
+  ;; This is the regression guard for the handshake write bound: without it
+  ;; the server's write hangs until the OS gives up and the error never
+  ;; arrives. It only reproduces where SO_RCVBUF can be lowered below the
+  ;; flight (Linux); on macOS the kernel clamps SO_RCVBUF to ~320 KiB, so the
+  ;; flight always fits, the server reaches its read phase and reports the
+  ;; same error through the read-side deadline. The assertions hold either
+  ;; way, but the write bound is only exercised where the window shrinks.
+  (let [err (promise)]
+    ;; :ssl-need-client-auth makes the server's TLS 1.2 flight carry a
+    ;; CertificateRequest with its whole CA list, several KiB that overflow
+    ;; the shrunken send buffer and receive window, so the write blocks for
+    ;; real rather than fitting in one segment.
+    (with-tls-server {:handshake-timeout 500 :idle-timeout 10000 :so-snd-buf-bytes 512
+                      :ssl-need-client-auth true
+                      :server-events {:protocol-error (fn [p kind] (deliver err [p kind]))}}
+      (fn [port]
+        (with-open [ch (java.nio.channels.SocketChannel/open)]
+          (.setOption ch java.net.StandardSocketOptions/SO_RCVBUF (int 512))
+          (.connect ch (java.net.InetSocketAddress. "127.0.0.1" (int port)))
+          (let [engine (doto ^javax.net.ssl.SSLEngine
+                        (.createSSLEngine (capturing-trust-context (atom [])) "127.0.0.1" (int port))
+                         (.setUseClientMode true)
+                         (.setEnabledProtocols (into-array String ["TLSv1.2"])))
+                net-out (java.nio.ByteBuffer/allocate (.getPacketBufferSize (.getSession engine)))
+                empty (java.nio.ByteBuffer/allocate 0)
+                t0 (System/nanoTime)]
+            (.beginHandshake engine)
+            ;; Produce the ClientHello (NEED_WRAP) and send it. After it the
+            ;; engine waits to read (NEED_UNWRAP); we never read, so the
+            ;; server's flight write stalls against our full receive window.
+            (loop []
+              (when (= javax.net.ssl.SSLEngineResult$HandshakeStatus/NEED_TASK
+                       (.getHandshakeStatus engine))
+                (loop [] (when-let [t (.getDelegatedTask engine)] (.run ^Runnable t) (recur))))
+              (when (= javax.net.ssl.SSLEngineResult$HandshakeStatus/NEED_WRAP
+                       (.getHandshakeStatus engine))
+                (.clear net-out)
+                (.wrap engine empty net-out)
+                (.flip net-out)
+                (while (.hasRemaining net-out) (.write ch net-out))
+                (recur)))
+            (is (= ["tls" "handshake-timeout"] (deref err 4000 :none))
+                "server abandons a stalled handshake write at the deadline")
+            (is (< (/ (- (System/nanoTime) t0) 1e6) 3000) "near the handshake deadline")))))))
+
 (deftest tls-http1-stalled-request-times-out
   (with-tls-server {:header-timeout 300}
     (fn [port]

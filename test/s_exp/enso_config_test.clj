@@ -114,6 +114,24 @@
     (is (= 10000 (.-maxConnections c)))
     (is (= 0 (.-maxConnectionsPerIp c)))))
 
+(deftest handshake-and-idle-timeout-not-both-zero
+  (testing "both 0 is rejected: a half-open connection would have no bound"
+    (is (thrown-with-msg?
+         IllegalArgumentException
+         #":handshake-timeout and :idle-timeout must not both be 0"
+         (.build (doto (Config/builder)
+                   (.handshakeTimeoutMillis 0)
+                   (.idleTimeoutMillis 0))))))
+  (testing "either one non-zero is accepted"
+    (is (instance? Config (.build (doto (Config/builder)
+                                    (.handshakeTimeoutMillis 0)
+                                    (.idleTimeoutMillis 1000)))))
+    (is (instance? Config (.build (doto (Config/builder)
+                                    (.handshakeTimeoutMillis 1000)
+                                    (.idleTimeoutMillis 0))))))
+  (testing "the defaults are fine"
+    (is (instance? Config (.build (Config/builder))))))
+
 (defn- build-error [f]
   (try (.build ^com.s_exp.enso.api.Config$Builder (doto (Config/builder) f)) nil
        (catch IllegalArgumentException e (.getMessage e))))

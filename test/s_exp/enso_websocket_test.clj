@@ -1789,6 +1789,10 @@
            [{:ws-allowed-origins ["http://evil.example"]} "http://127.0.0.1" "403"]
            [{:ws-allowed-origins ["*"]} "http://evil.example" "101"]
            [{:ws-allowed-origins ["*"]} nil "403"]
+           ;; Even match-anything "*" gates on an attributable origin: an
+           ;; opaque Origin: null (sandboxed iframe, privacy-stripped) is
+           ;; refused, as CORS's Allow-Origin: * does not match null.
+           [{:ws-allowed-origins ["*"]} "null" "403"]
            [{:ws-allowed-origins #(= % "http://fn.example")} "http://fn.example" "101"]
            [{:ws-allowed-origins #(= % "http://fn.example")} "http://evil.example" "403"]]]
     (with-server echo-handler opts

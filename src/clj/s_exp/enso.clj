@@ -362,7 +362,7 @@
    ;; Timeouts
    {:key :handshake-timeout :group "Timeouts" :default 10000 :field "handshakeTimeoutMillis" :check check-int
     :set (fn [^Config$Builder b v] (.handshakeTimeoutMillis b (int v)))
-    :doc "ms to complete the TLS handshake (plus the HTTP/2 preface and first SETTINGS, or the QUIC handshake), wall clock."}
+    :doc "ms to complete the TLS handshake (plus the HTTP/2 preface and first SETTINGS, or the QUIC handshake), wall clock. It and `:idle-timeout` must not both be 0, which would leave a half-open connection with no bound."}
    {:key :header-timeout :group "Timeouts" :default 10000 :field "headerTimeoutMillis" :check check-int
     :set (fn [^Config$Builder b v] (.headerTimeoutMillis b (int v)))
     :doc "ms to receive a complete request head from its first byte, wall clock (slowloris protection). Answered with 408."}

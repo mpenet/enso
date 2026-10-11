@@ -176,7 +176,8 @@ HTTP/3 and QUIC:
 
 - Retry tokens are bound to the address family and the Retry connection id. Retry is required automatically past `:http3-retry-threshold`, and half-open connections are capped. With `:max-connections-per-ip` set, clients prove their address with a Retry before taking a per-address slot.
 - Initials with a destination connection id under 8 bytes are dropped.
-- Rapid-reset protection. Unread request bodies are bounded per connection.
+- Rapid-reset protection counts peer resets and the server's own stream resets after a handler was dispatched (a malformed trailer or oversized body), so induced resets can't churn the server past `:http3-stream-reset-limit`. Unread request bodies are bounded per connection.
+- Trailers reject connection-specific fields and a `te` other than `trailers` (H3_MESSAGE_ERROR), the same rule HTTP/2 applies.
 - Control-stream rules (CANCEL_PUSH, MAX_PUSH_ID, SETTINGS first, critical streams) are enforced. An oversized control frame is refused (H3_EXCESSIVE_LOAD) before any of it is buffered. Unknown unidirectional stream types no longer leak state.
 - QPACK checks Huffman lengths before allocating, caps decoded sections and rejects overlong integers.
 - Partial header sections share a per-connection budget and a timeout. Streams the server stopped reading don't count against `:header-timeout`.
@@ -192,7 +193,7 @@ QUIC interoperability:
 
 WebSocket:
 
-- Same-origin check by default (cross-site WebSocket hijacking).
+- Same-origin check by default (cross-site WebSocket hijacking); the default compares the Origin scheme too. A configured `:ws-allowed-origins` is a hard gate: a missing or opaque Origin is refused even when the list is `["*"]`.
 - Pongs to a ping flood are coalesced.
 - A claimed frame length isn't allocated up front, deflate bombs are bounded, and a message must complete within `:read-timeout`.
 - Message buffers count against `:max-buffered-bytes` by capacity, a buffer kept for the next message included. Compressed messages count as they inflate, not as their compressed bytes arrive.
@@ -206,7 +207,7 @@ WebSocket:
 
 Core and TLS:
 
-- Global and per-address connection limits, a write watchdog for peers that stop reading, and a TLS handshake timeout.
+- Global and per-address connection limits, a write watchdog for peers that stop reading, and a TLS handshake timeout that bounds both directions, so a peer that stops reading mid-handshake can't wedge the server's write flight. `:handshake-timeout` and `:idle-timeout` may not both be 0 (that would leave a half-open connection unbounded); the server refuses to start.
 - TLS 1.2 client renegotiation is refused.
 - A TLS read timeout no longer replays plaintext.
 
@@ -236,6 +237,7 @@ Measured during this rework, each against the code before the change:
 - Heap per idle HTTP/1.1 keep-alive connection: 32.4 → 9.7 KiB plain, 98.6 → 16.1 KiB over TLS 1.3. Every protocol gives back grown buffers after a second idle (idle HTTP/2: about 11 KB cleartext and 23 KB over TLS; WebSocket 16 and 25 KiB; HTTP/3 about 3 KB).
 - HTTP/2 GET on the in-process test path: about 760 bytes per request, down from 3108.
 - HTTP/1.1 on the in-process test path: a browser-like 14-field GET went from 1728 to 329 bytes (header maps stay array maps up to 32 fields, and unknown header names and values are reused per connection), and reading `:remote-addr`, `:server-name` and `:server-port` from 376 to 240 (derived once per connection).
+- HTTP/2 and HTTP/3 request heads keep array maps up to 32 fields too, as HTTP/1.1 does. A 14-field browser GET allocates about 1.1 KB instead of 1.6 KB on HTTP/2; small heads are unchanged.
 
 ### Build and distribution
 

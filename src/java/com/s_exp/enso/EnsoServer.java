@@ -14,6 +14,7 @@ import com.s_exp.enso.core.LogLimiter;
 import com.s_exp.enso.core.Service;
 import com.s_exp.enso.core.Timer;
 import com.s_exp.enso.core.TlsSocket;
+import com.s_exp.enso.core.WriteWatchdog;
 import com.s_exp.enso.http1.HttpConnection;
 import com.s_exp.enso.http2.Http2Connection;
 import com.s_exp.enso.http3.Http3Listener;
@@ -362,6 +363,10 @@ public final class EnsoServer implements AutoCloseable {
         private final InetAddress remote;
         private volatile Socket socket;
         private volatile Drainable driver;
+        // Set when the handshake watchdog force-closed at the deadline, so
+        // the write it failed is reported as a handshake timeout, not a
+        // generic handshake failure.
+        private volatile boolean handshakeExpired;
 
         Accepted(SocketChannel channel, InetAddress remote) {
             this.channel = channel;
@@ -393,7 +398,7 @@ public final class EnsoServer implements AutoCloseable {
                     // A silent peer is still bounded with the handshake
                     // timeout disabled.
                     s.setSoTimeout(config.idleTimeoutMillis);
-                    tls.handshake(config.handshakeTimeoutMillis);
+                    boundedHandshake(tls, s);
                     protocol = H2.equals(tls.getApplicationProtocol()) ? H2 : HTTP_1_1;
                 } else {
                     s = channel.socket();
@@ -435,8 +440,10 @@ public final class EnsoServer implements AutoCloseable {
             } catch (Throwable t) {
                 if (protocol == null && config.sslContext != null) {
                     // A silent or drip-feeding peer runs out the handshake
-                    // deadline (or the idle timeout bounding each read).
-                    tlsError(t instanceof java.net.SocketTimeoutException ? "handshake-timeout" : "handshake");
+                    // deadline (the read side times out; the write side is
+                    // force-closed by the watchdog, which sets handshakeExpired).
+                    tlsError(t instanceof java.net.SocketTimeoutException || handshakeExpired
+                             ? "handshake-timeout" : "handshake");
                 }
                 if (!(t instanceof IOException) && running) {
                     CONNECTION_FAILURES.log("connection failed", t);
@@ -456,6 +463,41 @@ public final class EnsoServer implements AutoCloseable {
                     jfr.remoteAddress = remote.getHostAddress();
                     jfr.commit();
                 }
+            }
+        }
+
+        /**
+         * The TLS handshake with both directions bounded by the handshake
+         * deadline. The read side is bounded by the socket timeout the
+         * deadline lowers per read (see {@link TlsSocket}), but a blocking
+         * {@link SocketChannel} write ignores SO_TIMEOUT: a peer that drives
+         * the handshake far enough for the server to send a flight and then
+         * stops reading would wedge the write until the OS gives up, holding
+         * a connection slot with no application bound. A one-shot node on the
+         * shared wheel force-closes the connection at the deadline, which
+         * fails the stalled write (and any blocked read); it is retired the
+         * moment the handshake returns. With the handshake timeout disabled
+         * the idle timeout is the bound instead, as it is for the read side.
+         */
+        private void boundedHandshake(TlsSocket tls, Socket s) throws IOException {
+            long bound = config.handshakeTimeoutMillis > 0
+                ? config.handshakeTimeoutMillis : config.idleTimeoutMillis;
+            if (bound <= 0) {
+                tls.handshake(config.handshakeTimeoutMillis);
+                return;
+            }
+            Timer.Task watchdog = new Timer.Task() {
+                @Override
+                protected void onTimeout() {
+                    handshakeExpired = true;
+                    WriteWatchdog.forceCloseAsync(s);
+                }
+            };
+            timer.schedule(watchdog, bound);
+            try {
+                tls.handshake(config.handshakeTimeoutMillis);
+            } finally {
+                timer.retire(watchdog);
             }
         }
 

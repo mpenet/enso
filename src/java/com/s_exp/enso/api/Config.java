@@ -462,6 +462,14 @@ public final class Config {
             requireAtLeast(":min-data-rate-grace", minDataRateGraceMillis, 0);
             requireAtLeast(":write-timeout", writeTimeoutMillis, 0);
             requireAtLeast(":idle-timeout", idleTimeoutMillis, 0);
+            // Both 0 leaves a half-open connection (one that handshook but
+            // sent no request) with no bound at all: no handshake deadline
+            // and no idle deadline. At least one must stay on.
+            if (handshakeTimeoutMillis == 0 && idleTimeoutMillis == 0) {
+                throw invalid(":handshake-timeout", handshakeTimeoutMillis,
+                              ":handshake-timeout and :idle-timeout must not both be 0 "
+                              + "(a half-open connection would have no bound)");
+            }
             requireAtLeast(":handler-timeout", handlerTimeoutMillis, 0);
             requireAtLeast(":shutdown-timeout", shutdownTimeoutMillis, 0);
             requireAtLeast(":max-header-bytes", maxHeaderBytes, 1);
