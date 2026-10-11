@@ -421,20 +421,3 @@ Actions, in workflows and composite actions. Dependabot has no ecosystem
 for `deps.edn` or a bare `Cargo.lock`, so Clojure and Maven test
 dependencies are bumped by hand, and the shim's crates are covered by the
 nightly `cargo audit` (see [SECURITY.md](../SECURITY.md)).
-
-### Recommended GitHub settings
-
-These need a repository admin (Settings → Branches / Rules, and Settings
-→ Code security). For `main`:
-
-- Require a pull request before merging, with direct pushes off for admins too, so release tags always point at reviewed, tested commits. Require one approval once there is more than one maintainer.
-- Require status checks to pass and branches to be up to date. The required checks are the `test.yml` jobs `shim (amd64)`, `shim (arm64)`, `test (JDK 21)`, `test (JDK 25)`, `test (JDK 25, arm64)`, `sanitizer`, `h2spec`, `autobahn` and `h3spec`. `coverage` is informational and `nightly.yml` reports through its issue, so neither is required.
-- Require linear history, and block force pushes and branch deletion.
-- Protect `v*` tags with a ruleset so only admins can create or delete them, since a `v*` tag publishes to Clojars.
-- Keep the Clojars credentials in a `release` environment restricted to `v*` tags instead of repository-wide secrets (the `package` job in `release.yml` would then declare `environment: release`).
-- Enable private vulnerability reporting (referenced by `SECURITY.md`), Dependabot alerts and Dependabot security updates.
-- Allow only the actions pinned in the workflows (GitHub-owned, `DeLaGuardo/setup-clojure`, `dtolnay/rust-toolchain`, `docker/setup-docker-action`), and set the default `GITHUB_TOKEN` permissions to read-only; the workflows request more per job where needed.
-
-When a job is renamed or a matrix leg added, update the required checks
-in the same change, or pull requests will wait for a check that no longer
-exists.
