@@ -21,6 +21,11 @@ import javax.crypto.spec.SecretKeySpec;
  * no quiche connection, no handshake work. The packet is a few dozen
  * bytes, far below the 1200-byte datagram that triggered it.
  *
+ * <p>The same stateless close carries CONNECTION_REFUSED when an admission
+ * limit ({@code :max-connections}, {@code :max-connections-per-ip},
+ * {@code :http3-max-half-open}) turns a client away, so it falls back at
+ * once instead of waiting for a handshake timeout.
+ *
  * <p>The same packet carries the error of a client Initial quiche refused
  * (e.g. TRANSPORT_PARAMETER_ERROR): quiche queues that close at the
  * Handshake level, which a client that never received our ServerHello
@@ -34,6 +39,8 @@ public final class InitialClose {
         (byte) 0xbb, 0x7f, 0x0a};
     /** RFC 9000 §20.1. */
     public static final int INVALID_TOKEN = 0x0b;
+    /** RFC 9000 §20.1: the server refuses to accept the connection. */
+    public static final int CONNECTION_REFUSED = 0x02;
     private static final int CONNECTION_CLOSE_TRANSPORT = 0x1c;
     private static final int TAG_LEN = 16;
     // Payload: CONNECTION_CLOSE then PADDING, long enough for the header
@@ -104,6 +111,18 @@ public final class InitialClose {
     public static long invalidToken(byte[] clientDcid, byte[] clientScid, int version,
                                     ByteBuffer out, int off, int cap) {
         return transportClose(INVALID_TOKEN, clientDcid, clientScid, version, out, off, cap);
+    }
+
+    /**
+     * Writes into {@code out[off, off + cap)} a server Initial refusing the
+     * connection (CONNECTION_REFUSED), answering a client Initial whose
+     * destination id was {@code clientDcid} and source id {@code clientScid}.
+     * Returns its length, or -1 when it doesn't fit (or the crypto is
+     * unavailable).
+     */
+    public static long connectionRefused(byte[] clientDcid, byte[] clientScid, int version,
+                                         ByteBuffer out, int off, int cap) {
+        return transportClose(CONNECTION_REFUSED, clientDcid, clientScid, version, out, off, cap);
     }
 
     /**

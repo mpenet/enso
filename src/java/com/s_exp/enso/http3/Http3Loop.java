@@ -542,6 +542,16 @@ final class Http3Loop implements Runnable {
                 }
                 return;
             }
+            case Http3Listener.Admission.REFUSE -> {
+                // A real admission limit turned the client away: a stateless
+                // CONNECTION_REFUSED (smaller than the Initial it answers, so
+                // anti-amplification holds) lets it fall back at once.
+                if (ensureSendRoom()) {
+                    writePacket(meta, rec, InitialClose.connectionRefused(dcid, scid, version, sendSlab.buffer,
+                                                                         sendOff, maxPayload));
+                }
+                return;
+            }
             default -> {
             }
         }

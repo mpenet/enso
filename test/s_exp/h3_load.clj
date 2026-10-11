@@ -292,11 +292,16 @@
                   (.put open sid (long-array [0 (System/nanoTime)]))
                   (aset next-sid 0 (+ sid 4)))))
             (push! []
-              ;; Sends what flow control allows of every body still being sent.
+              ;; Sends what flow control allows of every body still being
+              ;; sent. A stream with no send capacity is skipped: calling
+              ;; streamSend against a full window re-arms a connection-level
+              ;; DATA_BLOCKED frame every round, a storm of tiny packets. The
+              ;; stream resumes here once MAX_DATA / MAX_STREAM_DATA reopens
+              ;; its capacity.
               (doseq [[sid ^longs st] open]
                 (loop []
                   (let [sent (aget st 0)]
-                    (when (< sent total)
+                    (when (and (< sent total) (pos? (.streamCapacity conn sid)))
                       (let [rc (if (< sent (alength prefix))
                                  (.streamSend conn sid prefix (int sent) (int (- (alength prefix) sent)) false)
                                  (let [n (min (alength zeros) (- total sent))]

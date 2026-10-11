@@ -176,9 +176,12 @@ in order:
 1. A Destination Connection ID shorter than 8 bytes: dropped (RFC 9000 §7.2).
 2. A token that verifies (our Retry token, bound to the client address and its family, the original and the Retry connection ids, valid 10 s) skips the Retry. An expired or misdirected token of ours gets CONNECTION_CLOSE(INVALID_TOKEN) in a small server Initial built without any state (RFC 9000 §8.1.2). Another server's token counts as no token.
 3. Without a valid token, a stateless Retry is required when `:http3-retry-threshold` (256) or more connections are handshaking, always with `:http3-stateless-retry`, and always when `:max-connections-per-ip` is set (a per-address slot taken for a spoofed address would lock that address out, so the address is proven first). A spoofed flood therefore can't make the server allocate connections or sign handshakes beyond the threshold.
-4. Past `:http3-max-half-open` (1024) handshaking connections, the Initial is dropped. The check takes the slot, so loops admitting at the same time can't overshoot it.
-5. While `:max-buffered-bytes` is exhausted, the Initial is dropped ("connection-limit"). Nothing is reserved at admission, so an idle connection costs no budget.
-6. Each connection holds a slot of the server's connection limiter for its whole life. `:max-connections` and `:max-connections-per-ip` count TCP and QUIC connections together. Past either, the Initial is dropped ("connection-limit").
+4. Past `:http3-max-half-open` (1024) handshaking connections, the Initial is refused ("handshake-limit"). The check takes the slot, so loops admitting at the same time can't overshoot it.
+5. Each connection holds a slot of the server's connection limiter for its whole life. `:max-connections` and `:max-connections-per-ip` count TCP and QUIC connections together. Past either, the Initial is refused ("connection-limit").
+
+A refused Initial (steps 4 and 5) is answered with a stateless CONNECTION_CLOSE carrying CONNECTION_REFUSED (transport error 0x02) at the Initial encryption level, built without any connection state, so the client falls back to HTTP/2 at once instead of waiting out a handshake timeout. The close is smaller than the 1200-byte Initial that triggered it, so it never amplifies a spoofed source, and both refusals are reached only after the address has been proven (a Retry token, step 2, or a config without stateless Retry). A Retry (step 3) asks the client to come back with a token; a refusal tells it to go away.
+
+An exhausted `:max-buffered-bytes` does not refuse admission. An idle connection buffers no request body, nothing is reserved at admission, and what a connection may buffer is bounded per connection, so budget pressure never blocks a new connection. The connection limiter bounds how many are accepted.
 
 Connections still handshaking at `:handshake-timeout` are dropped.
 

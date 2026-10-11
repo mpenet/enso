@@ -32,7 +32,7 @@ milliseconds.
 - `:port` (8080): listen port. 0 picks an ephemeral port (TCP only, see `:http3-port`).
 - `:host` ("0.0.0.0"): bind address.
 - `:backlog` (1024): accept queue length.
-- `:max-connections` (10000): open connections server-wide, TCP and QUIC together. 0 means unlimited. A TCP connection over the limit is closed right after accept, before it gets a thread or a TLS handshake. A QUIC Initial over the limit is dropped.
+- `:max-connections` (10000): open connections server-wide, TCP and QUIC together. 0 means unlimited. A TCP connection over the limit is closed right after accept, before it gets a thread or a TLS handshake. A QUIC Initial over the limit is refused with a stateless CONNECTION_REFUSED close, so the client falls back at once.
 - `:max-connections-per-ip` (0): open connections per client address, 0 means unlimited. Set it when clients connect directly, otherwise one address can take every slot. Leave it off behind a load balancer or NAT, where many clients share an address.
 
 Each connection costs a virtual thread and a few tens of KiB of buffers
@@ -174,8 +174,8 @@ connection window per connection. While a connection reads a request body
 its initial window is charged to the budget. Window growth past it
 (release builds only, see `:http3-max-window-bytes`) is reserved before
 quiche may use it and stays charged until the connection closes. A
-connection reading no body costs nothing. New QUIC connections are refused
-while the budget is exhausted.
+connection reading no body costs nothing. An exhausted budget never refuses
+a new QUIC connection; `:max-connections` bounds how many are accepted.
 
 ## TCP
 
@@ -267,7 +267,7 @@ behaviour are in [http3.md](http3.md).
 - `:http3-stateless-retry` (false): always make clients prove their address with a stateless Retry before any connection state is allocated (RFC 9000 §8.1.2). Without it, Retry still starts automatically past `:http3-retry-threshold`.
 - `:http3-cert-reload-interval` (10000): milliseconds between checks of the certificate and key files (modification time, size, inode). A changed pair is loaded for new connections; existing ones keep theirs. A pair that fails to load is logged and the current one kept. 0 turns it off.
 - `:http3-retry-threshold` (256): number of handshaking connections from which a client Initial without a valid token gets a stateless Retry. A spoofed flood can't make the server allocate connections or sign handshakes beyond it.
-- `:http3-max-half-open` (1024): number of handshaking connections above which new Initials are dropped. 0 means unlimited.
+- `:http3-max-half-open` (1024): number of handshaking connections above which new Initials are refused with a stateless CONNECTION_REFUSED close. 0 means unlimited.
 - `:http3-stream-reset-limit` (400): peer stream resets allowed per connection, refilling at that many per 30 seconds. Above it the connection is closed (rapid reset). 0 turns it off.
 - `:http3-event-loops` (0): event loop threads owning QUIC connections, between 0 and 64. 0 means one per core on Linux, each with its own `SO_REUSEPORT` socket, and 1 elsewhere.
 - `:http3-so-rcv-buf-bytes` (4194304): UDP receive buffer requested, best effort. Linux caps it at `net.core.rmem_max`. 0 keeps the OS default.

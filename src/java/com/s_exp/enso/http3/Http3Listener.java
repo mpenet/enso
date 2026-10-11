@@ -56,11 +56,15 @@ import java.util.logging.Logger;
  * (always with {@code :http3-stateless-retry}, and with
  * {@code :max-connections-per-ip}, so per-address slots only count proven
  * addresses), so a spoofed flood can't make the server sign handshakes;
- * past {@code :http3-max-half-open} handshaking connections Initials are
- * dropped; while {@code :max-buffered-bytes} is exhausted (the server is
- * overloaded) every Initial is dropped; every connection takes a slot
- * of the server's {@link ConnectionLimiter} ({@code :max-connections},
- * {@code :max-connections-per-ip}) for its whole life, and beyond while
+ * past {@code :http3-max-half-open} handshaking connections, or with no
+ * {@link ConnectionLimiter} slot free ({@code :max-connections},
+ * {@code :max-connections-per-ip}), the Initial is answered with a
+ * stateless CONNECTION_REFUSED close (see {@link com.s_exp.enso.quiche.InitialClose}),
+ * so the client falls back at once rather than waiting out a handshake
+ * timeout. An exhausted {@code :max-buffered-bytes} does not refuse
+ * admission: an idle connection buffers no request body, and what a
+ * connection may buffer is bounded per connection. Every connection takes
+ * a {@link ConnectionLimiter} slot for its whole life, and beyond while
  * any of its handlers still runs (closing a connection doesn't free
  * handlers to pile up).
  *
@@ -470,9 +474,11 @@ public final class Http3Listener implements AutoCloseable {
         static final int DROP = 1;
         static final int RETRY = 2;
         static final int INVALID_TOKEN = 3;
+        static final int REFUSE = 4;
         static final Admission DROPPED = new Admission(DROP, null, null);
         static final Admission RETRY_REQUIRED = new Admission(RETRY, null, null);
         static final Admission TOKEN_INVALID = new Admission(INVALID_TOKEN, null, null);
+        static final Admission REFUSED = new Admission(REFUSE, null, null);
 
         final int verdict;
         /** The client's original destination id after a Retry, else null. */
@@ -490,9 +496,9 @@ public final class Http3Listener implements AutoCloseable {
      * Decides a client Initial's fate. {@code hdr} is its parsed header
      * (token included), {@code meta[peerOff]} its source address,
      * {@code dcid} its destination id. On {@link Admission#ACCEPT} a
-     * limiter slot, a half-open slot and the connection window of native
-     * credit are taken: give them back through
-     * {@link #admissionFailed} if no connection results.
+     * limiter slot and a half-open slot are taken: give them back through
+     * {@link #admissionFailed} if no connection results. No request-body
+     * budget is reserved; an idle connection holds none.
      */
     Admission admit(ByteBuffer hdr, int tokenLen, ByteBuffer meta, int peerOff, byte[] dcid) {
         InetSocketAddress peer = Records.socketAddress(meta, peerOff);
@@ -523,22 +529,14 @@ public final class Http3Listener implements AutoCloseable {
         int handshaking = halfOpen.incrementAndGet();
         if (config.http3MaxHalfOpen > 0 && handshaking > config.http3MaxHalfOpen) {
             halfOpen.decrementAndGet();
-            refused("handshake-limit", "h3 Initial dropped: too many handshaking connections");
-            return Admission.DROPPED;
+            refused("handshake-limit", "h3 connection refused: too many handshaking connections");
+            return Admission.REFUSED;
         }
         InetAddress remote = peer.getAddress();
-        // An exhausted budget is overload: a new connection could make no
-        // progress on a body, while its window is promised in the handshake
-        // and paid for only once one is read (see Http3Connection).
-        if (service.budget.exhausted()) {
-            halfOpen.decrementAndGet();
-            refused("connection-limit", "h3 connection refused: :max-buffered-bytes exhausted");
-            return Admission.DROPPED;
-        }
         if (!limiter.tryAcquire(remote)) {
             halfOpen.decrementAndGet();
             refused("connection-limit", "h3 connection refused: connection limit reached");
-            return Admission.DROPPED;
+            return Admission.REFUSED;
         }
         return new Admission(Admission.ACCEPT, odcid, remote);
     }

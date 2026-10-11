@@ -2769,34 +2769,49 @@
         (.close l)
         (.close timer)))))
 
-(deftest new-connections-are-refused-while-the-budget-is-exhausted
-  ;; At the :max-buffered-bytes limit the server is overloaded: a new
-  ;; connection's Initial is dropped before any state ("connection-limit");
-  ;; connections are admitted again once the budget has room.
+(deftest budget-exhaustion-does-not-block-new-connections
+  ;; An idle QUIC connection holds no request-body bytes, so an exhausted
+  ;; :max-buffered-bytes must not stop a new connection from handshaking
+  ;; and being served (TCP, HTTP/1.1 and HTTP/2 don't refuse connects on
+  ;; the budget either; :max-connections bounds connection count).
+  (let [[^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+        (start-with-service (fn [_] (ok "ok"))
+                            (fn [^com.s_exp.enso.api.Config$Builder b]
+                              (.maxBufferedBytes b (* 256 1024))))
+        budget ^com.s_exp.enso.core.MemoryBudget (.-budget ^com.s_exp.enso.core.Service service)]
+    (try
+      (.charge budget (* 256 1024))
+      (is (.exhausted budget) "budget exhausted")
+      (h3/with-client [c (.port l)]
+        (h3/open-control! c)
+        (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/"))))
+            "a new connection handshakes and is served while the budget is exhausted"))
+      (finally
+        (.close l)
+        (.close timer)))))
+
+(deftest connection-limit-refuses-the-initial-with-connection-refused
+  ;; RFC 9000 §8.1: at :max-connections a new Initial is answered with a
+  ;; stateless CONNECTION_CLOSE carrying CONNECTION_REFUSED (0x02) at the
+  ;; Initial level, so a client falls back at once instead of timing out.
   (let [errors (atom [])
         events (reify com.s_exp.enso.api.ServerEvents
                  (protocolError [_ _ kind] (swap! errors conj kind)))
-        [^com.s_exp.enso.http3.Http3Listener l service ^com.s_exp.enso.core.Timer timer]
+        [^com.s_exp.enso.http3.Http3Listener l _service ^com.s_exp.enso.core.Timer timer]
         (start-with-service (fn [_] (ok "ok"))
                             (fn [^com.s_exp.enso.api.Config$Builder b]
-                              (.maxBufferedBytes b (* 1024 1024))
-                              (.serverEvents b events)))
-        budget ^com.s_exp.enso.core.MemoryBudget (.-budget ^com.s_exp.enso.core.Service service)]
+                              (.maxConnections b 1)
+                              (.serverEvents b events)))]
     (try
-      (.charge budget (* 3 256 1024))
-      (testing "under pressure, below the limit: admitted"
-        (h3/with-client [c (.port l)]
-          (h3/open-control! c)
-          (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))))
-      (.charge budget (* 256 1024))
-      (let [refused (h3/start-handshake (.port l))]
-        (try
-          (is (support/await-condition #(some #{"connection-limit"} @errors) 3000 10) (str @errors))
-          (finally (h3/close! refused))))
-      (.release budget (* 4 256 1024))
       (h3/with-client [c (.port l)]
         (h3/open-control! c)
-        (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))) "room again"))
+        (is (= "ok" (h3/body-str (h3/request! c 0 (h3/request-headers "GET" "/")))))
+        (let [refused (h3/start-handshake (.port l))]
+          (try
+            (is (= [false 0x02] (h3/await-peer-error refused 2000))
+                "second Initial refused with CONNECTION_REFUSED, well under the handshake timeout")
+            (is (some #{"connection-limit"} @errors) (str @errors))
+            (finally (h3/close! refused)))))
       (finally
         (.close l)
         (.close timer)))))

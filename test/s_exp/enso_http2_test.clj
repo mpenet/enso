@@ -1999,6 +1999,45 @@
         (send-request! conn 3 (request-headers "GET" "/") true)
         (is (= "200" (get (response-on conn 3) ":status")) "connection kept")))))
 
+(deftest h2-data-racing-the-response-end-is-stream-closed
+  ;; DATA after the request's END_STREAM is answered STREAM_CLOSED (h2spec
+  ;; 5.1/5): a stream error while the response is under way, a connection
+  ;; error once it ended the stream, and one of the two when the response
+  ;; ends the stream while the frame is handled. The DATA follows the
+  ;; request after a delay steered onto the response's end, so many
+  ;; rounds land there.
+  (with-server (fn [_] {:status 200 :body "ok"}) {}
+    (let [spin (fn [^long ns] (let [end (+ (System/nanoTime) ns)] (while (< (System/nanoTime) end))))
+          delay-ns (atom 50000)
+          unanswered (atom 0)]
+      (loop [i 0 conn (h2-connect!) sid 1]
+        (if (= i 4000)
+          (close-conn! conn)
+          (let [_ (send-request! conn sid (request-headers "GET" "/") true)
+                _ (spin @delay-ns)
+                _ (write-raw! conn (byte-array (concat (frame-bytes frame-data flag-end-stream sid (.getBytes "late"))
+                                                       (frame-bytes frame-ping 0 0 (byte-array 8)))))
+                seen (atom [])
+                _ (read-until conn ping-ack? seen)
+                reset (some #(and (= frame-rst (:type %)) (= sid (:sid %)) (= 0x5 (rst-code %))) @seen)
+                goaway (some #(and (= frame-goaway (:type %)) (= 0x5 (goaway-code %))) @seen)]
+            (cond
+              ;; Too late: the stream had ended. Fresh connection, shorter delay.
+              goaway (do (swap! delay-ns #(max 0 (- % 1000)))
+                         (close-conn! conn)
+                         (recur (inc i) (h2-connect!) 1))
+              ;; Too early: still half-closed (remote). Longer delay.
+              (and reset (< sid 199)) (do (swap! delay-ns + 1000)
+                                          (recur (inc i) conn (+ sid 2)))
+              ;; A fresh connection now and then, under the reset rate limit.
+              reset (do (swap! delay-ns + 1000)
+                        (close-conn! conn)
+                        (recur (inc i) (h2-connect!) 1))
+              :else (do (swap! unanswered inc)
+                        (close-conn! conn)
+                        (recur (inc i) (h2-connect!) 1))))))
+      (is (zero? @unanswered) "every late DATA frame answered STREAM_CLOSED"))))
+
 (deftest h2-frames-on-ended-stream-are-connection-errors
   ;; §5.1: after both sides ended a stream, DATA or HEADERS on it is a
   ;; connection error STREAM_CLOSED (h2spec 5.1/11).

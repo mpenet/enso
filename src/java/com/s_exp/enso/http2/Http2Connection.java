@@ -1104,7 +1104,7 @@ public final class Http2Connection implements Runnable, Drainable {
             streamError(st, Http2.ERROR_PROTOCOL_ERROR);
         } else if (st.remoteEnded()) {
             // Half-closed (remote): any further HEADERS is a stream error (§5.1).
-            streamError(st, Http2.ERROR_STREAM_CLOSED);
+            halfClosedStreamError(st, "HEADERS");
         } else if (!endStream || exchange.malformedTrailers()) {
             // §8.1: a trailer section ends the stream and follows the field
             // rules (no pseudo-headers); otherwise the request is malformed.
@@ -1241,7 +1241,7 @@ public final class Http2Connection implements Runnable, Drainable {
         if (body == null || st.remoteEnded()) {
             // Half-closed (remote): DATA is a stream error (§5.1).
             creditConnection(frameLen);
-            streamError(st, Http2.ERROR_STREAM_CLOSED);
+            halfClosedStreamError(st, "DATA");
             return;
         }
         if (!body.charge(frameLen, len)) {
@@ -1624,6 +1624,19 @@ public final class Http2Connection implements Runnable, Drainable {
         chargeReset();
         if (st.reset(Http2Stream.WE_RESET)) {
             writer.rstStream(st.id, code, true, false);
+        }
+    }
+
+    /**
+     * DATA or HEADERS on a half-closed (remote) stream: a stream error
+     * STREAM_CLOSED (§5.1). The response may have ended the stream since
+     * its state was read (its END_STREAM goes out from another thread):
+     * the frame is then on a closed stream, a connection error.
+     */
+    private void halfClosedStreamError(Http2Stream st, String frame) throws IOException {
+        streamError(st, Http2.ERROR_STREAM_CLOSED);
+        if (st.closedReason() == Http2Stream.ENDED) {
+            throw new Http2.ConnectionError(Http2.ERROR_STREAM_CLOSED, frame + " on closed stream " + st.id);
         }
     }
 

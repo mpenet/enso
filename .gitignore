@@ -8,3 +8,6 @@ target/
 /bench/quic-interop-runner/repo/
 bench/quic-interop-runner/repo
 /quiche-src/
+
+# Private coordinated-disclosure drafts (do not publish; see each REPORT.md)
+disclosure/

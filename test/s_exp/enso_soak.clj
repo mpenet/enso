@@ -117,6 +117,9 @@
    ;; Reset streams count against the concurrency limit until their
    ;; handlers return, so the request after a burst may be refused.
    "chaos-h2-rst-burst" #{"rst-stream-7"}
+   ;; A handshake that didn't complete is also counted, as unexpected,
+   ;; under the kind of the operation that needed the connection.
+   "h3-handshake" #{"handshake-timeout"}
    "cert-reload" #{"ok-mismatched-pair-window"}})
 
 (defn- unexpected? [kind outcome]
@@ -613,8 +616,16 @@
 
 ;; ---- HTTP/3 --------------------------------------------------------------------------------------
 
-(defn- h3-open [port]
-  (let [c (h3/connect port {:idle-timeout 30000})]
+(defn- h3-open
+  "Connects to `port`; every handshake is also counted under
+  \"h3-handshake\" (its latency, and how many didn't complete)."
+  [port]
+  (let [t0 (System/nanoTime)
+        c (try (h3/connect port {:idle-timeout 30000})
+               (catch Throwable t
+                 (record! "h3-handshake" "handshake-timeout" (- (System/nanoTime) t0))
+                 (throw t)))]
+    (record! "h3-handshake" "ok" (- (System/nanoTime) t0))
     (h3/open-control! c)
     (assoc c :next-sid (long-array [0]))))
 
@@ -630,6 +641,17 @@
 
 (defn- h3-close [c] (quietly #(h3/close! c)))
 
+(defn- h3-closed-outcome
+  "Outcome of an HTTP/3 operation whose connection closed under it: which
+  side closed it and with which error code (\"h3-peer-close-transport-0x3\"
+  is the server's FLOW_CONTROL_ERROR), or nil while the connection is open."
+  [{:keys [^com.s_exp.enso.quiche.QuicheConnection conn]}]
+  (let [out (long-array 2)
+        outcome (fn [side] (format "h3-%s-close-%s-0x%x" side (if (= 1 (aget out 0)) "app" "transport") (aget out 1)))]
+    (cond (.peerError conn out) (outcome "peer")
+          (.localError conn out) (outcome "local")
+          (.isClosed conn) "h3-closed-silently")))
+
 (defn- h3-request!
   "Sends a request and services the connection until its response ends
   (at most 60 s: uploads under memory pressure take a while)."
@@ -641,7 +663,7 @@
         r (h3/response c sid)]
     (cond
       (:reset r) (fail! (str "h3-reset-" (:reset r)))
-      (not (:fin r)) (fail! "timeout")
+      (not (:fin r)) (fail! (or (h3-closed-outcome c) "timeout"))
       :else r)))
 
 (defn- h3-get-op [c]
@@ -1405,7 +1427,7 @@
   `dir`, so edits to the working tree don't reach the running server;
   returns the server's classpath."
   [^File dir]
-  (let [cp (str/trim (or (sh-out "clojure" "-Spath" "-A:soak") (throw (ex-info "clojure -Spath failed" {}))))
+  (let [cp (str/trim (or (sh-out "clojure" "-Spath" "-M:soak") (throw (ex-info "clojure -Spath failed" {}))))
         copies {"target/classes" "classes" "target/native" "native" "src/clj" "src-clj" "test" "test"}]
     (.mkdirs dir)
     (doseq [[from to] copies :when (.exists (io/file from))]
