@@ -1,3 +1,8 @@
+<p align="center">
+<img width="200" height="200" alt="enso-logo-light" src="https://github.com/user-attachments/assets/5d4e7136-728b-4e8d-9a3a-5388e585ce78" />
+</p>
+
+-------
 # Ensō
 
 [![Clojars Project](https://img.shields.io/clojars/v/com.s-exp/enso.svg)](https://clojars.org/com.s-exp/enso)
