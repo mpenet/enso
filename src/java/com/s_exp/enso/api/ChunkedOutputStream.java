@@ -16,7 +16,8 @@ import java.util.concurrent.locks.LockSupport;
  * once {@code write-body-to-stream} returns (the server ends the body
  * itself, so {@link #close} only marks the stream); an asynchronous
  * handler's body may be written from other threads after it returns, and
- * ends when it closes the stream ({@link #awaitClose}).
+ * ends when it closes the stream ({@link #awaitClose}). Either way a
+ * closed stream refuses writes.
  */
 public final class ChunkedOutputStream extends OutputStream {
 
@@ -31,17 +32,33 @@ public final class ChunkedOutputStream extends OutputStream {
 
     @Override
     public void write(int b) throws IOException {
+        ensureOpen();
         writer.write(b);
     }
 
     @Override
     public void write(byte[] b, int off, int len) throws IOException {
+        ensureOpen();
         writer.write(b, off, len);
     }
 
+    /** Pushes what was written to the client; a no-op once closed, as nothing was written since. */
     @Override
     public void flush() throws IOException {
-        writer.flush();
+        if (!closed) {
+            writer.flush();
+        }
+    }
+
+    /**
+     * Writes after {@link #close} are refused: by then the server may be
+     * ending the response, from another thread for an asynchronous
+     * handler.
+     */
+    private void ensureOpen() throws IOException {
+        if (closed) {
+            throw new IOException("stream closed");
+        }
     }
 
     @Override

@@ -18,7 +18,7 @@
 (def ^:dynamic *server* nil)
 
 (defn- with-server [handler opts f]
-  (let [srv (enso/run-server handler (merge {:port 0} opts))]
+  (let [srv (enso/run-server handler (merge {:host "127.0.0.1" :port 0} opts))]
     (try
       (binding [*server* {:server srv :port (enso/port srv)}]
         (f))
@@ -1233,7 +1233,7 @@
                          (reify com.s_exp.enso.api.RingHandler
                            (handle [_ _]
                              (com.s_exp.enso.api.Response. 101 headers nil listener nil)))
-                         (.build (doto (com.s_exp.enso.api.Config/builder) (.port 0))))]
+                         (.build (doto (com.s_exp.enso.api.Config/builder) (.host "127.0.0.1") (.port 0))))]
                 (.start srv)
                 (try
                   (binding [*server* {:port (.port srv)}]
@@ -1306,7 +1306,7 @@
                (.countDown entered)
                (.await release 10 java.util.concurrent.TimeUnit/SECONDS)
                {:status 200 :body "late"})
-             {:port 0 :shutdown-timeout 400})]
+             {:host "127.0.0.1" :port 0 :shutdown-timeout 400})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (let [out (.getOutputStream sock)]
@@ -1333,7 +1333,7 @@
                (.countDown entered)
                (Thread/sleep 200)
                {:status 200 :body "done"})
-             {:port 0 :shutdown-timeout 3000})]
+             {:host "127.0.0.1" :port 0 :shutdown-timeout 3000})]
     (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
       (let [out (.getOutputStream sock)]
         (.write out (.getBytes "GET / HTTP/1.1\r\nHost: x\r\n\r\n" StandardCharsets/ISO_8859_1))
@@ -1492,7 +1492,7 @@
                   (handle [_ _]
                     (.incrementAndGet served)
                     (->response resp)))
-        srv (enso/run-server (fn [_] resp) {:port 0 :max-keep-alive-requests 0})
+        srv (enso/run-server (fn [_] resp) {:host "127.0.0.1" :port 0 :max-keep-alive-requests 0})
         n 2000]
     (try
       (doseq [pipelined [true false]]
@@ -1533,7 +1533,7 @@
                                (get-in req [:headers "user-agent"]))
                       (.incrementAndGet served))
                     (->response resp)))
-        srv (enso/run-server (fn [_] resp) {:port 0 :max-keep-alive-requests 0})
+        srv (enso/run-server (fn [_] resp) {:host "127.0.0.1" :port 0 :max-keep-alive-requests 0})
         n 2000]
     (try
       (doseq [[label req bound] [["3 fields" alloc-request 300] ["14 fields" browser-request 400]]]
@@ -1562,7 +1562,7 @@
   (let [resp {:status 200 :body "ok"}
         ->response @#'enso/->response
         handler (reify RingHandler (handle [_ _] (->response resp)))
-        srv (enso/run-server (fn [_] resp) {:port 0 :write-timeout 60000 :handler-timeout 60000})]
+        srv (enso/run-server (fn [_] resp) {:host "127.0.0.1" :port 0 :write-timeout 60000 :handler-timeout 60000})]
     (try
       (let [in (ByteArrayInputStream. alloc-request)
             out (OutputStream/nullOutputStream)
@@ -1786,7 +1786,7 @@
       (let [resp {:status 200 :body f}
             ->response @#'enso/->response
             handler (reify RingHandler (handle [_ _] (->response resp)))
-            srv (enso/run-server (fn [_] resp) {:port 0})
+            srv (enso/run-server (fn [_] resp) {:host "127.0.0.1" :port 0})
             stuck-channel (proxy [java.nio.channels.SocketChannel] [(java.nio.channels.spi.SelectorProvider/provider)]
                             (write
                               ([_] 0)
@@ -1953,7 +1953,7 @@
         served (promise)
         closed (promise)
         handler (reify RingHandler (handle [_ _] (deliver served true) (->response resp)))
-        srv (enso/run-server (fn [_] resp) {:port 0})
+        srv (enso/run-server (fn [_] resp) {:host "127.0.0.1" :port 0})
         conn (promise)
         req (.getBytes close-req StandardCharsets/ISO_8859_1)
         first-read (atom true)
@@ -2046,7 +2046,7 @@
   (let [resp {:status 200 :body "ok"}
         ->response @#'enso/->response
         handler (reify RingHandler (handle [_ _] (->response resp)))
-        srv (enso/run-server (fn [_] resp) {:port 0 :write-timeout 200})
+        srv (enso/run-server (fn [_] resp) {:host "127.0.0.1" :port 0 :write-timeout 200})
         closes (java.util.concurrent.atomic.AtomicInteger.)
         forced (java.util.concurrent.CountDownLatch. 1)
         in (ByteArrayInputStream. (.getBytes close-req StandardCharsets/ISO_8859_1))

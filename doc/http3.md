@@ -202,7 +202,9 @@ data it holds stays within the connection window plus a small overhead
 With a stock libquiche (a distribution's build, used for development)
 windows keep their initial sizes: one stream uploads at most 256 KiB per
 round trip (about 5 MiB/s at 50 ms), a connection 512 KiB. Stock libquiche
-also doesn't bound out-of-order buffering. Use it for development only.
+also doesn't bound out-of-order buffering, and doesn't report when a client
+is out of connection credit, so body clocks keep running then (see
+[Limits and timeouts](#limits-and-timeouts)). Use it for development only.
 
 quiche's buffers are native memory, charged to `:max-buffered-bytes`
 through the connection's account:
@@ -245,7 +247,7 @@ held.
 - Header sections: `:max-header-bytes` (advertised as SETTINGS_MAX_FIELD_SECTION_SIZE) and `:max-header-fields` apply as on the other protocols. A decoded section over either gets 431 without running the handler. A HEADERS frame over the hard ceiling (4×, at least 64 KiB) is reset with H3_EXCESSIVE_LOAD before anything is buffered. Bytes of incomplete sections across a connection's streams are bounded by that ceiling, and further streams get H3_REQUEST_REJECTED. A section not complete within `:header-timeout` gets H3_REQUEST_REJECTED. Time the server spends not reading a stream (because its connection's body buffers are full) doesn't count: the clock restarts when reading resumes.
 - `:max-request-body-bytes`: a larger Content-Length gets 413 without running the handler. A body that grows past it fails the handler's reads with a 413, and the rest of the stream isn't read.
 - `Expect: 100-continue` gets a 100 interim response on the handler's first body read. Any other expectation gets 417.
-- `:read-timeout`: a handler waiting longer for body bytes gets a `SocketTimeoutException`, answered 408. So does a body slower than `:min-data-rate-bytes` once `:min-data-rate-grace` of waiting has passed.
+- `:read-timeout`: a handler waiting longer for body bytes gets a `SocketTimeoutException`, answered 408. So does a body slower than `:min-data-rate-bytes` once `:min-data-rate-grace` of waiting has passed. Both only count time the client could have sent. They stop while the loop doesn't read the stream, and while the client has no connection credit left, which happens when unread bytes of streams the loop doesn't read fill the connection window. Only the patched libquiche reports that credit: with a stock one a stream can get a 408 while the client can't send.
 - `:write-timeout`: a response that makes no progress for that long (the client stopped reading) is reset with H3_REQUEST_CANCELLED and its streamed body's producer fails. Progress means 16 KiB sent, so a client handing out credit a few bytes at a time makes none.
 - `:idle-timeout`: sets quiche's `max_idle_timeout`. A connection with no request in flight for that long also sends GOAWAY and closes, even if the client keeps it alive with PINGs.
 - `:http3-stream-reset-limit` (400 per 30 s): peer stream resets beyond it close the connection with H3_EXCESSIVE_LOAD.
@@ -344,9 +346,9 @@ make -C native/enso_quiche       # -> target/native/<os>-<arch>/libenso_quiche.<
 ```
 
 A stock libquiche lacks the patches the release builds apply. Receive
-windows stay fixed, the tests that need receive-window control are
-skipped, and out-of-order buffering is unbounded. Use it for development
-only. Release shims always link the patched libquiche, and
+windows stay fixed, body clocks run while a client is out of connection
+credit, the tests that need receive-window control are skipped, and
+out-of-order buffering is unbounded. Use it for development only. Release shims always link the patched libquiche, and
 `check-shim.sh` refuses one without the patches. To run everything
 locally, build the shim the release way.
 

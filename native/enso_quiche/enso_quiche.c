@@ -66,7 +66,7 @@
 /* The JNI contract: bumped whenever a native's name, signature or a record
  * layout changes. Mirrored by Quiche.SHIM_ABI, checked when Java loads
  * the shim, so a stale build is refused instead of misread. */
-#define ENSO_SHIM_ABI 3
+#define ENSO_SHIM_ABI 4
 
 /* Shim-detected bad arguments (bounds, address). Distinct from every
  * quiche_error value; mirrored by Quiche.SHIM_ERR_INVALID_ARGUMENT. */
@@ -662,15 +662,18 @@ Java_com_s_1exp_enso_quiche_Quiche_connRttNanos(JNIEnv *env, jclass cls, jlong c
     return (jlong)stats.rtt;
 }
 
-/* Receive-window control on a live connection, added to libquiche by
- * native/enso_quiche/patches/ (absent from stock libquiche). Built against
- * the patched header (ENSO_QUICHE_RECV_WINDOW, set by the Makefile) the
- * calls are linked directly; otherwise they are looked up in the loaded
- * libquiche, so the shim still runs on a stock one, without them. */
+/* Receive-window control on a live connection (raise the connection
+ * window's bound, read the window and the credit it leaves the peer), added
+ * to libquiche by native/enso_quiche/patches/ (absent from stock
+ * libquiche). Built against the patched header (ENSO_QUICHE_RECV_WINDOW,
+ * set by the Makefile) the calls are linked directly; otherwise they are
+ * looked up in the loaded libquiche, so the shim still runs on a stock one,
+ * without them. A libquiche with only some of them counts as stock. */
 typedef void (*set_max_window_fn)(quiche_conn *, uint64_t);
-typedef uint64_t (*connection_window_fn)(const quiche_conn *);
+typedef uint64_t (*conn_u64_fn)(const quiche_conn *);
 static set_max_window_fn set_max_connection_window;
-static connection_window_fn connection_window;
+static conn_u64_fn connection_window;
+static conn_u64_fn connection_recv_credit;
 
 /* Whether libquiche offers receive-window control. Called once, when Java
  * loads the shim, before any connection exists. */
@@ -680,11 +683,19 @@ Java_com_s_1exp_enso_quiche_Quiche_recvWindowControl(JNIEnv *env, jclass cls) {
 #ifdef ENSO_QUICHE_RECV_WINDOW
     set_max_connection_window = quiche_conn_set_max_connection_window;
     connection_window = quiche_conn_connection_window;
+    connection_recv_credit = quiche_conn_connection_recv_credit;
 #else
     set_max_connection_window = (set_max_window_fn)dlsym(RTLD_DEFAULT, "quiche_conn_set_max_connection_window");
-    connection_window = (connection_window_fn)dlsym(RTLD_DEFAULT, "quiche_conn_connection_window");
+    connection_window = (conn_u64_fn)dlsym(RTLD_DEFAULT, "quiche_conn_connection_window");
+    connection_recv_credit = (conn_u64_fn)dlsym(RTLD_DEFAULT, "quiche_conn_connection_recv_credit");
 #endif
-    return set_max_connection_window != NULL && connection_window != NULL;
+    if (set_max_connection_window == NULL || connection_window == NULL || connection_recv_credit == NULL) {
+        set_max_connection_window = NULL;
+        connection_window = NULL;
+        connection_recv_credit = NULL;
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
 }
 
 /* Raises the connection window's autotuning bound (never below the current
@@ -703,6 +714,17 @@ Java_com_s_1exp_enso_quiche_Quiche_connConnectionWindow(JNIEnv *env, jclass cls,
     if (connection_window == NULL) return -1;
     uint64_t w = connection_window(CONN(conn));
     return w > (uint64_t)INT64_MAX ? INT64_MAX : (jlong)w;
+}
+
+/* How many more bytes of stream data the peer may send within the
+ * connection-level limit advertised to it, or -1 without receive-window
+ * control. */
+JNIEXPORT jlong JNICALL
+Java_com_s_1exp_enso_quiche_Quiche_connConnectionRecvCredit(JNIEnv *env, jclass cls, jlong conn) {
+    UNUSED(env); UNUSED(cls);
+    if (connection_recv_credit == NULL) return -1;
+    uint64_t c = connection_recv_credit(CONN(conn));
+    return c > (uint64_t)INT64_MAX ? INT64_MAX : (jlong)c;
 }
 
 /* DER bytes of the peer's certificate, or null when it presented none. */

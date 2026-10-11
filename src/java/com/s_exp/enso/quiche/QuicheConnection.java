@@ -136,6 +136,14 @@ public final class QuicheConnection {
     /** The connection-level receive window; -1 unless {@link Quiche#RECV_WINDOW_CONTROL}. */
     public long connectionWindow() { return Quiche.connConnectionWindow(p()); }
 
+    /**
+     * How many more bytes of stream data the connection-level limit
+     * advertised to the peer lets it send, on all streams; -1 unless
+     * {@link Quiche#RECV_WINDOW_CONTROL}. At 0 the peer can't send until
+     * reads let quiche raise the limit and a flush sends it.
+     */
+    public long connectionRecvCredit() { return Quiche.connConnectionRecvCredit(p()); }
+
     /** DER bytes of the certificate the peer presented, or null. */
     public byte[] peerCertificate() { return Quiche.connPeerCert(p()); }
 

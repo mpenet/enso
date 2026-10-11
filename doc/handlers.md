@@ -117,16 +117,18 @@ value: `write!` or `flush!` throws an `IOException`.
 - On HTTP/2 and HTTP/3 it happens once the stream is reset or the connection lost. A reset also interrupts the body's thread, so a blocking call between writes (`Thread/sleep`, a queue take) throws `InterruptedException` right away.
 
 Return from the fn to end the body. Letting the `IOException` escape is
-also fine: it is treated as the client going away. Other exceptions may be
-logged as server faults (at WARNING on HTTP/2), so catch
-`InterruptedException`.
+also fine: it is treated as the client going away. So is an
+`InterruptedException` from the interrupt a reset delivers, logged at FINE.
+Other exceptions are logged as server faults, at WARNING.
 
 ## Async handlers
 
 With `:async true`, the handler is `(fn [request respond raise])`. It runs
 on the request's virtual thread, which then waits until `respond` or
 `raise` is called, from any thread. Only the first call counts. `raise`
-goes to `:error-handler`.
+goes to `:error-handler`. A handler that throws before calling either has
+raised. One that throws after is logged at WARNING, and its response
+stands.
 
 The wait has no bound of its own, just as a synchronous handler's run has
 none. `:handler-timeout` bounds both (503), and stopping the server
@@ -195,7 +197,9 @@ Without that library, call the socket directly with a type hint:
 `(.sendText ^com.s_exp.enso.api.WebSocketSocket socket msg)`.
 
 A request that isn't a valid upgrade gets 400 (426 for a WebSocket version
-other than 13), a refused `Origin` gets 403, and a
+other than 13). `Upgrade` and `Connection` are token lists, so
+`Connection: keep-alive, Upgrade` and `Upgrade: h2c, websocket` are
+accepted. A refused `Origin` gets 403, and a
 `:ring.websocket/protocol` the client didn't offer is a 500. Headers set by
 the handler are sent on the 101.
 
@@ -204,7 +208,8 @@ the handler are sent on the 101.
 Text and binary messages are supported, and fragmented messages are
 reassembled. A message may be at most `:ws-max-message-bytes` (1 MiB) and
 must arrive within `:read-timeout` of its first frame. Past either the
-connection fails with 1009 or 1008.
+connection fails with 1009 or 1008. Time the server doesn't read a
+message because `:max-buffered-bytes` is exhausted doesn't count.
 
 Sends may come from any thread and go out in call order. A synchronous
 send writes on the calling thread, bounded by `:write-timeout`. It
@@ -224,17 +229,20 @@ An asynchronous send (`ring.websocket/send` with callbacks,
 `.sendTextAsync`, `.sendBinaryAsync`) queues the message and returns at
 once. A writer virtual thread hands it to the socket, then calls the
 success callback. Once `:ws-max-queued-bytes` are queued, further sends
-fail at once. Don't modify a `ByteBuffer` sent asynchronously until its
-callback has run. The writer thread only exists while there is something
-to write and ends after a second idle.
+fail at once. A binary send takes the bytes between the buffer's position
+and limit at the call, and never moves its position. Don't change those
+bytes until an asynchronous send's callback has run. The writer thread
+only exists while there is something to write and ends after a second
+idle.
 
 After the server sent CLOSE, or once the connection is gone, every send
 throws `IOException` "WebSocket closed", and asynchronous sends call their
 fail callback.
 
 Pings are answered automatically unless `:on-ping` (or `PingListener`) is
-provided. Pings and pongs never wait behind a stalled write; they queue
-behind it. Their payload is limited to 125 bytes
+provided. Pongs to pings that arrived together share a write, as replies
+to messages do. Pings and pongs never wait behind a stalled write; they
+queue behind it. Their payload is limited to 125 bytes
 (`IllegalArgumentException` above).
 
 ### Closing and failures
@@ -242,7 +250,8 @@ behind it. Their payload is limited to 125 bytes
 `(.close socket code reason)` or `ring.websocket/close` sends CLOSE, then
 waits up to `:ws-close-timeout` (5 s) for the client's CLOSE before
 dropping TCP. `:on-close` receives the client's code, or 1006 if it never
-answered. Codes must be 1000-1003, 1007-1014 or 3000-4999, and the reason
+answered. Once both CLOSE frames are exchanged the server closes TCP,
+after a TLS close_notify over TLS. Codes must be 1000-1003, 1007-1014 or 3000-4999, and the reason
 at most 123 UTF-8 bytes (`IllegalArgumentException` otherwise).
 
 Close codes the server sends:
@@ -263,7 +272,9 @@ server. Exceptions from `:on-error` and `:on-close` are ignored.
 `.code`) for protocol failures and the listener's exception otherwise;
 `:on-close` then gets the failure code. After a failure the server keeps
 reading until the client's CLOSE, or `:ws-close-timeout`, so its own CLOSE
-isn't lost to a TCP reset.
+isn't lost to a TCP reset. If the client's frames break again meanwhile,
+the server stops parsing them but still reads and discards them until
+then.
 
 `:idle-timeout` (75 s) bounds how long the client may send nothing. For
 server-push sockets whose clients stay silent, set `:ws-ping-interval`
@@ -281,10 +292,12 @@ window under 15 bits, which `java.util.zip` can't produce, only messages
 that fit the window are compressed, each on its own. Inflation stops at
 `:ws-max-message-bytes`. Messages under 256 bytes are sent uncompressed,
 and a message whose compressed form exceeds 64 KiB is sent as several
-frames.
+frames. Clients may end messages with final deflate blocks (RFC 7692
+§7.2.3.4); the window carries over to their next messages.
 
 A connection quiet for a second gives back its grown buffers (message
-assembly, compression, TLS records); the next message grows them again.
+assembly, compression, output, TLS records); the next message grows them
+again.
 
 ### Origin and authentication
 

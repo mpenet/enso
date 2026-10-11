@@ -139,15 +139,26 @@ for bytes held for peers and for credit granted to them.
 - Credit is reserved before it is granted (`tryReserve`, or `Account.tryReserve` per connection) and released when the bytes leave or the credit is abandoned. Bytes arriving within credit a protocol grants unasked, such as HTTP/2's initial 65535-octet windows, are `charge`d instead, which may exceed the limit by that much.
 - `exhausted()` is true at the limit, `pressured()` from the low-water mark at three quarters.
 - Each connection holds bytes through an `Account`. Under pressure an account over its fair share is refused and `throttled()`, while smaller ones may still reserve up to the limit.
-- `await(waiter)` registers a waiter unless usage is already below the low-water mark, in which case the caller carries on. Waiters are woken by a short-lived virtual thread holding no lock, never by the releasing thread. A release under one connection's locks would otherwise run another connection's callback, which takes that connection's locks, and two HTTP/2 connections could deadlock.
+- `await(waiter)` registers a waiter unless usage is already below the low-water mark, in which case the caller carries on. `await(waiter, level)` waits for a level of its own instead, such as HTTP/3's per-connection floor. Waiters are woken by a short-lived virtual thread holding no lock, never by the releasing thread. A release under one connection's locks would otherwise run another connection's callback, which takes that connection's locks, and two HTTP/2 connections could deadlock.
 - `cancel(waiter)` unregisters, so closed streams don't stay reachable.
+- `enterLane(waiter)` and `leaveLane(waiter)` run the progress lane: one holder at a time may grow past the limit, the others queue in arrival order and are handed it in turn (`budgetAvailable` on the leaving thread, which holds no lock). It is for holders that can only give bytes back after growing further. WebSocket readers use it, since a message is delivered whole.
 
 A buffer joins the budget by charging what it holds to its connection's
 account, releasing it on every exit path, and pausing credit or reads
-while throttled with a waiter to resume. Current users: HTTP/2 request
+while throttled with a waiter to resume. Throttling never takes a
+connection below a floor (HTTP/2's initial 65535-octet window, 64 KiB of
+HTTP/3 body per connection, 64 KiB of WebSocket message buffer per
+connection), so every connection keeps making progress.
+While the server holds a body back, its reader's clocks (`:read-timeout`,
+the `:min-data-rate-bytes` allowance) stop: an HTTP/2 reader parks
+untimed while the peer has no connection credit, an HTTP/3 reader while
+the loop doesn't read its stream or the peer has no connection credit
+(patched libquiche only), a WebSocket reader while it waits for room or
+the lane. Each is woken to recount when that changes, so no clock read is
+added on the data path. Current users: HTTP/2 request
 bodies and connection credit, HTTP/2 streamed responses, HTTP/3 request
 bodies, HTTP/3 receive credit, HTTP/3 response bytes quiche hasn't taken,
-WebSocket async sends, and WebSocket messages past 64 KiB. The protocol
+WebSocket async sends, and WebSocket message buffers past 64 KiB. The protocol
 sections below describe each.
 
 ### Timer
@@ -345,7 +356,8 @@ its parse buffer to 1 KiB and drops its grown output and body buffers,
 cached values and TLS records. HTTP/2 forgets retired streams and shrinks
 its input, header-block, HPACK, field, TLS and writer buffers
 (`h2-idle-connection-gives-back-its-buffers`). A WebSocket keeps a
-512-byte read buffer (`ws-idle-connection-gives-back-its-buffers`). An
+512-byte read buffer (`ws-idle-connection-gives-back-its-buffers`) and
+shrinks the HTTP/1.1 output buffer it writes through back to 1 KiB. An
 HTTP/3 connection keeps its scratch space on its event loop and replaces a
 stream map that grew past 16 entries.
 
@@ -443,11 +455,24 @@ the lock at most `:ws-close-timeout`.
 
 After a failure the driver sends CLOSE, then keeps reading until the
 client's CLOSE if frames are intact, or half-closes and drains if they
-aren't, so the CLOSE isn't destroyed by a reset.
+aren't (or break again), so the CLOSE isn't destroyed by a reset. Once
+both CLOSE frames are exchanged it closes the socket itself, which over
+TLS sends close_notify first, bounded by the close timer. Every other end
+aborts the socket.
 
-`WebSocketHandshake` applies the origin check, negotiates
-permessage-deflate (`PerMessageDeflate`) and writes the
-`Sec-WebSocket-*` headers.
+Incoming messages are assembled in a scratch buffer that grows by
+doubling and is kept for the next message up to 256 KiB. Its capacity past
+64 KiB is charged to the memory budget. Before it grows past what is
+charged, a reader finding the budget exhausted takes the progress lane or
+waits, parked untimed, for room or the lane; its message deadline moves
+by the time waited. Reading into capacity already held never waits. The
+lane is given up once the listener returned. Compressed messages are
+charged as they inflate.
+
+`HttpConnection` validates the upgrade. `WebSocketHandshake` holds the
+origin check and the response headers the server owns,
+`PerMessageDeflate` negotiates permessage-deflate, and `ResponseWriter`
+writes the 101 with the `Sec-WebSocket-*` headers.
 
 ## HTTP/2
 
@@ -485,6 +510,7 @@ Autotuning is described in [options.md](options.md#http2-flow-control).
 Implementation details:
 
 - Every DATA byte is held by the connection's account from arrival until it leaves the stream's buffer (`creditConnection`). Leaving bytes are granted again as credit unless the account is throttled. Then only enough to keep the window at 65535 is granted, the rest is released and owed, and a budget waiter grants it later in pieces of at least a frame.
+- Body readers with a clock running register with the connection while they park (`readerParking`). When the connection window runs out or comes back, `connectionCreditChanged` wakes them; while it is out they park untimed, as the client can't send. A stream window can't run out under a waiting reader: credit goes back once half the window is read.
 - `RequestBody.credit` returns a stream's credit once half its window is read, and doubles the window if the previous return was less than `4 × smoothed RTT × fraction read` ago. `autotuneConnectionWindow` applies the same rule to the connection over epochs of half its size. Connection growth is reserved from the account first and skipped if that fails. Stream growth needs no reservation, since the paid connection window bounds the peer; it is skipped while throttled.
 - The RTT comes from the SETTINGS acknowledgement, then a PING sent with a stream WINDOW_UPDATE when the last sample is over a second old (RFC 6298 smoothing). This costs one `System.nanoTime` per window update.
 - A body with a Content-Length is never granted stream credit past what it has left plus 256 octets, so a padding peer can always send its next frame.
@@ -531,7 +557,7 @@ terms:
 - `Http3Exchange` is the shared `Exchange`. Server-decided responses (413, 417, 431, 500, 501, 503) are the shared `HttpStatus` ones, prepared through `ResponseHead`.
 - Each QUIC connection is a `Drainable` in the server's registry and limiter, released by its teardown or by its last handler.
 - The loop supervisor catches anything escaping a loop: SEVERE log, "event-loop-failure", the loop's connections closed, restart on the same thread after 100 ms. Nothing it calls can escape it.
-- `Http3BodyPipe` buffers at most 64 KiB per request, charged to the connection's account and to its window-sized connection budget. `hasRoom()` false stops the loop reading that connection's request streams; `resumeWhenDrained` registers a waiter that signals the loop.
+- `Http3BodyPipe` buffers at most 64 KiB per request, charged to the connection's account and to its window-sized connection budget. `room()` 0 stops the loop reading that request stream; `resumeWhenDrained` registers a waiter that signals the loop. A throttled connection still reads while its pipes hold less than 64 KiB (`FLOOR`), and a stream stopped at the floor is woken when the connection's pipes fall below it. While the loop doesn't read a stream, its pipe's reader waits untimed, so `:read-timeout` and the data rate only count time the client could have sent. Unread bytes of such streams can fill the connection window, and then no stream's client can send. With `Quiche.RECV_WINDOW_CONTROL`, `Http3Connection.settle` reads the credit the peer has left (`quiche_conn_connection_recv_credit`) after each processing pass and flush while bodies are read, and when it reaches 0 or comes back tells every body being read (`Http3BodyPipe.creditExhausted`). Their readers wait untimed while it is 0, as on HTTP/2. A stock libquiche can't report it, so there the clocks keep running.
 - Receive credit: while a body is being read (`Http3Connection.bodyStarted` to the last `readDone`) the initial window is charged, not reserved, since it was granted in the handshake. With `Quiche.RECV_WINDOW_CONTROL`, `growConnectionWindow` reserves each doubling and passes it to `quiche_conn_set_max_connection_window`, up to twice `:http3-max-window-bytes`; the reservation is held until the connection goes. New connections are refused only while the budget is exhausted: from the low-water mark, fair shares already stop a connection over its share from growing, and refusing there would turn away GET traffic for bodies it doesn't send.
 - Response bytes quiche hasn't taken (`Http3Connection.defer`, `bodyHeld`) are charged without throttling: a fixed body is already in memory and a streamed producer already blocks on its hand-off, so the charge only adds pressure on other buffers.
 - Each certificate pair becomes a quiche configuration referenced by the connections accepted with it, and freed with the last of them.

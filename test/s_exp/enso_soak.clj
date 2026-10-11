@@ -1709,9 +1709,10 @@
                  :quiet (quiet-check (mark :baseline) (mark :final))
                  :drift (latency-drift all)
                  :totals (totals-by-phase all)
-                 :unexpected (into (sorted-map)
-                                   (for [[_ m] (totals-by-phase judged) [k os] m [o n] os :when (unexpected? k o)]
-                                     [[k o] n]))
+                 :unexpected (reduce (fn [acc [k n]] (update acc k (fnil + 0) n))
+                                     (sorted-map)
+                                     (for [[_ m] (totals-by-phase judged) [k os] m [o n] os :when (unexpected? k o)]
+                                       [[k o] n]))
                  :shutdown shutdown
                  :leftover-workers leftover-workers}]
     (write-csv! (io/file out "timeseries.csv") all)

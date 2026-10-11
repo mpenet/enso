@@ -41,8 +41,9 @@ public interface WebSocketSocket {
 
     /**
      * Sends the remaining bytes of {@code message} as a binary message;
-     * {@code message}'s position is not moved. Returns, blocks, waits in
-     * the buffer and fails like {@link #sendText}.
+     * {@code message}'s position is not moved, so one buffer may be sent to
+     * several connections at once. Returns, blocks, waits in the buffer
+     * and fails like {@link #sendText}.
      */
     void sendBinary(ByteBuffer message) throws IOException;
 
@@ -56,8 +57,10 @@ public interface WebSocketSocket {
     void sendTextAsync(CharSequence message, SendCallback callback);
 
     /**
-     * {@link #sendTextAsync} for binary. {@code message} is sent as it is
-     * when written: don't modify it before the callback ran.
+     * {@link #sendTextAsync} for binary: the bytes between
+     * {@code message}'s position and limit at the call, read when written.
+     * Don't change those bytes before the callback ran; the position is
+     * not moved.
      */
     void sendBinaryAsync(ByteBuffer message, SendCallback callback);
 
@@ -72,7 +75,9 @@ public interface WebSocketSocket {
 
     /**
      * Sends a ping now, or queued right behind a write in progress: never
-     * waits for a stalled writer.
+     * waits for a stalled writer. Sent from a listener while more of the
+     * client's frames are already read, it waits in the buffer like
+     * {@link #sendText}.
      *
      * @throws IllegalArgumentException if {@code data} has more than 125
      *         bytes remaining (RFC 6455 §5.5)

@@ -17,6 +17,7 @@ import com.s_exp.enso.EnsoServer;
 import com.s_exp.enso.api.ChunkedWriter;
 import com.s_exp.enso.api.Response;
 import com.s_exp.enso.core.ChunkedWriters;
+import com.s_exp.enso.core.Exchange;
 import com.s_exp.enso.core.HttpDates;
 import com.s_exp.enso.core.HttpFields;
 import com.s_exp.enso.core.HttpStatus;
@@ -146,9 +147,14 @@ final class ResponseWriter {
         if (heldFlush != null) timer.retire(heldFlush);
     }
 
-    /** Gives back the grown output buffer and the body copy buffer of an idle connection. */
+    /**
+     * Gives back the grown output buffer and the body copy buffer of an
+     * idle connection; the output buffer only while nothing is pending in
+     * it. Called by the thread that owns the output (for a WebSocket, under
+     * its write lock).
+     */
     void shrinkIdle() {
-        if (hbuf.length > OUTPUT_BUFFER_BYTES) {
+        if (hbuf.length > OUTPUT_BUFFER_BYTES && hlen == 0) {
             hbuf = new byte[OUTPUT_BUFFER_BYTES];
         }
         chunkBuf = null;
@@ -480,7 +486,10 @@ final class ResponseWriter {
                         }
                     }
                 } catch (RuntimeException e) {
-                    HttpConnection.BODY_FAILURES.log("response body failed, closing connection", e);
+                    // Written after the handler's response was claimed: nothing
+                    // interrupts it, so only the client can make it expected.
+                    (Exchange.clientCaused(e) ? HttpConnection.EXPECTED_BODY_FAILURES : HttpConnection.BODY_FAILURES)
+                        .log("response body failed, closing connection", e);
                     if (closeDelimited) {
                         abort();
                     }

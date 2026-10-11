@@ -30,7 +30,11 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>One producer (the framer) and one consumer (the handler thread),
  * under a lock of their own; the consumer parks with
  * {@link LockSupport#park} (no allocation) until bytes, the end, or
- * {@code :read-timeout}.
+ * {@code :read-timeout}. Its clocks ({@code :read-timeout}, the
+ * {@code :min-data-rate-bytes} allowance) only count time the client
+ * could have sent and didn't: while the connection window it was granted
+ * is used up (the server withholds credit until its handlers read) the
+ * wait isn't timed.
  *
  * <p>Memory is accounted per connection, not here: the connection pays
  * for every DATA byte when it arrives (from the credit it reserved before
@@ -108,6 +112,11 @@ final class RequestBody extends InputStream {
     // waiting for them.
     private long readBytes;
     private long waitedNanos;
+    // The connection's list of parked readers (see
+    // Http2Connection#readerParking), guarded by its lock.
+    RequestBody parkedPrev;
+    RequestBody parkedNext;
+    Thread parkedThread;
 
     // Consumer-side failure already reported: later reads fail the same way.
     private IOException failed;
@@ -356,7 +365,8 @@ final class RequestBody extends InputStream {
         int n;
         lock.lock();
         try {
-            long deadline = 0;
+            long left = readTimeoutNanos;
+            boolean timed = readTimeoutNanos > 0 || minDataRate > 0;
             while (count == 0) {
                 if (end == ENDED) {
                     eof = true;
@@ -368,36 +378,51 @@ final class RequestBody extends InputStream {
                 if (end == ABORTED || abandoned) {
                     throw fail(new IOException("HTTP/2 request body aborted before END_STREAM"));
                 }
-                long now = readTimeoutNanos > 0 || minDataRate > 0 ? System.nanoTime() : 0;
-                if (readTimeoutNanos > 0) {
-                    if (deadline == 0) {
-                        deadline = now + readTimeoutNanos;
-                    } else if (now - deadline >= 0) {
-                        throw fail(new RequestBodyTimeoutException());
-                    }
-                }
-                long wait = readTimeoutNanos > 0 ? deadline - now : Long.MAX_VALUE;
-                if (minDataRate > 0) {
-                    long allowance = DataRate.allowanceNanos(minDataRate, minDataRateGraceNanos, readBytes, waitedNanos);
-                    if (allowance <= 0) {
-                        throw fail(RequestBodyTimeoutException.minDataRate());
-                    }
-                    wait = Math.min(wait, allowance);
-                }
-                waiter = Thread.currentThread();
-                lock.unlock();
+                // A peer without connection credit can't send: no clock
+                // runs until it has some (the connection wakes us).
+                boolean held = timed && conn.readerParking(this);
+                long wait = Long.MAX_VALUE;
+                long start = 0;
+                boolean counted = timed && !held;
                 try {
-                    if (wait != Long.MAX_VALUE) {
-                        LockSupport.parkNanos(this, wait);
-                    } else {
-                        LockSupport.park(this);
+                    if (counted) {
+                        if (readTimeoutNanos > 0) {
+                            if (left <= 0) {
+                                throw fail(new RequestBodyTimeoutException());
+                            }
+                            wait = left;
+                        }
+                        if (minDataRate > 0) {
+                            long allowance = DataRate.allowanceNanos(minDataRate, minDataRateGraceNanos, readBytes,
+                                                                     waitedNanos);
+                            if (allowance <= 0) {
+                                throw fail(RequestBodyTimeoutException.minDataRate());
+                            }
+                            wait = Math.min(wait, allowance);
+                        }
+                        start = System.nanoTime();
+                    }
+                    waiter = Thread.currentThread();
+                    lock.unlock();
+                    try {
+                        if (wait != Long.MAX_VALUE) {
+                            LockSupport.parkNanos(this, wait);
+                        } else {
+                            LockSupport.park(this);
+                        }
+                    } finally {
+                        lock.lock();
+                        waiter = null;
                     }
                 } finally {
-                    lock.lock();
-                    waiter = null;
-                    if (minDataRate > 0) {
-                        waitedNanos += System.nanoTime() - now;
+                    if (timed) {
+                        conn.readerUnparked(this);
                     }
+                }
+                if (counted) {
+                    long waited = System.nanoTime() - start;
+                    left -= waited;
+                    waitedNanos += waited;
                 }
                 if (Thread.interrupted()) {
                     Thread.currentThread().interrupt();

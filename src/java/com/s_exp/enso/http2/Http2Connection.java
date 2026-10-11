@@ -269,6 +269,14 @@ public final class Http2Connection implements Runnable, Drainable {
     private long settingsSentNanos;
     // Set at teardown: credit is no longer granted nor paid for.
     private volatile boolean creditClosed;
+    // Body readers parked for bytes with a clock running (a list through
+    // RequestBody.parkedNext), and whether the peer has no connection
+    // credit left, guarded by parkLock. Without credit the client can't
+    // send, so those readers' clocks stop (they park untimed); each is
+    // woken to recount when that changes.
+    private final ReentrantLock parkLock = new ReentrantLock();
+    private RequestBody parked;
+    private boolean noCredit;
 
     // Serialises GOAWAY emission with admitting new streams, so no handler
     // starts on a stream above the last-stream-id we announced.
@@ -1188,8 +1196,12 @@ public final class Http2Connection implements Runnable, Drainable {
         }
         // Every DATA frame counts against the connection window, whatever
         // becomes of it (§6.9).
-        if (connRecvWindow.addAndGet(-frameLen) < 0) {
+        long window = connRecvWindow.addAndGet(-frameLen);
+        if (window < 0) {
             throw new Http2.ConnectionError(Http2.ERROR_FLOW_CONTROL_ERROR, "peer overran receive window");
+        }
+        if (window == 0 && frameLen > 0) {
+            connectionCreditChanged();
         }
         connHeld.addAndGet(frameLen);
         // And is held by the connection until it leaves (creditConnection):
@@ -1315,7 +1327,14 @@ public final class Http2Connection implements Runnable, Drainable {
     void creditConnection(long n) {
         if (n <= 0) return;
         long u = connRecvUncredited.addAndGet(n);
-        if (u < recvCreditThreshold || !connRecvUncredited.compareAndSet(u, 0)) return;
+        // Credit goes back in batches of half a stream window, or sooner
+        // once the peer holds less than half the initial window: a
+        // connection kept at that window (throttled, below) never has a
+        // batch's worth read when the stream window is larger.
+        if ((u < recvCreditThreshold && connRecvWindow.get() >= Http2.DEFAULT_INITIAL_WINDOW_SIZE / 2)
+            || !connRecvUncredited.compareAndSet(u, 0)) {
+            return;
+        }
         if (creditClosed) {
             account.release(u);
             return;
@@ -1364,8 +1383,65 @@ public final class Http2Connection implements Runnable, Drainable {
     private void grantConnectionCredit(long n) {
         if (n > 0) {
             reservedCredit.addAndGet(n);
-            connRecvWindow.addAndGet(n);
+            if (connRecvWindow.addAndGet(n) == n) {
+                connectionCreditChanged();
+            }
             writer.windowUpdate(0, (int) n);
+        }
+    }
+
+    /**
+     * Registers {@code body}'s reader, about to park for bytes with a
+     * clock running, until {@link #readerUnparked}. True when the peer has
+     * no connection credit left: it can't send, so the wait isn't timed.
+     * The reader is unparked whenever that changes. Any thread.
+     */
+    boolean readerParking(RequestBody body) {
+        parkLock.lock();
+        try {
+            body.parkedThread = Thread.currentThread();
+            body.parkedNext = parked;
+            body.parkedPrev = null;
+            if (parked != null) parked.parkedPrev = body;
+            parked = body;
+            return noCredit;
+        } finally {
+            parkLock.unlock();
+        }
+    }
+
+    /** {@code body}'s reader is done parking. */
+    void readerUnparked(RequestBody body) {
+        parkLock.lock();
+        try {
+            RequestBody prev = body.parkedPrev;
+            RequestBody next = body.parkedNext;
+            if (prev == null) parked = next; else prev.parkedNext = next;
+            if (next != null) next.parkedPrev = prev;
+            body.parkedPrev = null;
+            body.parkedNext = null;
+            body.parkedThread = null;
+        } finally {
+            parkLock.unlock();
+        }
+    }
+
+    /**
+     * The connection window may have run out or come back: when the peer's
+     * ability to send changed, parked readers are woken to recount their
+     * wait. Any thread.
+     */
+    private void connectionCreditChanged() {
+        parkLock.lock();
+        try {
+            boolean none = connRecvWindow.get() <= 0;
+            if (none == noCredit) return;
+            noCredit = none;
+            for (RequestBody b = parked; b != null; b = b.parkedNext) {
+                LockSupport.unpark(b.parkedThread);
+            }
+        } finally {
+            parkLock.unlock();
         }
     }
 

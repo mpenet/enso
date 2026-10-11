@@ -39,6 +39,7 @@ final class Http2Exchange implements Hpack.FieldSink {
     private static final Logger LOG = Logger.getLogger(Http2Exchange.class.getName());
     private static final LogLimiter INVALID_RESPONSES = new LogLimiter(LOG, Level.WARNING);
     private static final LogLimiter BODY_FAILURES = new LogLimiter(LOG, Level.WARNING);
+    private static final LogLimiter EXPECTED_BODY_FAILURES = new LogLimiter(LOG, Level.FINE);
 
 
     private static final int FIELDS_INITIAL = 16;
@@ -332,7 +333,7 @@ final class Http2Exchange implements Hpack.FieldSink {
             // failed. Never answer a peer's RST_STREAM with another one
             // (§5.4.2): resetStream only sends one if the stream is open.
             if (!(t instanceof IOException)) {
-                BODY_FAILURES.log("HTTP/2 response body failed", t);
+                (s.expectedFailure(t) ? EXPECTED_BODY_FAILURES : BODY_FAILURES).log("HTTP/2 response body failed", t);
             }
             conn.resetStream(s, Http2.ERROR_INTERNAL_ERROR, true);
         } finally {

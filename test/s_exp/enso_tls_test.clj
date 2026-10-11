@@ -86,7 +86,7 @@
         captured (atom [])
         srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0
+             {:host "127.0.0.1" :port 0
               :http2 true
               :ssl-context-provider
               (reify Supplier (get [_] ctx-a))})]
@@ -106,7 +106,7 @@
         ref (AtomicReference. ctx-a)
         srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0
+             {:host "127.0.0.1" :port 0
               :http2 true
               :ssl-context-provider
               (reify Supplier (get [_] (.get ref)))})]
@@ -133,7 +133,7 @@
         calls (atom 0)
         srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0
+             {:host "127.0.0.1" :port 0
               :http2 true
               :ssl-context-provider
               (reify Supplier
@@ -169,7 +169,7 @@
 
 (defn- with-tls-server [opts f]
   (let [srv (enso/run-server (:handler opts (fn [_] {:status 200 :body "ok"}))
-                             (merge {:port 0 :http2 true :ssl-context (keytool-gen! "cert-timeout")}
+                             (merge {:host "127.0.0.1" :port 0 :http2 true :ssl-context (keytool-gen! "cert-timeout")}
                                     (dissoc opts :handler)))]
     (try (f (enso/port srv)) (finally (enso/stop srv)))))
 
@@ -304,7 +304,7 @@
                       :body (fn [w]
                               (deliver writing true)
                               (dotimes [_ 64] (enso/write! w (byte-array (* 1024 1024)))))})
-             {:port 0 :http2 true :ssl-context (keytool-gen! "cert-stall")
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (keytool-gen! "cert-stall")
               :shutdown-timeout 300})
         factory (.getSocketFactory (capturing-trust-context (atom [])))]
     (with-open [^javax.net.ssl.SSLSocket sock (.createSocket factory "127.0.0.1" (int (enso/port srv)))]
@@ -327,7 +327,7 @@
         failing (atom false)
         srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0
+             {:host "127.0.0.1" :port 0
               :http2 true
               :ssl-context-provider
               (reify Supplier
@@ -358,7 +358,7 @@
                                     (let [c (keytool-gen! "cache-c")]
                                       [{:http2 true :ssl-context-provider (reify Supplier (get [_] c))} c])])]
     (let [srv (enso/run-server (fn [_] {:status 200 :body "ok"})
-                               (merge {:port 0 :ssl-session-cache-size 7} opts))]
+                               (merge {:host "127.0.0.1" :port 0 :ssl-session-cache-size 7} opts))]
       (try
         (is (= 7 (.getSessionCacheSize (.getServerSessionContext ctx))) (pr-str (keys opts)))
         (finally (enso/stop srv))))))
@@ -658,6 +658,91 @@
         (.append sb (char b))
         (when-not (.endsWith (str sb) "\r\n\r\nok")
           (recur))))))
+
+(defn- engine-client
+  "A blocking TLS client over an SSLEngine, for what SSLSocket hides:
+  whether the peer ended with close_notify (the engine's inbound is done).
+  Returns [engine write! read!]: write! takes bytes, read! returns the
+  next plaintext bytes, or nil once the peer closed."
+  [port]
+  (let [^javax.net.ssl.SSLEngine engine (doto (.createSSLEngine (capturing-trust-context (atom []))
+                                                                "127.0.0.1" (int port))
+                                          (.setUseClientMode true))
+        ch (java.nio.channels.SocketChannel/open (java.net.InetSocketAddress. "127.0.0.1" (int port)))
+        size (.getPacketBufferSize (.getSession engine))
+        net-in (java.nio.ByteBuffer/allocate (* 2 size))
+        net-out (java.nio.ByteBuffer/allocate (* 2 size))
+        app-in (java.nio.ByteBuffer/allocate (* 2 (.getApplicationBufferSize (.getSession engine))))
+        empty (java.nio.ByteBuffer/allocate 0)
+        _ (.setSoTimeout (.socket ch) 5000)
+        net-read (java.nio.channels.Channels/newChannel (.getInputStream (.socket ch)))
+        run-tasks! (fn [] (loop [] (when-let [t (.getDelegatedTask engine)] (.run ^Runnable t) (recur))))
+        wrap! (fn [^java.nio.ByteBuffer src]
+                (.clear net-out)
+                (.wrap engine src net-out)
+                (.flip net-out)
+                (while (.hasRemaining net-out) (.write ch net-out)))
+        ;; Unwraps into app-in; false once the channel ended.
+        unwrap! (fn []
+                  (.flip net-in)
+                  (let [r (.unwrap engine net-in app-in)]
+                    (.compact net-in)
+                    (when (= javax.net.ssl.SSLEngineResult$HandshakeStatus/NEED_TASK (.getHandshakeStatus r))
+                      (run-tasks!))
+                    (if (= javax.net.ssl.SSLEngineResult$Status/BUFFER_UNDERFLOW (.getStatus r))
+                      (not (neg? (.read net-read net-in)))
+                      (not= javax.net.ssl.SSLEngineResult$Status/CLOSED (.getStatus r)))))]
+    (.beginHandshake engine)
+    (loop []
+      (condp = (.getHandshakeStatus engine)
+        javax.net.ssl.SSLEngineResult$HandshakeStatus/NEED_WRAP (do (wrap! empty) (recur))
+        javax.net.ssl.SSLEngineResult$HandshakeStatus/NEED_UNWRAP (do (unwrap!) (recur))
+        javax.net.ssl.SSLEngineResult$HandshakeStatus/NEED_TASK (do (run-tasks!) (recur))
+        nil))
+    [engine
+     (fn [^bytes bs] (wrap! (java.nio.ByteBuffer/wrap bs)))
+     (fn []
+       (loop []
+         (if (pos? (.position app-in))
+           (let [_ (.flip app-in)
+                 bs (byte-array (.remaining app-in))]
+             (.get app-in bs)
+             (.clear app-in)
+             bs)
+           (when (unwrap!) (recur)))))]))
+
+(deftest tls-ws-closing-handshake-ends-with-close-notify
+  ;; Once both CLOSE frames are exchanged the server closes TCP first
+  ;; (RFC 6455 §7.1.1), over TLS after a close_notify, so the client
+  ;; sees a clean end of the TLS stream rather than a truncation.
+  (doseq [[label server-closes] [["client closes" false] ["server closes" true]]]
+    (with-tls-server {:handler (fn [_]
+                                 {:ring.websocket/listener
+                                  {:on-open (fn [^com.s_exp.enso.api.WebSocketSocket s]
+                                              (when server-closes (.close s 1000 "")))}})}
+      (fn [port]
+        (let [[^javax.net.ssl.SSLEngine engine write! read!] (engine-client port)
+              ;; CLOSE 1000, masked with a zero key
+              close-frame (byte-array (map unchecked-byte [0x88 0x82 0 0 0 0 0x03 0xE8]))
+              received (atom [])
+              read-until! (fn [pred] (loop []
+                                       (when-not (pred @received)
+                                         (when-let [bs (read!)]
+                                           (swap! received into bs)
+                                           (recur)))))
+              ends-with-close? (fn [v] (= [-120 2 3 -24] (take-last 4 v)))]
+          (write! (.getBytes (str "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+                                  "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                                  "Sec-WebSocket-Version: 13\r\n\r\n")
+                             java.nio.charset.StandardCharsets/ISO_8859_1))
+          (when-not server-closes
+            (read-until! #(clojure.string/includes? (String. (byte-array %) "ISO-8859-1") "\r\n\r\n"))
+            (write! close-frame))
+          (read-until! ends-with-close?)
+          (is (ends-with-close? @received) (str label ": the server's CLOSE"))
+          (when server-closes (write! close-frame))
+          (is (nil? (read!)) (str label ": then the end of the stream"))
+          (is (.isInboundDone engine) (str label ": after a close_notify")))))))
 
 (deftest tls-trickled-records-bounded-by-the-idle-and-head-clocks
   ;; SO_TIMEOUT restarts with every byte, and over TLS those bytes are

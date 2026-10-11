@@ -140,16 +140,25 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
     /** The handler drained the body pipe: reads resume. */
     void resume(Http3Exchange ex, long now) {
         if (!ex.readPaused) return;
-        ex.readPaused = false;
-        if (ex.readPhase == Http3Exchange.READ_HEADERS) {
-            // :header-timeout ignores the time we didn't read it.
-            ex.firstByteNanos = now;
-            conn.headerPhaseStarted(ex);
-        }
         try {
             read(ex, now);
         } catch (Http3ConnectionException e) {
             conn.closeWithError(e);
+        }
+    }
+
+    /**
+     * A stream the loop stopped reading is read again (woken, or reported
+     * readable with room back): its clocks run from now.
+     */
+    private void readingResumed(Http3Exchange ex, long now) {
+        ex.readPaused = false;
+        // The body's clocks pick up where they were.
+        if (ex.pipe != null) ex.pipe.readResumed();
+        if (ex.readPhase == Http3Exchange.READ_HEADERS) {
+            // :header-timeout ignores the time we didn't read it.
+            ex.firstByteNanos = now;
+            conn.headerPhaseStarted(ex);
         }
     }
 
@@ -190,6 +199,7 @@ final class Http3RequestReader implements QpackDecoder.FieldSink {
                 }
                 len = (int) Math.min(len, connRoom);
             }
+            if (ex.readPaused) readingResumed(ex, now);
             long rc = conn.quiche.streamRecv(ex.id, buf, 0, len);
             if (rc == Quiche.QUICHE_ERR_DONE) return;
             if (rc < 0) {

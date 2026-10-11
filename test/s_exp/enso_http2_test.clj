@@ -71,7 +71,7 @@
 
 (defn- with-h2-server [handler f]
   (let [srv (enso/run-server handler
-                             {:port 0 :http2 true
+                             {:host "127.0.0.1" :port 0 :http2 true
                               :ssl-context (gen-server-context)})]
     (try
       (binding [*port* (enso/port srv)]
@@ -273,7 +273,7 @@
                       (catch InterruptedException _
                         (deliver interrupted true)))
                  {:status 200 :body "late"})
-               {:port 0
+               {:host "127.0.0.1" :port 0
                 :http2 true
                 :ssl-context (gen-server-context)
                 :handler-timeout 300})]
@@ -583,7 +583,7 @@
   "Runs `body` with *port* bound to a TLS h2 server for `handler` and
   extra run-server `opts`, stopping it afterwards."
   [handler opts & body]
-  `(let [srv# (enso/run-server ~handler (merge {:port 0 :http2 true :ssl-context (gen-server-context)} ~opts))]
+  `(let [srv# (enso/run-server ~handler (merge {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)} ~opts))]
      (try
        (binding [*port* (enso/port srv#)] ~@body)
        (finally (enso/stop srv#)))))
@@ -652,7 +652,7 @@
                  (.await release 10 TimeUnit/SECONDS)
                  {:status 200
                   :body (str (alength (.readNBytes ^java.io.InputStream (:body req) 65535)))})
-               {:port 0 :http2 true :ssl-context (gen-server-context)
+               {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                 :http2-initial-window-bytes 65535})]
       (try
         (binding [*port* (enso/port srv)]
@@ -693,7 +693,7 @@
                    (do (.countDown blocking) (.await release 10 TimeUnit/SECONDS))
                    (reset! seen-header (get-in req [:headers "x-a"])))
                  {:status 200 :body "ok"})
-               {:port 0 :http2 true :ssl-context (gen-server-context)
+               {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                 :http2-max-concurrent-streams 1})]
       (try
         (binding [*port* (enso/port srv)]
@@ -733,7 +733,7 @@
   ;; check only applies to new streams.
   (let [srv (enso/run-server
              (fn [req] {:status 200 :body (slurp (:body req))})
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :http2-max-concurrent-streams 1})]
     (try
       (binding [*port* (enso/port srv)]
@@ -762,7 +762,7 @@
                    (.await release 10 TimeUnit/SECONDS)
                    (slurp (:body req)))
                  {:status 200 :body "ok"})
-               {:port 0 :http2 true :ssl-context (gen-server-context)
+               {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                 :http2-initial-window-bytes 65535})]
       (try
         (binding [*port* (enso/port srv)]
@@ -827,7 +827,7 @@
   (let [started (CountDownLatch. 1)
         srv (enso/run-server
              (fn [req] (.countDown started) {:status 200 :body (slurp (:body req))})
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :shutdown-timeout 5000})]
     (binding [*port* (enso/port srv)]
       (with-conn [conn]
@@ -863,7 +863,7 @@
                    (.countDown blocking)
                    (.await release 10 TimeUnit/SECONDS))
                  {:status 200 :body (some-> (:body req) slurp)})
-               {:port 0 :http2 true :ssl-context (gen-server-context)
+               {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                 :http2-max-concurrent-streams 1
                 :http2-initial-window-bytes 65535})]
       (try
@@ -951,7 +951,7 @@
                  (.countDown started)
                  (deliver p (read-twice (:body req)))
                  {:status 200 :body "ok"})
-               {:port 0 :http2 true :ssl-context (gen-server-context)
+               {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                 :max-request-body-bytes 1000})]
       (try
         (binding [*port* (enso/port srv)]
@@ -1133,7 +1133,7 @@
   (let [payload (byte-array (* 32 1024 1024))]
     (let [srv (enso/run-server
                (fn [_] {:status 200 :body payload})
-               {:port 0 :http2 true :ssl-context (gen-server-context)
+               {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                 :write-timeout 500})]
       (try
         (binding [*port* (enso/port srv)]
@@ -1191,7 +1191,7 @@
                                         (when (pos? (.getCount l)) (recur)))))]
     (let [srv (enso/run-server
                (fn [_] (.release started) (await-ignoring-interrupts release) {:status 200 :body "ok"})
-               {:port 0 :http2 true :ssl-context (gen-server-context)
+               {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                 :http2-max-concurrent-streams 2})]
       (try
         (binding [*port* (enso/port srv)]
@@ -1217,7 +1217,7 @@
   ;; budget is (budget refills at limit per 30 s).
   (let [srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :http2-stream-reset-limit 30})]
     (try
       (binding [*port* (enso/port srv)]
@@ -1246,7 +1246,7 @@
   ;; than it (quiet SSE, slow backend) must still get its response out.
   (let [srv (enso/run-server
              (fn [_] (Thread/sleep 1500) {:status 200 :body "slow"})
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :idle-timeout 500})]
     (try
       (binding [*port* (enso/port srv)]
@@ -1260,7 +1260,7 @@
   ;; hold the connection open forever.
   (let [srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :idle-timeout 300})]
     (try
       (binding [*port* (enso/port srv)]
@@ -1278,7 +1278,7 @@
 (deftest h2-idle-connection-closed-with-goaway
   (let [srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :idle-timeout 500})]
     (try
       (binding [*port* (enso/port srv)]
@@ -1295,7 +1295,7 @@
   (let [started (CountDownLatch. 1)
         srv (enso/run-server
              (fn [_] (.countDown started) (Thread/sleep 500) {:status 200 :body "done"})
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :shutdown-timeout 5000})]
     (binding [*port* (enso/port srv)]
       (with-conn [conn]
@@ -1435,7 +1435,7 @@
                  {:status 200
                   :body (proxy [java.io.ByteArrayInputStream] [(.getBytes "late")]
                           (close [] (deliver closed true)))})
-               {:port 0 :http2 true :ssl-context (gen-server-context)
+               {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                 :handler-timeout 200})]
       (try
         (binding [*port* (enso/port srv)]
@@ -1616,7 +1616,7 @@
   ;; One head limit for every protocol: SETTINGS_MAX_HEADER_LIST_SIZE
   ;; advertises :max-header-bytes.
   (let [srv (enso/run-server (fn [_] {:status 200 :body "ok"})
-                             {:port 0 :http2 true :ssl-context (gen-server-context)
+                             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                               :max-header-bytes 16384})]
     (try
       (binding [*port* (enso/port srv)]
@@ -1633,7 +1633,7 @@
   (let [ran (atom 0)
         srv (enso/run-server
              (fn [req] (swap! ran inc) (slurp (:body req)) {:status 200 :body "ok"})
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :max-request-body-bytes 1000})]
     (try
       (binding [*port* (enso/port srv)]
@@ -1662,7 +1662,7 @@
         release (CountDownLatch. 1)
         srv (enso/run-server
              (fn [_] (.countDown started) (.await release 5 TimeUnit/SECONDS) {:status 200 :body "ok"})
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :max-request-body-bytes 1000 :http2-initial-window-bytes 65535})]
     (try
       (binding [*port* (enso/port srv)]
@@ -1719,7 +1719,7 @@
   ;; HTTP/1.1.
   (let [srv (enso/run-server
              (fn [req] (when (= "/boom" (:uri req)) (throw (ex-info "boom" {}))))
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :error-handler (fn [_ t] {:status 418 :body (.getSimpleName (class t))})})]
     (try
       (binding [*port* (enso/port srv)]
@@ -1756,7 +1756,7 @@
   ;; however the bytes trickle in; :idle-timeout doesn't apply yet.
   (let [srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0 :http2 true :ssl-context (gen-server-context)
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
               :handshake-timeout 500 :idle-timeout 30000})]
     (try
       (binding [*port* (enso/port srv)]
@@ -2267,7 +2267,7 @@
                  (.countDown started)
                  (.await release 5 TimeUnit/SECONDS))
                {:status 200 :body "ok"})
-             {:port 0 :http2 true :ssl-context (gen-server-context) :shutdown-timeout 5000})]
+             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context) :shutdown-timeout 5000})]
     (binding [*port* (enso/port srv)]
       (with-conn [conn]
         (send-request! conn 1 (request-headers "GET" "/slow") true)
@@ -2386,7 +2386,7 @@
                  (requestCompleted [_ _ _ _ _ _ _] (.countDown ^CountDownLatch @current)))
         n 2000
         input (h2-alloc-input n)
-        srv (enso/run-server (fn [_] resp) {:port 0 :http2 true :ssl-context (gen-server-context)
+        srv (enso/run-server (fn [_] resp) {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                                             :http2-max-concurrent-streams 4096
                                             :server-events events})]
     (try
@@ -2410,7 +2410,7 @@
                  (requestCompleted [_ _ _ _ _ _ _] (.countDown ^CountDownLatch @current)))
         n 2000
         input (h2-alloc-input n)
-        srv (enso/run-server (fn [_] {:status 200}) {:port 0 :http2 true :ssl-context (gen-server-context)
+        srv (enso/run-server (fn [_] {:status 200}) {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)
                                                      :http2-max-concurrent-streams 4096
                                                      :server-events events})]
     (try
@@ -2619,7 +2619,7 @@
                                (try (.await (CountDownLatch. 1))
                                     (catch InterruptedException _ (Thread/sleep 50) (deliver exited :interrupted)))
                                {:status 200 :body "late"})
-                             {:port 0 :http2 true :ssl-context (gen-server-context) :shutdown-timeout 1000})]
+                             {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context) :shutdown-timeout 1000})]
     (binding [*port* (enso/port srv)]
       (let [conn (h2-connect!)]
         (try
@@ -2844,10 +2844,46 @@
 (defmacro ^:private with-server-instance
   "Like with-server, binding `srv` to the running server."
   [[srv handler opts] & body]
-  `(let [~srv (enso/run-server ~handler (merge {:port 0 :http2 true :ssl-context (gen-server-context)} ~opts))]
+  `(let [~srv (enso/run-server ~handler (merge {:host "127.0.0.1" :port 0 :http2 true :ssl-context (gen-server-context)} ~opts))]
      (try
        (binding [*port* (enso/port ~srv)] ~@body)
        (finally (enso/stop ~srv)))))
+
+(deftest h2-handlers-interrupted-by-a-reset-log-at-fine
+  ;; A reset stream's handler, or the producer of its streamed body, is
+  ;; interrupted by the server, which gave up on the exchange: the
+  ;; InterruptedException that follows is expected, logged at FINE as on
+  ;; every protocol, not as a handler bug.
+  ;; Rate limiters are per call site and JVM-wide: let windows opened by
+  ;; earlier tests pass.
+  (Thread/sleep 1100)
+  (let [started (CountDownLatch. 2)
+        done (CountDownLatch. 2)
+        idle (fn [] (try (Thread/sleep 10000) (finally (.countDown done))))
+        records (support/capture-logs
+                 "com.s_exp.enso"
+                 #(with-server-instance [_ (fn [req]
+                                             (if (= "/stream" (:uri req))
+                                               {:status 200
+                                                :body (fn [^com.s_exp.enso.api.ChunkedWriter w]
+                                                        (.write w "x")
+                                                        (.flush w)
+                                                        (.countDown started)
+                                                        (idle))}
+                                               (do (.countDown started) (idle) {:status 200 :body "late"})))
+                                         {}]
+                    (with-conn [conn]
+                      (send-request! conn 1 (request-headers "GET" "/handler") true)
+                      (send-request! conn 3 (request-headers "GET" "/stream") true)
+                      (is (.await started 5 TimeUnit/SECONDS))
+                      (write-frame! conn frame-rst 0 1 (u32-bytes 0x8))
+                      (write-frame! conn frame-rst 0 3 (u32-bytes 0x8))
+                      (is (.await done 5 TimeUnit/SECONDS))
+                      (ping-round-trip! conn))))
+        fine (support/records-at records java.util.logging.Level/FINE)]
+    (is (empty? (support/records-at records java.util.logging.Level/WARNING)))
+    (is (some #{"unhandled handler exception"} fine) (pr-str fine))
+    (is (some #{"HTTP/2 response body failed"} fine) (pr-str fine))))
 
 (deftest h2-idle-connection-gives-back-its-buffers
   ;; A connection quiet for a second keeps only what it needs to wait:
@@ -3127,6 +3163,74 @@
                   (read-until conn #(pos? (conn-credit [%])) seen 3000)
                   (is (pos? (conn-credit @seen)) "more once the other connection's bodies were read"))))))))))
 
+(deftest h2-exhausted-budget-gives-back-the-initial-window
+  ;; With the budget exhausted a connection keeps the RFC's initial
+  ;; window of 65535 octets, given back as its handler reads it, at the
+  ;; default stream window too: credit isn't held for a batch of half a
+  ;; stream window (128 KiB) that 65535 octets of credit never deliver.
+  ;; Otherwise a connection opened while others hold the budget stalls
+  ;; until its read times out (408).
+  (let [release-hogs (CountDownLatch. 1)
+        read-all (promise)]
+    (with-server-instance [srv (fn [req]
+                                 (when (= "/hog" (:uri req))
+                                   (.await release-hogs 10 TimeUnit/SECONDS))
+                                 (let [n (count (slurp (:body req)))]
+                                   (when (= "/up" (:uri req)) (deliver read-all n))
+                                   {:status 200 :body (str n)}))
+                           {:max-buffered-bytes 100000}]
+      (try
+        (with-conn [hog-1]
+          (with-conn [hog-2]
+            ;; Two connections fill their initial windows with bodies
+            ;; their handlers don't read yet: more than the budget.
+            (doseq [hog [hog-1 hog-2]]
+              (send-request! hog 1 (request-headers "POST" "/hog") false)
+              (send-data! hog 1 65535 false)
+              (ping-round-trip! hog))
+            (is (.exhausted (budget-of srv)))
+            (with-conn [conn]
+              (send-request! conn 1 (request-headers "POST" "/up") false)
+              (send-data! conn 1 65535 false)
+              (let [seen (atom [])]
+                (read-until conn #(pos? (conn-credit [%])) seen 3000)
+                (is (pos? (conn-credit @seen)) "credit for the octets the handler read"))
+              (send-data! conn 1 1 true)
+              (is (= 65536 (deref read-all 5000 nil))))))
+        (finally (.countDown release-hogs))))))
+
+(deftest h2-body-clocks-pause-while-the-peer-has-no-connection-credit
+  ;; A client with no connection credit left can't send: its body isn't
+  ;; late. Here the budget is exhausted, so the connection keeps the
+  ;; RFC's 65535 octets, all held by a handler that doesn't read yet;
+  ;; another stream's handler waits for its body past :read-timeout
+  ;; without a 408, and gets it once credit comes back.
+  (let [release-hold (CountDownLatch. 1)]
+    (with-server-instance [srv (fn [req]
+                                 (if (= "/hold" (:uri req))
+                                   (do (.await release-hold 10 TimeUnit/SECONDS)
+                                       {:status 200 :body (str (alength (.readNBytes ^java.io.InputStream (:body req) 65535)))})
+                                   {:status 200 :body (str (count (slurp (:body req))))}))
+                           {:max-buffered-bytes (* 1024 1024) :read-timeout 300}]
+      (let [budget (budget-of srv)]
+        (.charge budget (.limit budget))
+        (try
+          (with-conn [conn]
+            (send-request! conn 1 (request-headers "POST" "/hold") false)
+            (send-data! conn 1 65535 false)
+            (send-request! conn 3 (request-headers "POST" "/up") false)
+            (let [seen (atom [])]
+              (read-until conn (constantly false) seen 1000)
+              (is (not-any? #(= 3 (:sid %)) @seen) "no response while the client can't send")
+              (.countDown release-hold)
+              (read-until conn #(pos? (conn-credit [%])) seen 3000)
+              (is (pos? (conn-credit @seen)) "credit once the held body was read"))
+            (send-data! conn 3 1000 true)
+            (is (= "200" (get (response-on conn 3) ":status"))))
+          (finally
+            (.countDown release-hold)
+            (.release budget (.limit budget))))))))
+
 ;; ---- Receive window autotuning ---------------------------------------------------
 
 (defn- ack-settings-after!
@@ -3401,13 +3505,13 @@
             (is (not-any? #(= frame-ping (:type %)) (upload! sid)) "no PING within the first second"))
           (Thread/sleep 1100)
           (let [seen (atom (upload! 7))]
-          (read-until conn (end-stream-on 7) seen)
-          (let [pings (filter #(and (= frame-ping (:type %)) (zero? (bit-and 0x1 (:flags %)))) @seen)]
-            (is (= 1 (count pings)) "one PING with the returned credit")
-            (Thread/sleep 400)
-            (write-frame! conn frame-ping 0x1 0 (:payload (first pings)))
-            (ping-round-trip! conn)
-            (is (< first-rtt (long (field-of h2 "smoothedRttNanos"))) "the slower round trip counts"))))))))
+            (read-until conn (end-stream-on 7) seen)
+            (let [pings (filter #(and (= frame-ping (:type %)) (zero? (bit-and 0x1 (:flags %)))) @seen)]
+              (is (= 1 (count pings)) "one PING with the returned credit")
+              (Thread/sleep 400)
+              (write-frame! conn frame-ping 0x1 0 (:payload (first pings)))
+              (ping-round-trip! conn)
+              (is (< first-rtt (long (field-of h2 "smoothedRttNanos"))) "the slower round trip counts"))))))))
 
 (deftest h2-response-rings-are-charged-to-the-memory-budget
   ;; Streamed response bytes waiting in a stream's ring are held for a peer
@@ -3455,7 +3559,7 @@
   (^com.s_exp.enso.EnsoServer [handler] (h2c-server handler identity))
   (^com.s_exp.enso.EnsoServer [handler configure]
    (let [->response @#'enso/->response
-         b (doto (com.s_exp.enso.api.Config$Builder.) (.port 0) (.http2c true))
+         b (doto (com.s_exp.enso.api.Config$Builder.) (.host "127.0.0.1") (.port 0) (.http2c true))
          _ (configure b)
          srv (com.s_exp.enso.EnsoServer.
               (reify com.s_exp.enso.api.RingHandler

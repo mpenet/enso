@@ -21,7 +21,7 @@
 (defn- with-server
   ([handler f] (with-server handler nil f))
   ([handler opts f]
-   (let [srv (enso/run-server handler (merge {:port 0} opts))]
+   (let [srv (enso/run-server handler (merge {:host "127.0.0.1" :port 0} opts))]
      (try
        (binding [*server* {:server srv :port (enso/port srv)}]
          (f))
@@ -514,7 +514,7 @@
                (.countDown start-latch)
                (.await release-latch 2 java.util.concurrent.TimeUnit/SECONDS)
                {:status 200 :body "done"})
-             {:port 0 :shutdown-timeout 3000})
+             {:host "127.0.0.1" :port 0 :shutdown-timeout 3000})
         port (enso/port srv)
         result (promise)
         client (Thread/ofVirtual)]
@@ -545,7 +545,7 @@
   ;; Concurrent reader avoids losing the 408 to a TCP RST when the server closes mid-write.
   (let [srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0 :idle-timeout 5000 :header-timeout 500})]
+             {:host "127.0.0.1" :port 0 :idle-timeout 5000 :header-timeout 500})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (let [out (.getOutputStream sock)
@@ -694,7 +694,7 @@
 (deftest tls-basic-get
   (let [srv (enso/run-server
              (fn [req] {:status 200 :body (str "hello " (name (:request-method req)))})
-             {:port 0 :ssl-context (generate-self-signed-context)})]
+             {:host "127.0.0.1" :port 0 :ssl-context (generate-self-signed-context)})]
     (try
       (let [factory (.getSocketFactory (trust-all-context))]
         (with-open [sock (.createSocket factory "127.0.0.1" (int (enso/port srv)))]
@@ -714,7 +714,7 @@
 (deftest tls-request-scheme-https
   (let [srv (enso/run-server
              (fn [req] {:status 200 :body (name (:scheme req))})
-             {:port 0 :ssl-context (generate-self-signed-context)})]
+             {:host "127.0.0.1" :port 0 :ssl-context (generate-self-signed-context)})]
     (try
       (let [factory (.getSocketFactory (trust-all-context))]
         (with-open [sock (.createSocket factory "127.0.0.1" (int (enso/port srv)))]
@@ -736,7 +736,7 @@
                                  ^"[Ljava.nio.file.OpenOption;" (make-array java.nio.file.OpenOption 0))
       (let [srv (enso/run-server
                  (fn [_] {:status 200 :body f})
-                 {:port 0 :ssl-context (generate-self-signed-context)})]
+                 {:host "127.0.0.1" :port 0 :ssl-context (generate-self-signed-context)})]
         (try
           (let [factory (.getSocketFactory (trust-all-context))]
             (with-open [sock (.createSocket factory "127.0.0.1" (int (enso/port srv)))]
@@ -782,7 +782,7 @@
 (deftest error-handler-custom-response
   (let [srv (enso/run-server
              (fn [_] (throw (ex-info "boom" {:code :bad-data})))
-             {:port 0
+             {:host "127.0.0.1" :port 0
               :error-handler (fn [req t]
                                {:status 502
                                 :headers {"content-type" "text/plain"}
@@ -803,7 +803,7 @@
 (deftest error-handler-throws-falls-back-500
   (let [srv (enso/run-server
              (fn [_] (throw (RuntimeException. "orig")))
-             {:port 0
+             {:host "127.0.0.1" :port 0
               :error-handler (fn [_ _] (throw (RuntimeException. "eh boom")))})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
@@ -819,7 +819,7 @@
 (deftest error-handler-returns-nil-falls-back-500
   (let [srv (enso/run-server
              (fn [_] (throw (RuntimeException. "boom")))
-             {:port 0 :error-handler (fn [_ _] nil)})]
+             {:host "127.0.0.1" :port 0 :error-handler (fn [_ _] nil)})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (let [out (.getOutputStream sock)
@@ -872,6 +872,36 @@
           warnings (filter #(= java.util.logging.Level/WARNING (.getLevel ^java.util.logging.LogRecord %)) records)]
       (is (<= 1 (count warnings) 2) (str (count warnings) " warnings for 20 failures")))))
 
+(deftest handlers-interrupted-by-the-handler-timeout-log-at-fine
+  ;; :handler-timeout answered 503 and interrupted the handler: the
+  ;; InterruptedException that follows is expected, logged at FINE as on
+  ;; every protocol. A handler bug after the timeout stays a WARNING.
+  (Thread/sleep 1100)
+  (let [records (capture-logs "com.s_exp.enso"
+                              #(with-server
+                                 (fn [_] (Thread/sleep 10000) {:status 200 :body "late"})
+                                 {:handler-timeout 200}
+                                 (fn []
+                                   (is (= 503 (:status (get! "/"))))
+                                   (Thread/sleep 200))))
+        fine (keep (fn [^java.util.logging.LogRecord r]
+                     (when (= java.util.logging.Level/FINE (.getLevel r)) (.getMessage r)))
+                   records)]
+    (is (not-any? #(= java.util.logging.Level/WARNING (.getLevel ^java.util.logging.LogRecord %)) records)
+        (pr-str (map #(.getMessage ^java.util.logging.LogRecord %) records)))
+    (is (some #{"unhandled handler exception"} fine) (pr-str fine)))
+  (Thread/sleep 1100)
+  (let [records (capture-logs "com.s_exp.enso"
+                              #(with-server
+                                 (fn [_]
+                                   (try (Thread/sleep 10000)
+                                        (catch InterruptedException _ (throw (IllegalStateException. "bug")))))
+                                 {:handler-timeout 200}
+                                 (fn []
+                                   (is (= 503 (:status (get! "/"))))
+                                   (Thread/sleep 200))))]
+    (is (some #(= java.util.logging.Level/WARNING (.getLevel ^java.util.logging.LogRecord %)) records))))
+
 (deftest inputstream-body-exact-content-length
   (with-server
     (fn [_] {:status 200
@@ -920,7 +950,7 @@
 (deftest request-body-size-cap-content-length
   (let [srv (enso/run-server
              echo-handler
-             {:port 0 :max-request-body-bytes 100})]
+             {:host "127.0.0.1" :port 0 :max-request-body-bytes 100})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (let [out (.getOutputStream sock)
@@ -935,7 +965,7 @@
 (deftest request-body-size-cap-chunked
   (let [srv (enso/run-server
              echo-handler
-             {:port 0 :max-request-body-bytes 8})]
+             {:host "127.0.0.1" :port 0 :max-request-body-bytes 8})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (let [out (.getOutputStream sock)
@@ -1171,7 +1201,7 @@
 (deftest custom-max-header-bytes
   (let [srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0 :max-header-bytes 1024})]
+             {:host "127.0.0.1" :port 0 :max-header-bytes 1024})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (let [out (.getOutputStream sock)
@@ -1199,7 +1229,7 @@
 (deftest graceful-stop-closes-idle-keepalive
   (let [srv (enso/run-server
              (fn [_] {:status 200 :body "ok"})
-             {:port 0 :shutdown-timeout 3000})
+             {:host "127.0.0.1" :port 0 :shutdown-timeout 3000})
         port (enso/port srv)]
     (with-open [sock (Socket. "127.0.0.1" (int port))]
       (let [out (.getOutputStream sock)
@@ -1700,7 +1730,16 @@
         (fn []
           (let [r (get! "/")]
             (is (= 500 (:status r)) (pr-str status))
-            (is (str/includes? (:body r) ":status must be an integer") (pr-str status))))))))
+            (is (str/includes? (:body r) ":status must be an integer") (pr-str status)))))))
+  (testing "a response that isn't a map is a handler error naming what it is"
+    (doseq [[response class-name] [["ok" "java.lang.String"] [200 "java.lang.Long"] [[200 "ok"] "clojure.lang.PersistentVector"]]]
+      (with-server (fn [_] response)
+        {:error-handler (fn [_ t] {:status 500 :body (str (ex-message t))})}
+        (fn []
+          (let [r (get! "/")]
+            (is (= 500 (:status r)) (pr-str response))
+            (is (= (str "handler returned a " class-name ", not a Ring response map") (:body r))
+                (pr-str response))))))))
 
 (deftest write!-encodes-with-the-response-charset
   (with-server (fn [_] {:status 200
@@ -1733,6 +1772,28 @@
         (is (str/includes? (:body (get! "/")) "abc"))
         (is (= "com.s_exp.enso.api.ChunkedOutputStream" (.getName ^Class @seen)))))))
 
+(defrecord WriteAfterCloseBody [outcome]
+  ring.core.protocols/StreamableResponseBody
+  (write-body-to-stream [_ _ out]
+    (.write ^java.io.OutputStream out (.getBytes "kept" StandardCharsets/UTF_8))
+    (.close ^java.io.OutputStream out)
+    (reset! outcome (try (.write ^java.io.OutputStream out (.getBytes "late" StandardCharsets/UTF_8))
+                         (.flush ^java.io.OutputStream out)
+                         :written
+                         (catch java.io.IOException e (ex-message e))))))
+
+(deftest streamable-body-stream-refuses-writes-after-close
+  ;; A closed OutputStream refuses writes: nothing reaches the response
+  ;; after the body closed its stream. An asynchronous handler's response
+  ;; may be finishing on another thread by then.
+  (let [outcome (atom nil)]
+    (with-server (fn [_] {:status 200 :body (->WriteAfterCloseBody outcome)}) nil
+      (fn []
+        (let [body (:body (get! "/"))]
+          (is (str/includes? body "kept"))
+          (is (not (str/includes? body "late")) body)
+          (is (= "stream closed" @outcome)))))))
+
 (defrecord LaterBody [^String text]
   ring.core.protocols/StreamableResponseBody
   (write-body-to-stream [_ _ out]
@@ -1760,6 +1821,22 @@
         (let [r (get! "/")]
           (is (= 201 (:status r)))
           (is (= "later" (:body r)))))))
+  (testing "a throw after respond doesn't replace the response: only the first call counts"
+    (with-server (fn [_ respond _]
+                   (respond {:status 201 :body "responded"})
+                   (throw (ex-info "after respond" {})))
+      {:async true :error-handler (fn [_ t] {:status 502 :body (ex-message t)})}
+      (fn []
+        (let [r (get! "/")]
+          (is (= 201 (:status r)))
+          (is (= "responded" (:body r)))))))
+  (testing "a throw before respond is raised"
+    (with-server (fn [_ _ _] (throw (ex-info "before respond" {})))
+      {:async true :error-handler (fn [_ t] {:status 502 :body (ex-message t)})}
+      (fn []
+        (let [r (get! "/")]
+          (is (= 502 (:status r)))
+          (is (= "before respond" (:body r)))))))
   (testing "raise goes to the error handler"
     (with-server (fn [_ _ raise] (raise (ex-info "boom" {})))
       {:async true :error-handler (fn [_ t] {:status 502 :body (ex-message t)})}

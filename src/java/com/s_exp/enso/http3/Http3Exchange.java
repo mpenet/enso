@@ -35,7 +35,8 @@ import java.util.logging.Logger;
 final class Http3Exchange extends Http3Stream implements Runnable, SignalStack.Node<Http3Exchange> {
 
     private static final Logger LOG = Logger.getLogger(Http3Exchange.class.getName());
-    private static final LogLimiter BODY_FAILURES = new LogLimiter(LOG, Level.FINE);
+    private static final LogLimiter BODY_FAILURES = new LogLimiter(LOG, Level.WARNING);
+    private static final LogLimiter EXPECTED_BODY_FAILURES = new LogLimiter(LOG, Level.FINE);
     private static final LogLimiter INVALID_RESPONSES = new LogLimiter(LOG, Level.WARNING);
 
     private static final VarHandle EVENTS;
@@ -314,7 +315,7 @@ final class Http3Exchange extends Http3Stream implements Runnable, SignalStack.N
                 }
             }
         } catch (Throwable t) {
-            BODY_FAILURES.log("h3 response body failed stream=" + id, t);
+            (expectedFailure(t) ? EXPECTED_BODY_FAILURES : BODY_FAILURES).log("h3 response body failed stream=" + id, t);
             out.fail();
             if (t instanceof InterruptedException) Thread.currentThread().interrupt();
         }

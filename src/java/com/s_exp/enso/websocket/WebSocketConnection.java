@@ -35,8 +35,9 @@ import com.s_exp.enso.core.TlsSocket;
  * RFC 6455 WebSocket connection driver. Reads frames, dispatches events to a
  * {@link WebSocketListener}, and exposes a {@link WebSocketSocket} for
  * server-initiated sends. Continuation frames are reassembled into a single
- * text or binary message (bounded by {@code :ws-max-message-bytes}, and by
- * {@code :read-timeout} from its first frame); pings are auto-responded by
+ * text or binary message (bounded by {@code :ws-max-message-bytes}, by
+ * {@code :read-timeout} from its first frame, and by the memory budget, see
+ * {@link #awaitBudget}); pings are auto-responded by
  * the default listener implementation. Protocol violations fail the
  * connection with the matching CLOSE status (§7.1.7); a closing handshake
  * the server starts waits for the peer's CLOSE (up to
@@ -107,10 +108,10 @@ public final class WebSocketConnection {
     // Assembly buffers up to this many bytes are kept for the next
     // message; larger ones are released after each message.
     private static final int RETAIN_MAX = 256 * 1024;
-    // Message bytes past this many are charged to the memory budget while
-    // the message is assembled: up to it a connection's buffers are its
-    // own (bounded by :max-connections), and small messages cost no
-    // shared atomic.
+    // Message buffers past this many bytes are charged to the memory
+    // budget while they are held: up to it a connection's buffers are its
+    // own (bounded by :max-connections), so small messages cost no shared
+    // atomic and every connection can always read this far.
     private static final int UNCHARGED_MESSAGE_BYTES = READ_STEP;
     // Compressed output is sent in frames of at most this many bytes, so a
     // large message is compressed through a bounded buffer.
@@ -135,6 +136,9 @@ public final class WebSocketConnection {
     private static final int QUEUED_FRAME_OVERHEAD = 64;
 
     private static final byte[] EMPTY = new byte[0];
+    // Handed to listeners for empty pings and pongs: with no bytes, there
+    // is nothing a listener could change in it.
+    private static final ByteBuffer EMPTY_BUFFER = ByteBuffer.wrap(EMPTY);
     private static final String IDLE_TIMEOUT = "idle timeout";
     private static final byte[] IDLE_TIMEOUT_REASON = IDLE_TIMEOUT.getBytes(StandardCharsets.UTF_8);
     // A listener failure is answered with 1011 and this reason: its
@@ -205,6 +209,9 @@ public final class WebSocketConnection {
     // :max-buffered-bytes, charged for queued sends and large incoming
     // messages.
     private final MemoryBudget budget;
+    // Gives back the grown buffer of the output stream (shared with the
+    // HTTP/1.1 connection) while nothing is pending in it; or null.
+    private final Runnable releaseIdleOutput;
     // Drops TCP if the peer never answers a CLOSE the server sent.
     private final Timer.Task closeTimer = new Timer.Task() {
         @Override
@@ -314,15 +321,24 @@ public final class WebSocketConnection {
     private volatile boolean socketClosed;
     // The read loop's thread, unparked by budgetWaiter and forceClose.
     private volatile Thread readThread;
-    // Wakes the read loop when the memory budget has room; created on
-    // first use.
+    // Wakes the read loop when the memory budget has room or hands it the
+    // progress lane; created on first use.
     private MemoryBudget.Waiter budgetWaiter;
+    // The read loop holds the budget's progress lane (see awaitBudget).
+    private boolean holdsLane;
 
+    /**
+     * {@code releaseIdleOutput}, called under the write lock with nothing
+     * held in {@code out}, gives back what {@code out} grew to; may be
+     * null.
+     */
     public WebSocketConnection(Socket socket, InputStream in, OutputStream out,
                                WebSocketListener listener, Config config,
-                               PerMessageDeflate deflate, Timer timer, MemoryBudget budget) {
+                               PerMessageDeflate deflate, Timer timer, MemoryBudget budget,
+                               Runnable releaseIdleOutput) {
         this.timer = timer;
         this.budget = budget;
+        this.releaseIdleOutput = releaseIdleOutput;
         this.socket = socket;
         this.in = in;
         this.out = out;
@@ -389,20 +405,23 @@ public final class WebSocketConnection {
                 readFrames();
                 return;
             } catch (WebSocketException e) {
-                if (failed) {
-                    return;
+                // A second failure, while waiting for the peer's CLOSE,
+                // only ends the wait: the frame stream can't be trusted
+                // any more, so the rest is drained.
+                if (!failed) {
+                    failConnection(e.code(), e.getMessage(), e);
+                    if (resync()) {
+                        continue;
+                    }
                 }
-                failConnection(e.code(), e.getMessage(), e);
-                if (!resync()) {
-                    linger();
-                    return;
-                }
+                linger();
+                return;
             } catch (SocketTimeoutException e) {
                 // Mid-frame or mid-message: the message deadline passed.
-                if (failed || closeSent) {
-                    return;
+                // Once a CLOSE is out, it only ends the wait for the peer's.
+                if (!failed && !closeSent) {
+                    failConnection(CLOSE_POLICY_VIOLATION, "message timeout", e);
                 }
-                failConnection(CLOSE_POLICY_VIOLATION, "message timeout", e);
                 linger();
                 return;
             } catch (IOException e) {
@@ -485,7 +504,7 @@ public final class WebSocketConnection {
                     }
                 }
                 // The message is held until the listener returned.
-                reader.releaseBudget();
+                reader.settle();
             }
         }
     }
@@ -517,9 +536,7 @@ public final class WebSocketConnection {
                 }
                 // Copy so the listener can retain the buffer past the
                 // next readFrame (which overwrites controlIn).
-                byte[] copy = new byte[len];
-                System.arraycopy(controlIn, 0, copy, 0, len);
-                ByteBuffer bb = ByteBuffer.wrap(copy);
+                ByteBuffer bb = len == 0 ? EMPTY_BUFFER : ByteBuffer.wrap(Arrays.copyOf(controlIn, len));
                 try {
                     if (frame.opcode == OP_PING) listener.onPing(socketApi, bb);
                     else listener.onPong(socketApi, bb);
@@ -662,6 +679,9 @@ public final class WebSocketConnection {
     /** The read loop ended: release everything and report the close. */
     private void finish() {
         finished = true;
+        if (closeReceived && closeSent && !socketClosed) {
+            closeGracefully();
+        }
         forceClose();
         reader.releaseBudget();
         // retire: the wheel drops this connection on the next tick.
@@ -723,6 +743,21 @@ public final class WebSocketConnection {
     }
 
     /**
+     * The closing handshake completed: the server closes TCP first (RFC
+     * 6455 §7.1.1), over TLS after a close_notify, so the client can tell
+     * the end of the stream from a truncation. Nothing else writes once
+     * both CLOSE frames are out. Writing the close_notify may block on a
+     * peer that stopped reading: the close timer drops TCP then.
+     */
+    private void closeGracefully() {
+        timer.schedule(closeTimer, closeTimeoutMillis);
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+        }
+    }
+
+    /**
      * A write failed: TCP is dropped, since a partial frame can't be
      * followed by anything. The first failure before our CLOSE is kept
      * for finish to report and as the cause of later sends' failures; a
@@ -766,9 +801,14 @@ public final class WebSocketConnection {
     }
 
     /**
-     * Waits, between reads of a large message, while the memory budget is
-     * exhausted: not reading lets TCP push back on the peer. Bounded by the
-     * message deadline (a SocketTimeoutException, like a read).
+     * Waits, before a message buffer grows, while the memory budget is
+     * exhausted: not reading lets TCP push back on the peer. The budget
+     * limits growth, never progress: a message is delivered whole, so
+     * readers stopped mid-message would otherwise wait for each other.
+     * The reader holding the budget's progress lane grows past the limit
+     * until its message is delivered; the others wait for the lane or for
+     * room. The server holding the client back is not the client being
+     * slow: the message deadline moves by the time waited.
      */
     private void awaitBudget() throws IOException {
         if (outputHeld) {
@@ -787,25 +827,41 @@ public final class WebSocketConnection {
             };
             budgetWaiter = w;
         }
+        long start = System.nanoTime();
+        boolean waited = false;
         try {
             while (budget.exhausted()) {
-                if (socketClosed) {
-                    throw new EOFException("connection closed");
-                }
-                int timeout = messageReadTimeout();
-                if (!budget.await(w)) {
-                    // Already below the low-water mark.
+                if (budget.enterLane(w)) {
+                    holdsLane = true;
                     return;
                 }
-                if (timeout == 0) {
+                if (socketClosed || Thread.currentThread().isInterrupted()) {
+                    throw new EOFException("connection closed");
+                }
+                // Woken below the low-water mark or with the lane, never
+                // by a clock: the client isn't the one waited for.
+                if (budget.await(w)) {
+                    waited = true;
                     LockSupport.park(this);
-                } else {
-                    LockSupport.parkNanos(this, timeout * 1_000_000L);
                 }
             }
         } finally {
-            // Woken, timed out or closed: the budget forgets this reader.
+            // The budget forgets this reader, unless it holds the lane.
             budget.cancel(w);
+            if (!holdsLane) {
+                budget.leaveLane(w);
+            }
+            if (waited && deadlineStarted) {
+                deadlineNanos += System.nanoTime() - start;
+            }
+        }
+    }
+
+    /** Gives the progress lane up once the message that took it is done. */
+    private void leaveLane() {
+        if (holdsLane) {
+            holdsLane = false;
+            budget.leaveLane(budgetWaiter);
         }
     }
 
@@ -989,9 +1045,10 @@ public final class WebSocketConnection {
     /**
      * An idle connection keeps only small buffers: the read buffer shrinks,
      * message assembly, compression and staging buffers and the TLS record
-     * buffers are dropped (allocated again by the next message that needs
-     * them). The send side is only touched when no write is in progress: a
-     * writer stalled on the peer holds the lock.
+     * buffers are dropped, and the output stream gives back what it grew
+     * to (allocated again by the next message that needs them). The send
+     * side is only touched when no write is in progress: a writer stalled
+     * on the peer holds the lock.
      */
     private void releaseIdleBuffers() {
         if (rbuf.length > IDLE_READ_BUFFER_SIZE) {
@@ -1002,6 +1059,9 @@ public final class WebSocketConnection {
             try {
                 gatherOut = null;
                 deflateOut = EMPTY;
+                if (releaseIdleOutput != null && !outputHeld) {
+                    releaseIdleOutput.run();
+                }
                 if (socket instanceof TlsSocket.AdapterSocket tls) {
                     tls.tls().releaseIdleBuffers();
                 }
@@ -1151,9 +1211,10 @@ public final class WebSocketConnection {
     /** A frame queued for the writer thread. */
     private static final class Outgoing {
         final int opcode;
-        // Payload: array[offset..offset+length), or a direct buffer's
-        // remaining bytes. A pending PONG's array and length are replaced
-        // under queueLock until a writer takes it.
+        // Payload: array[offset..offset+length), or a buffer without an
+        // accessible array's bytes at [offset..offset+length). A pending
+        // PONG's array and length are replaced under queueLock until a
+        // writer takes it.
         byte[] array;
         final int offset;
         int length;
@@ -1226,8 +1287,10 @@ public final class WebSocketConnection {
 
     /**
      * Writes one frame (not flushed). The payload is {@code a[off..off+len)}
-     * or, when {@code direct} is non-null, its remaining bytes, read
-     * without moving its position. Data messages are compressed when
+     * or, when {@code direct} is non-null, its bytes at
+     * {@code [off..off+len)}, read with absolute gets: its position never
+     * moves, so one buffer may be sent by several threads at once. Data
+     * messages are compressed when
      * permessage-deflate is on and they are long enough. Caller holds
      * {@link #writeLock}.
      */
@@ -1254,14 +1317,14 @@ public final class WebSocketConnection {
         int h = putHeader(staging, FIN | opcode, len);
         int first = Math.min(len, staging.length - h);
         if (direct != null) {
-            direct.get(direct.position(), staging, h, first);
+            direct.get(off, staging, h, first);
         } else {
             System.arraycopy(a, off, staging, h, first);
         }
         out.write(staging, 0, h + first);
         if (direct != null) {
-            int pos = direct.position() + first;
-            int end = direct.position() + len;
+            int pos = off + first;
+            int end = off + len;
             while (pos < end) {
                 int n = Math.min(staging.length, end - pos);
                 direct.get(pos, staging, 0, n);
@@ -1286,7 +1349,7 @@ public final class WebSocketConnection {
         throws IOException {
         Deflater d = deflate.deflater();
         if (direct != null) {
-            d.setInput(direct.duplicate());
+            d.setInput(direct.slice(off, len));
         } else {
             d.setInput(a, off, len);
         }
@@ -1410,15 +1473,7 @@ public final class WebSocketConnection {
             }
             try {
                 writeFrameLocked(opcode, a, off, len, direct);
-                if (holdsOutput()) {
-                    if (!outputHeld) {
-                        outputHeld = true;
-                        timer.schedule(heldFlush, HELD_FLUSH_DELAY_MILLIS);
-                    }
-                } else {
-                    out.flush();
-                    outputHeld = false;
-                }
+                flushOrHold();
             } catch (IOException | RuntimeException e) {
                 writeFailed(e);
                 throw e;
@@ -1426,6 +1481,23 @@ public final class WebSocketConnection {
         } finally {
             writeLock.unlock();
             complete(written);
+        }
+    }
+
+    /**
+     * After a frame was written: flushes it, unless it may wait for the
+     * replies to the frames already read ({@link #holdsOutput}). Caller
+     * holds {@link #writeLock}.
+     */
+    private void flushOrHold() throws IOException {
+        if (holdsOutput()) {
+            if (!outputHeld) {
+                outputHeld = true;
+                timer.schedule(heldFlush, HELD_FLUSH_DELAY_MILLIS);
+            }
+        } else {
+            out.flush();
+            outputHeld = false;
         }
     }
 
@@ -1495,9 +1567,11 @@ public final class WebSocketConnection {
     }
 
     /**
-     * PING / PONG: written at once when no write is in progress, otherwise
-     * queued behind it, so neither the read loop's automatic pong nor a
-     * keep-alive ping ever waits for a stalled writer.
+     * PING / PONG: written at once when no write is in progress (held like
+     * a data frame, see {@link #flushOrHold}), otherwise queued behind it,
+     * so neither the read loop's automatic pong nor a keep-alive ping ever
+     * waits for a stalled writer. A pong finding one queued takes over its
+     * place (RFC 6455 §5.5.3): a ping flood leaves one, and costs nothing.
      */
     private void sendControl(int opcode, ByteBuffer data) throws IOException {
         int len = data == null ? 0 : data.remaining();
@@ -1521,7 +1595,7 @@ public final class WebSocketConnection {
                     }
                     writeHeader(FIN | opcode, len);
                     out.write(controlOut, 0, len);
-                    out.flush();
+                    flushOrHold();
                 } catch (IOException | RuntimeException e) {
                     writeFailed(e);
                     throw e;
@@ -1532,13 +1606,35 @@ public final class WebSocketConnection {
             }
             return;
         }
-        byte[] copy = len == 0 ? EMPTY : new byte[len];
+        if (opcode == OP_PONG && replacePendingPong(data, len)) {
+            return;
+        }
+        // A queued pong's array has room for any later payload.
+        byte[] copy = opcode == OP_PONG ? new byte[MAX_CONTROL_PAYLOAD] : len == 0 ? EMPTY : new byte[len];
         if (len > 0) {
             data.get(data.position(), copy, 0, len);
         }
         String rejected = enqueue(new Outgoing(opcode, copy, 0, len, null, null));
         if (rejected != null) {
             throw rejection(rejected);
+        }
+    }
+
+    /** Gives the queued PONG, if any, {@code data}'s payload; false when none is queued. */
+    private boolean replacePendingPong(ByteBuffer data, int len) {
+        queueLock.lock();
+        try {
+            Outgoing p = pendingPong;
+            if (p == null || !open || terminated) {
+                return false;
+            }
+            if (len > 0) {
+                data.get(data.position(), p.array, 0, len);
+            }
+            p.length = len;
+            return true;
+        } finally {
+            queueLock.unlock();
         }
     }
 
@@ -1753,6 +1849,8 @@ public final class WebSocketConnection {
      */
     private final class MessageReader {
         private static final int INITIAL = 4 * 1024;
+        // The LZ77 window of deflate (RFC 1951 §2).
+        private static final int WINDOW_BYTES = 32 * 1024;
         // A retained buffer is released after this many messages in a row
         // that used under a quarter of it.
         private static final int SHRINK_AFTER = 8;
@@ -1774,10 +1872,19 @@ public final class WebSocketConnection {
         private int smallMessages;
         // Text: the UTF-8 validation state after buf[0..len).
         private int utf8State;
-        // Bytes of this message charged to the memory budget.
+        // Bytes charged to the memory budget: what the scratch buffer holds
+        // past UNCHARGED_MESSAGE_BYTES, its capacity rather than the bytes
+        // read into it (see account).
         private long charged;
         // Compressed payload read off the wire, before inflating.
         private byte[] inflateIn;
+        // The inflater's LZ77 window, kept from the first final block on
+        // (see restartAfterFinalBlock): the last 32 KiB that compressed
+        // messages inflated to, and how much of this message's output it
+        // already holds. Protocol state: not released while idle.
+        private byte[] window;
+        private int windowLength;
+        private int windowMark;
 
         MessageReader(int limit) {
             this.limit = limit;
@@ -1789,12 +1896,14 @@ public final class WebSocketConnection {
             this.compressed = compressed;
             this.compressedSize = 0;
             this.len = 0;
+            this.windowMark = 0;
             this.utf8State = Utf8.ACCEPT;
             if (opcode == OP_BINARY && !compressed && fin
                 && firstFrameLength <= READ_STEP && firstFrameLength <= limit) {
                 // A single-frame binary message of trusted size gets its
                 // own exact array so finish() can hand it over without
-                // copying.
+                // copying. At most READ_STEP bytes, handed to the listener:
+                // part of the connection's uncharged allowance.
                 buf = firstFrameLength == 0 ? EMPTY : new byte[(int) firstFrameLength];
             } else {
                 buf = scratch;
@@ -1814,9 +1923,6 @@ public final class WebSocketConnection {
             long done = 0;
             while (remaining > 0) {
                 int step = (int) Math.min(remaining, READ_STEP);
-                if (len + step > UNCHARGED_MESSAGE_BYTES && budget.exhausted()) {
-                    awaitBudget();
-                }
                 ensureCapacity(len + step);
                 int from = len;
                 int n = readSome(buf, from, step);
@@ -1824,28 +1930,56 @@ public final class WebSocketConnection {
                 len += n;
                 done += n;
                 remaining -= n;
-                chargeGrowth();
                 if (opcode == OP_TEXT) {
                     validate(from, remaining);
                 }
             }
         }
 
-        /** Charges what the message holds past the uncharged allowance. */
-        private void chargeGrowth() {
-            long over = len - (long) UNCHARGED_MESSAGE_BYTES;
+        /**
+         * Charges, or gives back, the difference between what the scratch
+         * buffer holds past the uncharged allowance and what is charged. A
+         * shared atomic only when that changed.
+         */
+        private void account() {
+            long over = Math.max(0, scratch.length - UNCHARGED_MESSAGE_BYTES);
             if (over > charged) {
                 budget.charge(over - charged);
-                charged = over;
+            } else if (over < charged) {
+                budget.release(charged - over);
+            }
+            charged = over;
+        }
+
+        /**
+         * Before the message buffer grows to {@code capacity} bytes: past
+         * the uncharged allowance, waits while the budget is exhausted (see
+         * {@link #awaitBudget}). Reading into capacity already held never
+         * waits: the budget limits growth, never progress.
+         */
+        private void beforeGrowth(int capacity) throws IOException {
+            if (capacity - UNCHARGED_MESSAGE_BYTES > charged && !holdsLane && budget.exhausted()) {
+                awaitBudget();
             }
         }
 
-        /** Gives back what this message charged (delivered or dropped). */
+        /**
+         * The message was delivered or dropped: what stays charged is the
+         * buffer kept for the next message, and the progress lane is free
+         * for other readers.
+         */
+        void settle() {
+            account();
+            leaveLane();
+        }
+
+        /** The connection ended: gives back everything charged. */
         void releaseBudget() {
             if (charged > 0) {
                 budget.release(charged);
                 charged = 0;
             }
+            leaveLane();
         }
 
         private WebSocketException tooBig(long unreadFrameBytes) {
@@ -1879,9 +2013,6 @@ public final class WebSocketConnection {
             long remaining = frameLength;
             long done = 0;
             while (remaining > 0) {
-                if (len > UNCHARGED_MESSAGE_BYTES && budget.exhausted()) {
-                    awaitBudget();
-                }
                 int n = readSome(cin, 0, (int) Math.min(remaining, cin.length));
                 unmask(cin, 0, n, mask, done);
                 done += n;
@@ -1892,6 +2023,9 @@ public final class WebSocketConnection {
             if (fin) {
                 inflater.setInput(DEFLATE_TAIL);
                 inflate(inflater, DEFLATE_TAIL, DEFLATE_TAIL.length, false, 0);
+                if (window != null) {
+                    slideWindow();
+                }
             }
         }
 
@@ -1925,7 +2059,6 @@ public final class WebSocketConnection {
                 if (len > limit) {
                     throw tooBig(unreadFrameBytes);
                 }
-                chargeGrowth();
                 if (n == 0) {
                     if (!inflater.finished()) {
                         break;
@@ -1950,39 +2083,62 @@ public final class WebSocketConnection {
 
         /**
          * A new stream after a final block. Context takeover keeps the
-         * LZ77 window across it (RFC 7692 §7.2.3.4), so the window is
-         * restored as a preset dictionary from this message's output: up
-         * to 32 KiB, which covers back-references into this message;
-         * java.util.zip can't hand over what the window held of earlier
-         * messages.
+         * LZ77 window across it and across messages (RFC 7692 §7.2.3.4),
+         * so the window is restored as a preset dictionary.
+         * java.util.zip can't hand its own window over, so this reader
+         * keeps a copy from the first final block on, starting with that
+         * message's output. Clients flush with final blocks when their
+         * platform has no sync flush, so they do it from their first
+         * message; a client mixing both kinds of flush could refer back
+         * past the copy's start, and fails with 1007.
          */
         private void restartAfterFinalBlock(Inflater inflater) {
             inflater.reset();
-            int window = Math.min(len, 32 * 1024);
-            if (window > 0) {
-                inflater.setDictionary(buf, len - window, window);
+            if (window == null) {
+                window = new byte[WINDOW_BYTES];
             }
+            slideWindow();
+            if (windowLength > 0) {
+                inflater.setDictionary(window, 0, windowLength);
+            }
+        }
+
+        /** Adds this message's output not yet in the window, which keeps the last 32 KiB. */
+        private void slideWindow() {
+            int n = len - windowMark;
+            if (n >= WINDOW_BYTES) {
+                System.arraycopy(buf, len - WINDOW_BYTES, window, 0, WINDOW_BYTES);
+                windowLength = WINDOW_BYTES;
+            } else if (n > 0) {
+                int keep = Math.min(windowLength, WINDOW_BYTES - n);
+                System.arraycopy(window, windowLength - keep, window, 0, keep);
+                System.arraycopy(buf, windowMark, window, keep, n);
+                windowLength = keep + n;
+            }
+            windowMark = len;
         }
 
         /** Room for inflated output, up to one byte past the limit. */
-        private void growForInflate() {
+        private void growForInflate() throws IOException {
             int cap = (int) Math.min((long) limit + 1, Integer.MAX_VALUE);
-            int newLen = (int) Math.min(cap, Math.max(INITIAL, 2L * buf.length));
-            byte[] bigger = new byte[newLen];
-            System.arraycopy(buf, 0, bigger, 0, len);
-            buf = bigger;
-            scratch = bigger;
+            grow((int) Math.min(cap, Math.max(INITIAL, 2L * buf.length)));
         }
 
-        private void ensureCapacity(int needed) {
+        private void ensureCapacity(int needed) throws IOException {
             if (needed <= buf.length) {
                 return;
             }
-            int newLen = (int) Math.min(limit, Math.max(needed, Math.max(INITIAL, 2L * buf.length)));
-            byte[] bigger = new byte[newLen];
+            grow((int) Math.min(limit, Math.max(needed, Math.max(INITIAL, 2L * buf.length))));
+        }
+
+        /** Moves the message into a scratch buffer of {@code capacity} bytes, charged. */
+        private void grow(int capacity) throws IOException {
+            beforeGrowth(capacity);
+            byte[] bigger = new byte[capacity];
             System.arraycopy(buf, 0, bigger, 0, len);
             buf = bigger;
             scratch = bigger;
+            account();
         }
 
         Object finish() throws IOException {
@@ -2013,13 +2169,14 @@ public final class WebSocketConnection {
             len = 0;
             smallMessages = 0;
             inflateIn = null;
+            account();
         }
 
         /** Drops a message cut short by a failure or our CLOSE. */
         void abandon() {
             buf = scratch;
             len = 0;
-            releaseBudget();
+            settle();
         }
 
         // Keeps the assembly buffer for messages of a similar size, so a
@@ -2070,7 +2227,7 @@ public final class WebSocketConnection {
                 send(OP_BINARY, message.array(), message.arrayOffset() + message.position(),
                      message.remaining(), null);
             } else {
-                send(OP_BINARY, EMPTY, 0, message.remaining(), message);
+                send(OP_BINARY, EMPTY, message.position(), message.remaining(), message);
             }
         }
 
@@ -2088,7 +2245,8 @@ public final class WebSocketConnection {
                 sendAsync(new Outgoing(OP_BINARY, message.array(), message.arrayOffset() + message.position(),
                                        message.remaining(), null, callback));
             } else {
-                sendAsync(new Outgoing(OP_BINARY, EMPTY, 0, message.remaining(), message, callback));
+                sendAsync(new Outgoing(OP_BINARY, EMPTY, message.position(), message.remaining(), message,
+                                       callback));
             }
         }
 

@@ -1,5 +1,5 @@
 ;; ABOUTME: Shared helpers for the property, fuzz, soak and conformance namespaces:
-;; ABOUTME: self-signed certificates, trust-all TLS clients, shim detection, bounded waits.
+;; ABOUTME: self-signed certificates, trust-all TLS clients, shim detection, bounded waits, log capture.
 (ns s-exp.enso-test-support
   (:import (java.io File FileInputStream)
            (java.net DatagramSocket InetAddress)
@@ -107,3 +107,28 @@
         (if (or v (>= (System/currentTimeMillis) deadline))
           v
           (do (Thread/sleep poll-ms) (recur)))))))
+
+(defn capture-logs
+  "Runs `f` with every record of logger `logger-name` and its children
+  collected, at every level; returns the records."
+  [^String logger-name f]
+  (let [logger (java.util.logging.Logger/getLogger logger-name)
+        records (atom [])
+        handler (proxy [java.util.logging.Handler] []
+                  (publish [^java.util.logging.LogRecord r] (swap! records conj r))
+                  (flush [])
+                  (close []))
+        level (.getLevel logger)]
+    (.setLevel logger java.util.logging.Level/ALL)
+    (.addHandler logger handler)
+    (try
+      (f)
+      @records
+      (finally
+        (.removeHandler logger handler)
+        (.setLevel logger level)))))
+
+(defn records-at
+  "The messages of `records` logged at `level`."
+  [records level]
+  (keep (fn [^java.util.logging.LogRecord r] (when (= level (.getLevel r)) (.getMessage r))) records))

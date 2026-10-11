@@ -12,7 +12,7 @@
             [s-exp.enso-test-support :as support])
   (:import (com.s_exp.enso.api Config Response WebSocketException WebSocketListener WebSocketSocket
                                WebSocketSocket$SendCallback)
-           (com.s_exp.enso.core MemoryBudget Timer)
+           (com.s_exp.enso.core MemoryBudget MemoryBudget$Waiter Timer)
            (com.s_exp.enso.websocket PerMessageDeflate Utf8 WebSocketConnection ZlibPool)
            (java.io ByteArrayInputStream ByteArrayOutputStream DataInputStream EOFException
                     FilterInputStream InputStream SequenceInputStream)
@@ -44,7 +44,7 @@
       (.build)))
 
 (defn- with-ws-server [handler f]
-  (let [srv (enso/run-server handler {:port 0})]
+  (let [srv (enso/run-server handler {:host "127.0.0.1" :port 0})]
     (try
       (binding [*server* {:server srv :port (enso/port srv)}]
         (f))
@@ -392,7 +392,7 @@
                    (onError [_ _ t] (swap! events conj [:error t]))
                    (onClose [_ _ code reason] (swap! events conj [:close code reason])))
         conn (WebSocketConnection. (Socket.) in out listener (ws-config opts) deflate test-timer
-                                   (or budget (MemoryBudget. Long/MAX_VALUE)))]
+                                   (or budget (MemoryBudget. Long/MAX_VALUE)) nil)]
     (.run conn)
     {:frames (if sink (parse-frames (.toByteArray sink)) [])
      :events @events}))
@@ -457,6 +457,21 @@
         (is (= [expected] (server-close-codes r)) label)
         (is (= expected (second (close-event r))) label)
         (is (some #(= :error (first %)) (:events r)) label)))))
+
+(deftest ws-second-failure-still-lingers
+  ;; After a failure the server keeps reading until the client's CLOSE. A
+  ;; second failure on the way (here a broken frame after a 1009) can't
+  ;; resync any more, but closing with the client's bytes unread would
+  ;; reset the connection and could destroy the CLOSE: the server
+  ;; half-closes and drains instead, as after a first failure.
+  (let [unmasked (byte-array [(unchecked-byte 0x82) (byte 0x02) (byte 0x61) (byte 0x62)])
+        in (ByteArrayInputStream. (byte-array (concat (frames [0x2 true (byte-array 2000)])
+                                                      unmasked
+                                                      (repeat 20000 (byte 0x61)))))
+        r (run-ws in {:max-message 1024})]
+    (is (= [1009] (server-close-codes r)) "the first failure's CLOSE, once")
+    (is (= 1009 (second (close-event r))))
+    (is (zero? (.available in)) "what the client sent after was drained")))
 
 (deftest ws-frame-length-overflow-rejected
   ;; Fragment lengths summing past Integer/MAX_VALUE must not wrap the
@@ -745,7 +760,7 @@
                    (onError [_ _ _] (swap! events conj :error) (throw (RuntimeException. "error failed")))
                    (onClose [_ _ code _] (swap! events conj [:close code])))
         conn (WebSocketConnection. (Socket.) (ByteArrayInputStream. (byte-array 0)) out listener
-                                   (ws-config {}) nil test-timer (MemoryBudget. Long/MAX_VALUE))]
+                                   (ws-config {}) nil test-timer (MemoryBudget. Long/MAX_VALUE) nil)]
     (is (nil? (.run conn)))
     (is (= [1011] (mapv close-code (parse-frames (.toByteArray out)))))
     (is (= [:error [:close 1011]] @events))))
@@ -758,7 +773,7 @@
              (fn [_]
                {:ring.websocket/listener
                 {:on-close (fn [_ code reason] (deliver closed [code reason]))}})
-             {:port 0 :shutdown-timeout 5000})]
+             {:host "127.0.0.1" :port 0 :shutdown-timeout 5000})]
     (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
       (.setSoTimeout sock 8000)
       (let [[in ^java.io.OutputStream out] (ws-handshake! sock)
@@ -901,7 +916,7 @@
                  :on-close (fn [_ code reason]
                              (swap! events conj [:close code reason])
                              (.countDown closed))}})
-             {:port 0 :idle-timeout 300})]
+             {:host "127.0.0.1" :port 0 :idle-timeout 300})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (.setSoTimeout sock 3000)
@@ -927,7 +942,7 @@
   ;; silent client outlasts :idle-timeout. One that stops answering is
   ;; closed with 1001 once :idle-timeout passes.
   (let [srv (enso/run-server (fn [_] {:ring.websocket/listener {}})
-                             {:port 0 :ws-ping-interval 150 :idle-timeout 600})]
+                             {:host "127.0.0.1" :port 0 :ws-ping-interval 150 :idle-timeout 600})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (.setSoTimeout sock 3000)
@@ -971,7 +986,7 @@
                                      (.sendBinary s (.duplicate chunk))))
                                  (catch java.io.IOException _)))))
                  :on-close (fn [_ code _] (deliver closed code))}})
-             {:port 0 :write-timeout 300 :idle-timeout 0})]
+             {:host "127.0.0.1" :port 0 :write-timeout 300 :idle-timeout 0})]
     (try
       (with-open [sock (doto (Socket.) (.setReceiveBufferSize 4096))]
         (.connect sock (java.net.InetSocketAddress. "127.0.0.1" (int (enso/port srv))))
@@ -1114,6 +1129,33 @@
     (is (= :sent (:first @outcome)))
     (is (= [0x1 0x2 0x8] (mapv :opcode (:frames r))))))
 
+(deftest ws-async-binary-sends-take-the-bytes-remaining-at-the-call
+  ;; An asynchronous binary send takes the bytes between the buffer's
+  ;; position and limit at the call, for heap and direct buffers alike:
+  ;; moving its position afterwards (reusing the buffer, or reading it
+  ;; elsewhere) doesn't change what is sent.
+  (doseq [[label ^ByteBuffer bb] [["heap" (ByteBuffer/allocate 8)] ["direct" (ByteBuffer/allocateDirect 8)]]]
+    (dotimes [i 8] (.put bb (byte (inc i))))
+    (.flip bb)
+    (let [armed (atom false)
+          blocked (CountDownLatch. 1)
+          gate (CountDownLatch. 1)
+          sink (ByteArrayOutputStream.)
+          sent (promise)
+          r (run-ws-bytes (frames [0x8 true (close-payload 1000 "")])
+                          {:out (gated-output sink armed blocked gate)
+                           :sink sink
+                           :on-open (fn [^WebSocketSocket s]
+                                      (stall-writer! s armed blocked)
+                                      (.sendBinaryAsync s bb (callback sent))
+                                      (.position bb 6)
+                                      (reset! armed false)
+                                      (.countDown gate)
+                                      (deref sent 2000 :timed-out))})]
+      (is (= :sent (deref sent 0 :none)) label)
+      (is (= [1 2 3 4 5 6 7 8] (:payload (second (:frames r)))) label)
+      (is (= 6 (.position bb)) (str label ": the buffer's position is the caller's")))))
+
 (deftest ws-writer-thread-ends-when-idle
   ;; The writer thread of asynchronous sends doesn't stay parked for the
   ;; connection's lifetime: it ends once idle, and the next asynchronous
@@ -1154,6 +1196,18 @@
     (is (= [[0x1 "stalled"] [0xA "p199"] [0x8 nil]]
            (mapv (fn [f] [(:opcode f) (when-not (= 0x8 (:opcode f)) (frame-text f))]) (:frames r))))))
 
+(deftest ws-empty-pings-and-pongs-allocate-nothing
+  ;; Keep-alive pings and the pongs answering the server's own pings are
+  ;; empty: dispatching and answering them allocates nothing per frame.
+  (let [n 10000
+        input (apply frames (concat (repeat n [0x9 true (byte-array 0)]) (repeat n [0xA true (byte-array 0)])))
+        in (ByteArrayInputStream. input)
+        before (thread-allocated-bytes)
+        r (run-ws in {:out (java.io.OutputStream/nullOutputStream)})
+        allocated (- (thread-allocated-bytes) before)]
+    (is (= 1006 (second (close-event r))))
+    (is (< allocated (* 2 n 4)) (str "allocated " allocated " bytes for " (* 2 n) " frames"))))
+
 (defn- flush-counting-output
   "An OutputStream into `sink` that calls `on-flush` on every flush."
   ^java.io.OutputStream [^ByteArrayOutputStream sink on-flush]
@@ -1175,6 +1229,17 @@
                          :sink sink
                          :on-message (fn [^WebSocketSocket s m] (.sendText s ^String m))})]
     (is (= msgs (mapv frame-text (:frames r))))
+    (is (= 1 @flushes))))
+
+(deftest ws-pongs-to-buffered-pings-share-a-flush
+  ;; Pongs answering pings that arrived together go out in one write, as
+  ;; replies to buffered messages do.
+  (let [sink (ByteArrayOutputStream.)
+        flushes (atom 0)
+        r (run-ws-bytes (apply frames (map #(vector 0x9 true (utf8 (str "p" %))) (range 20)))
+                        {:out (flush-counting-output sink #(swap! flushes inc))
+                         :sink sink})]
+    (is (= (mapv #(str "p" %) (range 20)) (mapv frame-text (:frames r))))
     (is (= 1 @flushes))))
 
 (deftest ws-held-reply-does-not-wait-for-the-next-listener
@@ -1222,7 +1287,7 @@
                    (onError [_ _ _])
                    (onClose [_ _ _ _]))
         conn (WebSocketConnection. (Socket.) in (flush-counting-output sink #(.countDown flushed)) listener
-                                   (ws-config {}) nil timer (MemoryBudget. Long/MAX_VALUE))
+                                   (ws-config {}) nil timer (MemoryBudget. Long/MAX_VALUE) nil)
         ^ReentrantLock lock (.get (doto (.getDeclaredField WebSocketConnection "writeLock")
                                     (.setAccessible true))
                                   conn)
@@ -1381,39 +1446,132 @@
     (is (zero? (.used budget)) "given back once written")
     (is (= [0x1 0x2 0x8] (mapv :opcode (:frames r))))))
 
+(defn- lane-holder
+  "A waiter to hold a budget's progress lane with."
+  ^MemoryBudget$Waiter []
+  (proxy [MemoryBudget$Waiter] [] (budgetAvailable [])))
+
 (deftest ws-incoming-messages-are-charged-to-the-server-budget
-  ;; Message bytes past the first 64 KiB count against :max-buffered-bytes
-  ;; while the message is assembled. While the budget is exhausted the
-  ;; read loop stops reading (TCP pushes back) until bytes are released,
-  ;; within the message deadline.
-  (testing "reading waits for room, then the message completes"
-    (let [budget (MemoryBudget. 100000)
-          size 200000
-          input (frames [0x2 true (byte-array size)] [0x8 true (close-payload 1000 "")])
-          delivered (promise)
-          used-during (atom nil)
-          _ (.charge budget 100000)
-          done (future (run-ws-bytes input {:budget budget
-                                            :on-message (fn [_ ^ByteBuffer m]
-                                                          (reset! used-during (.used budget))
-                                                          (deliver delivered (.remaining m)))}))]
-      (is (= :waiting (deref delivered 300 :waiting)) "paused while the budget is exhausted")
-      (.release budget 100000)
-      (is (= size (deref delivered 2000 :timed-out)))
-      (is (= (- size 65536) @used-during) "past the first 64 KiB, charged until the listener returns")
-      (is (not= :timed-out (deref done 2000 :timed-out)))
-      (is (zero? (.used budget)) "released once delivered")))
-  (testing "a message that can't get room within :read-timeout fails with 1008"
-    (let [budget (doto (MemoryBudget. 100000) (.charge 100000))
-          r (run-ws-bytes (frames [0x2 true (byte-array 200000)]) {:budget budget :read-timeout 300})]
-      (is (= [1008] (server-close-codes r)))
-      (is (= 100000 (.used budget)) "what the message held was released"))))
+  ;; Message buffers past the first 64 KiB count against
+  ;; :max-buffered-bytes while the message is assembled. While the budget
+  ;; is exhausted and another reader holds the progress lane, the read
+  ;; loop stops reading (TCP pushes back) until there is room.
+  (let [budget (MemoryBudget. 100000)
+        holder (lane-holder)
+        size 200000
+        input (frames [0x2 true (byte-array size)] [0x8 true (close-payload 1000 "")])
+        delivered (promise)
+        used-during (atom nil)
+        _ (.charge budget 100000)
+        _ (.enterLane budget holder)
+        done (future (run-ws-bytes input {:budget budget
+                                          :on-message (fn [_ ^ByteBuffer m]
+                                                        (reset! used-during (.used budget))
+                                                        (deliver delivered (.remaining m)))}))]
+    (is (= :waiting (deref delivered 300 :waiting)) "paused while the budget is exhausted")
+    (.release budget 100000)
+    (is (= size (deref delivered 2000 :timed-out)) "resumed once there is room")
+    (is (= (- 262144 65536) @used-during) "its 256 KiB buffer past the first 64 KiB, until the listener returns")
+    (is (not= :timed-out (deref done 2000 :timed-out)))
+    (.leaveLane budget holder)
+    (is (zero? (.used budget)) "released once the connection ended")))
+
+(deftest ws-message-buffers-are-charged-what-they-hold
+  ;; A message buffer holds its capacity, not the bytes read into it so
+  ;; far: growth by doubling is charged whole, and a buffer kept for the
+  ;; next message stays charged while it is kept.
+  (let [budget (MemoryBudget. Long/MAX_VALUE)
+        used (atom [])
+        r (run-ws-bytes (frames [0x2 true (byte-array 100000)] [0x1 true (utf8 "x")])
+                        {:budget budget :on-message (fn [_ _] (swap! used conj (.used budget)))})]
+    (is (= 1006 (second (close-event r))))
+    (is (= [(- 131072 65536) (- 131072 65536)] @used) "a 128 KiB buffer, past the uncharged 64 KiB")
+    (is (zero? (.used budget)) "given back when the connection ends")))
+
+(deftest ws-message-larger-than-the-budget-completes
+  ;; The budget limits growth, never progress. A message needing more than
+  ;; the whole budget can't wait for room: only its own delivery would
+  ;; make some. Its reader takes the progress lane and grows past the
+  ;; limit, so the message completes instead of stalling.
+  (let [budget (MemoryBudget. 100000)
+        size 300000
+        delivered (promise)
+        done (future (run-ws-bytes (frames [0x2 true (byte-array size)] [0x8 true (close-payload 1000 "")])
+                                   {:budget budget
+                                    :on-message (fn [_ ^ByteBuffer m] (deliver delivered (.remaining m)))}))]
+    (is (= size (deref delivered 5000 :stalled)))
+    (is (not= :timed-out (deref done 5000 :timed-out)))
+    (is (zero? (.used budget)) "everything given back")))
+
+(defn- gated-input
+  "An InputStream over `bs` that stops after `cut` bytes: it counts down
+  `reached`, then serves the rest once `go` opens."
+  ^InputStream [^bytes bs cut ^CountDownLatch reached ^CountDownLatch go]
+  (let [pos (atom 0)]
+    (proxy [InputStream] []
+      (read
+        ([] (throw (UnsupportedOperationException.)))
+        ([^bytes b off len]
+         (let [p (long @pos)]
+           (when (= p cut)
+             (.countDown reached)
+             (.await go))
+           (let [end (if (< p cut) cut (alength bs))
+                 n (min (long len) (- end p))]
+             (if (pos? n)
+               (do (System/arraycopy bs p b off n)
+                   (reset! pos (+ p n))
+                   (int n))
+               -1))))))))
+
+(deftest ws-readers-waiting-on-each-other-for-the-budget-all-complete
+  ;; Two connections each hold part of a large message when the budget
+  ;; runs out, and each would wait for room only the other's delivery
+  ;; makes. One at a time takes the progress lane, so both complete.
+  (let [budget (MemoryBudget. 250000)
+        size 400000
+        reached (CountDownLatch. 2)
+        go (CountDownLatch. 1)
+        start! (fn []
+                 (let [delivered (promise)
+                       input (frames [0x2 true (byte-array size)] [0x8 true (close-payload 1000 "")])]
+                   [delivered
+                    (future (run-ws (gated-input input 200000 reached go)
+                                    {:budget budget
+                                     :on-message (fn [_ ^ByteBuffer m] (deliver delivered (.remaining m)))}))]))
+        [d1 f1] (start!)
+        [d2 f2] (start!)]
+    ;; Both hold about 200 KB, unless one already waits for room.
+    (.await reached 2 TimeUnit/SECONDS)
+    (.countDown go)
+    (is (= [size size] [(deref d1 5000 :stalled) (deref d2 5000 :stalled)]))
+    (is (not-any? #{:timed-out} [(deref f1 5000 :timed-out) (deref f2 5000 :timed-out)]))
+    (is (zero? (.used budget)))))
+
+(deftest ws-waiting-for-the-budget-does-not-count-against-the-message-deadline
+  ;; The server holding a message back is not the client being slow: while
+  ;; a reader waits for the budget (here for the progress lane, held by a
+  ;; connection whose listener takes long), its :read-timeout stops.
+  (let [budget (doto (MemoryBudget. 100000) (.charge 100000))
+        size 200000
+        input (frames [0x2 true (byte-array size)] [0x8 true (close-payload 1000 "")])
+        in-listener (CountDownLatch. 1)
+        slow (future (run-ws-bytes input {:budget budget :read-timeout 300
+                                          :on-message (fn [_ _] (.countDown in-listener) (Thread/sleep 800))}))
+        _ (.await in-listener 2 TimeUnit/SECONDS)
+        delivered (promise)
+        r (run-ws-bytes input {:budget budget :read-timeout 300
+                               :on-message (fn [_ ^ByteBuffer m] (deliver delivered (.remaining m)))})]
+    (is (= size (deref delivered 0 :none)))
+    (is (= [1000] (server-close-codes r)) "no 1008")
+    (is (not= :timed-out (deref slow 5000 :timed-out)))
+    (is (= 100000 (.used budget)) "what both messages held was given back")))
 
 (deftest ws-connection-events-use-protocol-websocket
   (let [log (atom [])
         closed (CountDownLatch. 2)]
     (let [srv (enso/run-server (fn [_] {:ring.websocket/listener {:on-open (fn [_])}})
-                               {:port 0
+                               {:host "127.0.0.1" :port 0
                                 :server-events {:connection-opened (fn [p _] (swap! log conj [:opened p]))
                                                 :connection-closed (fn [p _ _] (swap! log conj [:closed p])
                                                                      (.countDown closed))}})]
@@ -1433,7 +1591,7 @@
   ;; A server-initiated close waits :ws-close-timeout for the peer's CLOSE.
   (let [srv (enso/run-server
              (fn [_] {:ring.websocket/listener {:on-open (fn [^WebSocketSocket s] (.close s 4000 "bye"))}})
-             {:port 0 :ws-close-timeout 300})]
+             {:host "127.0.0.1" :port 0 :ws-close-timeout 300})]
     (try
       (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
         (.setSoTimeout sock 5000)
@@ -1517,7 +1675,7 @@
                      (onError [_ _ t] (swap! events conj [:error t]))
                      (onClose [_ _ code reason] (swap! events conj [:close code reason])))
           conn (WebSocketConnection. (Socket.) (ByteArrayInputStream. input) out listener
-                                     (ws-config {}) nil test-timer (MemoryBudget. Long/MAX_VALUE))
+                                     (ws-config {}) nil test-timer (MemoryBudget. Long/MAX_VALUE) nil)
           _ (.run conn)
           closes (filter #(= 0x8 (:opcode %)) (parse-frames (.toByteArray out)))]
       (is (= [1011] (mapv close-code closes)) [label cb])
@@ -1529,13 +1687,27 @@
 ;; ---- Limits and deadlines ---------------------------------------------------
 
 (defn- with-server [handler opts f]
-  (let [srv (enso/run-server handler (merge {:port 0} opts))]
+  (let [srv (enso/run-server handler (merge {:host "127.0.0.1" :port 0} opts))]
     (try (f (enso/port srv)) (finally (enso/stop srv)))))
 
 (def ^:private echo-handler
   (fn [_] {:ring.websocket/listener
            {:on-message (fn [^WebSocketSocket s m]
                           (if (string? m) (.sendText s ^String m) (.sendBinary s ^ByteBuffer m)))}}))
+
+(deftest ws-async-handler-throwing-after-respond-still-upgrades
+  ;; An asynchronous handler's response is the first respond or raise: a
+  ;; throw after responding with a listener doesn't replace the upgrade.
+  (let [opened (promise)]
+    (with-server (fn [_ respond _]
+                   (respond {:ring.websocket/listener {:on-open (fn [_] (deliver opened true))}})
+                   (throw (IllegalStateException. "after respond")))
+      {:async true}
+      (fn [port]
+        (with-open [sock (Socket. "127.0.0.1" (int port))]
+          (.setSoTimeout sock 3000)
+          (is (re-find #"^HTTP/1.1 101" (ws-handshake-response sock {})))
+          (is (true? (deref opened 2000 :timed-out))))))))
 
 (deftest ws-max-message-bytes-option
   (with-server echo-handler {:ws-max-message-bytes 1024}
@@ -1620,6 +1792,33 @@
           (let [resp (ws-handshake-response sock (if origin {"Origin" origin} {}))]
             (is (= expected (second (re-find #"^HTTP/1.1 (\d+)" resp)))
                 (str (pr-str opts) " " origin))))))))
+
+(deftest ws-upgrade-and-connection-are-token-lists
+  ;; Upgrade and Connection are comma-separated token lists, compared
+  ;; case-insensitively (RFC 9110 §7.6.1, §7.8; RFC 6455 §4.2.1), and
+  ;; repeated fields are one list.
+  (doseq [[fields expected]
+          [[["Upgrade: websocket" "Connection: Upgrade"] "101"]
+           [["Upgrade: WebSocket" "Connection: keep-alive, Upgrade"] "101"]
+           [["Upgrade: h2c, websocket" "Connection: upgrade"] "101"]
+           [["Upgrade: websocket , foo/2" "Connection: Upgrade"] "101"]
+           [["Upgrade: foo" "Upgrade: websocket" "Connection: Upgrade"] "101"]
+           [["Upgrade: websocketx" "Connection: Upgrade"] "400"]
+           [["Upgrade: web socket" "Connection: Upgrade"] "400"]
+           [["Upgrade: websocket" "Connection: keep-alive"] "400"]]]
+    (with-server echo-handler {}
+      (fn [port]
+        (with-open [sock (Socket. "127.0.0.1" (int port))]
+          (.setSoTimeout sock 3000)
+          (let [out (.getOutputStream sock)]
+            (.write out (.getBytes (str "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                        (apply str (map #(str % "\r\n") fields))
+                                        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                                        "Sec-WebSocket-Version: 13\r\n\r\n")
+                                   StandardCharsets/ISO_8859_1))
+            (.flush out)
+            (let [head (String. (.readNBytes (.getInputStream sock) 12) StandardCharsets/ISO_8859_1)]
+              (is (= (str "HTTP/1.1 " expected) head) (pr-str fields)))))))))
 
 (deftest ws-handler-extensions-header-is-not-sent
   ;; Only the server negotiates extensions: a handler's
@@ -1768,11 +1967,13 @@
 
 (defn- final-block
   "`data` compressed as one raw deflate stream ending with a BFINAL block,
-  as clients without a sync flush send it (RFC 7692 §7.2.3.4)."
-  ^bytes [^bytes data]
+  as clients without a sync flush send it (RFC 7692 §7.2.3.4), over the
+  window `dictionary` when given."
+  ^bytes [^bytes data & [^bytes dictionary]]
   (let [d (java.util.zip.Deflater. java.util.zip.Deflater/DEFAULT_COMPRESSION true)
         out (ByteArrayOutputStream.)
         buf (byte-array 4096)]
+    (when dictionary (.setDictionary d dictionary))
     (.setInput d data)
     (.finish d)
     (while (not (.finished d))
@@ -1802,6 +2003,25 @@
         (is (= [[:message "Hello"] [:message text] [:message text]]
                (filterv #(= :message (first %)) (:events r)))
             (pr-str (:events r)))))))
+
+(deftest ws-deflate-window-spans-messages-ended-by-final-blocks
+  ;; With context takeover the window spans messages, final blocks
+  ;; included: a client ending every message with a BFINAL block, then
+  ;; starting its next deflate stream over the window, may refer back
+  ;; past the previous message.
+  (let [a (utf8 (apply str (repeat 20 "the first message refers to nothing ")))
+        b (utf8 "second")
+        m1 (byte-array (concat (final-block a) [0]))
+        m2 (byte-array (concat (final-block b a) [0]))
+        m3 (deflate-message (doto (client-deflater) (.setDictionary (byte-array (concat a b)))) a)
+        m4 (byte-array (concat (final-block b (byte-array (concat a b a))) [0]))
+        m5 (deflate-message (doto (client-deflater) (.setDictionary (byte-array (concat a b a b)))) a)
+        r (run-ws-bytes (frames [0x41 true m1] [0x41 true m2] [0x41 true m3] [0x41 true m4] [0x41 true m5])
+                        {:deflate (negotiated)})]
+    (is (< (alength m3) 20) "the third message is back-references into the first")
+    (is (= (mapv #(vector :message (String. ^bytes % StandardCharsets/UTF_8)) [a b a b a])
+           (filterv #(= :message (first %)) (:events r)))
+        (pr-str (:events r)))))
 
 (deftest ws-deflate-large-messages-are-sent-as-fragments
   ;; A large compressed message leaves as a sequence of frames (RSV1 on
@@ -1893,6 +2113,26 @@
     (is (< (alength bomb) (* 64 1024)))
     (is (= [1009] (server-close-codes r)))
     (is (< allocated (* 8 1024 1024)) (str "allocated " allocated " bytes"))))
+
+(deftest ws-compressed-messages-wait-for-the-budget-as-they-inflate
+  ;; A compressed message is charged and paused as it inflates, not as its
+  ;; compressed bytes arrive: a few KiB inflating to a MiB can't grow past
+  ;; an exhausted budget while another reader holds the progress lane.
+  (let [budget (doto (MemoryBudget. 100000) (.charge 100000))
+        holder (lane-holder)
+        size (* 1024 1024)
+        _ (.enterLane budget holder)
+        delivered (promise)
+        done (future (run-ws-bytes (frames [0x42 true (deflate-message (client-deflater) (byte-array size))]
+                                           [0x8 true (close-payload 1000 "")])
+                                   {:budget budget :deflate (negotiated) :max-message (* 2 size)
+                                    :on-message (fn [_ ^ByteBuffer m] (deliver delivered (.remaining m)))}))]
+    (is (= :waiting (deref delivered 300 :waiting)) "inflating stopped at the uncharged 64 KiB")
+    (is (= 100000 (.used budget)) "nothing charged while waiting")
+    (.leaveLane budget holder)
+    (is (= size (deref delivered 5000 :stalled)))
+    (is (not= :timed-out (deref done 5000 :timed-out)))
+    (is (= 100000 (.used budget)))))
 
 (deftest ws-deflate-negotiated-over-tcp
   (with-server echo-handler {:ws-compression true}
@@ -1988,7 +2228,7 @@
                    {:on-open (fn [s] (deliver socket-p s))
                     :on-message (fn [^WebSocketSocket s m]
                                   (if (string? m) (.sendText s ^String m) (.sendBinary s ^ByteBuffer m)))}})
-        srv (enso/run-server handler (merge {:port 0 :idle-timeout 20000} opts))]
+        srv (enso/run-server handler (merge {:host "127.0.0.1" :port 0 :idle-timeout 20000} opts))]
     (try
       (with-open [^Socket sock (if (:ssl-context opts)
                                  (let [^javax.net.ssl.SSLSocket ss
@@ -2022,6 +2262,35 @@
                          (idle-footprint socket))]
             [busy idle (= text (send!))])))
       (finally (enso/stop srv)))))
+
+(deftest ws-idle-connection-gives-back-the-grown-output-buffer
+  ;; Replies batched for a burst of messages grow the connection's output
+  ;; buffer (shared with HTTP/1.1); a quiet second gives it back, as it
+  ;; does between HTTP/1.1 requests.
+  (let [socket-p (promise)
+        output-buffer #(alength ^bytes (field-value (field-value (field-value (field-value % "this$0") "out")
+                                                                 "this$0")
+                                                    "hbuf"))]
+    (with-server (fn [_] {:ring.websocket/listener
+                          {:on-open (fn [s] (deliver socket-p s))
+                           :on-message (fn [^WebSocketSocket s m] (.sendText s ^String m))}})
+      {:idle-timeout 20000}
+      (fn [port]
+        (with-open [sock (Socket. "127.0.0.1" (int port))]
+          (.setSoTimeout sock 5000)
+          (let [[in ^java.io.OutputStream out] (ws-handshake! sock)
+                msg (apply str (repeat 100 "x"))]
+            (.write out ^bytes (apply frames (repeat 100 [0x1 true (utf8 msg)])))
+            (.flush out)
+            (dotimes [_ 100] (read-frame in))
+            (let [socket (deref socket-p 2000 nil)
+                  busy (output-buffer socket)]
+              (is (< 1024 busy) "the burst's replies shared the buffer")
+              (is (support/await-condition #(= 1024 (output-buffer socket)) 5000 50)
+                  "given back once idle"))
+            (.write out ^bytes (mask-frame 0x1 true (utf8 "again")))
+            (.flush out)
+            (is (= "again" (frame-text (update (read-frame in) :payload vec))))))))))
 
 (deftest ws-idle-connection-gives-back-its-buffers
   ;; After a second without frames a WebSocket keeps only small buffers:

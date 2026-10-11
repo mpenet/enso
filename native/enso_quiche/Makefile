@@ -112,7 +112,7 @@ HARDEN_CFLAGS = -fstack-protector-strong $(FORTIFY_CFLAGS) $(PLATFORM_CFLAGS) $(
 # A libquiche built with patches/ declares the receive-window control
 # calls: linked directly then, looked up at run time otherwise (stock
 # libquiche, e.g. a distribution's dynamic build).
-RECV_WINDOW_CFLAGS := $(if $(shell grep -l quiche_conn_set_max_connection_window \
+RECV_WINDOW_CFLAGS := $(if $(shell grep -l quiche_conn_connection_recv_credit \
   $(QUICHE_INCLUDE_DIR)/quiche.h 2>/dev/null),-DENSO_QUICHE_RECV_WINDOW)
 SHIM_CFLAGS = -std=c11 -fPIC -fvisibility=hidden $(WARN_CFLAGS) $(HARDEN_CFLAGS) $(RECV_WINDOW_CFLAGS) \
   -I$(JAVA_HOME)/include -I$(JNI_MD_INC) -I$(QUICHE_INCLUDE_DIR)

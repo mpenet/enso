@@ -9,10 +9,11 @@
                                Config$InvalidOptionException Request Response RingErrorHandler RingHandler
                                ServerEvents StreamingBody WebSocketListener WebSocketSocket
                                WebSocketSocket$SendCallback)
-           (com.s_exp.enso.core HttpFields)
+           (com.s_exp.enso.core HttpFields LogLimiter)
            (java.nio ByteBuffer)
            (java.util Locale)
            (java.util.function Predicate Supplier)
+           (java.util.logging Level Logger)
            (javax.net.ssl SSLContext)))
 
 (set! *warn-on-reflection* true)
@@ -201,19 +202,18 @@
 (defn- websocket-response? [response]
   (contains? response :ring.websocket/listener))
 
-(defn- status-error [response status]
+(defn- status-error [status]
   (throw (IllegalArgumentException.
-          (str "response :status must be an integer, got " (pr-str status)
-               (when-not (map? response) (str " (handler returned " (.getName (class response)) ")"))))))
+          (str "response :status must be an integer, got " (pr-str status)))))
 
 (defn- other-status
-  "`status` (the response's :status, not a Long) as an integer: 200 when
-  the key is absent, else it must be an integer."
+  "`status` (the response map's :status, not a Long) as an integer: 200
+  when the key is absent, else it must be an integer."
   [response status]
   (cond
     (integer? status) status
-    (and (nil? status) (map? response) (not (contains? response :status))) 200
-    :else (status-error response status)))
+    (and (nil? status) (not (contains? response :status))) 200
+    :else (status-error status)))
 
 (defn- ->response
   "The handler's Ring response as a Response; `async` as for coerce-body."
@@ -221,6 +221,9 @@
   (^Response [response async]
    (when (nil? response)
      (throw (IllegalArgumentException. "handler returned nil response")))
+   (when-not (map? response)
+     (throw (IllegalArgumentException.
+             (str "handler returned a " (.getName (class response)) ", not a Ring response map"))))
    (if (websocket-response? response)
      (Response. 101
                 (:headers response)
@@ -365,7 +368,7 @@
     :doc "ms to receive a complete request head from its first byte, wall clock (slowloris protection). Answered with 408."}
    {:key :read-timeout :group "Timeouts" :default 30000 :field "readTimeoutMillis" :check check-int
     :set (fn [^Config$Builder b v] (.readTimeoutMillis b (int v)))
-    :doc "longest ms without progress reading a request body; the read fails (408 unless the handler catches it). Also bounds head reads when `:header-timeout` is 0, and is the wall-clock time a WebSocket message may take from its first frame to its last (CLOSE 1008)."}
+    :doc "longest ms without progress reading a request body; the read fails (408 unless the handler catches it). Also bounds head reads when `:header-timeout` is 0, and is the wall-clock time a WebSocket message may take from its first frame to its last (CLOSE 1008), less time the server held it back for `:max-buffered-bytes`."}
    {:key :min-data-rate-bytes :group "Timeouts" :default 240 :field "minDataRateBytes" :check check-int
     :set (fn [^Config$Builder b v] (.minDataRateBytes b (int v)))
     :doc "least request body bytes per second while a handler waits for them, once `:min-data-rate-grace` of waiting is spent (Kestrel's default), 0 = off. Below it the read fails (408, protocol error \"min-data-rate\"): a body trickled just inside `:read-timeout` can't hold a request forever. Time the handler isn't reading doesn't count."}
@@ -400,7 +403,7 @@
     :doc "requests per HTTP/1.1 connection, 0 = unlimited. The last response carries Connection: close."}
    {:key :max-buffered-bytes :group "Limits" :default 0 :field "maxBufferedBytes" :check check-long
     :set (fn [^Config$Builder b v] (.maxBufferedBytes b (long v)))
-    :doc "bytes the server buffers or promises (flow-control credit) for peers, server-wide: unread request bodies (HTTP/2, HTTP/3) and the HTTP/2 credit granted for them, streamed HTTP/2 response bytes, queued WebSocket sends and incoming WebSocket messages past 64 KiB. 0 = a quarter of the maximum heap. Credit is paid for before it is granted. From three quarters of it connections over their fair share are throttled, at the limit all are: HTTP/2 grants connection credit only up to the initial 65535 octets, HTTP/3 stops reading request streams until bodies are read and a WebSocket stops reading a large message until there is room (backpressure); WebSocket asynchronous sends fail at once."}
+    :doc "bytes the server buffers or promises (flow-control credit) for peers, server-wide: unread request bodies (HTTP/2, HTTP/3) and the HTTP/2 credit granted for them, streamed HTTP/2 response bytes, queued WebSocket sends and incoming WebSocket messages past 64 KiB. 0 = a quarter of the maximum heap. Credit is paid for before it is granted. From three quarters of it connections over their fair share are throttled, at the limit all are: HTTP/2 grants connection credit only up to the initial 65535 octets, HTTP/3 stops reading request streams until bodies are read and a WebSocket stops reading a large message until there is room (backpressure), one WebSocket at a time reading on past the limit so whole messages still complete; WebSocket asynchronous sends fail at once."}
 
    ;; TCP
    {:key :so-nodelay :group "TCP" :default true :field "soNodelay" :check check-bool
@@ -570,7 +573,7 @@
 
    ;; Handler and observability
    {:key :async :group "Handler and observability" :default false :check check-bool
-    :doc "`handler` is a Ring asynchronous handler, `(fn [request respond raise])`. It runs on the request's virtual thread, which waits until `respond` or `raise` is called (from any thread), without bound unless `:handler-timeout` is set; `raise` goes to `:error-handler`. Only the first call counts. A StreamableResponseBody may write after returning and ends when it closes its stream."}
+    :doc "`handler` is a Ring asynchronous handler, `(fn [request respond raise])`. It runs on the request's virtual thread, which waits until `respond` or `raise` is called (from any thread), without bound unless `:handler-timeout` is set; `raise` goes to `:error-handler`. Only the first call counts: the handler throwing before either is a `raise`, after one it is logged. A StreamableResponseBody may write after returning and ends when it closes its stream."}
    {:key :error-handler :group "Handler and observability" :default nil :check check-fn
     :doc "`(fn [request throwable])` returning a Ring response, when the handler throws or returns nil, on every protocol. If it throws or returns nil too, a plain 500 is sent."}
    {:key :server-header :group "Handler and observability" :default nil :field "serverHeader" :check check-string
@@ -669,12 +672,21 @@
                                           78 "    ")
                               "\n")))))))
 
+(def ^:private ^LogLimiter late-throws
+  (LogLimiter. (Logger/getLogger "com.s_exp.enso.api.RingHandler") Level/WARNING))
+
 (defn- call-async
   "Calls the Ring asynchronous `handler` and waits, on the request's
-  virtual thread, for its response or the exception it raised."
+  virtual thread, for its response or the exception it raised. Only the
+  first of respond, raise and a throw counts: the handler throwing before
+  either call raises, after one it is logged and the response stands."
   [handler request]
   (let [result (promise)]
-    (handler request #(deliver result %) #(deliver result %))
+    (try
+      (handler request #(deliver result %) #(deliver result %))
+      (catch Throwable t
+        (when-not (deliver result t)
+          (.log late-throws "asynchronous handler threw after respond or raise" t))))
     (let [v @result]
       (if (instance? Throwable v)
         (throw ^Throwable v)

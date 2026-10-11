@@ -45,22 +45,6 @@
   ;; Coverage-guided fuzzing (Jazzer); run through script/fuzz.sh.
   :fuzz {:extra-deps {com.code-intelligence/jazzer {:mvn/version "0.30.0"}}
          :extra-paths ["target/fuzz-classes"]}
-  :bench {:extra-deps {http-kit/http-kit {:mvn/version "2.8.0"}
-                       ring/ring-jetty-adapter {:mvn/version "1.14.2"}
-                       com.clojure-goes-fast/clj-async-profiler {:mvn/version "1.6.2"}
-                       nrepl/nrepl {:mvn/version "1.3.1"}
-                       ;; Netty HTTP/3 server for bench comparisons
-                       io.netty.incubator/netty-incubator-codec-http3 {:mvn/version "0.0.28.Final"}
-                       io.netty.incubator/netty-incubator-codec-native-quic$osx-aarch_64 {:mvn/version "0.0.66.Final"}
-                       ;; Jetty HTTP/3 server for bench comparisons
-                       org.eclipse.jetty.http3/jetty-http3-server {:mvn/version "12.0.14"}
-                       org.eclipse.jetty.quic/jetty-quic-server {:mvn/version "12.0.14"}
-                       org.eclipse.jetty.quic/jetty-quic-quiche-jna {:mvn/version "12.0.14"}}
-          :extra-paths ["bench"]
-          :jvm-opts ["-Djdk.attach.allowAttachSelf"
-                     "-XX:+UnlockDiagnosticVMOptions"
-                     "-XX:+DebugNonSafepoints"]
-          :main-opts ["-m" "nrepl.cmdline"]}
   ;; Cross-server comparison (see doc/performance.md). The driver runs the
   ;; load; each peer server runs in its own JVM from its own alias, so
   ;; Aleph's Netty 4.1 and the Netty 4.2 HTTP/3 codec never share a

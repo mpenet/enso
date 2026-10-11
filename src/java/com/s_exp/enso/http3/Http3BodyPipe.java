@@ -31,8 +31,11 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@link MemoryBudget}), every pipe of the server within
  * {@code :max-buffered-bytes} (the server's, through the connection's
  * {@link MemoryBudget.Account}: under pressure a connection over its fair
- * share stops first). Buffered bytes are charged to both until read or
- * discarded. quiche itself holds at most a connection window more
+ * share stops first). The budget limits growth, never progress: a
+ * connection whose pipes hold less than {@link #FLOOR} keeps reading
+ * however throttled it is, charged past the limit if need be (as
+ * HTTP/2's initial window). Buffered bytes are charged to both until
+ * read or discarded. quiche itself holds at most a connection window more
  * (native memory), charged to the account while the connection reads a
  * body ({@code Http3Connection.bodyStarted}).
  *
@@ -41,11 +44,28 @@ import java.util.concurrent.locks.ReentrantLock;
  * a {@link RequestBodyTimeoutException} (408), both answered with their
  * status by the exchange; a truncated body (reset, connection gone) a
  * plain IOException. The first one is kept ({@link #failure}).
+ *
+ * <p>Those clocks ({@code :read-timeout}, the {@code :min-data-rate-bytes}
+ * allowance) only count time the client could have sent and didn't:
+ * while the loop doesn't read the stream ({@link #resumeWhenDrained} until
+ * {@link #readResumed}) the bytes the client sent wait in quiche and flow
+ * control holds it back, so a waiting reader's clocks stop and pick up
+ * where they were once the loop reads again. They also stop while the
+ * client has no connection-level credit left ({@link #creditExhausted}),
+ * as when the unread bytes of streams the loop doesn't read fill the
+ * connection window: the client then can't send on any stream.
  */
 public final class Http3BodyPipe {
 
     /** Unread bytes above which the loop stops reading the stream. */
     static final int HIGH_WATER = 64 * 1024;
+
+    /**
+     * Unread body bytes a connection's pipes may always hold, whatever the
+     * server's budget: HTTP/2's initial connection window, which a peer
+     * gets without asking.
+     */
+    static final int FLOOR = 65535;
 
     private static final byte[] EMPTY = new byte[0];
     private static final int OPEN = 0, END = 1, TRUNCATED = 2, TOO_LARGE = 3;
@@ -71,14 +91,20 @@ public final class Http3BodyPipe {
     private int rpos;
     private int wpos;
     private int state = OPEN;
+    // The loop stopped reading the stream, or the client has no
+    // connection credit left: body clocks don't run.
+    private boolean readPaused;
+    private boolean noCredit;
     private Runnable onDrain;
     // The connection's share of :max-buffered-bytes, or null (no accounting).
     private final MemoryBudget.Account account;
     // The connection's share (its window), or null.
     private final MemoryBudget connectionBudget;
-    // Wake a loop paused on either budget; allocated on first need.
+    // Wake a loop paused on either budget, or on the connection's pipes
+    // holding the floor; allocated on first need.
     private MemoryBudget.Waiter budgetWaiter;
     private MemoryBudget.Waiter connectionWaiter;
+    private MemoryBudget.Waiter floorWaiter;
     // Buffered bytes dropped unread by discard(): later reads fail.
     private boolean discarded;
     // The first failure a read raised (reader thread).
@@ -163,10 +189,12 @@ public final class Http3BodyPipe {
         int unread;
         MemoryBudget.Waiter onServer;
         MemoryBudget.Waiter onConnection;
+        MemoryBudget.Waiter onFloor;
         lock.lock();
         try {
             onServer = budgetWaiter;
             onConnection = connectionWaiter;
+            onFloor = floorWaiter;
             if (state == OPEN) state = TRUNCATED;
             unread = wpos - rpos;
             if (unread > 0) {
@@ -181,6 +209,7 @@ public final class Http3BodyPipe {
         }
         if (onServer != null) account.budget().cancel(onServer);
         if (onConnection != null) connectionBudget.cancel(onConnection);
+        if (onFloor != null) connectionBudget.cancel(onFloor);
         if (unread > 0) release(unread);
     }
 
@@ -197,9 +226,10 @@ public final class Http3BodyPipe {
     /**
      * Body bytes the loop may move into this pipe now (event loop): what
      * keeps the pipe within {@link #HIGH_WATER} and the connection within
-     * its window; 0 while the connection's share of the server's budget is
+     * its window; while the connection's share of the server's budget is
      * throttled (the budget exhausted, or under pressure with this
-     * connection over its fair share).
+     * connection over its fair share), only what keeps the connection's
+     * pipes within {@link #FLOOR}.
      */
     public int room() {
         int unread;
@@ -211,42 +241,88 @@ public final class Http3BodyPipe {
         }
         long room = HIGH_WATER - unread;
         if (connectionBudget != null) room = Math.min(room, connectionBudget.limit() - connectionBudget.used());
-        if (account != null && account.throttled()) room = 0;
+        if (account != null && account.throttled()) room = Math.min(room, floorRoom());
         return (int) Math.max(0, room);
     }
 
+    // What the connection's pipes may still take within the floor.
+    private long floorRoom() {
+        return connectionBudget == null ? 0 : FLOOR - connectionBudget.used();
+    }
+
     /**
-     * Arranges for {@code wake} to run once {@link #room} may be positive
-     * again: this pipe drained below {@link #HIGH_WATER} (on the reader's
-     * thread), or the budget it waits on fell below its low-water mark (on
-     * the budget's waker thread). Runs it immediately if that already
-     * happened, so a wake-up can't be lost.
+     * The loop stops reading the stream ({@link #room} is 0): body clocks
+     * pause until {@link #readResumed}, and {@code wake} is arranged to run
+     * once {@link #room} may be positive again: this pipe drained below
+     * {@link #HIGH_WATER} (on the reader's thread), the budget it waits on
+     * fell below its low-water mark, or the connection's pipes below the
+     * floor (on the budget's waker thread). Runs it immediately if that
+     * already happened, so a wake-up can't be lost.
      */
     public void resumeWhenDrained(Runnable wake) {
         MemoryBudget.Waiter waiter = null;
         MemoryBudget on = null;
+        MemoryBudget.Waiter floor = null;
         lock.lock();
         try {
+            if (!readPaused) {
+                readPaused = true;
+                // A reader timing its wait recounts it from here.
+                readable.signalAll();
+            }
             if (wpos - rpos >= HIGH_WATER && state == OPEN) {
                 onDrain = wake;
                 return;
             }
-            if (state == OPEN && account != null && account.throttled()) {
-                // Paused on the server-wide budget, not on this pipe.
-                if (budgetWaiter == null) budgetWaiter = waiter(wake);
-                waiter = budgetWaiter;
-                on = account.budget();
-            } else if (state == OPEN && connectionBudget != null && connectionBudget.exhausted()) {
+            if (state == OPEN && connectionBudget != null && connectionBudget.exhausted()) {
                 // Paused on the connection's window: other streams hold it.
                 if (connectionWaiter == null) connectionWaiter = waiter(wake);
                 waiter = connectionWaiter;
                 on = connectionBudget;
+            } else if (state == OPEN && account != null && account.throttled()) {
+                // Paused on the server-wide budget, not on this pipe, until
+                // it has room or the connection's pipes are under the floor.
+                if (budgetWaiter == null) budgetWaiter = waiter(wake);
+                waiter = budgetWaiter;
+                on = account.budget();
+                if (connectionBudget != null && floorWaiter == null) floorWaiter = waiter(wake);
+                floor = floorWaiter;
             }
         } finally {
             lock.unlock();
         }
-        if (waiter == null || !on.await(waiter)) {
+        if (waiter == null || (floor != null && !connectionBudget.await(floor, FLOOR)) || !on.await(waiter)) {
             wake.run();
+        }
+    }
+
+    /** The loop reads the stream again: body clocks run. */
+    public void readResumed() {
+        lock.lock();
+        try {
+            if (readPaused) {
+                readPaused = false;
+                readable.signalAll();
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * The client has no connection-level credit left ({@code true}), or has
+     * some again (event loop): while it has none it can't send, so body
+     * clocks don't run.
+     */
+    public void creditExhausted(boolean exhausted) {
+        lock.lock();
+        try {
+            if (noCredit != exhausted) {
+                noCredit = exhausted;
+                readable.signalAll();
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -364,11 +440,18 @@ public final class Http3BodyPipe {
 
         // Blocks until bytes are buffered. False at clean EOF; throws when
         // the body was truncated or no byte came within the read timeout.
+        // Time the loop doesn't read the stream, or the client has no
+        // connection credit, isn't counted: such a wait is untimed, and
+        // either changing signals the reader to recount.
         // Called with lock held.
         private boolean awaitBytes() throws IOException {
             long left = readTimeoutNanos;
             while (rpos == wpos && state == OPEN) {
                 try {
+                    if (readPaused || noCredit) {
+                        readable.await();
+                        continue;
+                    }
                     if (readTimeoutNanos > 0 && left <= 0) {
                         throw new RequestBodyTimeoutException();
                     }

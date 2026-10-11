@@ -49,7 +49,7 @@ Each timeout means the same thing on every protocol.
 |---|---|---|
 | `:handshake-timeout` | TLS handshake; HTTP/2 preface and first SETTINGS; QUIC handshake | wall clock from accept |
 | `:header-timeout` | a complete request head | wall clock from its first byte |
-| `:read-timeout` | request body; a WebSocket message | longest wait without progress; for a WebSocket message, wall clock from first to last frame |
+| `:read-timeout` | request body; a WebSocket message | longest wait without progress; for a WebSocket message, wall clock from first to last frame, less time the server held it back |
 | `:min-data-rate-bytes` | request body | bytes per second of waiting, after `:min-data-rate-grace` |
 | `:write-timeout` | any response or frame write | longest wait without progress |
 | `:idle-timeout` | time with no request in progress | since the last activity |
@@ -69,8 +69,8 @@ Where each applies:
 
 - `:handshake-timeout` (10000): time allowed for the TLS handshake, plus the HTTP/2 preface and first SETTINGS, or the QUIC handshake. The connection is closed when it runs out.
 - `:header-timeout` (10000): time allowed to receive a complete request head, counted from its first byte. Protects against slowloris. Answered with 408.
-- `:read-timeout` (30000): longest time without progress while reading a request body. The read fails (408 unless the handler catches it) and the connection is not reused. Also bounds head reads when `:header-timeout` is 0. On a WebSocket it is a deadline: a message must arrive whole within this time of its first frame, or the connection is closed with 1008 "message timeout".
-- `:min-data-rate-bytes` (240): least request body bytes per second while a handler waits for them, once `:min-data-rate-grace` of waiting has passed. 0 turns it off. See [Minimum data rate](#minimum-data-rate).
+- `:read-timeout` (30000): longest time without progress while reading a request body. The read fails (408 unless the handler catches it) and the connection is not reused. Time the server holds the client back doesn't count, see [Memory budget](#memory-budget). Also bounds head reads when `:header-timeout` is 0. On a WebSocket it is a deadline: a message must arrive whole within this time of its first frame, or the connection is closed with 1008 "message timeout". Time the server doesn't read the message for the budget doesn't count.
+- `:min-data-rate-bytes` (240): least request body bytes per second while a handler waits for them, once `:min-data-rate-grace` of waiting has passed. 0 turns it off. Time the server holds the client back doesn't count. See [Minimum data rate](#minimum-data-rate).
 - `:min-data-rate-grace` (5000): waiting time allowed before `:min-data-rate-bytes` applies.
 - `:write-timeout` (30000): longest time without write progress, meaning the peer stopped reading. The connection is force-closed (TLS without close_notify). Progress is counted per 256 KiB slice. On HTTP/2 it also bounds a peer that keeps its flow-control window shut: a stream that can't send for this long is reset with CANCEL, and a connection window shut this long ends the connection with GOAWAY(ENHANCE_YOUR_CALM).
 - `:idle-timeout` (75000): how long a connection may sit with no request in progress. That is HTTP/1.1 before and between requests, HTTP/2 and HTTP/3 with no open stream (GOAWAY, or QUIC's idle timeout), and a WebSocket with no frame from the client (closing handshake with 1001 "idle timeout").
@@ -106,7 +106,7 @@ period.
 - `:max-header-fields` (100): request header fields per head on every protocol, 431 above. Same default as Apache's LimitRequestFields and Tomcat's maxHeaderCount.
 - `:max-request-body-bytes` (10485760): request body size on every protocol, 0 means no limit. A larger Content-Length gets 413 without running the handler. A body without one fails mid-stream. WebSocket messages have their own limit, `:ws-max-message-bytes`.
 - `:max-keep-alive-requests` (1000): requests per HTTP/1.1 connection, 0 means unlimited (nginx's default). The last response carries `Connection: close`.
-- `:max-buffered-bytes` (0): server-wide cap on the bytes held, or promised as flow-control credit, on behalf of peers. 0 means a quarter of the maximum heap (`-Xmx`), at least 1 MiB. See [Memory budget](#memory-budget).
+- `:max-buffered-bytes` (0): server-wide cap on the bytes held, or promised as flow-control credit, on behalf of peers. 0 means a quarter of the maximum heap (`-Xmx`), at least 1 MiB. It limits growth, not progress: every connection can always move a small amount of request body. See [Memory budget](#memory-budget).
 
 ### Memory budget
 
@@ -117,7 +117,7 @@ period.
 - HTTP/3 response bytes quiche hasn't taken yet;
 - HTTP/3 receive credit held natively by quiche (below);
 - queued WebSocket asynchronous sends;
-- incoming WebSocket messages past their first 64 KiB, until the listener's `on-message` returns.
+- incoming WebSocket message buffers past their first 64 KiB, by capacity, until the listener's `on-message` returns. A buffer up to 256 KiB kept for the next message stays charged until the connection is idle for a second.
 
 These buffers are transient, which is why the default leaves three
 quarters of the heap to handlers.
@@ -133,13 +133,41 @@ limit every connection is throttled. Throttling pushes back instead of
 failing:
 
 - HTTP/2 grants connection credit only up to the initial 65535 octets, and a streamed response holds one frame before its producer waits;
-- HTTP/3 stops reading request streams until handlers read what is buffered;
-- a WebSocket stops reading a large message (TCP pushes back on the client) until there is room, within the message's `:read-timeout`, else it closes with 1008;
+- HTTP/3 stops reading a connection's request streams once its buffered bodies hold 64 KiB, until handlers read them;
+- a WebSocket stops growing a message's buffer, and so stops reading it (TCP pushes back on the client), until there is room or its turn to read past the limit comes (below);
 - a WebSocket asynchronous send fails at once and its fail callback runs.
 
-The limit can be exceeded by what the protocols grant without asking: the
-initial 65535-octet window of an HTTP/2 connection receiving a body, and
-64 KiB per WebSocket reading a message.
+The budget limits growth, never progress. Each connection keeps a floor
+it may always use, so a connection holding less than that keeps reading
+however full the budget is. The limit can be exceeded by these floors: the
+initial 65535-octet window of an HTTP/2 connection receiving a body, 64 KiB
+of buffered body per HTTP/3 connection, and 64 KiB per WebSocket reading a
+message.
+
+A WebSocket message is delivered whole, so a connection stopped
+mid-message holds what it read until it reads the rest. If such messages
+filled the budget, each would wait for room only the others' delivery can
+make. So one WebSocket at a time reads past the limit until its
+`on-message` returns, then the next waiting one does, in arrival order. A
+message larger than the whole budget still completes. The limit can be
+exceeded by that one message too. A listener that blocks on a large
+message keeps the others waiting for room.
+
+The server holding a client back is not the client being slow. While a
+request body waits on the server, `:read-timeout` and the
+`:min-data-rate-bytes` allowance stop, and pick up where they were once
+the client can send again:
+
+- HTTP/2: while the client has no connection credit left, because the server withholds the WINDOW_UPDATE until handlers read;
+- HTTP/3: while the server doesn't read the request stream;
+- WebSocket: while the server doesn't read a message, waiting for room or for its turn to read past the limit;
+- HTTP/1.1 is never held back by the budget, so its clocks always run.
+
+This can't keep a request alive on the client's terms. The clocks only
+stop while the server is the one not reading, and they run again as soon
+as it reads. `:handler-timeout` and `:idle-timeout` still apply. Kestrel
+does the same for its minimum data rate: it isn't enforced while HTTP/2
+connection flow control is applying backpressure.
 
 HTTP/3 receive credit lives in quiche's native memory, up to one
 connection window per connection. While a connection reads a request body
@@ -281,7 +309,8 @@ in [http3.md](http3.md#flow-control-and-memory).
 Messages of 256 bytes or more are sent compressed (deflate level 1).
 Compressed messages from the client are inflated only up to
 `:ws-max-message-bytes`, so a small "zip bomb" fails with 1009 without
-being expanded. Compressed messages over 64 KiB go out as several frames,
+being expanded. They count against `:max-buffered-bytes` as they inflate,
+not as their compressed bytes arrive. Compressed messages over 64 KiB go out as several frames,
 so compressing one needs a bounded buffer.
 
 With context takeover, the default, a compressing connection holds a
@@ -365,7 +394,10 @@ Errors go through `java.util.logging`, under `com.s_exp.enso.*`
 `com.s_exp.enso.api.RingErrorHandler`, `com.s_exp.enso.core.Timer`).
 
 Failures a client can cause (malformed requests, resets, timeouts, peers
-that vanish, handler exceptions caused by I/O errors) log at FINE. Server
+that vanish, handler exceptions caused by I/O errors) log at FINE. So does
+the InterruptedException of a handler or streamed body the server
+interrupted because it gave up on the request (stream reset, connection
+gone, `:handler-timeout`). Server
 faults (handler exceptions, invalid responses, internal errors) log at
 WARNING, rate-limited per call site to one record per second with a count
 of suppressed records. Install an SLF4J bridge in your application to

@@ -94,6 +94,10 @@ public abstract class Exchange extends Timer.Task {
     public long responseBytes;
     /** What {@link #serve} decided. */
     public byte outcome;
+    // The server gave up on the exchange (timed out, cancelled) and
+    // interrupts its handler. Written before the interrupt, so the
+    // interrupted thread sees it (JLS 17.4.4).
+    private boolean gaveUp;
 
     /** The server's service (handler, events, config). */
     protected abstract Service service();
@@ -125,6 +129,7 @@ public abstract class Exchange extends Timer.Task {
         status = 0;
         responseBytes = 0;
         outcome = RESPONSE;
+        gaveUp = false;
     }
 
     /** Who owns the response: {@link #OPEN}, {@link #HANDLER}, {@link #TIMED_OUT}, {@link #CANCELLED}. */
@@ -144,6 +149,7 @@ public abstract class Exchange extends Timer.Task {
      */
     public final void cancel() {
         claim(CANCELLED);
+        gaveUp = true;
         interruptHandler();
     }
 
@@ -169,6 +175,7 @@ public abstract class Exchange extends Timer.Task {
     @Override
     protected final void onTimeout() {
         if (claim(TIMED_OUT)) {
+            gaveUp = true;
             service().protocolError(protocol(), "handler-timeout");
             handlerTimedOut();
         }
@@ -222,7 +229,7 @@ public abstract class Exchange extends Timer.Task {
             return HttpStatus.error(clientStatus);
         }
         if (thrown != null) {
-            Response r = RingErrorHandler.respond(s.errorHandler, request, thrown);
+            Response r = RingErrorHandler.respond(s.errorHandler, request, thrown, expectedFailure(thrown));
             if (r != null) {
                 outcome = RESPONSE;
                 return r;
@@ -232,6 +239,27 @@ public abstract class Exchange extends Timer.Task {
         }
         outcome = RESPONSE;
         return response;
+    }
+
+    /**
+     * Whether failure {@code t} of this exchange's handler (or of its
+     * streamed body) is expected rather than a server-side fault: the
+     * client caused it ({@link #clientCaused}), or the server gave up on
+     * the exchange ({@code :handler-timeout}, stream reset, connection
+     * gone) and {@code t} comes from the interrupt it delivered. Expected
+     * failures log at FINE, others at WARNING.
+     */
+    public final boolean expectedFailure(Throwable t) {
+        return clientCaused(t) || (gaveUp && Causes.find(t, InterruptedException.class) != null);
+    }
+
+    /**
+     * Whether failure {@code t} comes from the client: an I/O error in its
+     * cause chain (the peer went away, reset the stream, sent a broken
+     * body), including interrupted I/O.
+     */
+    public static boolean clientCaused(Throwable t) {
+        return Causes.find(t, IOException.class) != null;
     }
 
     /** The status of a client error in {@code t}'s cause chain (body failure, {@link HttpError}), else 0. */

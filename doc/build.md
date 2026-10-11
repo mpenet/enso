@@ -44,8 +44,8 @@ clojure -T:build jar-all                                        # core and every
 
 Other tasks: `jar` (a development jar with whatever is staged under
 `target/native`), `install`, `deploy-jars` (refuses a version already on
-Clojars), `tag`, `clean`, `shim` (the development shim, same as
-`make -C native/enso_quiche`) and `javac-bench` (below).
+Clojars), `tag`, `clean` and `shim` (the development shim, same as
+`make -C native/enso_quiche`).
 
 ## HTTP/3 shim
 
@@ -81,7 +81,7 @@ apply. They are part of its cache key and of CI's. They add what enso
 needs beyond quiche's stock API, written in quiche's own style (doc
 comments, `quiche.h`, unit tests) so they can be sent upstream as is.
 
-- `0001-live-receive-window-maximums.patch` adds `quiche_conn_set_max_connection_window` and `quiche_conn_set_max_stream_window`, which raise the receive-window bounds of a live connection, and `quiche_conn_connection_window`, which reads its connection window. enso uses them to grow each connection's window as its memory budget pays for it (`:http3-max-window-bytes`).
+- `0001-live-receive-window-maximums.patch` adds `quiche_conn_set_max_connection_window` and `quiche_conn_set_max_stream_window`, which raise the receive-window bounds of a live connection, and `quiche_conn_connection_window`, which reads its connection window. enso uses them to grow each connection's window as its memory budget pays for it (`:http3-max-window-bytes`). It also adds `quiche_conn_connection_recv_credit`, which tells how many more bytes the connection-level limit lets the peer send. At zero the client can't send on any stream, and enso stops the body clocks of that connection's requests.
 - `0002-bound-out-of-order-fragments.patch` limits a stream to 64 out-of-order fragments plus one per 256 bytes of stream they span. Past that the connection is closed with FLOW_CONTROL_ERROR. quiche's stock receive buffer has no such limit. With the patch, what a connection buffers stays within its window plus about 150 bytes per allowed fragment, about 1.5 MiB at the defaults.
 
 Since every patch is applied or the build fails, a libquiche with the
@@ -128,15 +128,6 @@ shim for `script/sanitizer-test.sh` (see
 3. Regenerate the lockfile in a checkout of that commit (`cargo generate-lockfile`) and copy it to `native/enso_quiche/quiche-Cargo.lock`.
 4. Regenerate the attributions with `python3 native/enso_quiche/third_party_notices.py quiche-src > THIRD-PARTY-NOTICES`, and update the BoringSSL section of `NOTICE` if boring-sys vendors a different BoringSSL (its commit is the `boring-sys/deps/boringssl` submodule of the matching cloudflare/boring tag). The `shim` CI job fails while THIRD-PARTY-NOTICES is out of date.
 5. Check the lockfile against the RustSec database (`cargo audit --file native/enso_quiche/quiche-Cargo.lock`, also run nightly). A bump made for a security advisory follows [SECURITY.md](../SECURITY.md#native-dependency-advisories).
-
-## Benchmark servers
-
-The Netty and Jetty HTTP/3 servers used for comparison live under
-`bench/java`:
-
-```
-clojure -T:build javac-bench
-```
 
 ## Release CI
 

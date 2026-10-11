@@ -23,6 +23,12 @@ Each namespace runs in its own JVM, so ports, threads, the native library
 and static caches never leak between namespaces. Don't run the whole
 suite in one JVM.
 
+Test servers bind 127.0.0.1 on port 0, the address their clients dial. On
+macOS a wildcard listener (0.0.0.0 with SO_REUSEADDR) can be given a port
+that another process's 127.0.0.1 listener already holds, and loopback
+clients then reach that other process (a soak or perf server running at
+the same time, for instance).
+
 `script/test.sh` prints a PASS or FAIL line per namespace, keeps each
 namespace's output under `target/test-logs/` (`ENSO_TEST_LOG_DIR` moves
 it), and exits non-zero if any namespace failed. `ENSO_TEST_EXCLUDE`

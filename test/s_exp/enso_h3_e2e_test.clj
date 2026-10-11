@@ -965,6 +965,30 @@
         (is (= 0x10e (:reset (h3/response c 0))))
         (is (= :interrupted (deref exited 2000 :still-running)))))))
 
+(deftest handlers-interrupted-by-a-reset-log-at-fine
+  ;; The server gave up on a reset request and interrupted its handler:
+  ;; the InterruptedException that follows is expected, logged at FINE as
+  ;; on every protocol, not as a handler bug.
+  ;; Rate limiters are per call site and JVM-wide: let windows opened by
+  ;; earlier tests pass.
+  (Thread/sleep 1100)
+  (let [started (promise)
+        done (promise)
+        records (support/capture-logs
+                 "com.s_exp.enso"
+                 #(h3/with-server [srv (fn [_]
+                                         (deliver started true)
+                                         (try (Thread/sleep 10000) (finally (deliver done true)))
+                                         (ok "x"))]
+                    (h3/with-client [c (.port srv)]
+                      (h3/open-control! c)
+                      (reset-once-started! c 0 (fn [] (realized? started)))
+                      (is (deref done 2000 false))
+                      (h3/pump! c 200))))
+        fine (support/records-at records java.util.logging.Level/FINE)]
+    (is (empty? (support/records-at records java.util.logging.Level/WARNING)))
+    (is (some #{"unhandled handler exception"} fine) (pr-str fine))))
+
 (deftest abandoned-handlers-are-bounded
   ;; Resetting requests frees their QUIC streams but not handlers that
   ;; ignore interrupts: once twice the stream limit of handlers is live,
@@ -2292,6 +2316,87 @@
         (h3/pump-until! c #(h3/stream-done? c 16) 5000)
         (is (= 200 (:status (h3/response c 16))))))))
 
+(deftest exhausted-budget-leaves-every-connection-a-floor
+  ;; :max-buffered-bytes limits growth, never progress: with the budget
+  ;; exhausted by others, a connection holding less than the floor of
+  ;; body bytes keeps reading, so a small upload completes instead of
+  ;; waiting until its read times out.
+  (let [[^com.s_exp.enso.http3.Http3Listener l ^com.s_exp.enso.core.Service service ^com.s_exp.enso.core.Timer timer]
+        (start-with-service (fn [^Request req]
+                              (ok (str (alength (.readAllBytes ^java.io.InputStream (.-body req))))))
+                            (fn [^com.s_exp.enso.api.Config$Builder b]
+                              (.maxBufferedBytes b (* 1024 1024))
+                              (.readTimeoutMillis b 500)))
+        budget ^com.s_exp.enso.core.MemoryBudget (.-budget service)]
+    (try
+      (h3/with-client [c (.port l)]
+        (h3/open-control! c)
+        (h3/send! c 0 (h3/headers-frame (h3/request-headers "POST" "/")) false)
+        (h3/pump! c 200)
+        (.charge budget (.limit budget))
+        (h3/send! c 0 (h3/data-frame (byte-array (* 40 1024))) true)
+        (h3/pump-until! c #(h3/stream-done? c 0) 5000)
+        (is (= 200 (:status (h3/response c 0))))
+        (is (= "40960" (h3/body-str (h3/response c 0)))))
+      (finally
+        (.release budget (.limit budget))
+        (.close l)
+        (.close timer)))))
+
+(deftest body-clocks-pause-while-the-server-holds-the-body-back
+  ;; While the loop doesn't read a stream (its connection is over the
+  ;; floor and the budget is exhausted), the client is held back by the
+  ;; server: :read-timeout doesn't run. Reading resumes once the
+  ;; connection is under the floor again (another of its handlers read),
+  ;; and from then the clock runs: a body that stops gets its 408.
+  (let [gate (promise)
+        outcome (promise)
+        [^com.s_exp.enso.http3.Http3Listener l ^com.s_exp.enso.core.Service service ^com.s_exp.enso.core.Timer timer]
+        (start-with-service (fn [^Request req]
+                              (let [in ^java.io.InputStream (.-body req)]
+                                (if (= "/hold" (.-uri req))
+                                  (do @gate (.readNBytes in (* 64 1024)) (ok "held"))
+                                  (let [buf (byte-array 4096)
+                                        n (atom 0)]
+                                    (try
+                                      (loop [] (let [r (.read in buf)] (when (pos? r) (swap! n + r) (recur))))
+                                      (deliver outcome [:read @n])
+                                      (ok (str @n))
+                                      (catch java.io.IOException e
+                                        (deliver outcome [:failed @n (System/nanoTime)])
+                                        (throw e)))))))
+                            (fn [^com.s_exp.enso.api.Config$Builder b]
+                              (.maxBufferedBytes b (* 1024 1024))
+                              (.readTimeoutMillis b 300)))
+        budget ^com.s_exp.enso.core.MemoryBudget (.-budget service)]
+    (try
+      (h3/with-client [c (.port l)]
+        (h3/open-control! c)
+        (h3/send! c 0 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/hold"))
+                                       (h3/data-frame (byte-array (* 64 1024))))
+                  false)
+        (h3/pump! c 300)
+        (h3/send! c 4 (h3/headers-frame (h3/request-headers "POST" "/up")) false)
+        (h3/pump! c 100)
+        (.charge budget (.limit budget))
+        (h3/send! c 4 (h3/data-frame (byte-array 10000)) false)
+        (h3/pump! c 1000)
+        (is (not (realized? outcome)) (str "no timeout while held back: " (deref outcome 0 nil)))
+        (is (not (h3/stream-done? c 4)))
+        (let [resumed (System/nanoTime)]
+          (deliver gate true)
+          (h3/pump-until! c #(h3/stream-done? c 4) 5000)
+          (is (= 408 (:status (h3/response c 4))))
+          (let [[how n at] (deref outcome 1000 nil)]
+            (is (= :failed how))
+            (is (= 10000 n) "the held bytes were read once reading resumed")
+            (is (>= (- (long at) resumed) (* 250 1000000)) "timed out a read timeout after resuming"))))
+      (finally
+        (deliver gate true)
+        (.release budget (.limit budget))
+        (.close l)
+        (.close timer)))))
+
 (deftest unread-body-bytes-are-released-when-the-connection-goes
   ;; A handler that never reads its body (and ignores interrupts) can't
   ;; give the buffered bytes back: closing the connection must.
@@ -2533,6 +2638,70 @@
           (is (= (* 520 1024) (budget-used service)) "nothing reserved"))
         (.release budget (* 520 1024))
         (finally
+          (.close l)
+          (.close timer))))))
+
+(deftest body-clocks-pause-while-the-connection-has-no-credit
+  ;; Unread bytes of a stream the loop doesn't read can use up the
+  ;; connection's receive credit: then no client stream can send, so a
+  ;; reader waiting on another stream isn't timed (no 408) until reading
+  ;; gives credit back. A stream whose client has credit and stops
+  ;; sending still gets its 408.
+  (if-not recv-window-control
+    (skip-without-recv-window-control)
+    (let [window (* 128 1024)
+          hold (promise)
+          start (promise)
+          received (atom 0)
+          outcome (promise)
+          [^com.s_exp.enso.http3.Http3Listener l _ ^com.s_exp.enso.core.Timer timer]
+          (start-with-service (fn [^Request req]
+                                (let [in ^java.io.InputStream (.-body req)]
+                                  (if (= "/hold" (.-uri req))
+                                    (do @hold
+                                        (ok (str (.transferTo in (java.io.OutputStream/nullOutputStream)))))
+                                    (let [buf (byte-array 4096)]
+                                      @start
+                                      (try
+                                        (loop [] (let [r (.read in buf)] (when (pos? r) (swap! received + r) (recur))))
+                                        (deliver outcome :read)
+                                        (ok (str @received))
+                                        (catch java.io.IOException e
+                                          (deliver outcome e)
+                                          (throw e)))))))
+                              (fn [^com.s_exp.enso.api.Config$Builder b]
+                                (.readTimeoutMillis b 300)
+                                (.http3InitialMaxDataBytes b window)
+                                (.http3InitialMaxStreamDataBidiRemoteBytes b window)))]
+      (try
+        (h3/with-client [c (.port l)]
+          (h3/open-control! c)
+          (h3/send! c 4 (h3/headers-frame (h3/request-headers "POST" "/up")) false)
+          (h3/pump! c 100)
+          ;; Stream 0's unread body takes all the connection's credit.
+          (h3/send! c 0 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/hold"))
+                                         (h3/data-frame (byte-array (* 3 window))))
+                    true)
+          (h3/pump! c 300)
+          (deliver start true)
+          (h3/send! c 4 (h3/data-frame (byte-array 10000)) true)
+          (h3/pump! c 1000)
+          (is (zero? @received) "the client couldn't send")
+          (is (not (realized? outcome)) (str "no timeout without credit: " (deref outcome 0 nil)))
+          (deliver hold true)
+          (h3/pump-until! c #(and (h3/stream-done? c 0) (h3/stream-done? c 4)) 5000)
+          (is (= 200 (:status (h3/response c 4))))
+          (is (= "10000" (h3/body-str (h3/response c 4))))
+          (is (= (str (* 3 window)) (h3/body-str (h3/response c 0))))
+          (testing "a client with credit that stops sending"
+            (h3/send! c 8 (h3/concat-bytes (h3/headers-frame (h3/request-headers "POST" "/up"))
+                                           (h3/data-frame (byte-array 100)))
+                      false)
+            (h3/pump-until! c #(h3/stream-done? c 8) 5000)
+            (is (= 408 (:status (h3/response c 8))))))
+        (finally
+          (deliver hold true)
+          (deliver start true)
           (.close l)
           (.close timer))))))
 

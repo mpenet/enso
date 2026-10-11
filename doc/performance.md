@@ -12,16 +12,16 @@ scenario after 5 s of warm-up, server `-Xmx1g`, unlimited keep-alive.
 Every response is a 200 with the 13-byte body `Hello, World!`. Server and
 load generator share the CPUs, so throughput varies by about 10% between
 runs. Allocation per request is stable to a few bytes. Each figure is the
-median of three runs at revision 8100538 (October 2026).
+median of three runs, measured on October 11, 2026.
 
 | Scenario | req/s | alloc B/req | p50 ms | p99 ms | p99.9 ms | Load |
 |---|---:|---:|---:|---:|---:|---|
-| h1-get | 119,600 | 393 | 0.47 | 1.22 | 7.18 | 64 connections, closed loop |
-| h1-get-rate | 19,994 | 396 | 0.29 | 0.93 | 2.16 | open model, 20k req/s over 64 connections, CO-corrected |
-| h1-pipelined | 1,428,232 | 235 | 0.16 | 0.50 | 2.03 | 16 connections × depth 16, latency per batch |
-| h2-get | 775,097 | 1,098 | 0.24 | 0.79 | – | h2load `-c 8 -m 32` over TLS, closed loop |
-| h3-get | 72,060 | 800 | 1.82 | 2.71 | 3.06 | 4 QUIC connections × 32 requests in flight, closed loop |
-| ws-echo | 424,786 | 334 | 1.14 | 2.31 | 12.66 | 64 WebSockets × 8 messages of 128 bytes in flight; one request is one message echoed |
+| h1-get | 123,830 | 393 | 0.47 | 0.99 | 5.77 | 64 connections, closed loop |
+| h1-get-rate | 19,998 | 396 | 0.24 | 0.38 | 0.71 | open model, 20k req/s over 64 connections, CO-corrected |
+| h1-pipelined | 1,384,895 | 235 | 0.17 | 0.53 | 2.07 | 16 connections × depth 16, latency per batch |
+| h2-get | 745,127 | 1,090 | 0.26 | 0.71 | – | h2load `-c 8 -m 32` over TLS, closed loop |
+| h3-get | 73,221 | 801 | 1.74 | 2.70 | 3.03 | 4 QUIC connections × 32 requests in flight, closed loop |
+| ws-echo | 1,023,481 | 333 | 0.47 | 0.92 | 3.99 | 64 WebSockets × 8 messages of 128 bytes in flight; one request is one message echoed |
 
 ### Uploads
 
@@ -36,10 +36,10 @@ On the same laptop, over loopback:
 
 | Scenario | MiB/s | alloc per MiB |
 |---|---:|---:|
-| h2-upload (1 stream, TLS) | 1,045 | 114 KiB |
-| h2-upload-4 (4 streams, TLS) | 1,096 | 116 KiB |
-| h3-upload (1 stream) | 154 | 25 KiB |
-| h3-upload-4 (4 streams) | 168 | 30 KiB |
+| h2-upload (1 stream, TLS) | 1,042 | 117 KiB |
+| h2-upload-4 (4 streams, TLS) | 1,077 | 120 KiB |
+| h3-upload (1 stream) | 155 | 25 KiB |
+| h3-upload-4 (4 streams) | 170 | 30 KiB |
 
 The HTTP/3 figures are limited by the load client (`s-exp.h3-load`), not
 the server.

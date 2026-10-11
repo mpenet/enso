@@ -34,8 +34,9 @@
   (:import (com.s_exp.enso EnsoServer)
            (com.s_exp.enso.api ChunkedWriter WebSocketSocket)
            (com.s_exp.enso.core MemoryBudget)
-           (com.sun.management OperatingSystemMXBean UnixOperatingSystemMXBean)
-           (java.io InputStream)
+           (com.sun.management HotSpotDiagnosticMXBean HotSpotDiagnosticMXBean$ThreadDumpFormat OperatingSystemMXBean
+                               UnixOperatingSystemMXBean)
+           (java.io File InputStream)
            (java.lang.management BufferPoolMXBean GarbageCollectorMXBean ManagementFactory MemoryPoolMXBean
                                  MemoryType)
            (java.nio ByteBuffer)
@@ -70,13 +71,15 @@
    :request-completed (fn [protocol _ status _ _ _] (bump! (:requests events) (str protocol " " status)))
    :protocol-error (fn [protocol kind] (bump! (:protocol-errors events) (str protocol " " kind)))})
 
-;; Virtual thread starts and ends, and pinning, counted from JFR.
+;; Rare virtual thread events counted from JFR. Thread starts and ends
+;; aren't: the consumer keeps a RecordedThread per thread it has seen,
+;; which would show up as heap growth (live threads come from a thread
+;; dump instead, see live-virtual-threads).
 (def ^:private jfr-counts (counter-map))
 
 (defn- start-jfr! ^RecordingStream []
   (let [rs (RecordingStream.)]
-    (doseq [e ["jdk.VirtualThreadStart" "jdk.VirtualThreadEnd" "jdk.VirtualThreadPinned"
-               "jdk.VirtualThreadSubmitFailed"]]
+    (doseq [e ["jdk.VirtualThreadPinned" "jdk.VirtualThreadSubmitFailed"]]
       (.enable rs ^String e)
       (.onEvent rs ^String e (reify Consumer (accept [_ _] (bump! jfr-counts e)))))
     ;; Only pinning longer than this is an event.
@@ -207,6 +210,18 @@
                         (some-> (.getCollectionUsage p) .getUsed)))
                     (ManagementFactory/getMemoryPoolMXBeans))))
 
+(defn- live-virtual-threads
+  "Virtual threads alive now, counted in a JSON thread dump (which lists
+  every thread of every thread container)."
+  ^long []
+  (let [f (File/createTempFile "enso-soak-threads" ".json")]
+    (try
+      (.delete f)
+      (.dumpThreads ^HotSpotDiagnosticMXBean (ManagementFactory/getPlatformMXBean HotSpotDiagnosticMXBean)
+                    (.getPath f) HotSpotDiagnosticMXBean$ThreadDumpFormat/JSON)
+      (count (re-seq #"\"virtual\": *true" (slurp f)))
+      (finally (.delete f)))))
+
 (defn stats
   "Process and server counters; a full GC first when `gc`."
   [servers gc]
@@ -216,9 +231,7 @@
   (let [mem (ManagementFactory/getMemoryMXBean)
         ^OperatingSystemMXBean os (ManagementFactory/getOperatingSystemMXBean)
         heap (.getHeapMemoryUsage mem)
-        jfr (snapshot-counts jfr-counts)
-        vstart (get jfr "jdk.VirtualThreadStart" 0)
-        vend (get jfr "jdk.VirtualThreadEnd" 0)]
+        jfr (snapshot-counts jfr-counts)]
     (merge
      (target/stats)
      {:time-ms (System/currentTimeMillis)
@@ -234,7 +247,7 @@
       :process-cpu-ns (.getProcessCpuTime os)
       :threads (.getThreadCount (ManagementFactory/getThreadMXBean))
       :thread-groups (thread-groups)
-      :virtual-threads {:started vstart :ended vend :live (- (long vstart) (long vend))
+      :virtual-threads {:live (live-virtual-threads)
                         :pinned (get jfr "jdk.VirtualThreadPinned" 0)
                         :submit-failed (get jfr "jdk.VirtualThreadSubmitFailed" 0)}
       :gcs (into {} (map (fn [^GarbageCollectorMXBean g]

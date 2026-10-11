@@ -756,7 +756,7 @@
         b (IllegalStateException. "b")]
     (.initCause a b)
     (.initCause b a)
-    (let [f (future (RingErrorHandler/respond nil nil a))]
+    (let [f (future (RingErrorHandler/respond nil nil a (com.s_exp.enso.core.Exchange/clientCaused a)))]
       (is (nil? (deref f 2000 ::hung)) "no error handler: nil, promptly"))))
 
 ;; ---- Memory budget ---------------------------------------------------------
@@ -805,6 +805,26 @@
     (Thread/sleep 50)
     (is (= 1 (.get woken)) "a woken or refused waiter is no longer registered")))
 
+(deftest memory-budget-wakes-waiters-below-their-own-level
+  ;; A waiter may wait for a level of its own: woken once usage is below
+  ;; it, independently of low-water waiters.
+  (let [b (MemoryBudget. 100)
+        floor-woken (AtomicInteger.)
+        low-woken (AtomicInteger.)
+        floor (recording-waiter floor-woken (atom nil))
+        low (recording-waiter low-woken (atom nil))]
+    (is (false? (.await b floor 20)) "already below its level: not registered")
+    (.charge b 110)
+    (is (true? (.await b floor 20)))
+    (is (true? (.await b low)))
+    (.release b 40)
+    (is (support/await-condition #(= 1 (.get low-woken)) 2000 1) "70: below the low-water mark")
+    (Thread/sleep 50)
+    (is (zero? (.get floor-woken)) "70: above its level")
+    (.release b 55)
+    (is (support/await-condition #(= 1 (.get floor-woken)) 2000 1) "15: below its level")
+    (is (= 1 (.get low-woken)) "told once")))
+
 (deftest memory-budget-waiters-can-be-cancelled
   (let [b (MemoryBudget. 100)
         gone (AtomicInteger.)
@@ -820,6 +840,33 @@
     (is (support/await-condition #(= 1 (.get kept)) 2000 1))
     (is (zero? (.get gone)) "a cancelled waiter is never told")
     (is (false? (.cancel b w-kept)) "a woken waiter is no longer registered")))
+
+(deftest memory-budget-progress-lane-is-held-by-one-waiter-at-a-time
+  ;; Holders that can only give bytes back after growing further take
+  ;; turns past the limit: the lane is held by one waiter at a time and
+  ;; handed to the next queued one, first come first served.
+  (let [b (MemoryBudget. 100)
+        woken (mapv (fn [_] (AtomicInteger.)) (range 3))
+        [w1 w2 w3] (mapv #(recording-waiter % (atom nil)) woken)]
+    (is (true? (.enterLane b w1)) "a free lane is taken")
+    (is (true? (.enterLane b w1)) "and kept by its holder")
+    (is (false? (.enterLane b w2)) "held: queued")
+    (is (false? (.enterLane b w3)))
+    (is (false? (.enterLane b w2)) "queued once")
+    (.leaveLane b w1)
+    (is (support/await-condition #(= 1 (.get ^AtomicInteger (woken 1))) 2000 1) "handed to the first queued")
+    (is (true? (.enterLane b w2)) "which holds it")
+    (is (false? (.enterLane b w1)) "the former holder queues behind the others")
+    (.leaveLane b w3)
+    (.leaveLane b w2)
+    (is (support/await-condition #(= 1 (.get ^AtomicInteger (woken 0))) 2000 1)
+        "a waiter that left the queue is skipped")
+    (is (zero? (.get ^AtomicInteger (woken 2))))
+    (is (true? (.enterLane b w1)))
+    (.leaveLane b w2)
+    (is (true? (.enterLane b w1)) "leaving a lane not held changes nothing")
+    (.leaveLane b w1)
+    (is (true? (.enterLane b w3)) "free again")))
 
 (deftest memory-budget-accounts-share-fairly-under-pressure
   (let [b (MemoryBudget. 1000)
@@ -852,4 +899,6 @@
   (let [b (MemoryBudget. Long/MAX_VALUE)
         a (.account b)]
     (is (> 1.0 (bytes-per-op 100000 (fn [] (.tryReserve b 100) (.charge b 10) (.release b 110)))))
-    (is (> 1.0 (bytes-per-op 100000 (fn [] (.tryReserve a 100) (.charge a 10) (.release a 110) (.throttled a)))))))
+    (is (> 1.0 (bytes-per-op 100000 (fn [] (.tryReserve a 100) (.charge a 10) (.release a 110) (.throttled a)))))
+    (let [w (recording-waiter (AtomicInteger.) (atom nil))]
+      (is (> 1.0 (bytes-per-op 100000 (fn [] (.enterLane b w) (.leaveLane b w))))))))

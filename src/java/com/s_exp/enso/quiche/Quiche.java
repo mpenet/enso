@@ -61,7 +61,7 @@ public final class Quiche {
      * {@code target/native}, a classifier jar of another release) is
      * refused at load instead of failing on the first changed call.
      */
-    public static final int SHIM_ABI = 3;
+    public static final int SHIM_ABI = 4;
 
     /** System property naming the shim to load, bypassing every lookup. */
     static final String SHIM_PROPERTY = "enso.quiche.shim";
@@ -71,10 +71,12 @@ public final class Quiche {
 
     /**
      * Whether the loaded libquiche can raise a live connection's receive
-     * window ({@link QuicheConnection#setMaxConnectionWindow}) and report it
-     * ({@link QuicheConnection#connectionWindow}): added by the patches the
-     * release builds apply (native/enso_quiche/patches/), absent from a
-     * stock libquiche. Without it receive windows stay fixed.
+     * window ({@link QuicheConnection#setMaxConnectionWindow}), report it
+     * ({@link QuicheConnection#connectionWindow}) and the credit it leaves
+     * the peer ({@link QuicheConnection#connectionRecvCredit}): added by
+     * the patches the release builds apply (native/enso_quiche/patches/),
+     * absent from a stock libquiche. Without it receive windows stay fixed,
+     * and body clocks can't tell when a connection's peer is out of credit.
      */
     public static final boolean RECV_WINDOW_CONTROL;
 
@@ -472,6 +474,8 @@ public final class Quiche {
     static native void connSetMaxConnectionWindow(long conn, long v);
     /** The connection-level receive window; -1 without receive-window control. */
     static native long connConnectionWindow(long conn);
+    /** The peer's connection-level send credit; -1 without receive-window control. */
+    static native long connConnectionRecvCredit(long conn);
 
     // -----------------------------------------------------------------
     // Streams

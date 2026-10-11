@@ -73,6 +73,7 @@ Unchanged: `:port` `:host` `:backlog` `:shutdown-timeout`
 - `Config.Builder` setters follow the option names (`soRcvBuf` → `soRcvBufBytes`, `alpnProtocols` → `sslAlpnProtocols`, `http2InitialWindowSize` → `http2InitialWindowBytes`, `http3InitialMaxData` → `http3InitialMaxDataBytes`, ...), and setters of removed options are gone. `build()` throws `Config.InvalidOptionException`, an `IllegalArgumentException` with `option()` and `value()`.
 - `EnsoServer` constructors no longer throw `IOException`; `start()` does. `register` and `unregister` are removed.
 - `ChunkedWriter.write` declares `IOException`, since it may flush. `closeInternal()` is removed; `charset(Charset)` and `bytesWritten()` are added.
+- `RingErrorHandler.respond` takes a fourth argument, `expected`: whether the failure is expected (I/O, or the interrupt that follows the server giving up on the exchange), which is logged at FINE instead of WARNING.
 
 #### Request map
 
@@ -86,6 +87,7 @@ Unchanged: `:port` `:host` `:backlog` `:shutdown-timeout`
 These apply to every protocol. A violation is a 500, or `:error-handler`.
 
 - `:status` must be an integer in 200-599, or 101 for a WebSocket upgrade. A `:status` that is present but nil or not an integer is a handler error. A missing `:status` still means 200.
+- A response that isn't a map is a handler error naming its class.
 - Header names must be RFC 9110 tokens. Values may not contain control characters (HTAB is allowed) or characters above U+00FF. alpha56 only rejected CR, LF and NUL.
 - A handler `Transfer-Encoding` is dropped, since the server frames the body. A handler `Content-Length` is dropped when the server knows the length. Two different `Content-Length` values are an error.
 - String bodies are encoded with the `Content-Type` charset, UTF-8 when there is none. An unknown charset is a 500. alpha56 always used UTF-8.
@@ -109,7 +111,8 @@ These apply to every protocol. A violation is a 500, or `:error-handler`.
 
 ### Features and behaviour changes
 
-- Ring async handlers with `:async true`. `raise` goes to `:error-handler`, and `:handler-timeout` applies.
+- Ring async handlers with `:async true`. `raise` goes to `:error-handler`, and `:handler-timeout` applies. A handler that throws before `respond` or `raise` has raised; one that throws after is logged and its response stands.
+- The stream a `StreamableResponseBody` writes to refuses writes once closed.
 - Cleartext HTTP/2 (`:http2c`) with prior knowledge on the plain listener, next to HTTP/1.1. No `Upgrade: h2c`. Reported as protocol "h2c".
 - HTTP/2 receive windows autotune, as quiche's and quic-go's do. A window doubles when its handler reads half of it within two round trips (measured from the SETTINGS acknowledgement, refreshed by a PING at most once a second while uploading), from `:http2-initial-window-bytes` up to `:http2-max-window-bytes`, and the connection's up to twice that. Every growth of the connection window is paid for from `:max-buffered-bytes` first, nothing grows while the connection is throttled, the connection window returns to its baseline once no request body is open, and no credit is granted past what bodies with a Content-Length have left to send.
 - HTTP/2 request bodies allocate nothing per burst. Past 8 KiB they are buffered in pooled 64 KiB segments, returned as the handler reads them.
@@ -127,7 +130,9 @@ These apply to every protocol. A violation is a 500, or `:error-handler`.
 - Graceful shutdown: `:shutdown-timeout` is one deadline for the whole server, HTTP/2 and HTTP/3 drain in two GOAWAYs, and streams in flight when a peer sends GOAWAY finish.
 - WebSocket: `ring.websocket.protocols` support (`Listener`, `PingListener`, `Socket`, `AsyncSocket`), asynchronous sends with back-pressure, permessage-deflate, server pings, idle close with 1001, CLOSE 1001 on server stop. A listener exception closes with 1011 and its message stays on the server. Handler `:headers` are sent on the 101. A WebSocket response on HTTP/2 or HTTP/3 is answered 501.
 - Observability: `api.ServerEvents` (`connectionOpened`, `connectionClosed`, `requestCompleted`, `protocolError`) for HTTP/1.1, h2, h2c, h3, WebSocket, TCP and TLS, and the JFR events `com.s_exp.enso.Connection`, `Request` and `ProtocolError` on every protocol.
-- Logging: client-caused failures at FINE, server faults at WARNING, rate-limited to one record per second per call site. A logging setup that throws never reaches a server thread.
+- Logging: client-caused failures at FINE, server faults at WARNING, rate-limited to one record per second per call site. A logging setup that throws never reaches a server thread. The same rule holds for handlers and streamed response bodies on every protocol. A handler the server interrupted because it gave up on the request (stream reset, connection gone, `:handler-timeout`) logs the resulting InterruptedException at FINE. A streamed body that fails for another reason logs at WARNING on HTTP/1.1 and HTTP/3 too.
+- `:max-buffered-bytes` limits growth, never progress. Each connection keeps a floor it can always use (HTTP/2's initial 65535-octet window, 64 KiB of buffered body per HTTP/3 connection, 64 KiB of message buffer per WebSocket), so an upload on a connection under its floor goes on while the budget is exhausted. WebSocket messages are delivered whole, so one WebSocket at a time reads past the limit until its message is delivered, and the others take turns. Messages that together, or alone, need more than the budget no longer stall until their deadline.
+- `:read-timeout` and `:min-data-rate-bytes` only count time the client could have sent. While the server holds a request body back (an HTTP/2 client out of connection credit the server withholds, an HTTP/3 stream the server doesn't read, an HTTP/3 client out of connection credit because unread streams fill its window) they stop, so the client no longer gets a 408 for a stall the server caused. A WebSocket message's `:read-timeout` stops the same way while the server doesn't read it for the budget, so no false 1008.
 - Supervised server threads. The timer survives failing tasks and restarts its loop, the acceptor survives any failure of one iteration, and an HTTP/3 event loop restart can't be undone by a failure while reporting it. `EnsoServer.isHealthy()` tells whether they all run.
 - Options taking a function accept a var (`#'handler`).
 - Stricter request parsing. Content-Length must be digits and appear once, even with equal values. An HTTP/1.1 request without Host is 400. The request target and Host authority are validated. HTTP/2 and HTTP/3 heads follow the same rules. A well-formed CONNECT gets 501. On HTTP/1.1 a request line over `:max-header-bytes` is 414 ("uri-too-long"), and a bare LF line ending is 400 at once instead of waiting out `:header-timeout`.
@@ -188,6 +193,14 @@ WebSocket:
 - Same-origin check by default (cross-site WebSocket hijacking).
 - Pongs to a ping flood are coalesced.
 - A claimed frame length isn't allocated up front, deflate bombs are bounded, and a message must complete within `:read-timeout`.
+- Message buffers count against `:max-buffered-bytes` by capacity, a buffer kept for the next message included. Compressed messages count as they inflate, not as their compressed bytes arrive.
+- A second protocol failure while waiting for the client's CLOSE still drains the client's input, so the first CLOSE isn't lost to a reset.
+- Over TLS the closing handshake ends with close_notify before TCP is closed.
+- `Upgrade` is read as a token list, like `Connection` (`Upgrade: h2c, websocket`).
+- Clients that end messages with final deflate blocks keep their window across messages. Back-references past the previous message failed with 1007.
+- An asynchronous binary send of a buffer without an accessible array (a direct buffer) takes the bytes remaining at the call, as for heap buffers. Moving its position before the write failed the connection.
+- Pongs to pings that arrived together share a write, empty pings and pongs allocate nothing, and a pending pong takes a new payload without allocating.
+- An idle WebSocket gives back the HTTP/1.1 output buffer that a burst of replies grew.
 
 Core and TLS:
 
@@ -209,11 +222,11 @@ Apple M1 Pro laptop, 8 CPUs, JDK 25, median of three runs; see
 
 | Scenario | req/s | Allocated per request (whole server JVM) |
 |---|---:|---:|
-| HTTP/1.1 GET, 64 connections | 119,600 | 393 B |
-| HTTP/1.1 pipelined, depth 16 | 1,428,232 | 235 B |
-| HTTP/2 GET over TLS (h2load `-c 8 -m 32`) | 775,097 | 1,098 B |
-| HTTP/3 GET, 4 connections × 32 in flight | 72,060 | 800 B |
-| WebSocket echo, 128-byte messages | 424,786 | 334 B |
+| HTTP/1.1 GET, 64 connections | 123,830 | 393 B |
+| HTTP/1.1 pipelined, depth 16 | 1,384,895 | 235 B |
+| HTTP/2 GET over TLS (h2load `-c 8 -m 32`) | 745,127 | 1,090 B |
+| HTTP/3 GET, 4 connections × 32 in flight | 73,221 | 801 B |
+| WebSocket echo, 128-byte messages | 1,023,481 | 333 B |
 
 Measured during this rework, each against the code before the change:
 

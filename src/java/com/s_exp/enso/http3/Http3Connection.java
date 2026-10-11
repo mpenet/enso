@@ -180,6 +180,11 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
     // Request bodies being read; while any is, the connection window is
     // charged to the account (see bodyStarted).
     private int bodiesInPlay;
+    // The peer has no connection-level credit left (receive-window
+    // control only), as last read by checkRecvCredit; told to the bodies
+    // being read.
+    private boolean noCredit;
+    private final Long2ObjectHashMap.EntryConsumer<Http3Exchange> creditNotifier = this::notifyCredit;
     // What quiche may autotune the connection window to; raised by
     // growConnectionWindow, the growth past the initial window reserved
     // from the account until the connection goes.
@@ -394,7 +399,28 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
         long t = quiche.timeoutNanosOrClosed();
         if (t == QuicheConnection.CLOSED) return false;
         updateDeadline(now, t);
+        if (Quiche.RECV_WINDOW_CONTROL && (bodiesInPlay > 0 || noCredit)) checkRecvCredit();
         return true;
+    }
+
+    /**
+     * Reads the credit quiche's connection-level limit leaves the peer once
+     * the connection was processed and flushed, so a limit raised by reads
+     * is counted. When the peer runs out (unread bytes of streams the loop
+     * doesn't read fill the window) or gets credit back, every body being
+     * read is told: without credit the client can't send on any stream, so
+     * its readers' clocks stop, as on HTTP/2. One call into quiche, only
+     * while bodies are read.
+     */
+    private void checkRecvCredit() {
+        boolean none = bodiesInPlay > 0 && quiche.connectionRecvCredit() == 0;
+        if (none == noCredit) return;
+        noCredit = none;
+        exchanges.forEach(creditNotifier);
+    }
+
+    private void notifyCredit(long id, Http3Exchange ex) {
+        if (ex.bodyInPlay) ex.pipe.creditExhausted(noCredit);
     }
 
     /** True while a deadline is armed (see {@link #settle}). */
@@ -780,6 +806,7 @@ final class Http3Connection implements Drainable, DeadlineHeap.Node,
     void bodyStarted(Http3Exchange ex) {
         ex.bodyInPlay = true;
         if (bodiesInPlay++ == 0) account().charge(config.http3InitialMaxDataBytes);
+        if (noCredit) ex.pipe.creditExhausted(true);
     }
 
     /**

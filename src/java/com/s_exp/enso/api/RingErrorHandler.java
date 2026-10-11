@@ -2,9 +2,7 @@
 // ABOUTME: plus the shared policy every driver uses to log such failures.
 package com.s_exp.enso.api;
 
-import com.s_exp.enso.core.Causes;
 import com.s_exp.enso.core.LogLimiter;
-import java.io.IOException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -15,11 +13,13 @@ public interface RingErrorHandler {
      * The response for a request whose handler threw {@code t} (or returned
      * nil): {@code eh}'s, or null when there is no error handler, it
      * returned nil or it threw itself; null means the caller sends its own
-     * 500. Failures caused by an I/O error (the client went away while the
-     * handler read the body) log at FINE; others at WARNING, rate-limited.
+     * 500. {@code expected} failures (see
+     * {@link com.s_exp.enso.core.Exchange#expectedFailure}: the client went
+     * away, or the server gave up on the exchange and interrupted the
+     * handler) log at FINE; others at WARNING, rate-limited.
      */
-    static Response respond(RingErrorHandler eh, Request request, Throwable t) {
-        LogLimiter log = Logs.limiter(t);
+    static Response respond(RingErrorHandler eh, Request request, Throwable t, boolean expected) {
+        LogLimiter log = expected ? Logs.CLIENT_FAILURES : Logs.WARNINGS;
         if (eh == null) {
             log.log("unhandled handler exception", t);
             return null;
@@ -44,9 +44,5 @@ public interface RingErrorHandler {
         static final LogLimiter CLIENT_FAILURES = new LogLimiter(LOG, Level.FINE);
 
         private Logs() {}
-
-        static LogLimiter limiter(Throwable t) {
-            return Causes.find(t, IOException.class) != null ? CLIENT_FAILURES : WARNINGS;
-        }
     }
 }

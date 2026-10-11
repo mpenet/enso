@@ -1,5 +1,5 @@
 ABOUTME: quiche patch applied by build-libquiche.sh: raise the receive-window maximums of a live
-ABOUTME: connection and read its connection window (upstreamable as is; the diff starts below).
+ABOUTME: connection and read its connection window and credit (upstreamable as is; the diff starts below).
 
 Raise the receive-window maximums of a live connection
 
@@ -14,15 +14,24 @@ Connection::set_max_stream_window(), the live connection's equivalents
 (the latter applies to existing and future streams; neither lowers a
 maximum below the current window), and Connection::connection_window(),
 which returns the current connection-level window, so an application can
-grant more window to a connection once it can afford to. Exposed through
-the FFI as quiche_conn_set_max_connection_window(),
-quiche_conn_set_max_stream_window() and quiche_conn_connection_window().
+grant more window to a connection once it can afford to.
+
+Add Connection::connection_recv_credit(), which returns how many more
+bytes of stream data the connection-level limit advertised to the peer
+lets it send. At zero the peer can't send on any stream, for instance
+because unread data of streams the application doesn't read fills the
+window, so an application timing how long it waits for a stream's data
+can tell a peer that stopped sending from one that can't send.
+
+Exposed through the FFI as quiche_conn_set_max_connection_window(),
+quiche_conn_set_max_stream_window(), quiche_conn_connection_window() and
+quiche_conn_connection_recv_credit().
 
 diff --git a/quiche/include/quiche.h b/quiche/include/quiche.h
-index 3afa20e2..2b453e0e 100644
+index 3afa20e..279c185 100644
 --- a/quiche/include/quiche.h
 +++ b/quiche/include/quiche.h
-@@ -657,6 +657,17 @@ typedef struct {
+@@ -657,6 +657,21 @@ typedef struct {
      bool tx_buffered_inconsistent;
  } quiche_stats;
  
@@ -37,14 +46,18 @@ index 3afa20e2..2b453e0e 100644
 +// Returns the current size of the connection-level receive window.
 +uint64_t quiche_conn_connection_window(const quiche_conn *conn);
 +
++// Returns how many more bytes of stream data the peer may send, as allowed by
++// the connection-level flow control limit advertised to it.
++uint64_t quiche_conn_connection_recv_credit(const quiche_conn *conn);
++
  // Collects and returns statistics about the connection.
  void quiche_conn_stats(const quiche_conn *conn, quiche_stats *out);
  
 diff --git a/quiche/src/ffi.rs b/quiche/src/ffi.rs
-index 3306b618..f6c4b65b 100644
+index 3306b61..7d6f1be 100644
 --- a/quiche/src/ffi.rs
 +++ b/quiche/src/ffi.rs
-@@ -1367,6 +1367,25 @@ pub struct TransportParams {
+@@ -1367,6 +1367,30 @@ pub struct TransportParams {
      max_datagram_frame_size: ssize_t,
  }
  
@@ -67,11 +80,16 @@ index 3306b618..f6c4b65b 100644
 +    conn.connection_window()
 +}
 +
++#[no_mangle]
++pub extern "C" fn quiche_conn_connection_recv_credit(conn: &Connection) -> u64 {
++    conn.connection_recv_credit()
++}
++
  #[no_mangle]
  pub extern "C" fn quiche_conn_stats(conn: &Connection, out: &mut Stats) {
      let stats = conn.stats();
 diff --git a/quiche/src/flowcontrol.rs b/quiche/src/flowcontrol.rs
-index 0398ad9a..5e2e6675 100644
+index 0398ad9..5e2e667 100644
 --- a/quiche/src/flowcontrol.rs
 +++ b/quiche/src/flowcontrol.rs
 @@ -72,6 +72,11 @@ impl FlowControl {
@@ -116,10 +134,10 @@ index 0398ad9a..5e2e6675 100644
      fn max_data() {
          let fc = FlowControl::new(100, 20, 100);
 diff --git a/quiche/src/lib.rs b/quiche/src/lib.rs
-index d08110e6..3718a609 100644
+index d08110e..3a704d6 100644
 --- a/quiche/src/lib.rs
 +++ b/quiche/src/lib.rs
-@@ -7796,6 +7796,46 @@ impl<F: BufFactory> Connection<F> {
+@@ -7796,6 +7796,62 @@ impl<F: BufFactory> Connection<F> {
          self.local_error.as_ref()
      }
  
@@ -163,11 +181,27 @@ index d08110e6..3718a609 100644
 +        self.flow_control.window()
 +    }
 +
++    /// Returns how many more bytes of stream data the peer may send.
++    ///
++    /// This is what the connection-level flow control limit advertised to
++    /// the peer leaves it, across all streams. At zero the peer can't send
++    /// stream data until a MAX_DATA frame raises the limit, which happens
++    /// once the application reads enough with [`stream_recv()`] and the
++    /// frame is sent: a raised limit only counts from the time the frame is
++    /// written by [`send()`].
++    ///
++    /// [`stream_recv()`]: struct.Connection.html#method.stream_recv
++    /// [`send()`]: struct.Connection.html#method.send
++    #[inline]
++    pub fn connection_recv_credit(&self) -> u64 {
++        self.max_rx_data() - self.rx_data
++    }
++
      /// Collects and returns statistics about the connection.
      #[inline]
      pub fn stats(&self) -> Stats {
 diff --git a/quiche/src/stream/mod.rs b/quiche/src/stream/mod.rs
-index d51bdc60..95d75365 100644
+index d51bdc6..95d7536 100644
 --- a/quiche/src/stream/mod.rs
 +++ b/quiche/src/stream/mod.rs
 @@ -219,6 +219,18 @@ impl<F: BufFactory> StreamMap<F> {
@@ -190,7 +224,7 @@ index d51bdc60..95d75365 100644
      pub fn get(&self, id: u64) -> Option<&Stream<F>> {
          self.streams.get(&id)
 diff --git a/quiche/src/stream/recv_buf.rs b/quiche/src/stream/recv_buf.rs
-index 738f2292..95ba6d69 100644
+index 738f229..95ba6d6 100644
 --- a/quiche/src/stream/recv_buf.rs
 +++ b/quiche/src/stream/recv_buf.rs
 @@ -354,6 +354,11 @@ impl RecvBuf {
@@ -206,10 +240,10 @@ index 738f2292..95ba6d69 100644
      pub fn autotune_window(&mut self, now: Instant, rtt: Duration) {
          self.flow_control.autotune_window(now, rtt);
 diff --git a/quiche/src/tests.rs b/quiche/src/tests.rs
-index b22be3a3..fd2d0404 100644
+index b22be3a..c68834e 100644
 --- a/quiche/src/tests.rs
 +++ b/quiche/src/tests.rs
-@@ -7866,6 +7866,96 @@ fn retransmit_data_acked_before_fully_retransmitted(
+@@ -7866,6 +7866,134 @@ fn retransmit_data_acked_before_fully_retransmitted(
      );
  }
  
@@ -301,6 +335,44 @@ index b22be3a3..fd2d0404 100644
 +    let window = pipe.server.streams.get(0).unwrap().recv.window();
 +    assert!(window > 30);
 +    assert!(window <= 1000);
++}
++
++#[rstest]
++/// Tests that the connection-level credit left to the peer drops as stream
++/// data arrives, blocks the peer on every stream at zero, and comes back once
++/// the application reads and the MAX_DATA frame is sent.
++fn connection_recv_credit(
++    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
++) {
++    let mut buf = [0; 65535];
++
++    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
++    config.set_initial_max_data(30);
++    config.set_max_connection_window(30);
++    config.set_initial_max_stream_data_bidi_local(1000);
++    config.set_initial_max_stream_data_bidi_remote(1000);
++    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
++    assert_eq!(pipe.handshake(), Ok(()));
++    assert_eq!(pipe.server.connection_recv_credit(), 30);
++
++    assert_eq!(pipe.client.stream_send(4, &[42u8; 10], false), Ok(10));
++    assert_eq!(pipe.advance(), Ok(()));
++    assert_eq!(pipe.server.connection_recv_credit(), 20);
++
++    // Unread data on one stream uses up the credit of all streams.
++    assert_eq!(pipe.client.stream_send(4, &[42u8; 50], false), Ok(20));
++    assert_eq!(pipe.advance(), Ok(()));
++    assert_eq!(pipe.server.connection_recv_credit(), 0);
++    assert_eq!(pipe.client.stream_send(0, b"a", false), Err(Error::Done));
++
++    // Reading gives it back once the limit update is sent.
++    assert_eq!(pipe.server.stream_recv(4, &mut buf), Ok((30, false)));
++    assert_eq!(pipe.server.connection_recv_credit(), 0);
++    assert_eq!(pipe.advance(), Ok(()));
++    assert_eq!(pipe.server.connection_recv_credit(), 30);
++    assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
++    assert_eq!(pipe.advance(), Ok(()));
++    assert_eq!(pipe.server.connection_recv_credit(), 29);
 +}
 +
  #[rstest]

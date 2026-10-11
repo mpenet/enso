@@ -55,7 +55,8 @@ public final class HttpConnection implements Runnable, Drainable {
 
     private static final Logger LOG = Logger.getLogger(HttpConnection.class.getName());
     static final LogLimiter INVALID_RESPONSES = new LogLimiter(LOG, Level.WARNING);
-    static final LogLimiter BODY_FAILURES = new LogLimiter(LOG, Level.FINE);
+    static final LogLimiter BODY_FAILURES = new LogLimiter(LOG, Level.WARNING);
+    static final LogLimiter EXPECTED_BODY_FAILURES = new LogLimiter(LOG, Level.FINE);
 
     private static final byte[] SEC_WEBSOCKET_VERSION_13 =
         "Sec-WebSocket-Version: 13\r\n".getBytes(StandardCharsets.ISO_8859_1);
@@ -698,9 +699,10 @@ public final class HttpConnection implements Runnable, Drainable {
         String key = request.header("sec-websocket-key");
         String version = request.header("sec-websocket-version");
         // RFC 6455 §4.1 / §4.2.1: a GET over HTTP/1.1 whose key is the
-        // base64 of 16 bytes.
+        // base64 of 16 bytes. Upgrade and Connection are token lists
+        // (RFC 9110 §7.8, §7.6.1).
         if (!request.method.equals("GET") || !request.protocol.equals("HTTP/1.1")
-            || upgrade == null || !upgrade.equalsIgnoreCase("websocket")
+            || upgrade == null || !HttpFields.containsToken(upgrade, "websocket")
             || connection == null || !HttpFields.containsToken(connection, "upgrade")
             || !isWebSocketKey(key)
             || version == null) {
@@ -749,7 +751,7 @@ public final class HttpConnection implements Runnable, Drainable {
 
         WebSocketConnection ws = new WebSocketConnection(socket, reader.upgradeInput(), writer.output(),
                                                          response.webSocketListener, config, deflate, timer,
-                                                         service.budget);
+                                                         service.budget, writer::shrinkIdle);
         webSocket = ws;
         // A shutdown that began before the field was set didn't see this
         // WebSocket, so it closes itself.
