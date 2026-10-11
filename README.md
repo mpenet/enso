@@ -1,9 +1,7 @@
-<p align="center">
-<img width="200" height="200" alt="enso-logo-light" src="https://github.com/user-attachments/assets/5d4e7136-728b-4e8d-9a3a-5388e585ce78" />
-</p>
-
--------
-# Ensō
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/b8c415c0-61b1-43ac-b8c3-e1fd94c36c80">
+  <img src="https://github.com/user-attachments/assets/560555f7-9221-4e85-b161-bcc70d1e5fb7">
+</picture>
 
 [![Clojars Project](https://img.shields.io/clojars/v/com.s-exp/enso.svg)](https://clojars.org/com.s-exp/enso)
 
