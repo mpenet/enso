@@ -1,7 +1,10 @@
+
+<p align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/b8c415c0-61b1-43ac-b8c3-e1fd94c36c80">
-  <img src="https://github.com/user-attachments/assets/560555f7-9221-4e85-b161-bcc70d1e5fb7">
+  <img height="50%" width="50%" src="https://github.com/user-attachments/assets/560555f7-9221-4e85-b161-bcc70d1e5fb7"/>
 </picture>
+</p>
 
 [![Clojars Project](https://img.shields.io/clojars/v/com.s-exp/enso.svg)](https://clojars.org/com.s-exp/enso)
 
