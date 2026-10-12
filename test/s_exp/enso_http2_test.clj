@@ -3478,7 +3478,11 @@
                             (reset! credit (+ (:conn-left r) (conn-credit @seen)))
                             r))]
             (is (< baseline (:conn (upload! 1))) "the connection window grew past the baseline")
-            (is (< baseline @credit) "and the peer holds more than the baseline")
+            ;; Once the upload stream ends, no body is open, so the window is
+            ;; already eligible to shrink back; how much credit the peer still
+            ;; holds at this instant is a transient the shrink-back (asserted
+            ;; below) races. @credit drives the spend loop whatever it holds;
+            ;; the grow is proven above, the shrink-back below.
             ;; The peer spends what it holds on bodies whose handlers read
             ;; only once every body has ended.
             (let [sids (loop [left @credit sid 3 sids []]
