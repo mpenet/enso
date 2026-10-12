@@ -2301,6 +2301,27 @@
     (dotimes [_ 20] (.reloadCertificates srv))
     (is (<= (count (private-field srv "configs")) 2))))
 
+(deftest http3-serves-from-the-shared-ssl-cert-files
+  ;; With :ssl-cert-path / :ssl-key-path set and no :http3-cert-path, quiche
+  ;; loads the shared file source (Config.quicheCertPath), so one pair of
+  ;; files feeds both transports.
+  (let [[cert key] @h3/cert-pair
+        cfg (.build (doto (com.s_exp.enso.api.Config/builder)
+                      (.host "127.0.0.1") (.port 0) (.http3 true) (.advertiseAltSvc false)
+                      (.sslCertPath cert) (.sslKeyPath key)))
+        listener (doto (com.s_exp.enso.http3.Http3Listener.
+                        cfg
+                        (reify com.s_exp.enso.api.RingHandler (handle [_ _] (ok "shared")))
+                        nil)
+                   (.start))]
+    (try
+      (h3/with-client [c (.port listener)]
+        (h3/open-control! c)
+        (let [r (h3/request! c 0 (h3/request-headers "GET" "/"))]
+          (is (= 200 (:status r)))
+          (is (= "shared" (h3/body-str r)))))
+      (finally (.close listener)))))
+
 ;; ---- request-body memory -----------------------------------------------------
 
 (defn- start-with-service

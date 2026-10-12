@@ -3770,7 +3770,7 @@
             (.sslContext (gen-server-context)))]
     (is (thrown-with-msg? IllegalArgumentException #":http2c serves a plain listener"
                           (.build b))))
-  (is (thrown-with-msg? IllegalArgumentException #":http2 needs :ssl-context \(cleartext HTTP/2 is :http2c\)"
+  (is (thrown-with-msg? IllegalArgumentException #":http2 needs a TLS source"
                         (.build (doto (com.s_exp.enso.api.Config$Builder.) (.http2 true))))))
 
 (deftest h2-closed-stream-memory-matches-a-model

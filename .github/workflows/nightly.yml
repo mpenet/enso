@@ -216,7 +216,7 @@ jobs:
   # RustSec advisories against every crate locked for the shim's libquiche
   # build (the whole quiche workspace lockfile, a superset of what is
   # linked). Vulnerabilities fail the job; unmaintained / unsound notices
-  # are listed but do not. See SECURITY.md for the response process.
+  # are listed but do not.
   cargo-audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

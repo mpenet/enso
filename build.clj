@@ -11,7 +11,7 @@
 ;; Local dev falls back to a git-count-based auto version.
 (defn- current-version []
   (or (System/getenv "ENSO_VERSION")
-      (format "1.0.0-alpha%s" (b/git-count-revs nil))))
+      (format "1.0.0-beta%s" (b/git-count-revs nil))))
 (def version (current-version))
 (def class-dir "target/classes")
 ;; Jar contents are staged separately from `class-dir`: target/classes

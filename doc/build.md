@@ -127,7 +127,7 @@ shim for `script/sanitizer-test.sh` (see
 2. Check that every patch in `native/enso_quiche/patches/` still applies, and drop the ones upstream has merged.
 3. Regenerate the lockfile in a checkout of that commit (`cargo generate-lockfile`) and copy it to `native/enso_quiche/quiche-Cargo.lock`.
 4. Regenerate the attributions with `python3 native/enso_quiche/third_party_notices.py quiche-src > THIRD-PARTY-NOTICES`, and update the BoringSSL section of `NOTICE` if boring-sys vendors a different BoringSSL (its commit is the `boring-sys/deps/boringssl` submodule of the matching cloudflare/boring tag). The `shim` CI job fails while THIRD-PARTY-NOTICES is out of date.
-5. Check the lockfile against the RustSec database (`cargo audit --file native/enso_quiche/quiche-Cargo.lock`, also run nightly). A bump made for a security advisory follows [SECURITY.md](../SECURITY.md#native-dependency-advisories).
+5. Check the lockfile against the RustSec database (`cargo audit --file native/enso_quiche/quiche-Cargo.lock`, also run nightly).
 
 ## Release CI
 

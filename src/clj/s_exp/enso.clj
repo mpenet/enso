@@ -429,6 +429,18 @@
    {:key :ssl-context-provider :group "TLS" :default nil :check check-supplier
     :set (fn [^Config$Builder b v] (.sslContextProvider b ^Supplier v))
     :doc "fn (or `java.util.function.Supplier`) returning an `SSLContext`, called at startup and per accepted connection so rotated certificates apply to new connections; return a cached context (one built per call costs that per connection and loses session resumption). Exclusive with `:ssl-context`."}
+   {:key :ssl-cert-path :group "TLS" :default nil :field "sslCertPath" :check check-string
+    :set (fn [^Config$Builder b v] (.sslCertPath b ^String v))
+    :doc "PEM server certificate file, leaf first then any intermediates; with `:ssl-key-path` the TCP listener speaks TLS, reloading on change. Exclusive with `:ssl-context` and `:ssl-context-provider`. Shared with HTTP/3 when `:http3-cert-path` is not set."}
+   {:key :ssl-key-path :group "TLS" :default nil :field "sslKeyPath" :check check-string
+    :set (fn [^Config$Builder b v] (.sslKeyPath b ^String v))
+    :doc "PEM private key file for `:ssl-cert-path`, required with it. Unencrypted RSA or EC, in PKCS8 (`PRIVATE KEY`), PKCS1 (`RSA PRIVATE KEY`) or SEC1 (`EC PRIVATE KEY`); extra PEM blocks (such as `EC PARAMETERS`) are ignored. Encrypted keys are rejected: convert with `openssl pkcs8 -topk8 -nocrypt`."}
+   {:key :ssl-ca-path :group "TLS" :default nil :field "sslCaPath" :check check-string
+    :set (fn [^Config$Builder b v] (.sslCaPath b ^String v))
+    :doc "PEM CA bundle verifying client certificates (mutual TLS), reloading on change. Only with the `:ssl-cert-path` file source and `:ssl-need-client-auth` or `:ssl-want-client-auth`. TCP only: not yet supported with `:http3`."}
+   {:key :ssl-cert-reload-interval :group "TLS" :default 10000 :field "sslCertReloadIntervalMillis" :check check-int
+    :set (fn [^Config$Builder b v] (.sslCertReloadIntervalMillis b (int v)))
+    :doc "milliseconds between checks of `:ssl-cert-path` / `:ssl-key-path` / `:ssl-ca-path` for changes; a changed file is parsed and served on the next handshake, existing connections keep theirs; a bad or half-written file is kept out and logged; 0 = off. Governs the shared files for HTTP/3 too when it has no `:http3-cert-path`."}
    {:key :ssl-need-client-auth :group "TLS" :default false :field "sslNeedClientAuth" :check check-bool
     :set (fn [^Config$Builder b v] (.sslNeedClientAuth b (boolean v)))
     :doc "require a valid client certificate."}

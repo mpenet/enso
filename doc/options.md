@@ -193,6 +193,10 @@ thread, under `:handshake-timeout`.
 
 - `:ssl-context` (none): a `javax.net.ssl.SSLContext`. When set, the TCP listener speaks TLS. File bodies then go through user space, since zero-copy `sendfile` needs plain HTTP.
 - `:ssl-context-provider` (none): a fn (or `java.util.function.Supplier`) returning an `SSLContext`. It is called at startup and for every accepted connection, on that connection's virtual thread before the handshake, so rotated certificates apply to new connections without a restart. Return a cached context and replace it when the certificates change; building one per call costs that on every connection and loses session resumption. A nil return closes the connection. Exclusive with `:ssl-context`.
+- `:ssl-cert-path` (none): PEM server certificate file, leaf first then any intermediates. With `:ssl-key-path` the TCP listener speaks TLS from one context that reloads on change. Exclusive with `:ssl-context` and `:ssl-context-provider`. Shared with HTTP/3 when `:http3-cert-path` is not set.
+- `:ssl-key-path` (none): PEM private key file, required with `:ssl-cert-path`. Unencrypted RSA or EC, in PKCS8 (`PRIVATE KEY`), PKCS1 (`RSA PRIVATE KEY`) or SEC1 (`EC PRIVATE KEY`) encoding; a file with extra PEM blocks (such as the `EC PARAMETERS` block `openssl ecparam -genkey` emits) is accepted, the first private-key block is used. EC keys must name a curve (no explicit parameters). Encrypted keys are rejected with a message pointing at `openssl pkcs8 -topk8 -nocrypt`.
+- `:ssl-ca-path` (none): PEM CA bundle verifying client certificates, for mutual TLS. Reloads on change. Only with the `:ssl-cert-path` file source and `:ssl-need-client-auth` or `:ssl-want-client-auth`. TCP only: HTTP/3 mutual TLS is not yet supported, so this is rejected with `:http3`.
+- `:ssl-cert-reload-interval` (10000): milliseconds between checks of `:ssl-cert-path`, `:ssl-key-path` and `:ssl-ca-path` for changes (modification time, size, inode). A changed file is parsed and served on the next handshake; existing connections keep theirs. A bad or half-written file is kept out and logged. 0 turns it off. Governs the shared files for HTTP/3 too when it has no `:http3-cert-path`.
 - `:ssl-need-client-auth` (false): require a valid client certificate.
 - `:ssl-want-client-auth` (false): ask for a client certificate without requiring one. Exclusive with `:ssl-need-client-auth`.
 - `:ssl-alpn-protocols` (none): ALPN protocol ids offered. Defaults to `["h2" "http/1.1"]` with `:http2`, else `["http/1.1"]`. Offering "h2" requires `:http2`.
@@ -201,15 +205,22 @@ thread, under `:handshake-timeout`.
 - `:ssl-session-cache-size` (0): server TLS session cache size, set on every context the server uses, provider contexts included. 0 keeps the JVM default.
 
 `:ssl-alpn-protocols`, `:ssl-cipher-suites`, `:ssl-protocols` and the
-client-auth options require `:ssl-context` or `:ssl-context-provider`.
+client-auth options require a TLS source: `:ssl-context`,
+`:ssl-context-provider`, or `:ssl-cert-path` with `:ssl-key-path`.
+
+The file source builds one `SSLContext` for the server's life. A
+per-handshake key manager hands out the current certificate from a
+volatile, so a reload is one write and a handshake one read, with no
+per-connection context rebuild. A watcher thread checks the files every
+`:ssl-cert-reload-interval` off the request path.
 
 ## HTTP/2
 
 These settings apply to HTTP/2 over TLS (`:http2`) and to cleartext
 HTTP/2 (`:http2c`).
 
-- `:http2` (false): serve "h2" over TLS. Requires `:ssl-context` or `:ssl-context-provider`.
-- `:http2c` (false): serve cleartext HTTP/2 with prior knowledge on the plain listener, next to HTTP/1.1. A connection that opens with the HTTP/2 preface is HTTP/2. `Upgrade: h2c` is not supported (RFC 9113 deprecated it). Not compatible with `:ssl-context` or `:ssl-context-provider`.
+- `:http2` (false): serve "h2" over TLS. Requires a TLS source: `:ssl-context`, `:ssl-context-provider`, or `:ssl-cert-path` with `:ssl-key-path`.
+- `:http2c` (false): serve cleartext HTTP/2 with prior knowledge on the plain listener, next to HTTP/1.1. A connection that opens with the HTTP/2 preface is HTTP/2. `Upgrade: h2c` is not supported (RFC 9113 deprecated it). Not compatible with a TLS source.
 - `:http2-max-concurrent-streams` (100): SETTINGS_MAX_CONCURRENT_STREAMS.
 - `:http2-initial-window-bytes` (262144): receive window a stream starts with, between 65535 and 2^31-1. The spec's 64 KiB default starves throughput beyond a LAN. See [HTTP/2 flow control](#http2-flow-control).
 - `:http2-max-window-bytes` (8388608): the largest a stream's receive window grows to, between `:http2-initial-window-bytes` and 2^31-1. The connection window grows to twice this (16 MiB by default). 8 MiB lets one stream upload about 160 MiB/s over a 50 ms round trip. Set it equal to `:http2-initial-window-bytes` for fixed windows.
@@ -256,16 +267,16 @@ from the `SSLContext`. `:idle-timeout` sets QUIC's max_idle_timeout and
 `:handshake-timeout` bounds the QUIC handshake. Setup and runtime
 behaviour are in [http3.md](http3.md).
 
-- `:http3` (false): serve HTTP/3. Requires `:http3-cert-path` and `:http3-key-path`.
+- `:http3` (false): serve HTTP/3. Requires `:http3-cert-path` and `:http3-key-path`, or the shared `:ssl-cert-path` and `:ssl-key-path`.
 - `:http3-port` (0): UDP port. 0 means the same number as `:port`. With `:port` 0, set this (or `:advertise-alt-svc` false), because `Alt-Svc` must name a fixed port. Requires `:http3`.
-- `:http3-cert-path` (none): PEM certificate chain.
-- `:http3-key-path` (none): PEM private key.
+- `:http3-cert-path` (none): PEM certificate chain. Overrides the shared `:ssl-cert-path` for HTTP/3 (a split certificate); without it HTTP/3 loads `:ssl-cert-path` when that is set.
+- `:http3-key-path` (none): PEM private key. Overrides the shared `:ssl-key-path` for HTTP/3.
 - `:http3-initial-max-data-bytes` (524288): connection flow-control window a connection starts with. It also caps the request body bytes buffered per connection while handlers aren't reading. With a stock libquiche it never grows, so one connection uploads at most this much per round trip (512 KiB per 50 ms is about 10 MiB/s). See [HTTP/3 flow control](#http3-flow-control).
 - `:http3-initial-max-streams-bidi` (100): concurrent request streams per connection. Handlers of reset requests are interrupted but may keep running. Once twice this many handlers are live on a connection, new requests are refused with H3_REQUEST_REJECTED.
 - `:http3-initial-max-streams-uni` (8): peer unidirectional stream credit, at least 3 (control, QPACK encoder and decoder).
 - `:http3-max-udp-payload-bytes` (1350): largest UDP payload, between 1200 and 65527. The default is safe for common MTUs.
 - `:http3-stateless-retry` (false): always make clients prove their address with a stateless Retry before any connection state is allocated (RFC 9000 §8.1.2). Without it, Retry still starts automatically past `:http3-retry-threshold`.
-- `:http3-cert-reload-interval` (10000): milliseconds between checks of the certificate and key files (modification time, size, inode). A changed pair is loaded for new connections; existing ones keep theirs. A pair that fails to load is logged and the current one kept. 0 turns it off.
+- `:http3-cert-reload-interval` (10000): milliseconds between checks of the certificate and key files (modification time, size, inode). A changed pair is loaded for new connections; existing ones keep theirs. A pair that fails to load is logged and the current one kept. 0 turns it off. Applies to a dedicated `:http3-cert-path`; when HTTP/3 shares `:ssl-cert-path`, `:ssl-cert-reload-interval` governs the files and one watcher drives both transports.
 - `:http3-retry-threshold` (256): number of handshaking connections from which a client Initial without a valid token gets a stateless Retry. A spoofed flood can't make the server allocate connections or sign handshakes beyond it.
 - `:http3-max-half-open` (1024): number of handshaking connections above which new Initials are refused with a stateless CONNECTION_REFUSED close. 0 means unlimited.
 - `:http3-stream-reset-limit` (400): peer stream resets allowed per connection, refilling at that many per 30 seconds. Above it the connection is closed (rapid reset). 0 turns it off.

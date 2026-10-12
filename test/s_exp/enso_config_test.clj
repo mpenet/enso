@@ -87,6 +87,66 @@
       (.set ar (default-context))
       (is (some? (.get ^Supplier (.-sslContextProvider cfg)))))))
 
+;; ---- File-based TLS certificate source -----------------------------------
+
+(deftest ssl-file-source-builds
+  (is (instance? Config (.build (doto (Config/builder) (.sslCertPath "c") (.sslKeyPath "k")))))
+  (testing "with http2, no :ssl-context needed"
+    (is (instance? Config (.build (doto (Config/builder) (.sslCertPath "c") (.sslKeyPath "k") (.http2 true))))))
+  (testing "with a client-auth CA bundle"
+    (is (instance? Config (.build (doto (Config/builder)
+                                    (.sslCertPath "c") (.sslKeyPath "k") (.sslCaPath "ca")
+                                    (.sslNeedClientAuth true)))))))
+
+(deftest ssl-cert-and-key-go-together
+  (is (thrown-with-msg? IllegalArgumentException
+                        #":ssl-cert-path and :ssl-key-path must be set together"
+                        (.build (doto (Config/builder) (.sslCertPath "c")))))
+  (is (thrown-with-msg? IllegalArgumentException
+                        #":ssl-cert-path and :ssl-key-path must be set together"
+                        (.build (doto (Config/builder) (.sslKeyPath "k"))))))
+
+(deftest ssl-ca-path-needs-the-file-source
+  (is (thrown-with-msg? IllegalArgumentException
+                        #":ssl-ca-path needs :ssl-cert-path and :ssl-key-path"
+                        (.build (doto (Config/builder) (.sslCaPath "ca"))))))
+
+(deftest tls-identity-sources-are-mutually-exclusive
+  (is (thrown-with-msg? IllegalArgumentException #"mutually exclusive"
+                        (.build (doto (Config/builder) (.sslContext (default-context)) (.sslCertPath "c") (.sslKeyPath "k")))))
+  (is (thrown-with-msg? IllegalArgumentException #"mutually exclusive"
+                        (.build (doto (Config/builder)
+                                  (.sslContextProvider (reify Supplier (get [_] (default-context))))
+                                  (.sslCertPath "c") (.sslKeyPath "k"))))))
+
+(deftest ssl-cert-reload-interval-default-and-range
+  (is (= 10000 (.-sslCertReloadIntervalMillis (.build (Config/builder)))))
+  (is (thrown-with-msg? IllegalArgumentException #":ssl-cert-reload-interval must be >= 0"
+                        (.build (doto (Config/builder) (.sslCertReloadIntervalMillis -1))))))
+
+(deftest http3-shares-the-file-source-cert
+  (let [c (.build (doto (Config/builder) (.http3 true) (.sslCertPath "c") (.sslKeyPath "k")
+                        (.advertiseAltSvc false)))]
+    (is (= "c" (.quicheCertPath c)))
+    (is (= "k" (.quicheKeyPath c))))
+  (testing "http3 cert paths override the shared ones"
+    (let [c (.build (doto (Config/builder) (.http3 true) (.sslCertPath "shared-c") (.sslKeyPath "shared-k")
+                          (.http3CertPath "h3-c") (.http3KeyPath "h3-k") (.advertiseAltSvc false)))]
+      (is (= "h3-c" (.quicheCertPath c)))
+      (is (= "h3-k" (.quicheKeyPath c))))))
+
+(deftest http3-needs-a-cert-source
+  (is (thrown-with-msg? IllegalArgumentException #":http3 needs"
+                        (.build (doto (Config/builder) (.http3 true) (.advertiseAltSvc false))))))
+
+(deftest http3-mutual-tls-from-ca-path-is-rejected
+  (is (thrown-with-msg? IllegalArgumentException
+                        #"HTTP/3 mutual TLS is not yet supported"
+                        (.build (doto (Config/builder)
+                                  (.http3 true) (.advertiseAltSvc false)
+                                  (.sslCertPath "c") (.sslKeyPath "k") (.sslCaPath "ca")
+                                  (.sslNeedClientAuth true))))))
+
 ;; ---- Other validation regressions ----------------------------------------
 
 (deftest host-must-be-non-empty
@@ -180,7 +240,7 @@
            [#(.serverHeader ^com.s_exp.enso.api.Config$Builder % " enso")
             #":server-header must be a valid field value"]
            [#(.http2 ^com.s_exp.enso.api.Config$Builder % true)
-            #":http2 needs :ssl-context"]]]
+            #":http2 needs a TLS source"]]]
     (is (re-find msg (str (build-error f))) (str msg))))
 
 (deftest http3-on-ephemeral-port-allowed-without-alt-svc

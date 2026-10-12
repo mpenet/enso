@@ -302,6 +302,10 @@ public final class Http3Listener implements AutoCloseable {
     private void startCertWatcher() {
         long interval = config.http3CertReloadIntervalMillis;
         if (interval <= 0) return;
+        // Dedicated h3 cert files only. When the cert comes from the shared
+        // :ssl-cert-path, the TCP watcher (:ssl-cert-reload-interval) drives
+        // both transports, so this listener doesn't watch the same files.
+        if (config.http3CertPath == null) return;
         certWatcher = Thread.ofVirtual().name("enso-h3-cert-watcher").start(() -> {
             while (true) {
                 try {
@@ -359,7 +363,7 @@ public final class Http3Listener implements AutoCloseable {
         install(fresh);
         loadedCerts = now;
         refusedCerts = null;
-        LOG.info(() -> "h3 certificate reloaded from " + config.http3CertPath);
+        LOG.info(() -> "h3 certificate reloaded from " + config.quicheCertPath());
     }
 
     /** What identifies a version of the certificate and key files: modification time, size, file key. */
@@ -367,8 +371,8 @@ public final class Http3Listener implements AutoCloseable {
                              long keyModified, long keySize, Object keyKey) {
 
         static CertFiles read(Config config) throws IOException {
-            BasicFileAttributes c = Files.readAttributes(Path.of(config.http3CertPath), BasicFileAttributes.class);
-            BasicFileAttributes k = Files.readAttributes(Path.of(config.http3KeyPath), BasicFileAttributes.class);
+            BasicFileAttributes c = Files.readAttributes(Path.of(config.quicheCertPath()), BasicFileAttributes.class);
+            BasicFileAttributes k = Files.readAttributes(Path.of(config.quicheKeyPath()), BasicFileAttributes.class);
             return new CertFiles(c.lastModifiedTime().toMillis(), c.size(), c.fileKey(),
                                  k.lastModifiedTime().toMillis(), k.size(), k.fileKey());
         }

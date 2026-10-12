@@ -5,10 +5,15 @@
   Verifies the sslContextProvider path serves live-swapped contexts on
   new connections without restart."
   (:require [clojure.test :refer [deftest testing is]]
-            [s-exp.enso :as enso])
+            [s-exp.enso :as enso]
+            [s-exp.enso-test-support :as support])
   (:import (java.io File FileInputStream)
-           (java.security KeyStore)
-           (java.security.cert X509Certificate)
+           (java.nio.file CopyOption Files Path StandardCopyOption)
+           (java.nio.file.attribute FileAttribute)
+           (java.security KeyFactory KeyStore)
+           (java.security.cert Certificate CertificateFactory X509Certificate)
+           (java.security.spec PKCS8EncodedKeySpec)
+           (java.util Base64 List)
            (java.util.concurrent.atomic AtomicReference)
            (java.util.function Supplier)
            (javax.net.ssl KeyManagerFactory SSLContext TrustManager X509TrustManager)))
@@ -886,3 +891,302 @@
               (.inputPending tls) true
               (< n 200) (do (Thread/sleep 10) (recur (inc n)))
               :else false))))))
+
+;; ---- File-based certificate source --------------------------------------------
+
+(defn- openssl! [& args]
+  (let [p (-> (ProcessBuilder. ^List (map str (cons "openssl" args)))
+              (.redirectErrorStream true)
+              (.start))
+        out (slurp (.getInputStream p))]
+    (when-not (zero? (.waitFor p))
+      (throw (ex-info (str "openssl failed: " (vec args) "\n" out) {})))
+    out))
+
+(defn- tls-temp-dir ^Path []
+  (Files/createTempDirectory "enso-tls-file" (make-array FileAttribute 0)))
+
+(defn- in-dir ^String [^Path dir ^String name]
+  (str (.resolve dir name)))
+
+(defn- self-signed!
+  "Writes a self-signed PEM pair for `cn` into `dir`, algorithm `:rsa` or
+  `:ec` (a PKCS8 key either way). Returns [cert-path key-path]."
+  [^Path dir cn algo]
+  (let [cert (in-dir dir (str cn ".crt"))
+        key (in-dir dir (str cn ".key"))]
+    (apply openssl!
+           (concat ["req" "-x509"]
+                   (case algo
+                     :rsa ["-newkey" "rsa:2048"]
+                     :ec ["-newkey" "ec" "-pkeyopt" "ec_paramgen_curve:prime256v1"
+                          "-pkeyopt" "ec_param_enc:named_curve"])
+                   ["-keyout" key "-out" cert "-sha256" "-days" "1" "-nodes" "-subj" (str "/CN=" cn)]))
+    [cert key]))
+
+(defn- gen-key!
+  "Writes a private key of `format` into `dir` with the natural openssl
+  command for that encoding; returns the key path. The formats cover the
+  common unencrypted key files: PKCS8 (`PRIVATE KEY`), PKCS1 (`RSA PRIVATE
+  KEY`), SEC1 (`EC PRIVATE KEY`), SEC1 preceded by an `EC PARAMETERS` block
+  (the default `ecparam -genkey` output), and a P-384 SEC1 key."
+  ^String [^Path dir format]
+  (let [key (in-dir dir (str (name format) ".key"))]
+    (case format
+      :rsa-pkcs8 (openssl! "genpkey" "-algorithm" "RSA" "-pkeyopt" "rsa_keygen_bits:2048" "-out" key)
+      :rsa-pkcs1 (openssl! "genrsa" "-out" key "2048")
+      ;; named_curve: LibreSSL's genpkey defaults to explicit EC
+      ;; parameters, which the JDK rejects in both certs and keys.
+      :ec-pkcs8 (openssl! "genpkey" "-algorithm" "EC"
+                          "-pkeyopt" "ec_paramgen_curve:P-256"
+                          "-pkeyopt" "ec_param_enc:named_curve" "-out" key)
+      :ec-sec1 (openssl! "ecparam" "-name" "prime256v1" "-genkey" "-noout" "-out" key)
+      :ec-sec1-params (openssl! "ecparam" "-name" "prime256v1" "-genkey" "-out" key)
+      :ec-sec1-p384 (openssl! "ecparam" "-name" "secp384r1" "-genkey" "-out" key))
+    key))
+
+(defn- cert-for-key!
+  "Self-signed cert (CN=`cn`) for an existing key; returns the cert path.
+  The key material is untouched, so the cert matches whatever encoding the
+  key file uses."
+  ^String [^Path dir cn ^String key-path]
+  (let [cert (in-dir dir (str cn ".crt"))]
+    (openssl! "req" "-new" "-x509" "-key" key-path "-out" cert
+              "-sha256" "-days" "1" "-subj" (str "/CN=" cn))
+    cert))
+
+(defn- move! [^String from ^String to]
+  (Files/move (Path/of from (make-array String 0)) (Path/of to (make-array String 0))
+              (into-array CopyOption [StandardCopyOption/REPLACE_EXISTING])))
+
+(defn- write-pair!
+  "Generates a self-signed RSA pair for `cn` and renames it over
+  `cert-path` / `key-path`, each in one rename (as deploy tools do)."
+  [^Path dir cert-path key-path cn]
+  (let [[c k] (self-signed! dir cn :rsa)]
+    (move! c cert-path)
+    (move! k key-path)))
+
+(defn- cert-chain!
+  "Generates root -> intermediate -> leaf (CN=localhost). Returns
+  [chain-cert-path leaf-key-path]; the chain file is leaf then intermediate."
+  [^Path dir]
+  (let [p #(in-dir dir %)
+        bc (p "bc.ext")]
+    (spit bc "basicConstraints=critical,CA:TRUE\n")
+    (openssl! "req" "-x509" "-newkey" "rsa:2048" "-keyout" (p "root.key") "-out" (p "root.crt")
+              "-sha256" "-days" "1" "-nodes" "-subj" "/CN=enso-root"
+              "-addext" "basicConstraints=critical,CA:TRUE")
+    (openssl! "req" "-newkey" "rsa:2048" "-keyout" (p "int.key") "-out" (p "int.csr")
+              "-nodes" "-subj" "/CN=enso-intermediate")
+    (openssl! "x509" "-req" "-in" (p "int.csr") "-CA" (p "root.crt") "-CAkey" (p "root.key")
+              "-CAcreateserial" "-days" "1" "-sha256" "-extfile" bc "-out" (p "int.crt"))
+    (openssl! "req" "-newkey" "rsa:2048" "-keyout" (p "leaf.key") "-out" (p "leaf.csr")
+              "-nodes" "-subj" "/CN=localhost")
+    (openssl! "x509" "-req" "-in" (p "leaf.csr") "-CA" (p "int.crt") "-CAkey" (p "int.key")
+              "-CAcreateserial" "-days" "1" "-sha256" "-out" (p "leaf.crt"))
+    (spit (p "chain.crt") (str (slurp (p "leaf.crt")) (slurp (p "int.crt"))))
+    [(p "chain.crt") (p "leaf.key")]))
+
+(defn- client-auth-material!
+  "A client CA, a client cert signed by it, and an unrelated (rogue)
+  self-signed client cert. Returns a map of file paths."
+  [^Path dir]
+  (let [p #(in-dir dir %)]
+    (openssl! "req" "-x509" "-newkey" "rsa:2048" "-keyout" (p "cca.key") "-out" (p "cca.crt")
+              "-sha256" "-days" "1" "-nodes" "-subj" "/CN=enso-client-ca"
+              "-addext" "basicConstraints=critical,CA:TRUE")
+    (openssl! "req" "-newkey" "rsa:2048" "-keyout" (p "cl.key") "-out" (p "cl.csr")
+              "-nodes" "-subj" "/CN=enso-client")
+    (openssl! "x509" "-req" "-in" (p "cl.csr") "-CA" (p "cca.crt") "-CAkey" (p "cca.key")
+              "-CAcreateserial" "-days" "1" "-sha256" "-out" (p "cl.crt"))
+    (let [[rc rk] (self-signed! dir "enso-rogue" :rsa)]
+      {:ca (p "cca.crt") :client-cert (p "cl.crt") :client-key (p "cl.key")
+       :rogue-cert rc :rogue-key rk})))
+
+(defn- strip-pem ^bytes [^String pem]
+  (-> pem
+      (.replaceAll "-----BEGIN[^-]*-----" "")
+      (.replaceAll "-----END[^-]*-----" "")
+      (.replaceAll "\\s" "")
+      (->> (.decode (Base64/getDecoder)))))
+
+(defn- client-identity-context
+  "Client SSLContext that trusts any server (test-only) and presents the
+  RSA cert/key at the given paths."
+  ^SSLContext [cert-path key-path]
+  (let [cert (with-open [in (FileInputStream. (str cert-path))]
+               (.generateCertificate (CertificateFactory/getInstance "X.509") in))
+        key (.generatePrivate (KeyFactory/getInstance "RSA")
+                              (PKCS8EncodedKeySpec. (strip-pem (slurp key-path))))
+        pass (char-array 0)
+        ks (doto (KeyStore/getInstance (KeyStore/getDefaultType))
+             (.load nil nil)
+             (.setKeyEntry "c" key pass (into-array Certificate [cert])))
+        kmf (doto (KeyManagerFactory/getInstance (KeyManagerFactory/getDefaultAlgorithm))
+              (.init ks pass))
+        tm (reify X509TrustManager
+             (checkClientTrusted [_ _ _])
+             (checkServerTrusted [_ _ _])
+             (getAcceptedIssuers [_] (make-array X509Certificate 0)))
+        ctx (SSLContext/getInstance "TLS")]
+    (.init ctx (.getKeyManagers kmf) (into-array TrustManager [tm]) nil)
+    ctx))
+
+(defn- presented-cn
+  "The CN of the leaf certificate a new TLS connection to `port` is shown."
+  [port]
+  (let [captured (atom [])]
+    (do-tls-get! (capturing-trust-context captured) port)
+    (when (seq @captured)
+      (.getName (.getSubjectX500Principal ^X509Certificate (first @captured))))))
+
+(defn- negotiated-alpn
+  "The ALPN protocol the server picks for a client offering `protocols`."
+  [port protocols]
+  (let [factory (.getSocketFactory (capturing-trust-context (atom [])))]
+    (with-open [^javax.net.ssl.SSLSocket sock (.createSocket factory "127.0.0.1" (int port))]
+      (let [params (.getSSLParameters sock)]
+        (.setApplicationProtocols params (into-array String protocols))
+        (.setSSLParameters sock params))
+      (.startHandshake sock)
+      (.getApplicationProtocol sock))))
+
+(deftest file-source-serves-rsa-over-h1-and-h2
+  (let [dir (tls-temp-dir)
+        [cert key] (self-signed! dir "file-rsa" :rsa)
+        srv (enso/run-server (fn [_] {:status 200 :body "ok"})
+                             {:host "127.0.0.1" :port 0 :http2 true
+                              :ssl-cert-path cert :ssl-key-path key})]
+    (try
+      (let [resp (String. ^bytes (do-tls-get! (capturing-trust-context (atom [])) (enso/port srv))
+                          java.nio.charset.StandardCharsets/ISO_8859_1)]
+        (is (.startsWith resp "HTTP/1.1 200") resp))
+      (is (re-find #"CN=file-rsa" (presented-cn (enso/port srv))))
+      (is (= "h2" (negotiated-alpn (enso/port srv) ["h2" "http/1.1"])) "ALPN negotiates h2")
+      (finally (enso/stop srv)))))
+
+(deftest file-source-serves-ec
+  (let [dir (tls-temp-dir)
+        [cert key] (self-signed! dir "file-ec" :ec)
+        srv (enso/run-server (fn [_] {:status 200 :body "ok"})
+                             {:host "127.0.0.1" :port 0 :http2 true
+                              :ssl-cert-path cert :ssl-key-path key})]
+    (try
+      (is (re-find #"CN=file-ec" (presented-cn (enso/port srv))))
+      (is (= "h2" (negotiated-alpn (enso/port srv) ["h2" "http/1.1"])) "ALPN negotiates h2 on an EC cert")
+      (finally (enso/stop srv)))))
+
+(deftest file-source-presents-the-full-chain
+  (let [dir (tls-temp-dir)
+        [chain key] (cert-chain! dir)
+        captured (atom [])
+        srv (enso/run-server (fn [_] {:status 200 :body "ok"})
+                             {:host "127.0.0.1" :port 0 :ssl-cert-path chain :ssl-key-path key})]
+    (try
+      (let [chain-ref (atom [])
+            tm (reify X509TrustManager
+                 (checkClientTrusted [_ _ _])
+                 (checkServerTrusted [_ ch _] (reset! chain-ref (vec ch)))
+                 (getAcceptedIssuers [_] (make-array X509Certificate 0)))
+            ctx (doto (SSLContext/getInstance "TLS") (.init nil (into-array TrustManager [tm]) nil))]
+        (do-tls-get! ctx (enso/port srv))
+        (is (<= 2 (count @chain-ref)) "leaf and intermediate presented")
+        (is (re-find #"CN=localhost"
+                     (.getName (.getSubjectX500Principal ^X509Certificate (first @chain-ref)))))
+        (is (re-find #"CN=enso-intermediate"
+                     (.getName (.getSubjectX500Principal ^X509Certificate (second @chain-ref))))))
+      (finally (enso/stop srv)))))
+
+(deftest mutual-tls-accepts-a-ca-signed-client-and-rejects-others
+  (let [dir (tls-temp-dir)
+        [cert key] (self-signed! dir "mtls-server" :rsa)
+        {:keys [ca client-cert client-key rogue-cert rogue-key]} (client-auth-material! dir)
+        srv (enso/run-server (fn [_] {:status 200 :body "ok"})
+                             {:host "127.0.0.1" :port 0
+                              :ssl-cert-path cert :ssl-key-path key
+                              :ssl-ca-path ca :ssl-need-client-auth true})]
+    (try
+      (let [resp (String. ^bytes (do-tls-get! (client-identity-context client-cert client-key) (enso/port srv))
+                          java.nio.charset.StandardCharsets/ISO_8859_1)]
+        (is (.startsWith resp "HTTP/1.1 200") "a CA-signed client is accepted"))
+      (is (thrown? java.io.IOException
+                   (do-tls-get! (client-identity-context rogue-cert rogue-key) (enso/port srv)))
+          "an untrusted client certificate is rejected")
+      (finally (enso/stop srv)))))
+
+(deftest file-source-hot-reloads-and-keeps-the-old-on-a-bad-file
+  (let [dir (tls-temp-dir)
+        cert (in-dir dir "cert.pem")
+        key (in-dir dir "key.pem")
+        _ (write-pair! dir cert key "reload-a")
+        srv (enso/run-server (fn [_] {:status 200 :body "ok"})
+                             {:host "127.0.0.1" :port 0 :http2 true
+                              :ssl-cert-path cert :ssl-key-path key :ssl-cert-reload-interval 50})]
+    (try
+      (is (re-find #"CN=reload-a" (presented-cn (enso/port srv))) "the initial certificate")
+      (write-pair! dir cert key "reload-b")
+      (is (support/await-condition #(some->> (presented-cn (enso/port srv)) (re-find #"CN=reload-b"))
+                                   5000 50)
+          "a new connection gets the rotated certificate")
+      (testing "a bad PEM does not swap and is logged, the server stays up"
+        (let [records (support/capture-logs
+                       "com.s_exp.enso.core"
+                       (fn []
+                         (spit cert "-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n")
+                         (Thread/sleep 400)))]
+          (is (re-find #"CN=reload-b" (presented-cn (enso/port srv)))
+              "the current certificate still serves")
+          (is (some #(re-find #"reload failed" %)
+                    (support/records-at records java.util.logging.Level/WARNING))
+              "a warning was logged")))
+      (finally (enso/stop srv)))))
+
+;; ---- Private-key formats ------------------------------------------------------
+
+(deftest file-source-serves-every-private-key-format
+  ;; Each row is a real openssl-generated key in one of the common
+  ;; unencrypted encodings, paired with a matching self-signed cert. All
+  ;; must load and actually serve TLS, presenting their own leaf.
+  (doseq [[format cn] [[:rsa-pkcs8 "key-rsa-pkcs8"]
+                       [:rsa-pkcs1 "key-rsa-pkcs1"]
+                       [:ec-pkcs8 "key-ec-pkcs8"]
+                       [:ec-sec1 "key-ec-sec1"]
+                       [:ec-sec1-params "key-ec-sec1-params"]
+                       [:ec-sec1-p384 "key-ec-p384"]]]
+    (testing (name format)
+      (let [dir (tls-temp-dir)
+            key (gen-key! dir format)
+            cert (cert-for-key! dir cn key)
+            srv (enso/run-server (fn [_] {:status 200 :body "ok"})
+                                 {:host "127.0.0.1" :port 0 :http2 true
+                                  :ssl-cert-path cert :ssl-key-path key})]
+        (try
+          (let [resp (String. ^bytes (do-tls-get! (capturing-trust-context (atom [])) (enso/port srv))
+                              java.nio.charset.StandardCharsets/ISO_8859_1)]
+            (is (.startsWith resp "HTTP/1.1 200") (str (name format) ": " resp)))
+          (is (re-find (re-pattern (str "CN=" cn)) (presented-cn (enso/port srv)))
+              (str (name format) " presents its own certificate"))
+          (finally (enso/stop srv)))))))
+
+(deftest file-source-rejects-an-encrypted-key
+  (let [dir (tls-temp-dir)
+        plain (gen-key! dir :rsa-pkcs8)
+        cert (cert-for-key! dir "enc-test" plain)
+        encrypted (in-dir dir "encrypted.key")]
+    (openssl! "pkcs8" "-topk8" "-in" plain "-out" encrypted "-passout" "pass:secret")
+    (is (thrown-with-msg?
+         java.io.IOException #"encrypted private key"
+         (enso/run-server (fn [_] {:status 200 :body "ok"})
+                          {:host "127.0.0.1" :port 0 :ssl-cert-path cert :ssl-key-path encrypted})))))
+
+(deftest file-source-rejects-a-non-key-pem
+  (let [dir (tls-temp-dir)
+        key (gen-key! dir :rsa-pkcs8)
+        cert (cert-for-key! dir "junk-test" key)
+        junk (in-dir dir "junk.key")]
+    (spit junk "-----BEGIN CERTIFICATE-----\nnot a key\n-----END CERTIFICATE-----\n")
+    (is (thrown-with-msg?
+         java.io.IOException #"no PKCS8, PKCS1 or SEC1 private key"
+         (enso/run-server (fn [_] {:status 200 :body "ok"})
+                          {:host "127.0.0.1" :port 0 :ssl-cert-path cert :ssl-key-path junk})))))

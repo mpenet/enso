@@ -13,6 +13,7 @@ import com.s_exp.enso.core.Jfr;
 import com.s_exp.enso.core.LogLimiter;
 import com.s_exp.enso.core.Service;
 import com.s_exp.enso.core.Timer;
+import com.s_exp.enso.core.PemTlsContext;
 import com.s_exp.enso.core.TlsSocket;
 import com.s_exp.enso.core.WriteWatchdog;
 import com.s_exp.enso.http1.HttpConnection;
@@ -55,6 +56,7 @@ public final class EnsoServer implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger(EnsoServer.class.getName());
     private static final LogLimiter ACCEPT_FAILURES = new LogLimiter(LOG, Level.WARNING);
     private static final LogLimiter CONNECTION_FAILURES = new LogLimiter(LOG, Level.FINE);
+    private static final LogLimiter CERT_RELOAD_FAILURES = new LogLimiter(LOG, Level.WARNING);
     private static final long ACCEPT_FAILURE_BACKOFF_MILLIS = 50;
     // Longest part of :shutdown-timeout kept for force-closing what didn't
     // drain and joining its threads (a quarter of the timeout when shorter).
@@ -88,6 +90,12 @@ public final class EnsoServer implements AutoCloseable {
     // The TLS context last configured (session cache size), so a provider
     // returning the same context isn't reconfigured per connection.
     private volatile SSLContext configuredContext;
+    // The file source's context and its reload watcher, when :ssl-cert-path
+    // drives the TCP listener; null otherwise.
+    private PemTlsContext pemTls;
+    // Whether the TCP listener speaks TLS: a prebuilt context (static or the
+    // provider's seed) or the PEM file source.
+    private final boolean tcpTls;
 
     public EnsoServer(RingHandler handler, Config config) {
         this(handler, null, config);
@@ -97,6 +105,7 @@ public final class EnsoServer implements AutoCloseable {
         this.handler = handler;
         this.errorHandler = errorHandler;
         this.config = config;
+        this.tcpTls = config.sslContext != null || config.sslCertPath != null;
         this.limiter = new ConnectionLimiter(config.maxConnections, config.maxConnectionsPerIp);
     }
 
@@ -123,10 +132,14 @@ public final class EnsoServer implements AutoCloseable {
             executor = Executors.newVirtualThreadPerTaskExecutor();
             if (config.sslContext != null) {
                 configureContext(config.sslContext);
+            } else if (config.sslCertPath != null) {
+                pemTls = PemTlsContext.create(config);
+                configureContext(pemTls.sslContext());
             }
             channel = bind();
             running = true;
             http3Listener = createHttp3Listener();
+            startPemTlsWatcher();
             acceptor = Thread.ofPlatform().name("enso-acceptor").daemon(true).unstarted(this::acceptLoop);
             acceptor.start();
         } catch (Throwable t) {
@@ -314,6 +327,27 @@ public final class EnsoServer implements AutoCloseable {
         return config.http2 ? new String[] {H2, HTTP_1_1} : new String[] {HTTP_1_1};
     }
 
+    /**
+     * Starts the file-source watcher, if any. When HTTP/3 serves from the
+     * same files (no {@code :http3-cert-path}), the watcher reloads the QUIC
+     * transport too, so one watcher drives both and never two over the same
+     * files.
+     */
+    private void startPemTlsWatcher() {
+        if (pemTls == null) return;
+        Runnable afterReload = null;
+        if (http3Listener instanceof Http3Listener h3 && config.http3CertPath == null) {
+            afterReload = () -> {
+                try {
+                    h3.reloadCertificates();
+                } catch (IOException e) {
+                    CERT_RELOAD_FAILURES.log("h3 certificate reload from the shared files failed", e);
+                }
+            };
+        }
+        pemTls.startWatcher(afterReload);
+    }
+
     private void configureContext(SSLContext ctx) {
         if (config.sslSessionCacheSize > 0) {
             ctx.getServerSessionContext().setSessionCacheSize(config.sslSessionCacheSize);
@@ -325,7 +359,7 @@ public final class EnsoServer implements AutoCloseable {
     private SSLEngine newEngine() throws IOException {
         SSLContext ctx = config.sslContextProvider != null
             ? config.sslContextProvider.get()
-            : config.sslContext;
+            : (pemTls != null ? pemTls.sslContext() : config.sslContext);
         if (ctx == null) {
             throw new IOException("SSLContext provider returned null");
         }
@@ -388,7 +422,7 @@ public final class EnsoServer implements AutoCloseable {
                 applySocketOptions(channel);
                 Socket s;
                 long handshakeDeadline = 0;
-                if (config.sslContext != null) {
+                if (tcpTls) {
                     tls = new TlsSocket(channel, newEngine());
                     s = tls.asSocket();
                     socket = s;
@@ -438,7 +472,7 @@ public final class EnsoServer implements AutoCloseable {
                     c.run();
                 }
             } catch (Throwable t) {
-                if (protocol == null && config.sslContext != null) {
+                if (protocol == null && tcpTls) {
                     // A silent or drip-feeding peer runs out the handshake
                     // deadline (the read side times out; the write side is
                     // force-closed by the watchdog, which sets handshakeExpired).
@@ -676,6 +710,9 @@ public final class EnsoServer implements AutoCloseable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+        if (pemTls != null) {
+            pemTls.close();
         }
         if (timer != null) {
             timer.close();

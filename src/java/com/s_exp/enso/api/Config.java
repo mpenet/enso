@@ -80,6 +80,26 @@ public final class Config {
      * connections; null → {@link #sslContext} throughout.
      */
     public final Supplier<SSLContext> sslContextProvider;
+    /**
+     * PEM server certificate, leaf first, optionally followed by its
+     * intermediate chain; null unless the file source builds the TCP
+     * context. Paired with {@link #sslKeyPath}.
+     */
+    public final String sslCertPath;
+    /** PEM PKCS8 private key (RSA or EC) for {@link #sslCertPath}. */
+    public final String sslKeyPath;
+    /**
+     * PEM CA bundle verifying client certificates (mutual TLS over TCP);
+     * only with the file source and client authentication. null → the
+     * JVM default trust.
+     */
+    public final String sslCaPath;
+    /**
+     * Milliseconds between checks of {@link #sslCertPath} / {@link #sslKeyPath}
+     * / {@link #sslCaPath} for changes; a changed file is parsed and served
+     * on the next handshake (existing connections keep theirs). 0 disables.
+     */
+    public final int sslCertReloadIntervalMillis;
     public final boolean sslNeedClientAuth;
     public final boolean sslWantClientAuth;
     /** null → h2 + http/1.1 when http2 is on, else http/1.1. */
@@ -212,6 +232,10 @@ public final class Config {
         this.soSndBufBytes = b.soSndBufBytes;
         this.sslContext = b.sslContext;
         this.sslContextProvider = b.sslContextProvider;
+        this.sslCertPath = b.sslCertPath;
+        this.sslKeyPath = b.sslKeyPath;
+        this.sslCaPath = b.sslCaPath;
+        this.sslCertReloadIntervalMillis = b.sslCertReloadIntervalMillis;
         this.sslNeedClientAuth = b.sslNeedClientAuth;
         this.sslWantClientAuth = b.sslWantClientAuth;
         // Fields are public final but arrays are mutable: copies keep a
@@ -275,6 +299,19 @@ public final class Config {
         return new Builder();
     }
 
+    /**
+     * The certificate PEM the QUIC transport loads: the {@link #http3CertPath}
+     * override when set, else the shared {@link #sslCertPath} file source.
+     */
+    public String quicheCertPath() {
+        return http3CertPath != null ? http3CertPath : sslCertPath;
+    }
+
+    /** The private key PEM the QUIC transport loads; see {@link #quicheCertPath}. */
+    public String quicheKeyPath() {
+        return http3KeyPath != null ? http3KeyPath : sslKeyPath;
+    }
+
     public static final class Builder {
 
         private String host = "0.0.0.0";
@@ -304,6 +341,10 @@ public final class Config {
         private int soSndBufBytes = 0;
         private SSLContext sslContext;
         private Supplier<SSLContext> sslContextProvider;
+        private String sslCertPath;
+        private String sslKeyPath;
+        private String sslCaPath;
+        private int sslCertReloadIntervalMillis = 10_000;
         private boolean sslNeedClientAuth;
         private boolean sslWantClientAuth;
         private String[] sslAlpnProtocols;
@@ -385,6 +426,10 @@ public final class Config {
         public Builder soSndBufBytes(int v) { this.soSndBufBytes = v; return this; }
         public Builder sslContext(SSLContext v) { this.sslContext = v; return this; }
         public Builder sslContextProvider(Supplier<SSLContext> v) { this.sslContextProvider = v; return this; }
+        public Builder sslCertPath(String v) { this.sslCertPath = v; return this; }
+        public Builder sslKeyPath(String v) { this.sslKeyPath = v; return this; }
+        public Builder sslCaPath(String v) { this.sslCaPath = v; return this; }
+        public Builder sslCertReloadIntervalMillis(int v) { this.sslCertReloadIntervalMillis = v; return this; }
         public Builder sslNeedClientAuth(boolean v) { this.sslNeedClientAuth = v; return this; }
         public Builder sslWantClientAuth(boolean v) { this.sslWantClientAuth = v; return this; }
         public Builder sslAlpnProtocols(String[] v) { this.sslAlpnProtocols = v == null ? null : v.clone(); return this; }
@@ -435,6 +480,16 @@ public final class Config {
 
         private boolean advertiseAltSvc() {
             return advertiseAltSvcExplicit != null ? advertiseAltSvcExplicit : http3;
+        }
+
+        /**
+         * Whether the TCP listener speaks TLS: a prebuilt context (static or
+         * the provider's seed) or the PEM file source. Valid after
+         * {@link #validateTls}, which seeds {@link #sslContext} from the
+         * provider.
+         */
+        private boolean tlsEnabled() {
+            return sslContext != null || sslCertPath != null;
         }
 
         public Config build() {
@@ -519,6 +574,21 @@ public final class Config {
                 throw invalid(":ssl-context-provider", sslContextProvider,
                               ":ssl-context and :ssl-context-provider are mutually exclusive");
             }
+            // The file source gives the server its certificate and key as
+            // PEM files that one SSLContext serves and reloads; cert and key
+            // come as a pair.
+            if ((sslCertPath != null) != (sslKeyPath != null)) {
+                throw invalid(sslCertPath != null ? ":ssl-key-path" : ":ssl-cert-path",
+                              sslCertPath != null ? sslKeyPath : sslCertPath,
+                              ":ssl-cert-path and :ssl-key-path must be set together");
+            }
+            boolean fileSource = sslCertPath != null;
+            // The TLS identity is exactly one of the three sources.
+            if (fileSource && (sslContext != null || sslContextProvider != null)) {
+                throw invalid(":ssl-cert-path", sslCertPath,
+                              ":ssl-cert-path / :ssl-key-path and :ssl-context / :ssl-context-provider "
+                              + "are mutually exclusive");
+            }
             // The provider's first context is the one validated against and
             // used for startup; it is asked again per accepted connection.
             if (sslContext == null && sslContextProvider != null) {
@@ -529,7 +599,14 @@ public final class Config {
                 }
                 sslContext = seed;
             }
-            boolean tls = sslContext != null;
+            // The CA bundle verifies client certificates, which only the
+            // file source presents to a TrustManager.
+            if (sslCaPath != null && !fileSource) {
+                throw invalid(":ssl-ca-path", sslCaPath,
+                              ":ssl-ca-path needs :ssl-cert-path and :ssl-key-path");
+            }
+            requireAtLeast(":ssl-cert-reload-interval", sslCertReloadIntervalMillis, 0);
+            boolean tls = sslContext != null || fileSource;
             if (!tls) {
                 if (sslNeedClientAuth || sslWantClientAuth) {
                     throw invalid(sslNeedClientAuth ? ":ssl-need-client-auth" : ":ssl-want-client-auth", true,
@@ -562,11 +639,14 @@ public final class Config {
         }
 
         private void validateHttp2() {
-            if (http2 && sslContext == null) {
-                throw invalid(":http2", true, ":http2 needs :ssl-context (cleartext HTTP/2 is :http2c)");
+            if (http2 && !tlsEnabled()) {
+                throw invalid(":http2", true,
+                              ":http2 needs a TLS source (:ssl-context, :ssl-context-provider or "
+                              + ":ssl-cert-path with :ssl-key-path; cleartext HTTP/2 is :http2c)");
             }
-            if (http2c && (sslContext != null || sslContextProvider != null)) {
-                throw invalid(":http2c", true, ":http2c serves a plain listener; with :ssl-context use :http2");
+            if (http2c && tlsEnabled()) {
+                throw invalid(":http2c", true,
+                              ":http2c serves a plain listener; with a TLS source use :http2");
             }
             requireAtLeast(":http2-max-concurrent-streams", http2MaxConcurrentStreams, 1);
             // RFC 9113 §6.9.2 caps windows at 2^31-1. Below the 65535
@@ -586,10 +666,27 @@ public final class Config {
 
         private void validateHttp3() {
             requireRange(":http3-port", http3Port, 0, 65535);
+            // The http3 cert and key, or neither (the shared file source
+            // then serves QUIC).
+            if ((http3CertPath != null) != (http3KeyPath != null)) {
+                throw invalid(http3CertPath != null ? ":http3-key-path" : ":http3-cert-path",
+                              http3CertPath != null ? http3KeyPath : http3CertPath,
+                              ":http3-cert-path and :http3-key-path must be set together");
+            }
             if (http3) {
-                if (http3CertPath == null || http3KeyPath == null) {
-                    throw invalid(":http3", true, ":http3 needs :http3-cert-path and :http3-key-path (PEM files: "
-                                  + "quiche loads cert and key from disk, not from the SSLContext)");
+                boolean h3Cert = (http3CertPath != null) || (sslCertPath != null);
+                if (!h3Cert) {
+                    throw invalid(":http3", true, ":http3 needs :http3-cert-path and :http3-key-path, "
+                                  + "or the shared :ssl-cert-path and :ssl-key-path (PEM files: quiche loads "
+                                  + "cert and key from disk, not from the SSLContext)");
+                }
+                // Verifying client certificates over QUIC needs a quiche
+                // load_verify_locations shim that isn't wired yet, so the
+                // CA bundle can't gate HTTP/3 as it does TCP.
+                if (sslCaPath != null && (sslNeedClientAuth || sslWantClientAuth)) {
+                    throw invalid(":ssl-ca-path", sslCaPath,
+                                  "HTTP/3 mutual TLS is not yet supported; use :ssl-context for h3 client auth, "
+                                  + "or drop :http3");
                 }
                 // Alt-Svc must name the UDP port clients connect to: an
                 // ephemeral one is only known after binding, separately

@@ -28,7 +28,7 @@
 
 ;; ---- server ---------------------------------------------------------------
 
-(def ^:private cert-pair
+(def cert-pair
   (delay
     (let [dir (Files/createTempDirectory "enso-h3-e2e" (make-array FileAttribute 0))
           cert (str (.resolve dir "cert.pem"))

@@ -1,8 +1,7 @@
 # Deployment
 
 Settings to review before putting enso in front of real traffic, and what
-the server already protects against. To report a vulnerability, see
-[SECURITY.md](../SECURITY.md).
+the server already protects against.
 
 ## Checklist
 
@@ -75,6 +74,32 @@ Floods and resource exhaustion:
 - Leave `:max-connections-per-ip` off; every client shares the proxy's address.
 - If the proxy rewrites `Host`, list the public origins in `:ws-allowed-origins`.
 - The default `:idle-timeout` of 75 s is longer than the 60 s idle timeout of common load balancers (AWS ALB), so the balancer, not enso, closes idle connections.
+
+## TLS certificates
+
+- Point `:ssl-cert-path` and `:ssl-key-path` at PEM files for TLS from
+  disk: the certificate (leaf first, then any intermediates) and an
+  unencrypted RSA or EC private key in PKCS8 (`PRIVATE KEY`), PKCS1 (`RSA
+  PRIVATE KEY`) or SEC1 (`EC PRIVATE KEY`) encoding — the common `openssl`
+  outputs, including the `EC PARAMETERS` block it prepends to a SEC1 key.
+  EC keys must name a curve. Encrypted keys are rejected; convert one with
+  `openssl pkcs8 -topk8 -nocrypt`. This path reloads on change, so
+  certificate rotation needs no restart. `:ssl-context` and
+  `:ssl-context-provider` stay available for a prebuilt context.
+- Replace certificate files atomically (write elsewhere, then rename), so
+  the reload check never sees a mismatched pair. A bad or half-written file
+  is kept out and logged at WARNING; the current certificate keeps serving.
+- `:ssl-cert-reload-interval` sets how often the files are checked (10 s by
+  default, 0 to turn it off). A handshake reads only the current
+  certificate, so reloading costs nothing per connection.
+- For mutual TLS, set `:ssl-ca-path` to the CA bundle that signs client
+  certificates and turn on `:ssl-need-client-auth` (or
+  `:ssl-want-client-auth`). This is TCP only; combining it with `:http3` is
+  rejected, since HTTP/3 client authentication is not yet supported.
+- HTTP/3 loads `:ssl-cert-path` and `:ssl-key-path` too when
+  `:http3-cert-path` is not set, so both transports rotate from one pair of
+  files under one watcher. Set `:http3-cert-path` and `:http3-key-path` for
+  a separate HTTP/3 certificate.
 
 ## HTTP/3
 

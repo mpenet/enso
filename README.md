@@ -14,13 +14,15 @@ An HTTP/1.1, HTTP/2, HTTP/3 and WebSocket server for Clojure Ring
 handlers, with no dependency besides Clojure. The core is written in Java
 for Ring and runs on virtual threads.
 
-Status: alpha. Option names and the API may still change between releases
+Status: beta. Option names and the API may still change between releases
 (see the [changelog](CHANGELOG.md)).
 
 ## Installation
 
+[![Clojars Project](https://img.shields.io/clojars/v/com.s-exp/enso.svg)](https://clojars.org/com.s-exp/enso)
+
 ```clojure
-{:deps {com.s-exp/enso {:mvn/version "1.0.0-alphaN"}}}
+{:deps {com.s-exp/enso {:mvn/version "..."}}}
 ```
 
 HTTP/3 is optional. It needs a second artifact for your platform, which
@@ -28,8 +30,8 @@ contains a JNI shim with libquiche linked in, so there is nothing to
 install on the system:
 
 ```clojure
-{:deps {com.s-exp/enso             {:mvn/version "1.0.0-alphaN"}
-        com.s-exp/enso$linux-amd64 {:mvn/version "1.0.0-alphaN"}}}
+{:deps {com.s-exp/enso             {:mvn/version "..."}
+        com.s-exp/enso$linux-amd64 {:mvn/version "..."}}}
 ```
 
 Classifiers: `linux-amd64`, `linux-arm64`, `linux-musl-amd64`,
@@ -112,7 +114,6 @@ needs `--enable-native-access=ALL-UNNAMED`.
 - [HTTP/3 conformance](doc/h3-conformance.md): h3spec results.
 - [Building](doc/build.md): build tasks, jars, the native shim and releases.
 - [Changelog](CHANGELOG.md)
-- [Security policy](SECURITY.md)
 
 ## Prior art
 

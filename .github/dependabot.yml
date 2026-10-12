@@ -1,5 +1,5 @@
 # ABOUTME: Dependabot: weekly grouped updates of the SHA-pinned GitHub Actions used by the workflows and the
-# ABOUTME: composite actions. deps.edn and the quiche lockfile are not Dependabot ecosystems (see SECURITY.md).
+# ABOUTME: composite actions. deps.edn and the quiche lockfile are not Dependabot ecosystems.
 version: 2
 updates:
   - package-ecosystem: github-actions

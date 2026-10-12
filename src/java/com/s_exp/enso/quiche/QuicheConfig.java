@@ -146,15 +146,17 @@ public final class QuicheConfig implements AutoCloseable {
     public long maxStreamWindow() { return maxStreamWindow; }
 
     private void loadCertKey(Config cfg) throws IOException {
-        int rc = Quiche.configLoadCertChainFromPemFile(handle(), cfg.http3CertPath);
+        String certPath = cfg.quicheCertPath();
+        String keyPath = cfg.quicheKeyPath();
+        int rc = Quiche.configLoadCertChainFromPemFile(handle(), certPath);
         if (rc < 0) {
             throw new IOException("quiche_config_load_cert_chain_from_pem_file failed rc=" + rc
-                + " for " + cfg.http3CertPath);
+                + " for " + certPath);
         }
-        rc = Quiche.configLoadPrivKeyFromPemFile(handle(), cfg.http3KeyPath);
+        rc = Quiche.configLoadPrivKeyFromPemFile(handle(), keyPath);
         if (rc < 0) {
             throw new IOException("quiche_config_load_priv_key_from_pem_file failed rc=" + rc
-                + " for " + cfg.http3KeyPath);
+                + " for " + keyPath);
         }
     }
 

@@ -420,4 +420,4 @@ workflow failing" issue.
 Actions, in workflows and composite actions. Dependabot has no ecosystem
 for `deps.edn` or a bare `Cargo.lock`, so Clojure and Maven test
 dependencies are bumped by hand, and the shim's crates are covered by the
-nightly `cargo audit` (see [SECURITY.md](../SECURITY.md)).
+nightly `cargo audit`.
