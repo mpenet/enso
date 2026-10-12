@@ -2,7 +2,7 @@
 
 There are two sets of numbers here, from two tools:
 
-- [Current numbers](#current-numbers) come from the regression harness (`clojure -M:perf`), with the server in its own JVM and allocation measured exactly inside it. They track the code; quote these.
+- [Current numbers](#current-numbers) come from the regression harness (`clojure -M:perf`), with the server in its own JVM and allocation measured exactly inside it. They track the code.
 - [Comparison with other servers](#comparison-with-other-servers) runs the same harness against other JVM servers, each in its own JVM, so allocation is measured the same way for all of them.
 
 ## Current numbers
