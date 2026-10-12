@@ -1110,9 +1110,16 @@
       (let [resp (String. ^bytes (do-tls-get! (client-identity-context client-cert client-key) (enso/port srv))
                           java.nio.charset.StandardCharsets/ISO_8859_1)]
         (is (.startsWith resp "HTTP/1.1 200") "a CA-signed client is accepted"))
-      (is (thrown? java.io.IOException
-                   (do-tls-get! (client-identity-context rogue-cert rogue-key) (enso/port srv)))
-          "an untrusted client certificate is rejected")
+      ;; need-client-auth makes the JSSE server fail the handshake for a cert
+      ;; that doesn't chain to the CA, so the handler never runs. The client
+      ;; sees that as an IOException (the server's alert) or, under TLS 1.3,
+      ;; as a closed connection with no response; either way it gets no 200.
+      (let [rogue (try (String. ^bytes (do-tls-get! (client-identity-context rogue-cert rogue-key)
+                                                    (enso/port srv))
+                                java.nio.charset.StandardCharsets/ISO_8859_1)
+                       (catch java.io.IOException _ ::rejected))]
+        (is (or (= ::rejected rogue) (not (.startsWith ^String rogue "HTTP/1.1 200")))
+            "an untrusted client certificate gets no successful response"))
       (finally (enso/stop srv)))))
 
 (deftest file-source-hot-reloads-and-keeps-the-old-on-a-bad-file
