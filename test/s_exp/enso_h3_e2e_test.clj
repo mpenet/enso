@@ -2890,7 +2890,9 @@
           (try
             (is (= [false 0x02] (h3/await-peer-error refused 2000))
                 "second Initial refused with CONNECTION_REFUSED, well under the handshake timeout")
-            (is (some #{"connection-limit"} @errors) (str @errors))
+            ;; protocolError is delivered off the server thread (GuardedEvents),
+            ;; so poll rather than read once.
+            (is (support/await-condition #(some #{"connection-limit"} @errors) 2000 1) (str @errors))
             (finally (h3/close! refused)))))
       (finally
         (.close l)
