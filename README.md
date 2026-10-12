@@ -8,8 +8,6 @@
 
 ------
 
-[![Clojars Project](https://img.shields.io/clojars/v/com.s-exp/enso.svg)](https://clojars.org/com.s-exp/enso)
-
 An HTTP/1.1, HTTP/2, HTTP/3 and WebSocket server for Clojure Ring
 handlers, with no dependency besides Clojure. The core is written in Java
 for Ring and runs on virtual threads.
