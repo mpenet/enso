@@ -36,12 +36,16 @@
     out))
 
 (defn get-frame
-  "HEADERS frame of a GET for `path`."
-  ^bytes [^String path]
-  (frame 0x01 (QpackFieldSection/encode ^Iterable (mapv #(into-array String %)
-                                                        [[":method" "GET"] [":scheme" "https"]
-                                                         [":authority" "localhost"] [":path" path]
-                                                         ["user-agent" "enso-h3-load"]]))))
+  "HEADERS frame of a GET for `path`. With `headers` ([name value] pairs),
+  those field lines follow the pseudo-headers instead of the lone
+  user-agent, so a caller can send a realistic browser-sized head."
+  (^bytes [^String path] (get-frame path nil))
+  (^bytes [^String path headers]
+   (frame 0x01 (QpackFieldSection/encode
+                ^Iterable (mapv #(into-array String %)
+                                (into [[":method" "GET"] [":scheme" "https"]
+                                       [":authority" "localhost"] [":path" path]]
+                                      (or (seq headers) [["user-agent" "enso-h3-load"]])))))))
 
 (defn- status-200?
   "True when the first `n` bytes of a response stream in `buf` start with
@@ -182,13 +186,13 @@
 (defn run
   "Drives `port` for `ms` milliseconds; returns {:requests :rps :hist
   :non-2xx :errors}."
-  [^long port {:keys [connections in-flight ms path] :or {connections 4 in-flight 32 path "/"}}]
+  [^long port {:keys [connections in-flight ms path headers] :or {connections 4 in-flight 32 path "/"}}]
   (let [stop (AtomicBoolean.)
         done (AtomicLong.)
         non-2xx (AtomicLong.)
         reset-streams (AtomicLong.)
         hist (Histogram. 3600000000000 3)
-        request (get-frame path)
+        request (get-frame path headers)
         errors (atom [])
         threads (mapv (fn [i]
                         (doto (.unstarted (.name (Thread/ofPlatform) (str "h3-load-" i))

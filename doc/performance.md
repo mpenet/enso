@@ -23,6 +23,35 @@ median of three runs, measured on October 11, 2026.
 | h3-get | 73,221 | 801 | 1.74 | 2.70 | 3.03 | 4 QUIC connections × 32 requests in flight, closed loop |
 | ws-echo | 1,023,481 | 333 | 0.47 | 0.92 | 3.99 | 64 WebSockets × 8 messages of 128 bytes in flight; one request is one message echoed |
 
+### Browser-sized request heads
+
+The `h2-get` and `h3-get` rows send a tiny request head. A browser sends
+more. The `h2-get-browser` and `h3-get-browser` scenarios send a 16-field
+head (user-agent, accept, accept-language, accept-encoding, cookie,
+referer, the four `sec-ch-ua*` and three `sec-fetch-*` fields,
+upgrade-insecure-requests, dnt, cache-control, pragma) to the same
+handler. They run only when named:
+
+```
+clojure -M:perf '{:scenarios [:h2-get-browser :h3-get-browser]}'
+```
+
+On the same laptop, median of three rounds, server and load generator
+sharing the CPUs, measured on October 12, 2026:
+
+| Scenario | req/s | alloc B/req | p50 ms | p99 ms |
+|---|---:|---:|---:|---:|
+| h2-get-browser | 647,899 | 2,122 | 0.26 | 1.08 |
+| h3-get-browser | 55,482 | 2,248 | 1.51 | 3.19 |
+
+A 16-field head fits in a PersistentArrayMap, which now holds up to 32
+fields where it used to hold 8. The head allocates about 970 bytes less
+per request on HTTP/2 and about 900 less on HTTP/3 than the hash map it
+replaces, measured end to end over three before/after rounds each.
+Throughput does not drop: looking a name up by scanning the array costs
+less than building and hashing the map. The small-head rows above are
+unchanged by the wider array map.
+
 ### Uploads
 
 16 MiB POST bodies read to the end by the handler, one connection, one

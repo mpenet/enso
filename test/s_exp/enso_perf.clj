@@ -8,7 +8,9 @@
   - `:scenarios` subset of [:h1-get :h1-get-rate :h1-pipelined :h2-get :h3-get :ws-echo],
     plus the upload scenarios, run only when named: :h2-upload (one
     stream) and :h2-upload-4 (four concurrent streams on one connection),
-    :h3-upload and :h3-upload-4 (the same over HTTP/3), and the wrk
+    :h3-upload and :h3-upload-4 (the same over HTTP/3),
+    :h2-get-browser and :h3-get-browser (like :h2-get / :h3-get but the
+    client sends a ~16-field browser request head), and the wrk
     scenarios, also run only when named: :h1-wrk (`:connections`
     connections) and :h1-wrk-pipelined (16 connections, `:pipeline-depth`
     requests per batch)
@@ -74,6 +76,28 @@
    :server-opts {:max-keep-alive-requests 0 :max-request-body-bytes 0}
    :server-alias "test-server"
    :out-dir "target/perf"})
+
+;; A representative browser GET request head, ~16 header fields. The
+;; :h2-get-browser / :h3-get-browser scenarios send it so the request path
+;; builds a header map the size a real browser produces, unlike the tiny
+;; heads of :h2-get / :h3-get.
+(def ^:private browser-headers
+  [["user-agent" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"]
+   ["accept" "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"]
+   ["accept-language" "en-US,en;q=0.9"]
+   ["accept-encoding" "gzip, deflate, br, zstd"]
+   ["cookie" "session_id=38afes7a8; user_pref=dark_mode_on; _ga=GA1.2.1234567890.1234567890; _gid=GA1.2.0987654321.0987654321; csrftoken=abcdefghijklmnopqrstuvwxyz0123456789"]
+   ["referer" "https://www.example.com/previous/page"]
+   ["sec-ch-ua" "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\""]
+   ["sec-ch-ua-mobile" "?0"]
+   ["sec-ch-ua-platform" "\"macOS\""]
+   ["sec-fetch-site" "same-origin"]
+   ["sec-fetch-mode" "navigate"]
+   ["sec-fetch-dest" "document"]
+   ["upgrade-insecure-requests" "1"]
+   ["dnt" "1"]
+   ["cache-control" "max-age=0"]
+   ["pragma" "no-cache"]])
 
 ;; ---- process helpers ---------------------------------------------------------------
 
@@ -408,8 +432,8 @@
   [scenario {:keys [ports]}]
   (case scenario
     (:h1-get :h1-get-rate :h1-pipelined :h1-wrk :h1-wrk-pipelined) (verify-h1 (:h1 ports))
-    (:h2-get :h2-upload :h2-upload-4) (verify-h2 (:h2 ports))
-    (:h3-get :h3-upload :h3-upload-4) (when (:h3 ports) (verify-h3 (:h3 ports)))
+    (:h2-get :h2-get-browser :h2-upload :h2-upload-4) (verify-h2 (:h2 ports))
+    (:h3-get :h3-get-browser :h3-upload :h3-upload-4) (when (:h3 ports) (verify-h3 (:h3 ports)))
     :ws-echo (verify-ws (:h1 ports))))
 
 ;; ---- server stats -------------------------------------------------------------------------
@@ -484,24 +508,29 @@
     {:errors (Long/parseLong failed)
      :non-2xx (reduce + (map #(Long/parseLong %) codes))}))
 
-(defn- h2load [port secs]
-  (if-let [out (sh-out "h2load" "-D" (str secs) "-c" "8" "-m" "32" "-t" "2"
-                       (str "https://127.0.0.1:" port "/"))]
-    (let [[_ rps] (re-find #"finished in [0-9.]+s, ([0-9.]+) req/s" out)
-          [_ done] (re-find #"requests: \d+ total, \d+ started, (\d+) done" out)
-          [latency reported] (h2load-latency out)]
-      (merge
-       (h2load-failures out)
-       {:requests (Long/parseLong done)
-        :rps (Math/round (Double/parseDouble rps))
-        :latency-ms latency
-        :latency-model (str "h2load -c 8 -m 32 closed loop (not CO-corrected); h2load reports " reported)}))
-    (throw (ex-info "h2load failed" {:port port}))))
+(defn- h2load
+  ([port secs] (h2load port secs nil))
+  ([port secs headers]
+   (if-let [out (apply sh-out "h2load" "-D" (str secs) "-c" "8" "-m" "32" "-t" "2"
+                       (concat (mapcat (fn [[k v]] ["-H" (str k ": " v)]) headers)
+                               [(str "https://127.0.0.1:" port "/")]))]
+     (let [[_ rps] (re-find #"finished in [0-9.]+s, ([0-9.]+) req/s" out)
+           [_ done] (re-find #"requests: \d+ total, \d+ started, (\d+) done" out)
+           [latency reported] (h2load-latency out)]
+       (merge
+        (h2load-failures out)
+        {:requests (Long/parseLong done)
+         :rps (Math/round (Double/parseDouble rps))
+         :latency-ms latency
+         :latency-model (str "h2load -c 8 -m 32 closed loop (not CO-corrected); h2load reports " reported)}))
+     (throw (ex-info "h2load failed" {:port port})))))
 
-(defn- h2-scenario [{:keys [ports duration-s warmup-s]}]
-  (if-not (sh-out "h2load" "--version")
-    {:skipped "h2load not found on PATH"}
-    (measured (:h1 ports) #(h2load (:h2 ports) warmup-s) #(h2load (:h2 ports) duration-s))))
+(defn- h2-scenario
+  ([cfg] (h2-scenario cfg nil))
+  ([{:keys [ports duration-s warmup-s]} headers]
+   (if-not (sh-out "h2load" "--version")
+     {:skipped "h2load not found on PATH"}
+     (measured (:h1 ports) #(h2load (:h2 ports) warmup-s headers) #(h2load (:h2 ports) duration-s headers)))))
 
 ;; ---- HTTP/1.1 via wrk ------------------------------------------------------------------------
 
@@ -595,11 +624,12 @@
 
 ;; ---- HTTP/3 via the batched quiche load client ----------------------------------------
 
-(defn- h3-run [{:keys [h3-connections h3-in-flight]} port secs]
+(defn- h3-run [{:keys [h3-connections h3-in-flight]} port secs headers]
   (let [run! (requiring-resolve 's-exp.h3-load/run)
         {:keys [requests rps hist errors non-2xx]} (run! port {:connections h3-connections
                                                                :in-flight h3-in-flight
-                                                               :ms (* 1000 (long secs))})]
+                                                               :ms (* 1000 (long secs))
+                                                               :headers headers})]
     {:requests requests
      :rps rps
      :errors errors
@@ -608,10 +638,12 @@
      :latency-model (str h3-connections " QUIC connections x " h3-in-flight
                          " requests in flight, closed loop (not CO-corrected)")}))
 
-(defn- h3-scenario [{:keys [ports duration-s warmup-s] :as cfg}]
-  (cond
-    (not (:h3 ports)) {:skipped "enso_quiche shim not available"}
-    :else (measured (:h1 ports) #(h3-run cfg (:h3 ports) warmup-s) #(h3-run cfg (:h3 ports) duration-s))))
+(defn- h3-scenario
+  ([cfg] (h3-scenario cfg nil))
+  ([{:keys [ports duration-s warmup-s] :as cfg} headers]
+   (cond
+     (not (:h3 ports)) {:skipped "enso_quiche shim not available"}
+     :else (measured (:h1 ports) #(h3-run cfg (:h3 ports) warmup-s headers) #(h3-run cfg (:h3 ports) duration-s headers)))))
 
 ;; ---- HTTP/3 uploads via the quiche load client ------------------------------------------------
 
@@ -694,7 +726,7 @@
   [opts]
   (let [cfg (merge defaults opts)
         _ (.mkdirs (io/file (:out-dir cfg)))
-        h3? (and (some #{:h3-get :h3-upload :h3-upload-4} (:scenarios cfg)) (support/shim-available?))
+        h3? (and (some #{:h3-get :h3-get-browser :h3-upload :h3-upload-4} (:scenarios cfg)) (support/shim-available?))
         server (start-server! cfg h3?)
         cfg (assoc cfg :ports (:ports server))
         n-conn (long (:connections cfg))]
@@ -718,7 +750,9 @@
                                                              (str "pipelined depth " (:pipeline-depth cfg)
                                                                   ", latency per batch"))
                                   :h2-get (h2-scenario cfg)
+                                  :h2-get-browser (h2-scenario cfg browser-headers)
                                   :h3-get (h3-scenario cfg)
+                                  :h3-get-browser (h3-scenario cfg browser-headers)
                                   :h2-upload (h2-upload-scenario cfg 1)
                                   :h2-upload-4 (h2-upload-scenario cfg 4)
                                   :h3-upload (h3-upload-scenario cfg 1)

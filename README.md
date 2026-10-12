@@ -90,9 +90,11 @@ generator sharing the cores:
 | HTTP/3 GET | 73k | 801 B |
 | WebSocket echo | 1.0M msg/s | 333 B |
 
-enso allocates 393 bytes per HTTP/1.1 request where http-kit, Jetty and
-Aleph allocate 3.6 to 4 KB. [doc/performance.md](doc/performance.md) has
-latency percentiles, uploads, and the full peer comparison.
+In a separate-process comparison with http-kit, Jetty, Aleph and Netty,
+enso has the highest throughput on every scenario above and allocates 393
+bytes per HTTP/1.1 request where the others allocate 3.6 to 4 KB.
+[doc/performance.md](doc/performance.md) has latency percentiles, uploads,
+and the full comparison.
 
 Requirements: JDK 21 or later and Clojure 1.12 or later. HTTP/3 runs on
 Linux (glibc 2.28+ or musl) and macOS 11+ on Apple Silicon, and on JDK 24+
