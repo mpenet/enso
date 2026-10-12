@@ -37,6 +37,7 @@ jobs:
   # unless it passes.
   test:
     uses: ./.github/workflows/test.yml
+    secrets: inherit
 
   build-darwin:
     needs: test

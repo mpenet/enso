@@ -229,12 +229,22 @@ jobs:
       - name: Compile Java sources
         run: clojure -T:build javac
 
-      # A GHCR mirror of the pinned crossbario image (same digest): Docker Hub
-      # rate-limits anonymous pulls from shared CI runners. GHCR has no such
-      # limit and the public mirror needs no auth.
-      - name: Autobahn TestSuite (WebSocket)
+      # Authenticate to Docker Hub when a token is configured, so the
+      # Autobahn image pull isn't throttled by Docker Hub's anonymous-pull
+      # limit on shared runners. No token (forks, Dependabot PRs) falls back
+      # to an anonymous pull.
+      - name: Log in to Docker Hub
         env:
-          AUTOBAHN_IMAGE: ghcr.io/mpenet/autobahn-testsuite:25.10.1@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          else
+            echo "no Docker Hub token configured; pulling anonymously"
+          fi
+
+      - name: Autobahn TestSuite (WebSocket)
         run: bench/autobahn/run.sh
 
       - name: Upload Autobahn report

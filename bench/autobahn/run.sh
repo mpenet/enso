@@ -24,10 +24,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../conformance-lib.sh
 . "$HERE/../conformance-lib.sh"
 
-# Default to the Docker Hub image for local use; CI sets AUTOBAHN_IMAGE to a
-# GHCR mirror of the same digest, since Docker Hub rate-limits anonymous pulls
-# from shared CI runners ("unauthorized: authentication required").
-IMAGE="${AUTOBAHN_IMAGE:-crossbario/autobahn-testsuite:25.10.1@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074}"
+IMAGE="crossbario/autobahn-testsuite:25.10.1@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074"
 PORT="${AUTOBAHN_PORT:-18080}"
 CASES="${AUTOBAHN_CASES:-[\"*\"]}"
 WORK_DIR="$ROOT/target/conformance/autobahn"
