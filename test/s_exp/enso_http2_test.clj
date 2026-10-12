@@ -2443,7 +2443,11 @@
       (dotimes [_ 20] (h2-connection-alloc-bytes srv handler input n current))
       (let [per-request (/ (double (apply min (repeatedly 3 #(h2-connection-alloc-bytes srv handler input n current)))) n)]
         (println "h2 GET:" per-request "bytes/request")
-        (is (< per-request 1000) (str per-request " bytes/request")))
+        ;; A coarse runaway-allocation guard (the per-platform perf gate in
+        ;; bench/perf/baseline.edn tracks the exact figure). JDK 21 allocates
+        ;; ~24% more than JDK 25, so the bound has cross-JDK headroom; a real
+        ;; regression (the pre-pooling path) was ~3x this.
+        (is (< per-request 1300) (str per-request " bytes/request")))
       (finally (enso/stop srv)))))
 
 (deftest h2-browser-head-allocation-budget
@@ -2471,7 +2475,10 @@
       (dotimes [_ 20] (h2-connection-alloc-bytes srv handler input n current))
       (let [per-request (/ (double (apply min (repeatedly 3 #(h2-connection-alloc-bytes srv handler input n current)))) n)]
         (println "h2 GET, 14-field browser head:" per-request "bytes/request")
-        (is (< per-request 1400) (str per-request " bytes/request")))
+        ;; Array-map (not hash-map) head: it sits below the hash-map path a
+        ;; regression would take (~1600 on JDK 25, higher on JDK 21) while
+        ;; leaving JDK-variance headroom over the array-map figure.
+        (is (< per-request 1550) (str per-request " bytes/request")))
       (finally (enso/stop srv)))))
 
 (deftest h2-small-stream-body-allocation-budget
