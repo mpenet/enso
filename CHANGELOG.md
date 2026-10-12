@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-alpha57 — 2026-10-12
 
 Changes since 1.0.0-alpha56. This release reworks the server core. HTTP/1.1,
 HTTP/2 and HTTP/3 now share one request and response policy and one
