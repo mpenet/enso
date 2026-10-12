@@ -200,6 +200,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends tshark python3-venv
           tshark --version | head -1
 
+      # Authenticate to Docker Hub when a token is configured: the runner
+      # pulls client images (quiche, ngtcp2, ...) from Docker Hub, throttled
+      # for anonymous pulls on shared runners. No token falls back to anonymous.
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          else
+            echo "no Docker Hub token configured; pulling anonymously"
+          fi
+
       - name: quic-interop-runner (enso server)
         env:
           CLIENTS: ${{ inputs.interop-clients || 'quiche,ngtcp2,quic-go,neqo,quinn' }}
