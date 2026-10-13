@@ -1,0 +1,5 @@
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.3"}
+        s-exp/enso {:local/root "../.."}}
+ :aliases
+ {:native {:extra-deps {com.github.clj-easy/graal-build-time {:mvn/version "1.0.5"}}}}}

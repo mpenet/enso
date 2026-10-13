@@ -111,6 +111,7 @@ needs `--enable-native-access=ALL-UNNAMED`.
 - [Testing](doc/testing.md): the test suite, fuzzing, conformance suites, benchmarks and CI.
 - [HTTP/3 conformance](doc/h3-conformance.md): h3spec results.
 - [Building](doc/build.md): build tasks, jars, the native shim and releases.
+- [GraalVM](doc/graalvm.md): compiling the server to a native image.
 - [Changelog](CHANGELOG.md)
 
 ## Prior art
