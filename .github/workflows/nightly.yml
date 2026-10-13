@@ -168,7 +168,7 @@ jobs:
         with:
           name: perf-results
           path: target/perf/
-          retention-days: 90
+          retention-days: 30
 
   # Official quic-interop-runner, enso as the HTTP/3 server: only the
   # http3 test case negotiates h3 (the transport cases use the hq-interop

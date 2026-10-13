@@ -149,11 +149,10 @@ jobs:
         with:
           name: coverage
           path: |
-            target/coverage/html/
             target/coverage/jacoco.xml
             target/coverage/jacoco.csv
             target/coverage/jacoco.exec
-          retention-days: 14
+          retention-days: 7
 
   sanitizer:
     runs-on: ubuntu-24.04
@@ -209,7 +208,7 @@ jobs:
         run: bench/h2spec/run.sh h2c
 
       - name: Upload h2spec report
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: h2spec-report
@@ -248,7 +247,7 @@ jobs:
         run: bench/autobahn/run.sh
 
       - name: Upload Autobahn report
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: autobahn-report
@@ -281,7 +280,7 @@ jobs:
         run: bench/h3spec/run.sh
 
       - name: Upload h3spec report
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: h3spec-report

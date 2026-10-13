@@ -211,6 +211,7 @@ jobs:
           name: enso-jars
           path: target/enso-*.jar
           if-no-files-found: error
+          retention-days: 30
 
       # Publishes core + every per-classifier jar to Clojars. Users declare
       # `com.s-exp/enso` (core) plus `com.s-exp/enso$<classifier>` for each
