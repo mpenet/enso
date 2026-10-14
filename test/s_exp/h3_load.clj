@@ -301,11 +301,12 @@
               ;; streamSend against a full window re-arms a connection-level
               ;; DATA_BLOCKED frame every round, a storm of tiny packets. The
               ;; stream resumes here once MAX_DATA / MAX_STREAM_DATA reopens
-              ;; its capacity.
+              ;; its capacity. A stream not yet opened reports an error
+              ;; (negative) rather than zero: its first streamSend opens it.
               (doseq [[sid ^longs st] open]
                 (loop []
                   (let [sent (aget st 0)]
-                    (when (and (< sent total) (pos? (.streamCapacity conn sid)))
+                    (when (and (< sent total) (not (zero? (.streamCapacity conn sid))))
                       (let [rc (if (< sent (alength prefix))
                                  (.streamSend conn sid prefix (int sent) (int (- (alength prefix) sent)) false)
                                  (let [n (min (alength zeros) (- total sent))]

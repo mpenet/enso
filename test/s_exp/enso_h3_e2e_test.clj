@@ -22,6 +22,18 @@
         (is (= "hello" (h3/body-str r)))
         (is (:fin r))))))
 
+(deftest load-client-upload-completes
+  ;; The perf h3-upload scenarios drive s-exp.h3-load/upload, which sends
+  ;; each body as fast as flow control allows. A request stream does not
+  ;; exist in quiche until its first byte is sent, so the client must not
+  ;; wait for send capacity before that first write.
+  (h3/with-server [srv (fn [^Request req]
+                         (.readAllBytes ^java.io.InputStream (.-body req))
+                         (ok "ok"))]
+    (let [upload (requiring-resolve 's-exp.h3-load/upload)
+          {:keys [requests]} (upload (.port srv) {:streams 1 :body-bytes (* 1024 1024) :ms 2000})]
+      (is (pos? requests) "at least one 1 MiB upload completes in 2 s"))))
+
 (defn- stream-bytes ^bytes [c sid]
   (some-> (h3/stream-state c sid) ^java.io.ByteArrayOutputStream (:out) .toByteArray))
 

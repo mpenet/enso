@@ -79,20 +79,20 @@ Conformance: h2spec 146/146 over TLS, Autobahn TestSuite 517/517, h3spec
 
 ## Performance
 
-On an M1 Pro laptop (8 CPUs, JDK 25), a 13-byte response, server and load
+On an M1 Pro laptop (8 CPUs, Temurin 25), a 13-byte response, server and load
 generator sharing the cores:
 
 | | req/s | allocated per request |
 |---|---:|---:|
-| HTTP/1.1 GET | 124k | 393 B |
-| HTTP/1.1 pipelined | 1.4M | 235 B |
-| HTTP/2 GET over TLS | 745k | 1.1 KB |
-| HTTP/3 GET | 73k | 801 B |
-| WebSocket echo | 1.0M msg/s | 333 B |
+| HTTP/1.1 GET | 132k | 377 B |
+| HTTP/1.1 pipelined | 1.45M | 233 B |
+| HTTP/2 GET over TLS | 798k | 1.1 KB |
+| HTTP/3 GET | 73k | 800 B |
+| WebSocket echo | 1.0M msg/s | 331 B |
 
 In a separate-process comparison with http-kit, Jetty, Aleph and Netty,
-enso has the highest throughput on every scenario above and allocates 393
-bytes per HTTP/1.1 request where the others allocate 3.6 to 4 KB.
+enso has the highest throughput on every scenario above and allocates 376
+bytes per HTTP/1.1 request where the others allocate 3.3 to 4.1 KB.
 [doc/performance.md](doc/performance.md) has latency percentiles, uploads,
 and the full comparison.
 

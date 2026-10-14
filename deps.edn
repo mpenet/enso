@@ -18,6 +18,7 @@
           :main-opts ["-m" "nrepl.cmdline"]}
   :test {:extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                       org.clojure/test.check {:mvn/version "1.1.1"}
+                      org.hdrhistogram/HdrHistogram {:mvn/version "2.2.2"}
                       org.ring-clojure/ring-core-protocols {:mvn/version "1.15.5"}
                       org.ring-clojure/ring-websocket-protocols {:mvn/version "1.15.5"}}
          :extra-paths ["test"]
