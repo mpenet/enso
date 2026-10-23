@@ -553,7 +553,7 @@ Implementation details:
 - `RequestBody.credit` returns a stream's credit once half its window is read, and doubles the window if the previous return was less than `4 × smoothed RTT × fraction read` ago. `autotuneConnectionWindow` applies the same rule to the connection over epochs of half its size. Connection growth is reserved from the account first and skipped if that fails. Stream growth needs no reservation, since the paid connection window bounds the peer; it is skipped while throttled.
 - The RTT comes from the SETTINGS acknowledgement, then a PING sent with a stream WINDOW_UPDATE when the last sample is over a second old (RFC 6298 smoothing). This costs one `System.nanoTime` per window update.
 - A body with a Content-Length is never granted stream credit past what it has left plus 256 octets, so a padding peer can always send its next frame.
-- Request bodies cost no object per DATA frame: up to 8 KiB in a ring of the stream's own, then a chain of pooled 64 KiB segments, each returned once read.
+- Request bodies cost no object per DATA frame: up to 8 KiB in a ring of the stream's own, then a chain of pooled 64 KiB segments, each returned once read. The pool keeps 32 segments (2 MiB) server-wide, so bodies buffered past that at once, by handlers reading slower than their clients send within grown windows, allocate the extra segments.
 
 ### Send flow control
 

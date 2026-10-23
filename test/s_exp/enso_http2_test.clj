@@ -3469,14 +3469,15 @@
         (with-conn [conn]
           (ack-settings-after! conn 200)
           (send-request! conn 1 (request-headers "POST" "/") false)
-          (let [r (upload-within-credit! conn 1 (* 2 1024 1024) 65536)
-                seen (atom [])]
-            (read-until conn (end-stream-on 1) seen)
-            (swap! seen into (drain-frames conn 300))
-            (is (= 262144 (deref window 5000 nil)))
-            (let [promised (+ (:conn-left r) (conn-credit @seen))]
-              (is (< 262144 promised) "the grown connection window")
-              (is (<= (- promised 65535) (.used budget)) "paid for, past the RFC's initial window")))
+          ;; The body stays open while the credit is counted: once the last
+          ;; open body closes, the window goes back to its baseline.
+          (let [r (send-within-credit! conn 1 nil (* 2 1024 1024) 65536 65535 false)
+                promised (+ (:conn-left r) (conn-credit (drain-frames conn 300)))]
+            (is (< 262144 promised) "the grown connection window")
+            (is (<= (- promised 65535) (.used budget)) "paid for, past the RFC's initial window")
+            (send-data! conn 1 0 true)
+            (read-until conn (end-stream-on 1) (atom []))
+            (is (= 262144 (deref window 5000 nil))))
           (send-request! conn 3 (request-headers "POST" "/") false)
           (send-data! conn 3 30000 false)
           (write-frame! conn frame-rst 0 3 (u32-bytes 0x8))
@@ -4250,13 +4251,18 @@
   ;; Request body rings come from the server-wide pool of full-size rings
   ;; and go back once the handler reads them empty, so a long upload costs
   ;; no heap per burst. Cleartext, so no TLS cost is counted; measured over
-  ;; every thread of this JVM, client included.
+  ;; every thread of this JVM, client included. The windows are capped so
+  ;; what the client may send ahead of the handler (a 512 KiB stream
+  ;; window, a connection window of twice that: 16 rings) fits the pool's
+  ;; 32 rings however the handler is scheduled; past them, rings are
+  ;; allocated.
   (let [mib 16
         srv (h2c-server (fn [req]
                           {:status 200
                            :body (str (.transferTo ^java.io.InputStream (:body req)
                                                    (java.io.OutputStream/nullOutputStream)))})
-                        #(.maxRequestBodyBytes ^com.s_exp.enso.api.Config$Builder % 0))]
+                        #(.http2MaxWindowBytes (.maxRequestBodyBytes ^com.s_exp.enso.api.Config$Builder % 0)
+                                               (* 512 1024)))]
     (try
       (binding [*port* (.port srv)]
         (let [conn (h2-connect-on! (plain-socket) [])]

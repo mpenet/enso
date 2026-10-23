@@ -2194,7 +2194,8 @@
       (set-private-field! l "ready" ready)
       (is (zero? (await-connection-count srv 0 3000)) "freed despite its broken timer entry")
       (is (empty? (loop-connections srv)))
-      (is (not (identical? timers (private-field l "timers"))) "fresh timers")
+      ;; The loop frees its connections before it resets its tables.
+      (is (support/await-condition #(not (identical? timers (private-field l "timers"))) 3000 10) "fresh timers")
       (h3/with-client [c (.port srv)]
         (h3/open-control! c)
         (is (served? c 0) "the restarted loop serves new connections")))))
