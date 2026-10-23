@@ -80,13 +80,18 @@ client renegotiation is refused. A TLS 1.3 KeyUpdate asking for ours stays
 queued in the engine and goes out ahead of the next record written
 (RFC 8446 §4.6.3), so the read path never writes and never waits behind a
 writer blocked on a peer that doesn't read. Record buffers of the
-session's size (about 16 KiB) come from a server-wide `BufferPool`. As a
-connection goes idle, `releaseIdleBuffers()` gives them back and keeps a
-2 KiB ciphertext buffer, which a typical request's first record arrives in
-with one read, and empty plaintext and output buffers. The next request
-takes full buffers from the pool, so it allocates none. The pool is
-striped and bounded, and never waits: a busy or empty stripe means an
-allocation, a full one drops the buffer.
+session's size (about 16 KiB) come from a server-wide `BufferPool`. A
+connection waiting for input gives the input ones back
+(`releaseIdleInputBuffers()`) and keeps a 2 KiB ciphertext buffer, which a
+typical request's first record arrives in with one read, and an empty
+plaintext buffer. HTTP/1.1 gives the output buffer back at the same time
+(`releaseIdleBuffers()`), a WebSocket after a quiet second, and HTTP/2
+writes through its own buffers. The next request takes full buffers from
+the pool, so it allocates none. The pool is striped and bounded, and never
+waits: a busy or empty stripe means an allocation, a full one drops the
+buffer. It keeps at most 8 buffers per CPU (about 130 KiB per CPU), and a
+second pool of the same shape holds the read buffers HTTP/2 and WebSocket
+borrow for bursts; neither shrinks once filled.
 
 Other `TlsSocket` calls drivers use:
 
@@ -94,7 +99,7 @@ Other `TlsSocket` calls drivers use:
 - `shutdownOutput()` sends close_notify and half-closes, keeping input readable for a lingering close.
 - `setReadDeadline(nanos)` puts a wall-clock bound on a read. SO_TIMEOUT alone bounds one wait for ciphertext, and a read only returns whole records, so a peer trickling a record a byte at a time could otherwise hold a read forever.
 - `inputPending()` tells whether closing now would be answered with a reset.
-- `awaitInput()` waits for the first ciphertext without decrypting it, so HTTP/1.1 ends its idle wait on a request's first byte rather than once a whole record is in.
+- `awaitInput()` waits for the first ciphertext without decrypting it, so HTTP/1.1 and WebSocket end their idle wait on a request's or frame's first byte rather than once a whole record is in.
 - `free()` gives the record buffers back to the pool when the connection is over.
 
 `isHealthy()` checks that the acceptor, the timer and every HTTP/3 event
@@ -371,11 +376,14 @@ had to grow it again after such a release (its requests need it); over
 TLS its record buffers go back to the pool. Its parse buffer starts at
 4 KiB in cleartext, enough for most heads in one read, and at 1 KiB over
 TLS, where it is filled from the decrypted record without a syscall.
-HTTP/2 and WebSocket connections wait for frames with untimed reads too.
-As a wait starts they give back what the blocked read would otherwise
-hold: the input buffer goes back to its initial size (2 KiB; a burst that
-needs more borrows a 16 KiB buffer from the server's pool) and the TLS
-input records go back to the pool. After a quiet second (`IdleWait`)
+It keeps the values it caches from the last request, so the next request
+map is built without allocating them again, and after a streamed response
+its 8 KiB chunk buffer. HTTP/2 and WebSocket connections wait for frames
+with untimed reads too. As a wait starts they give back what the blocked
+read would otherwise hold: the input buffer goes back to its wait size
+(2 KiB, or 512 bytes for a WebSocket over TLS, which fills it from the
+decrypted record; a burst that needs more borrows a 16 KiB buffer from the
+server's pool) and the TLS input records go back to the pool. After a quiet second (`IdleWait`)
 HTTP/2 forgets retired streams and shrinks its header-block, HPACK, field
 and writer buffers (`h2-idle-connection-gives-back-its-buffers`), and a
 WebSocket drops message assembly and compression buffers, its TLS output

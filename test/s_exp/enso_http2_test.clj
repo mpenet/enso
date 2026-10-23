@@ -3000,7 +3000,13 @@
       (send-split-headers! conn 1 (header-block conn (request-headers "POST" "/" [["x-in" (apply str (repeat 30000 "i"))]])) false)
       (send-data! conn 1 16384 true)
       (is (some? (read-until conn (end-stream-on 1))))
-      (Thread/sleep 1500)
+      ;; The quiet-second release runs on the timer, the writer's part on a
+      ;; virtual thread after it: wait for the last of it.
+      (let [c0 (server-h2-connection srv)]
+        (support/await-condition
+         #(and (nil? (field-of c0 "pendingHeaderBytes"))
+               (>= 256 (alength ^bytes (field-of (field-of (field-of c0 "writer") "encoder") "buf"))))
+         3000 20))
       (let [c (server-h2-connection srv)
             tls (.tls ^com.s_exp.enso.core.TlsSocket$AdapterSocket (field-of c "socket"))
             writer (field-of c "writer")]

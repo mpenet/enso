@@ -1884,16 +1884,59 @@
   ;; for longer than the timeout in total; after the last one it closes.
   (with-server
     (fn [_] {:status 200 :body "ok"})
-    {:idle-timeout 300}
+    {:idle-timeout 1000}
     (fn []
       (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
-        (dotimes [_ 6]
+        (dotimes [_ 4]
           (write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
           (is (clojure.string/ends-with? (read-available! sock 2000) "ok"))
-          (Thread/sleep 150))
+          (Thread/sleep 400))
         (let [[resp ms] (read-all-timed sock 3000)]
           (is (= "" resp) "closed without another response")
-          (is (< ms 1000) "closed by the idle timeout"))))))
+          (is (< ms 1700) "closed by the idle timeout"))))))
+
+(deftest idle-timeout-zero-outlives-the-quiet-second
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {:idle-timeout 0 :handshake-timeout 5000}
+    (fn []
+      (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+        (write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        (is (clojure.string/ends-with? (read-available! sock 2000) "ok"))
+        (Thread/sleep 1500)
+        (write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        (is (clojure.string/ends-with? (read-available! sock 2000) "ok") "served after a quiet second and more")))))
+
+(defn- server-reader-buffer
+  "The parse buffer of `srv`'s only open HTTP/1.1 connection."
+  ^bytes [srv]
+  (let [field (fn [^Class c obj ^String n] (.get (doto (.getDeclaredField c n) (.setAccessible true)) obj))
+        live (field com.s_exp.enso.core.ConnectionRegistry (field com.s_exp.enso.EnsoServer srv "registry") "live")
+        accepted (Class/forName "com.s_exp.enso.EnsoServer$Accepted")
+        conn (some #(field accepted % "driver") live)
+        reader (field com.s_exp.enso.http1.HttpConnection conn "reader")]
+    (field (class reader) reader "buf")))
+
+(deftest a-grown-parse-buffer-is-given-back-unless-requests-keep-needing-it
+  ;; A head line longer than the parse buffer grows it; going idle gives it
+  ;; back, unless the next request grew it again (its requests need it).
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {}
+    (fn []
+      (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+        (let [big (str "GET / HTTP/1.1\r\nHost: x\r\nX-Big: " (apply str (repeat 6000 "b")) "\r\n\r\n")
+              small "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+              buf-size #(alength (server-reader-buffer (:server *server*)))]
+          (write! sock big)
+          (is (clojure.string/ends-with? (read-available! sock 2000) "ok"))
+          (is (support/await-condition #(= 4096 (buf-size)) 2000 10) "given back as it went idle")
+          (write! sock small)
+          (is (clojure.string/ends-with? (read-available! sock 2000) "ok"))
+          (write! sock big)
+          (is (clojure.string/ends-with? (read-available! sock 2000) "ok"))
+          (Thread/sleep 100)
+          (is (< 4096 (buf-size)) "grown again after a release: kept"))))))
 
 ;; ---- Connection end: interrupts, drains, aborts, closes ----------------------
 

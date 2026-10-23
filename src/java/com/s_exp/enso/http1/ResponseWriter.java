@@ -106,7 +106,7 @@ final class ResponseWriter {
     private final OutputStream out = new Output();
     private byte[] hbuf = new byte[OUTPUT_BUFFER_BYTES];
     private int hlen;
-    // Cleartext: an idle connection gave a grown hbuf back
+    // An idle connection gave a grown hbuf back
     // (releaseGrownOutput), and whether a later response grew it again, i.e.
     // this connection's responses need it and it keeps it from then on.
     private boolean releasedGrownOutput;
@@ -166,7 +166,7 @@ final class ResponseWriter {
     }
 
     /**
-     * A cleartext connection going idle: gives back an output buffer grown
+     * A connection going idle: gives back an output buffer grown
      * past its initial size while nothing is pending in it, unless an
      * earlier release was followed by growing it again. Connection thread.
      */

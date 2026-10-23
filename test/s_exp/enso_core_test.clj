@@ -998,9 +998,9 @@
   (with-open [timer (Timer.)]
     (let [calls (AtomicInteger.)
           w (idle-wait timer (fn [_] (.incrementAndGet calls) -1))]
-      (.begin w 50)
+      (.begin w 500)
       (.end w)
-      (Thread/sleep 200)
+      (Thread/sleep 700)
       (is (zero? (.get calls))))))
 
 (deftest idle-wait-runs-again-when-expired-asks
@@ -1024,3 +1024,17 @@
       (is (.await inside 2 TimeUnit/SECONDS))
       (.end w)
       (is (.get finished) "end returned after expired finished"))))
+
+(deftest idle-wait-begin-waits-for-an-expiry-in-progress
+  ;; A wait beginning while an expiry claims the previous one (a caller
+  ;; that never ends its waits) starts only once the expiry is done, and the
+  ;; expiry judged the old wait.
+  (with-open [timer (Timer.)]
+    (let [inside (CountDownLatch. 1)
+          finished (java.util.concurrent.atomic.AtomicBoolean.)
+          w (idle-wait timer (fn [_] (.countDown inside) (Thread/sleep 150) (.set finished true) -1))]
+      (.begin w 10)
+      (is (.await inside 2 TimeUnit/SECONDS))
+      (.begin w 60000)
+      (is (.get finished) "begin returned after expired finished"))))
+

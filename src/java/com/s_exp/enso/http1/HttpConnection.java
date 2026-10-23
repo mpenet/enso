@@ -201,7 +201,12 @@ public final class HttpConnection implements Runnable, Drainable {
             // on the next tick.
             if (watchdog != null) timer.retire(watchdog);
             if (handlerTimeout != null) timer.retire(handlerTimeout);
-            if (idleTimeout != null) timer.retire(idleTimeout);
+            if (idleTimeout != null) {
+                // Ended first: an expiry in progress could otherwise re-arm
+                // the node of a closed connection.
+                idleTimeout.end();
+                timer.retire(idleTimeout);
+            }
             writer.retireTimers();
         }
     }

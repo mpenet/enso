@@ -51,14 +51,22 @@ public abstract class IdleWait extends Timer.Task {
      * negative). State {@link #expired} reads must be written before this.
      */
     public final void begin(long firstDelayMillis) {
-        while (since == CLAIMED) {
-            Thread.onSpinWait();
-        }
         long now = System.nanoTime();
         if (now == NONE || now == CLAIMED) {
             now++;
         }
-        since = now;
+        // A CAS from the value seen, not a plain write: a caller that never
+        // ends its waits leaves the last one's start here, and an expiry may
+        // claim it between a check and a write (the claim would be lost and
+        // the expiry would judge the new wait by the old one's start).
+        while (true) {
+            long s = since;
+            if (s == CLAIMED) {
+                Thread.onSpinWait();
+            } else if (SINCE.compareAndSet(this, s, now)) {
+                break;
+            }
+        }
         if (firstDelayMillis >= 0) {
             timer.schedule(this, firstDelayMillis);
         }

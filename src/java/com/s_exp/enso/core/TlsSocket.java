@@ -362,8 +362,11 @@ public final class TlsSocket implements AutoCloseable {
 
     /** An empty buffer of at least {@code minCap} replacing {@code old}, whose content is dropped; old is given back. */
     private ByteBuffer replace(ByteBuffer old, int minCap) {
+        // Taken first: if that fails, the caller's field still holds old,
+        // which must not be in the pool already.
+        ByteBuffer b = take(minCap);
         give(old);
-        return take(minCap);
+        return b;
     }
 
     private ByteBuffer take(int minCap) {

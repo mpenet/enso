@@ -228,6 +228,11 @@ public final class WebSocketConnection {
     // The idle timeout closed the connection (Quiet, off the read loop):
     // finish reports 1001 "idle timeout" unless the peer's CLOSE came.
     private volatile boolean idleClosed;
+    // The idle timeout decided to close, under the wait's claim: a frame
+    // the read loop gets from that wait came after the decision and is
+    // dropped like any frame after our CLOSE, so a message is never both
+    // delivered and closed on as idle.
+    private volatile boolean idleClosing;
     // Drops TCP if the peer never answers a CLOSE the server sent.
     private final Timer.Task closeTimer = new Timer.Task() {
         @Override
@@ -495,9 +500,9 @@ public final class WebSocketConnection {
                 handleControlFrame(frame);
                 continue;
             }
-            if (!open) {
-                // Our CLOSE is out: data frames are read and dropped until
-                // the peer's CLOSE arrives.
+            if (!open || idleClosing) {
+                // Our CLOSE is out (or the idle close is sending it): data
+                // frames are read and dropped until the peer's CLOSE arrives.
                 if (inMessage) {
                     inMessage = false;
                     reader.abandon();
@@ -545,9 +550,14 @@ public final class WebSocketConnection {
         if (closeSent) {
             return;
         }
+        // Set before the CLOSE goes out, so the read loop finishing on the
+        // peer's EOF sees it; cleared when this CLOSE wasn't the one sent
+        // (another close won, or it couldn't be written).
         idleClosed = true;
         if (sendClose(CLOSE_GOING_AWAY, IDLE_TIMEOUT_REASON)) {
             startCloseTimer();
+        } else {
+            idleClosed = false;
         }
     }
 
@@ -687,6 +697,8 @@ public final class WebSocketConnection {
         try {
             rpos = 0;
             rlim = 0;
+            // Discarding is no message: no message deadline applies.
+            deadlineStarted = false;
             while (fill(rbuf, 0, rbuf.length, idleTimeoutMillis) >= 0) {
                 // discard
             }
@@ -1032,7 +1044,10 @@ public final class WebSocketConnection {
                     socket.setSoTimeout(0);
                     soTimeout = 0;
                 }
-                if (!tls.awaitInput()) {
+                // Frames sent right behind the upgrade request were read with
+                // it and sit in the stream (in.available()): nothing to wait
+                // for on the socket.
+                if (in.available() == 0 && !tls.awaitInput()) {
                     return -1;
                 }
                 quiet.end();
@@ -1162,6 +1177,7 @@ public final class WebSocketConnection {
             }
             if (idleTimeoutMillis > 0 && waitedMillis >= idleTimeoutMillis) {
                 closing = true;
+                idleClosing = true;
                 Thread.ofVirtual().name("enso-ws-idle-close").start(WebSocketConnection.this::closeOnIdle);
                 return -1;
             }
@@ -1192,9 +1208,10 @@ public final class WebSocketConnection {
 
     /**
      * Reads from the stream into {@code dst} with SO_TIMEOUT
-     * {@code timeout}: the idle wait between messages; inside a frame or
-     * message the message deadline ({@link #messageReadTimeout}), so a
-     * peer trickling bytes can't hold a buffer longer than
+     * {@code timeout}: 0 for the wait between messages (untimed, see
+     * {@link #awaitFrame}); inside a frame or message the message deadline
+     * ({@link #messageReadTimeout}), also as a TLS read's wall-clock bound,
+     * so a peer trickling bytes can't hold a buffer longer than
      * {@code :read-timeout}.
      */
     private int fill(byte[] dst, int off, int len, int timeout) throws IOException {
@@ -1206,6 +1223,12 @@ public final class WebSocketConnection {
         if (timeout != soTimeout) {
             socket.setSoTimeout(timeout);
             soTimeout = timeout;
+        }
+        if (tls != null) {
+            // A TLS read returns only whole records, which a peer can trickle
+            // a byte per socket timeout: it is held to the message
+            // deadline's wall clock too.
+            tls.setReadDeadline(deadlineStarted ? deadlineNanos : 0);
         }
         return in.read(dst, off, len);
     }

@@ -713,9 +713,107 @@
           (is (support/await-condition
                #(let [[[net app out]] (capacities)]
                   (and net (<= net 2048) (<= app 2048) (<= out 512)))
-               600 10)
-              (str "small record buffers within 600 ms of going idle: " (pr-str (capacities))))
+               900 10)
+              (str "small record buffers within 900 ms of going idle (the old release took a second): "
+                   (pr-str (capacities))))
           (finally (.close socket)))))))
+
+(deftest tls-idle-timeout-closes-after-a-response
+  (with-tls-server* {:idle-timeout 300}
+    (fn [srv]
+      (let [{:keys [post read ^java.net.Socket socket]} (tls-client (enso/port srv))]
+        (try
+          (post 10)
+          (is (.endsWith ^String (read) "\r\n\r\n10"))
+          (let [t0 (System/nanoTime)
+                eof (try (.setSoTimeout socket 3000) (.read (.getInputStream socket))
+                         (catch java.io.IOException _ -1))]
+            (is (= -1 eof) "closed")
+            (is (< (/ (- (System/nanoTime) t0) 1e6) 1500) "by the idle timeout"))
+          (finally (.close socket)))))))
+
+(deftest tls-idle-timeout-zero-outlives-the-quiet-second
+  (with-tls-server* {:idle-timeout 0 :handshake-timeout 5000}
+    (fn [srv]
+      (let [{:keys [post read ^java.net.Socket socket]} (tls-client (enso/port srv))]
+        (try
+          (post 10)
+          (is (.endsWith ^String (read) "\r\n\r\n10"))
+          (Thread/sleep 1500)
+          (post 20)
+          (is (.endsWith ^String (read) "\r\n\r\n20") "served after a quiet second and more")
+          (finally (.close socket)))))))
+
+(deftest tls-pipelined-requests-across-a-release
+  ;; Requests sent together, and one split over two records, survive the
+  ;; record buffers going small between requests.
+  (with-tls-server* {}
+    (fn [srv]
+      (let [{:keys [read ^java.net.Socket socket]} (tls-client (enso/port srv))
+            out (.getOutputStream socket)
+            req (fn [n] (str "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: " n "\r\n\r\n" (apply str (repeat n "q"))))
+            bytes #(.getBytes ^String % java.nio.charset.StandardCharsets/ISO_8859_1)]
+        (try
+          (.write out ^bytes (bytes (str (req 1) (req 3000) (req 2))))
+          (.flush out)
+          (doseq [n [1 3000 2]]
+            (is (.endsWith ^String (read) (str "\r\n\r\n" n)) (str n)))
+          (let [whole (req 5000)]
+            (.write out ^bytes (bytes (subs whole 0 30)))
+            (.flush out)
+            (Thread/sleep 100)
+            (.write out ^bytes (bytes (subs whole 30)))
+            (.flush out)
+            (is (.endsWith ^String (read) "\r\n\r\n5000")))
+          (finally (.close socket)))))))
+
+(deftest tls-concurrent-bodies-are-byte-exact
+  ;; Record buffers come from a server-wide pool and go back as connections
+  ;; go idle: concurrent connections with idle gaps each get their own
+  ;; bytes back.
+  (let [srv (enso/run-server (fn [req] {:status 200 :body (.readAllBytes ^java.io.InputStream (:body req))})
+                             {:host "127.0.0.1" :port 0 :ssl-context (keytool-gen! "exact")})
+        factory (.getSocketFactory (capturing-trust-context (atom [])))]
+    (try
+      (let [results
+            (doall
+             (for [c (range 12)]
+               (future
+                 (with-open [^javax.net.ssl.SSLSocket sock (.createSocket factory "127.0.0.1" (int (enso/port srv)))]
+                   (.setSoTimeout sock 10000)
+                   (let [out (.getOutputStream sock)
+                         in (java.io.DataInputStream. (.getInputStream sock))
+                         rnd (java.util.Random. c)]
+                     (every? true?
+                             (for [_ (range 6)]
+                               (let [body (byte-array (+ 100 (.nextInt rnd 60000)))]
+                                 (.nextBytes rnd body)
+                                 (.write out (.getBytes (str "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: "
+                                                             (alength body) "\r\n\r\n")
+                                                        java.nio.charset.StandardCharsets/ISO_8859_1))
+                                 (.write out body)
+                                 (.flush out)
+                                 (let [sb (StringBuilder.)]
+                                   (while (not (.endsWith (str sb) "\r\n\r\n"))
+                                     (.append sb (char (.readUnsignedByte in))))
+                                   (let [n (Long/parseLong (second (re-find #"(?i)content-length: (\d+)" (str sb))))
+                                         echo (byte-array n)]
+                                     (.readFully in echo)
+                                     (Thread/sleep (.nextInt rnd 50))
+                                     (java.util.Arrays/equals body echo)))))))))))]
+        (is (every? true? (map deref results))))
+      (finally (enso/stop srv)))))
+
+(deftest tls-record-buffers-go-back-to-the-pool-when-connections-close
+  (with-tls-server* {}
+    (fn [srv]
+      (dotimes [_ 4]
+        (let [{:keys [post read ^java.net.Socket socket]} (tls-client (enso/port srv))]
+          (post 10)
+          (read)
+          (.close socket)))
+      (let [^com.s_exp.enso.core.BufferPool pool (private-field srv "tlsRecords")]
+        (is (support/await-condition #(pos? (.pooled pool)) 2000 10) "buffers back in the pool")))))
 
 (deftest tls-large-request-right-after-a-small-one
   ;; A multi-record request on a connection that just went idle grows the
@@ -898,11 +996,11 @@
           (is (nil? (read!)) (str label ": then the end of the stream"))
           (is (.isInboundDone engine) (str label ": after a close_notify")))))))
 
-(deftest tls-trickled-records-bounded-by-the-idle-and-head-clocks
+(deftest tls-trickled-records-bounded-by-the-head-clock
   ;; SO_TIMEOUT restarts with every byte, and over TLS those bytes are
   ;; ciphertext: a record trickled a byte at a time would hold one read
-  ;; for as long as the client likes. Reads are held to the wall clock
-  ;; of their phase instead.
+  ;; for as long as the client likes. The first ciphertext of a request
+  ;; ends the idle wait, and its reads are held to the head's wall clock.
   (with-tls-server {:idle-timeout 2000 :header-timeout 500}
     (fn [port]
       (testing "a request record trickled into an idle connection"
@@ -915,7 +1013,8 @@
               (tls-write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
               (let [[resp _ ms] (tls-read-to-end! sock 6000)]
                 (is (.startsWith ^String resp "HTTP/1.1 408") (pr-str resp))
-                (is (< ms 3000) (str "closed after " ms "ms"))))
+                ;; 500 ms of head clock from the first trickled byte.
+                (is (< ms 1300) (str "closed after " ms "ms"))))
             (finally (.close proxy)))))
       (testing "the rest of a request head trickled"
         (let [drip (atom 0)
@@ -931,6 +1030,38 @@
                 (is (.startsWith ^String resp "HTTP/1.1 408") (pr-str resp))
                 (is (< ms 2000) (str "closed after " ms "ms"))))
             (finally (.close proxy))))))))
+
+(deftest tls-trickled-websocket-frame-bounded-by-the-read-timeout
+  ;; A WebSocket message must arrive whole within :read-timeout of its
+  ;; first frame. Over TLS a read only returns whole records, which a client
+  ;; can trickle a byte per socket timeout: the record read is held to the
+  ;; message deadline's wall clock too.
+  (with-tls-server {:read-timeout 500 :idle-timeout 10000
+                    :handler (fn [_] {:ring.websocket/listener
+                                      {:on-message (fn [^com.s_exp.enso.api.WebSocketSocket s m]
+                                                     (.sendText s ^String m))}})}
+    (fn [port]
+      (let [drip (atom 0)
+            proxy (drip-proxy port drip)]
+        (try
+          (with-open [sock (tls-connect (.getLocalPort proxy))]
+            (tls-write! sock (str "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                                  "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+            (.setSoTimeout sock 5000)
+            (let [in (.getInputStream sock)
+                  sb (StringBuilder.)]
+              (while (not (.endsWith (str sb) "\r\n\r\n"))
+                (.append sb (char (.read in))))
+              (is (.startsWith (str sb) "HTTP/1.1 101") (str sb)))
+            (reset! drip 150)
+            ;; A masked text frame with a zero mask key: the payload as is.
+            (doto (.getOutputStream sock)
+              (.write (byte-array (map unchecked-byte (concat [0x81 (bit-or 0x80 5) 0 0 0 0] (map int "hello")))))
+              (.flush))
+            (let [[text end ms] (tls-read-to-end! sock 6000)]
+              (is (some #(= (int %) 0x88) text) (str "a CLOSE frame, got " (pr-str text) " " end))
+              (is (< ms 2500) (str "closed after " ms "ms"))))
+          (finally (.close proxy)))))))
 
 (deftest tls-trickled-body-record-bounded-by-the-min-data-rate
   (with-tls-server {:min-data-rate-bytes 1000 :min-data-rate-grace 500 :read-timeout 10000

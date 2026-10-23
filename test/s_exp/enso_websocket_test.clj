@@ -2344,6 +2344,109 @@
               (timeout)))))
       (finally (enso/stop srv)))))
 
+(defn- ws-tls-socket ^Socket [port]
+  (let [^javax.net.ssl.SSLSocket ss (.createSocket (.getSocketFactory (support/trust-all-ssl-context))
+                                                   "127.0.0.1" (int port))]
+    (.startHandshake ss)
+    ss))
+
+(defn- recording-close-handler
+  "A handler whose listener records :message and :close events in `events`
+  and counts `closed` down on close."
+  [events ^CountDownLatch closed]
+  (fn [_]
+    {:ring.websocket/listener
+     {:on-message (fn [_ m] (swap! events conj [:message m]))
+      :on-close (fn [_ code reason] (swap! events conj [:close code reason]) (.countDown closed))}}))
+
+(deftest ws-idle-close-unanswered-reports-1001
+  ;; The idle close starts off the read loop; a peer that never answers it
+  ;; is dropped by the close timer and the listener hears why.
+  (let [events (atom []) closed (CountDownLatch. 1)]
+    (with-server (recording-close-handler events closed) {:idle-timeout 200 :ws-close-timeout 300}
+      (fn [port]
+        (with-open [sock (Socket. "127.0.0.1" (int port))]
+          (.setSoTimeout sock 3000)
+          (let [[in _] (ws-handshake! sock)]
+            (is (= 1001 (close-code (update (read-frame in) :payload vec))))
+            (is (.await closed 3 TimeUnit/SECONDS))
+            (is (= [[:close 1001 "idle timeout"]] @events))))))))
+
+(deftest ws-idle-close-answered-reports-the-peers-close
+  (let [events (atom []) closed (CountDownLatch. 1)]
+    (with-server (recording-close-handler events closed) {:idle-timeout 200}
+      (fn [port]
+        (with-open [sock (Socket. "127.0.0.1" (int port))]
+          (.setSoTimeout sock 3000)
+          (let [[in ^java.io.OutputStream out] (ws-handshake! sock)]
+            (is (= 1001 (close-code (update (read-frame in) :payload vec))))
+            (.write out ^bytes (mask-frame 0x8 true (close-payload 1000 "bye")))
+            (.flush out)
+            (is (.await closed 3 TimeUnit/SECONDS))
+            (is (= [[:close 1000 "bye"]] @events))))))))
+
+(deftest ws-frame-after-the-idle-close-is-not-delivered
+  ;; Once the idle close is decided, a message is not delivered: the
+  ;; connection is closing as idle.
+  (let [events (atom []) closed (CountDownLatch. 1)]
+    (with-server (recording-close-handler events closed) {:idle-timeout 200}
+      (fn [port]
+        (with-open [sock (Socket. "127.0.0.1" (int port))]
+          (.setSoTimeout sock 3000)
+          (let [[in ^java.io.OutputStream out] (ws-handshake! sock)]
+            (is (= 1001 (close-code (update (read-frame in) :payload vec))))
+            (.write out ^bytes (mask-frame 0x1 true (utf8 "late")))
+            (.write out ^bytes (mask-frame 0x8 true (close-payload 1001 "")))
+            (.flush out)
+            (is (.await closed 3 TimeUnit/SECONDS))
+            (is (= [[:close 1001 ""]] @events) "no message delivered")))))))
+
+(deftest ws-idle-timeout-zero-outlives-the-quiet-second
+  ;; No idle close with :idle-timeout 0, past the quiet-second release too.
+  (with-server echo-handler {:idle-timeout 0 :handshake-timeout 5000}
+    (fn [port]
+      (with-open [sock (Socket. "127.0.0.1" (int port))]
+        (.setSoTimeout sock 3000)
+        (let [[in ^java.io.OutputStream out] (ws-handshake! sock)]
+          (Thread/sleep 1500)
+          (.write out ^bytes (mask-frame 0x1 true (utf8 "still")))
+          (.flush out)
+          (is (= "still" (String. ^bytes (:payload (read-frame in)) StandardCharsets/UTF_8))))))))
+
+(deftest ws-tls-idle-timeout-sends-close-1001
+  (with-server echo-handler {:idle-timeout 300 :ssl-context (support/server-ssl-context)}
+    (fn [port]
+      (with-open [sock (ws-tls-socket port)]
+        (.setSoTimeout sock 3000)
+        (let [[in _] (ws-handshake! sock)
+              f (update (read-frame in) :payload vec)]
+          (is (= 0x8 (:opcode f)))
+          (is (= 1001 (close-code f))))))))
+
+(deftest ws-tls-concurrent-echoes-are-byte-exact
+  ;; Read and record buffers come from server-wide pools and go back as
+  ;; connections wait: concurrent connections with idle gaps must each get
+  ;; their own bytes back.
+  (with-server echo-handler {:ssl-context (support/server-ssl-context) :ws-max-message-bytes (* 1024 1024)}
+    (fn [port]
+      (let [results (doall
+                     (for [c (range 12)]
+                       (future
+                         (with-open [sock (ws-tls-socket port)]
+                           (.setSoTimeout sock 10000)
+                           (let [[in ^java.io.OutputStream out] (ws-handshake! sock)
+                                 rnd (java.util.Random. c)]
+                             (every? true?
+                                     (for [_ (range 6)]
+                                       (let [payload (byte-array (+ 100 (.nextInt rnd 40000)))]
+                                         (.nextBytes rnd payload)
+                                         (.write out ^bytes (mask-frame 0x2 true payload))
+                                         (.flush out)
+                                         (let [echo ^bytes (:payload (read-frame in))]
+                                           (Thread/sleep (.nextInt rnd 50))
+                                           (java.util.Arrays/equals payload echo))))))))))]
+        (is (every? true? (map deref results)))))))
+
 (deftest ws-idle-wait-sets-no-socket-timeout
   ;; As on HTTP/1.1: a timed read per wait would park through the JDK's
   ;; one delay-scheduler thread. :idle-timeout, the keepalive ping and the
@@ -2352,6 +2455,36 @@
     (is (= 0 (idle-wait-so-timeout {:ws-ping-interval 30000}))))
   (testing "TLS"
     (is (= 0 (idle-wait-so-timeout {:ssl-context (support/server-ssl-context) :ws-ping-interval 30000})))))
+
+(deftest ws-tls-frame-sent-with-the-upgrade-request-is-served
+  ;; A client that sends its first frame right behind the upgrade request
+  ;; (one TLS record) has that frame read with the request head; the wait
+  ;; for the next frame must not block on the socket while it is buffered.
+  (let [srv (enso/run-server (fn [_] {:ring.websocket/listener
+                                      {:on-message (fn [^WebSocketSocket s m] (.sendText s ^String m))}})
+                             {:host "127.0.0.1" :port 0 :ssl-context (support/server-ssl-context)})]
+    (try
+      (with-open [^javax.net.ssl.SSLSocket sock
+                  (.createSocket (.getSocketFactory (support/trust-all-ssl-context))
+                                 "127.0.0.1" (int (enso/port srv)))]
+        (.startHandshake sock)
+        (.setSoTimeout sock 3000)
+        (let [out (.getOutputStream sock)
+              in (.getInputStream sock)
+              request (.getBytes (str "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                                      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+                                 StandardCharsets/ISO_8859_1)
+              frame ^bytes (mask-frame 0x1 true (utf8 "early"))]
+          (.write out (byte-array (concat request frame)))
+          (.flush out)
+          ;; Skip the 101 head, then the echo must come without anything
+          ;; more from the client.
+          (let [sb (StringBuilder.)]
+            (while (not (.endsWith (str sb) "\r\n\r\n"))
+              (.append sb (char (.read in)))))
+          (is (= "early" (try (String. ^bytes (:payload (read-frame in)) StandardCharsets/UTF_8)
+                              (catch java.net.SocketTimeoutException _ :timed-out))))))
+      (finally (enso/stop srv)))))
 
 (deftest ws-idle-connection-gives-back-its-buffers
   ;; Waiting for a frame, a WebSocket reads into a small buffer and gives
@@ -2369,7 +2502,14 @@
     (let [[busy idle echoed] (idle-release-check {:ssl-context (support/server-ssl-context)} nil)]
       (is (= 2048 (:tls-in busy)) "input given back as the wait starts")
       (is (< 0 (:tls-out busy)))
-      (is (= {:tls-in 2048 :tls-app 0 :tls-out 0} (select-keys idle [:tls-in :tls-app :tls-out])))
+      (is (= {:read-buffer 512 :tls-in 2048 :tls-app 0 :tls-out 0}
+             (select-keys idle [:read-buffer :tls-in :tls-app :tls-out])))
+      (is echoed)))
+  (testing "compressed over TLS"
+    (let [[_ idle echoed] (idle-release-check {:ws-compression true :ssl-context (support/server-ssl-context)}
+                                              "permessage-deflate")]
+      (is (= {:message-buffer 0 :inflate-input nil :deflate-output 0 :tls-app 0 :tls-out 0}
+             (select-keys idle [:message-buffer :inflate-input :deflate-output :tls-app :tls-out])))
       (is echoed)))
   (testing "compressed, context takeover: the Deflater and Inflater keep their windows"
     (let [[busy idle echoed] (idle-release-check {:ws-compression true} "permessage-deflate")]
