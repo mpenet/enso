@@ -13,16 +13,16 @@ unlimited keep-alive. Every response is a 200 with the 13-byte body
 `Hello, World!`. Server and load generator share the CPUs, so throughput
 varies by about 10% between runs. Allocation per request is stable to a
 few bytes. Each figure is the median of three runs, measured on October
-14, 2026.
+23, 2026.
 
 | Scenario | req/s | alloc B/req | p50 ms | p99 ms | p99.9 ms | Load |
 |---|---:|---:|---:|---:|---:|---|
-| h1-get | 131,807 | 377 | 0.46 | 0.87 | 3.95 | 64 connections, closed loop |
-| h1-get-rate | 19,997 | 379 | 0.38 | 0.91 | 1.82 | open model, 20k req/s over 64 connections, CO-corrected |
-| h1-pipelined | 1,450,752 | 233 | 0.16 | 0.43 | 1.93 | 16 connections × depth 16, latency per batch |
-| h2-get | 798,239 | 1,101 | 0.22 | 0.71 | – | h2load `-c 8 -m 32` over TLS, closed loop |
-| h3-get | 72,525 | 800 | 1.85 | 2.77 | 3.09 | 4 QUIC connections × 32 requests in flight, closed loop |
-| ws-echo | 1,041,493 | 331 | 0.47 | 0.88 | 3.72 | 64 WebSockets × 8 messages of 128 bytes in flight; one request is one message echoed |
+| h1-get | 133,580 | 289 | 0.46 | 0.79 | 3.41 | 64 connections, closed loop |
+| h1-get-rate | 19,997 | 292 | 0.32 | 0.87 | 1.02 | open model, 20k req/s over 64 connections, CO-corrected |
+| h1-pipelined | 1,522,354 | 228 | 0.16 | 0.35 | 1.37 | 16 connections × depth 16, latency per batch |
+| h2-get | 822,935 | 1,098 | 0.21 | 0.72 | – | h2load `-c 8 -m 32` over TLS, closed loop |
+| h3-get | 71,819 | 800 | 1.86 | 2.79 | 3.14 | 4 QUIC connections × 32 requests in flight, closed loop |
+| ws-echo | 1,061,040 | 320 | 0.46 | 0.84 | 3.48 | 64 WebSockets × 8 messages of 128 bytes in flight; one request is one message echoed |
 
 ### Browser-sized request heads
 
@@ -38,12 +38,12 @@ clojure -M:perf '{:scenarios [:h2-get-browser :h3-get-browser]}'
 ```
 
 On the same laptop, median of three rounds, server and load generator
-sharing the CPUs, measured on October 14, 2026:
+sharing the CPUs, measured on October 23, 2026:
 
 | Scenario | req/s | alloc B/req | p50 ms | p99 ms |
 |---|---:|---:|---:|---:|
-| h2-get-browser | 645,666 | 2,205 | 0.25 | 1.05 |
-| h3-get-browser | 51,959 | 2,296 | 1.60 | 3.38 |
+| h2-get-browser | 692,201 | 2,241 | 0.24 | 1.00 |
+| h3-get-browser | 51,110 | 2,296 | 1.63 | 3.43 |
 
 A 16-field head fits in a PersistentArrayMap, which now holds up to 32
 fields where it used to hold 8. The head allocates about 970 bytes less
@@ -66,9 +66,9 @@ On the same laptop, over loopback:
 
 | Scenario | MiB/s | alloc per MiB |
 |---|---:|---:|
-| h2-upload (1 stream, TLS) | 1,088 | 114 KiB |
-| h2-upload-4 (4 streams, TLS) | 1,107 | 119 KiB |
-| h3-upload (1 stream) | 163 | 22 KiB |
+| h2-upload (1 stream, TLS) | 1,074 | 114 KiB |
+| h2-upload-4 (4 streams, TLS) | 1,117 | 118 KiB |
+| h3-upload (1 stream) | 162 | 23 KiB |
 | h3-upload-4 (4 streams) | 170 | 29 KiB |
 
 The HTTP/3 figures are limited by the load client (`s-exp.h3-load`), not
@@ -126,7 +126,7 @@ reported but not CO-corrected.
 
 - `h2-get` uses h2load, which reports median and p99 from nghttp2 1.62 on, and only min, max and mean before.
 - `h3-get` drives `:h3-connections` (4) QUIC connections, each keeping `:h3-in-flight` (32) requests open, from a lean load client (`s-exp.h3-load`: quiche through the enso shim, one platform thread per connection).
-- `ws-echo` keeps `:ws-depth` (8) text messages of `:ws-message-bytes` (128) in flight on each connection against the echo endpoint. A request is one message read, dispatched and written back, so its allocation includes the message String and the echo's encoded bytes. Part of it is the JDK's: a virtual thread parking in a socket read with a timeout (every read here, bounded by `:idle-timeout`) allocates a scheduler task, so a server that drains each batch sooner parks, and allocates, more often.
+- `ws-echo` keeps `:ws-depth` (8) text messages of `:ws-message-bytes` (128) in flight on each connection against the echo endpoint. A request is one message read, dispatched and written back, so its allocation includes the message String and the echo's encoded bytes.
 
 Results go to `target/perf/latest.{edn,json,md}`, plus a timestamped
 copy: git revision, JVM, OS, CPU count, configuration, and per scenario
@@ -149,14 +149,14 @@ Allocation is measured inside each server JVM, as described in
 [Methodology](#methodology). Each figure below is the median of three
 rounds, with the lowest and highest round as the range.
 
-Measured on October 14, 2026 at revision 21df5c8, on the same laptop as the
+Measured on October 23, 2026 at revision e64a31d, on the same laptop as the
 current numbers.
 
 ### Servers
 
 | Server | Version | Configuration |
 |---|---|---|
-| Ensō | 21df5c8 | the perf test server, defaults, unlimited keep-alive requests; handlers on virtual threads |
+| Ensō | e64a31d | the perf test server, defaults, unlimited keep-alive requests; handlers on virtual threads |
 | http-kit | 2.8.1 | defaults: 4 worker threads |
 | Jetty | 12.1.14, through ring-jetty9-adapter 0.40.5 | adapter defaults: a pool of 8 to 50 platform threads |
 | Jetty, virtual threads | same | `:virtual-threads? true` |
@@ -174,8 +174,13 @@ and Aleph adds a charset and `Connection: Keep-Alive`. Before measuring
 each scenario, the harness fetches one response over that protocol and
 checks the status and the body. Load generators count failed requests and
 non-2xx responses. Every cell below had zero of both, in every round,
-except one wrk socket error for Jetty in one non-pipelined HTTP/1.1 round,
-out of 1.2 million requests.
+except two wrk timeouts for Ensō: one in a non-pipelined round and one in
+a pipelined round, out of 3.9 and 46 million requests. Neither was a slow
+response. wrk times requests with the wall clock (`gettimeofday`), which
+macOS steps back by a few microseconds now and then, and a request that
+completes within such a step gets a negative latency that wrk counts as a
+timeout. Rerunning both kinds of run with a wrk build that prints the
+latency of each timeout showed -8 and -19 µs.
 
 TLS (HTTP/2) uses the JDK's provider and the same self-signed RSA 2048
 certificate on Ensō, Jetty and Aleph. All three HTTP/3 servers use quiche:
@@ -193,25 +198,25 @@ Non-pipelined:
 
 | Server | req/s | range | alloc B/req | p50 ms | p99 ms |
 |---|---:|---:|---:|---:|---:|
-| Ensō | 127,370 | 126,644–127,954 | 376 | 0.37 | 1.50 |
-| Jetty, virtual threads | 127,327 | 126,694–128,261 | 4,128 | 0.30 | 5.44 |
-| http-kit | 126,709 | 126,635–127,200 | 3,705 | 0.43 | 0.96 |
-| Jetty | 120,759 | 119,743–121,707 | 3,659 | 0.28 | 5.46 |
-| Aleph | 87,575 | 87,256–88,399 | 3,274 | 0.47 | 47.86 |
+| Ensō | 128,405 | 128,357–128,721 | 289 | 0.37 | 1.07 |
+| Jetty, virtual threads | 127,113 | 126,453–127,598 | 4,149 | 0.32 | 4.39 |
+| http-kit | 126,342 | 126,111–127,780 | 3,627 | 0.44 | 0.96 |
+| Jetty | 120,788 | 120,329–121,323 | 3,570 | 0.27 | 5.12 |
+| Aleph | 88,089 | 87,773–89,159 | 3,313 | 0.47 | 49.39 |
 
 Pipelined, depth 16:
 
 | Server | req/s | range | alloc B/req |
 |---|---:|---:|---:|
-| Ensō | 1,476,909 | 1,475,755–1,477,254 | 234 |
-| http-kit | 407,769 | 404,614–414,205 | 3,935 |
-| Jetty | 385,977 | 385,809–386,637 | 3,553 |
-| Jetty, virtual threads | 370,367 | 368,620–372,119 | 3,560 |
-| Aleph | 71,751 | 71,736–72,249 | 2,968 |
+| Ensō | 1,511,371 | 1,509,445–1,528,437 | 228 |
+| http-kit | 411,912 | 402,864–412,112 | 3,880 |
+| Jetty | 380,129 | 378,455–380,670 | 3,465 |
+| Jetty, virtual threads | 371,824 | 368,127–376,735 | 3,584 |
+| Aleph | 71,515 | 71,455–72,212 | 3,000 |
 
 Without pipelining, all servers fall between 120k and 128k req/s except
-Aleph. Ensō has the second lowest p99, after http-kit. It allocates 376
-bytes per request, where the others allocate 3,300 to 4,100.
+Aleph. Ensō has the second lowest p99, after http-kit. It allocates 289
+bytes per request, where the others allocate 3,300 to 4,200.
 
 ### HTTP/2
 
@@ -220,10 +225,10 @@ HTTP/2 server.
 
 | Server | req/s | range | alloc B/req | p50 ms | p99 ms |
 |---|---:|---:|---:|---:|---:|
-| Ensō | 785,223 | 772,266–787,353 | 1,104 | 0.23 | 0.73 |
-| Jetty, virtual threads | 410,412 | 407,921–418,968 | 7,521 | 0.45 | 2.68 |
-| Jetty | 162,820 | 161,738–164,203 | 6,362 | 1.16 | 7.04 |
-| Aleph | 38,185 | 37,982–44,068 | 14,079 | 4.10 | 56.14 |
+| Ensō | 830,285 | 826,442–835,618 | 1,105 | 0.22 | 0.70 |
+| Jetty, virtual threads | 419,251 | 416,876–419,903 | 7,639 | 0.43 | 2.49 |
+| Jetty | 162,443 | 161,330–163,873 | 6,349 | 1.16 | 6.86 |
+| Aleph | 39,447 | 38,980–41,318 | 14,027 | 4.06 | 53.53 |
 
 ### HTTP/3
 
@@ -233,12 +238,12 @@ of every response. http-kit and Aleph have no HTTP/3 server.
 
 | Server | req/s | range | alloc B/req | p50 ms | p99 ms |
 |---|---:|---:|---:|---:|---:|
-| Ensō | 72,987 | 71,974–74,528 | 805 | 1.76 | 2.71 |
-| Netty | 55,831 | 54,460–56,105 | 4,286 | 2.29 | 2.98 |
-| Jetty | 23,384 | 23,081–23,877 | 12,084 | 3.96 | 42.11 |
-| Jetty, virtual threads | 9,662 | 9,656–9,742 | 17,216 | 12.80 | 20.63 |
+| Ensō | 72,323 | 72,048–72,906 | 805 | 1.80 | 2.74 |
+| Netty | 56,038 | 55,953–57,677 | 4,281 | 2.28 | 2.81 |
+| Jetty | 23,550 | 9,769–23,743 | 12,614 | 3.96 | 42.63 |
+| Jetty, virtual threads | 9,545 | 9,473–9,766 | 17,618 | 12.91 | 20.51 |
 
-Ensō is 31% faster than Netty, with a slightly lower p99. The load client runs one
+Ensō is 29% faster than Netty, with a slightly lower p99. The load client runs one
 platform thread per connection and may limit both. That was not measured
 separately.
 
@@ -256,11 +261,11 @@ on each. One request is one message echoed.
 
 | Server | msg/s | range | alloc B/msg | p50 ms | p99 ms |
 |---|---:|---:|---:|---:|---:|
-| Ensō | 1,044,344 | 1,033,530–1,044,791 | 331 | 0.47 | 0.89 |
-| http-kit | 526,876 | 526,331–533,738 | 871 | 0.95 | 1.67 |
-| Jetty | 384,225 | 381,420–384,552 | 5,277 | 0.75 | 6.82 |
-| Jetty, virtual threads | 379,299 | 378,938–381,308 | 5,338 | 1.03 | 8.66 |
-| Aleph | 54,728 | 53,583–68,569 | 2,684 | 6.97 | 57.70 |
+| Ensō | 1,058,454 | 1,050,719–1,058,961 | 320 | 0.46 | 0.83 |
+| http-kit | 526,831 | 524,601–533,142 | 871 | 0.95 | 1.65 |
+| Jetty | 382,962 | 381,082–383,783 | 5,277 | 0.80 | 6.73 |
+| Jetty, virtual threads | 379,770 | 377,046–383,525 | 5,338 | 1.02 | 8.29 |
+| Aleph | 53,099 | 51,098–62,110 | 2,685 | 7.34 | 54.30 |
 
 Ensō echoes twice as many messages per second as http-kit, at half the
 latency, and allocates less per message.
@@ -287,8 +292,8 @@ methods, Jetty the Ring WebSocket API (`ring.websocket/send`), http-kit
   (adapter, server, TLS, the JDK's own bookkeeping), so it includes work
   each adapter does to build the Ring request map.
 - Before each server run, the driver waited for the 1-minute load average
-  to drop below 4. Every run started between 3.76 and 3.99. The 5-minute
-  average stayed between 7.4 and 10.5 because of the benchmark itself. An
+  to drop below 4. Every run started between 3.60 and 3.96. The 5-minute
+  average stayed between 6.1 and 8.9 because of the benchmark itself. An
   editor and a browser stayed open during the runs.
 - The WebSocket client opens its connections one at a time. With 64
   simultaneous connects, http-kit's listen backlog (50, the JDK default,

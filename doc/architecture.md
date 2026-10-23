@@ -343,8 +343,8 @@ warm-up, so the numbers are exact. Tests assert the bounds.
 | The same with a 13-byte `ByteArrayInputStream` body | as above (bound 1200) | `h2-small-stream-body-allocation-budget` |
 | HTTP/3 GET | ~730 with compressed oops (bound 900), ~1050 without (bound 1300) | `h3-get-allocation-budget` |
 
-The harness, counting the whole server JVM, measures 377 bytes per
-HTTP/1.1 GET, 233 pipelined, 1,101 per HTTP/2 GET over TLS and 800 per
+The harness, counting the whole server JVM, measures 289 bytes per
+HTTP/1.1 GET, 228 pipelined, 1,098 per HTTP/2 GET over TLS and 800 per
 HTTP/3 GET ([performance.md](performance.md#current-numbers)). The
 allocation gate holds these to `bench/perf/baseline.edn`.
 
@@ -359,7 +359,7 @@ Nothing is allocated per request for timeouts, the write watchdog,
 response validation, Date (cached bytes), status lines, the response head
 (reused buffer), HPACK encoding or HTTP/2 framing (pooled batch buffers).
 
-HTTP/1.1 over TLS 1.3 allocates about 3460 bytes per request (wrk, 64
+HTTP/1.1 over TLS 1.3 allocates about 3130 bytes per request (wrk, 64
 keep-alive connections, Temurin 25), mostly in the JDK's `SSLEngine`. A direct outbound record buffer was tried: about 5%
 more throughput, but about 370 B/req more allocation (the cipher copies
 through a heap array for a direct destination) and a costly
