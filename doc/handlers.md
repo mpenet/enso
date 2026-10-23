@@ -295,9 +295,10 @@ and a message whose compressed form exceeds 64 KiB is sent as several
 frames. Clients may end messages with final deflate blocks (RFC 7692
 §7.2.3.4); the window carries over to their next messages.
 
-A connection quiet for a second gives back its grown buffers (message
-assembly, compression, output, TLS records); the next message grows them
-again.
+Waiting for a frame, a connection reads into a small buffer and gives its
+TLS input records back. Quiet for a second, it also gives back its grown
+buffers (message assembly, compression, output, the TLS output record);
+the next message grows them again.
 
 ### Origin and authentication
 

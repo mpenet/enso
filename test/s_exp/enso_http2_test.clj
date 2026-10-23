@@ -2970,6 +2970,22 @@
     (is (some #{"unhandled handler exception"} fine) (pr-str fine))
     (is (some #{"HTTP/2 response body failed"} fine) (pr-str fine))))
 
+(deftest h2-framer-wait-sets-no-socket-timeout
+  ;; A timed read per wait between frames would park through the JDK's one
+  ;; delay-scheduler thread; the quiet-second release runs on the server's
+  ;; timer instead.
+  (with-server-instance [srv (fn [_] {:status 200 :body "ok"}) {}]
+    (with-conn [conn]
+      (send-request! conn 1 (request-headers "GET" "/") true)
+      (is (= "200" (get (response-on conn 1) ":status")))
+      (let [c (server-h2-connection srv)
+            tls (.tls ^com.s_exp.enso.core.TlsSocket$AdapterSocket (field-of c "socket"))
+            raw (.socket ^java.nio.channels.SocketChannel (field-of tls "channel"))]
+        ;; Well inside the quiet second, after which a timed wait would
+        ;; switch to an untimed one too.
+        (is (support/await-condition #(zero? (.getSoTimeout ^java.net.Socket raw)) 400 10)
+            "the framer's wait has no socket timeout")))))
+
 (deftest h2-idle-connection-gives-back-its-buffers
   ;; A connection quiet for a second keeps only what it needs to wait:
   ;; TLS record buffers swapped for small ones, the framer's input and
@@ -2989,8 +3005,9 @@
             tls (.tls ^com.s_exp.enso.core.TlsSocket$AdapterSocket (field-of c "socket"))
             writer (field-of c "writer")]
         (is (= 2048 (capacity (field-of tls "peerNetData"))) "TLS input record buffer")
+        (is (= 0 (capacity (field-of tls "peerAppData"))) "TLS plaintext buffer, not held while waiting")
         (is (= 0 (capacity (field-of tls "myNetData"))) "TLS output record buffer")
-        (is (>= 64 (alength ^bytes (field-of c "inBuf"))) "framer input buffer")
+        (is (>= 2048 (alength ^bytes (field-of c "inBuf"))) "framer input buffer back to its initial size")
         (is (nil? (field-of c "pendingHeaderBytes")) "header block buffer")
         (is (nil? (field-of c "retired")) "closed streams forgotten")
         (is (zero? (field-of (field-of c "streams") "size")) "stream table empty")

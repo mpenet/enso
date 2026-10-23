@@ -25,6 +25,7 @@ import com.s_exp.enso.core.Exchange;
 import com.s_exp.enso.core.HttpError;
 import com.s_exp.enso.core.HttpFields;
 import com.s_exp.enso.core.HttpStatus;
+import com.s_exp.enso.core.IdleWait;
 import com.s_exp.enso.core.LogLimiter;
 import com.s_exp.enso.core.RequestBodyException;
 import com.s_exp.enso.core.RequestBodyTimeoutException;
@@ -78,14 +79,12 @@ public final class HttpConnection implements Runnable, Drainable {
     private static final int CLOSING = 2;
     private static final VarHandle STATE;
     private static final VarHandle TIMED_SINCE;
-    private static final VarHandle IDLE_SINCE;
 
     static {
         try {
             MethodHandles.Lookup lookup = MethodHandles.lookup();
             STATE = lookup.findVarHandle(HttpConnection.class, "state", int.class);
             TIMED_SINCE = lookup.findVarHandle(HandlerTimeout.class, "timedSince", long.class);
-            IDLE_SINCE = lookup.findVarHandle(IdleTimeout.class, "idleSince", long.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -261,7 +260,7 @@ public final class HttpConnection implements Runnable, Drainable {
      */
     private void enterIdle() {
         if (idleTimeout != null) {
-            idleTimeout.arm();
+            idleTimeout.begin(config.idleTimeoutMillis);
         }
         STATE.setVolatile(this, IDLE);
     }
@@ -692,55 +691,27 @@ public final class HttpConnection implements Runnable, Drainable {
     }
 
     /**
-     * The {@code :idle-timeout} node of a connection, armed each
-     * time the connection goes idle but never cancelled: the next idle
-     * period only moves its deadline (one CAS on this node, no timer thread
-     * visit per request, as for {@link HandlerTimeout}). So an expiry may
-     * come while a request is in flight, or be left over from an earlier
-     * idle period; {@link #idleSince} tells: when the connection went idle,
-     * or {@link #NONE}. An expiry claims that idle period through one CAS on
-     * it, and only once it has lasted the whole timeout, then closes the
-     * connection as a drain would (IDLE to CLOSING, see {@link #state}). A
-     * new idle period waits for a claim in progress to finish (it never
-     * blocks), so the claim can't land on it.
+     * The {@code :idle-timeout} node (see {@link IdleWait}), begun each time
+     * the connection goes idle and never ended: whether the connection is
+     * still idle is the state's to tell. An expiry closes it as a drain would
+     * (IDLE to CLOSING, see {@link #state}), so a request's first byte and
+     * the close can't both win, and an expiry left over from an earlier idle
+     * period finds the connection busy, or idle for less than the timeout.
      */
-    private final class IdleTimeout extends Timer.Task {
-        private static final long NONE = 0;
-        private static final long EXPIRING = Long.MIN_VALUE;
-        private final long timeoutNanos = config.idleTimeoutMillis * 1_000_000L;
-        private volatile long idleSince;
-
-        /** The connection is about to go idle (connection thread). */
-        void arm() {
-            while (idleSince == EXPIRING) {
-                Thread.onSpinWait();
-            }
-            long now = System.nanoTime();
-            if (now == NONE || now == EXPIRING) {
-                now++;
-            }
-            idleSince = now;
-            timer.schedule(this, config.idleTimeoutMillis);
+    private final class IdleTimeout extends IdleWait {
+        IdleTimeout() {
+            super(timer);
         }
 
         @Override
-        protected void onTimeout() {
-            long since = idleSince;
-            if (since == NONE || since == EXPIRING || System.nanoTime() - since < timeoutNanos) {
-                // An expiry armed for an earlier idle period: the current
-                // one armed its own after setting since.
-                return;
+        protected long expired(long waitedMillis) {
+            if (waitedMillis < config.idleTimeoutMillis) {
+                return config.idleTimeoutMillis - waitedMillis;
             }
-            if (IDLE_SINCE.compareAndSet(this, since, EXPIRING)) {
-                try {
-                    // A request already started wins (state ACTIVE).
-                    if (STATE.compareAndSet(HttpConnection.this, IDLE, CLOSING)) {
-                        Thread.ofVirtual().name("enso-h1-idle-close").start(HttpConnection.this::closeWatched);
-                    }
-                } finally {
-                    idleSince = NONE;
-                }
+            if (STATE.compareAndSet(HttpConnection.this, IDLE, CLOSING)) {
+                Thread.ofVirtual().name("enso-h1-idle-close").start(HttpConnection.this::closeWatched);
             }
+            return -1;
         }
     }
 
@@ -823,7 +794,7 @@ public final class HttpConnection implements Runnable, Drainable {
 
         WebSocketConnection ws = new WebSocketConnection(socket, reader.upgradeInput(), writer.output(),
                                                          response.webSocketListener, config, deflate, timer,
-                                                         service.budget, writer::shrinkIdle);
+                                                         service.budget, writer::shrinkIdle, service.readBuffers);
         webSocket = ws;
         // A shutdown that began before the field was set didn't see this
         // WebSocket, so it closes itself.

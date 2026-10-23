@@ -4,7 +4,7 @@
   (:require [clojure.test :refer [are deftest testing is]]
             [s-exp.enso-test-support :as support])
   (:import (com.s_exp.enso.api Response RingErrorHandler ServerEvents StreamingBody)
-           (com.s_exp.enso.core BufferPool ConnectionLimiter ConnectionRegistry DataRate Drainable GuardedEvents Jfr MemoryBudget
+           (com.s_exp.enso.core BufferPool ConnectionLimiter IdleWait ConnectionRegistry DataRate Drainable GuardedEvents Jfr MemoryBudget
                                 MemoryBudget$Waiter RequestHead ResponseHead Timer Timer$Task
                                 WatchedOutputStream WriteWatchdog)
            (java.net InetAddress)
@@ -976,3 +976,51 @@
   (let [pool (BufferPool. 1024 2 4)]
     (.release pool (ByteBuffer/allocate 1024))
     (is (> 1.0 (bytes-per-op 100000 (fn [] (.release pool (.acquire pool 1024))))))))
+
+;; ---- IdleWait -----------------------------------------------------------------
+
+(defn- idle-wait
+  "An IdleWait on `timer` whose expired calls `f` with the time waited."
+  ^IdleWait [^Timer timer f]
+  (proxy [IdleWait] [timer]
+    (expired [waited] (f waited))))
+
+(deftest idle-wait-expires-after-its-delay
+  (with-open [timer (Timer.)]
+    (let [p (promise)
+          w (idle-wait timer (fn [waited] (deliver p waited) -1))]
+      (.begin w 50)
+      (let [waited (deref p 2000 nil)]
+        (is (some? waited) "expired ran")
+        (is (<= 50 waited) "not before the delay")))))
+
+(deftest idle-wait-ended-first-never-expires
+  (with-open [timer (Timer.)]
+    (let [calls (AtomicInteger.)
+          w (idle-wait timer (fn [_] (.incrementAndGet calls) -1))]
+      (.begin w 50)
+      (.end w)
+      (Thread/sleep 200)
+      (is (zero? (.get calls))))))
+
+(deftest idle-wait-runs-again-when-expired-asks
+  (with-open [timer (Timer.)]
+    (let [calls (AtomicInteger.)
+          done (CountDownLatch. 1)
+          w (idle-wait timer (fn [_] (if (= 1 (.incrementAndGet calls)) 30 (do (.countDown done) -1))))]
+      (.begin w 20)
+      (is (.await done 2 TimeUnit/SECONDS))
+      (Thread/sleep 100)
+      (is (= 2 (.get calls)) "twice, then never again"))))
+
+(deftest idle-wait-end-waits-for-an-expiry-in-progress
+  ;; While expired runs the wait is claimed: end returns only once it is
+  ;; done, so expired may touch what the waiting thread owns.
+  (with-open [timer (Timer.)]
+    (let [inside (CountDownLatch. 1)
+          finished (java.util.concurrent.atomic.AtomicBoolean.)
+          w (idle-wait timer (fn [_] (.countDown inside) (Thread/sleep 150) (.set finished true) -1))]
+      (.begin w 10)
+      (is (.await inside 2 TimeUnit/SECONDS))
+      (.end w)
+      (is (.get finished) "end returned after expired finished"))))

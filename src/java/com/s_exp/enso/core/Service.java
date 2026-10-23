@@ -23,6 +23,13 @@ public final class Service {
     public final GuardedEvents events;
     /** {@code :max-buffered-bytes}. */
     public final MemoryBudget budget;
+    /**
+     * Read buffers borrowed while a burst of frames comes in and given back
+     * when the connection waits for the next one: an HTTP/2 frame of the
+     * default maximum size with its header (16384 + 9 bytes) fits, and a
+     * WebSocket reads its bursts through one.
+     */
+    public final BufferPool readBuffers = new BufferPool(16384 + 9);
     // Server and Alt-Svc values added to responses, or null.
     private final String server;
     private final String altSvc;

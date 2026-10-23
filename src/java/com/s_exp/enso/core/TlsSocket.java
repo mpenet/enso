@@ -745,11 +745,6 @@ public final class TlsSocket implements AutoCloseable {
          */
         private boolean fillPlaintext() throws IOException {
             peerAppData.compact();
-            if (peerAppData == idleAppIn) {
-                // The idle buffer holds no plaintext: take a full one now
-                // rather than through a failed unwrap.
-                peerAppData = enlarge(peerAppData, engine.getSession().getApplicationBufferSize());
-            }
             try {
                 return unwrapUntilPlaintext();
             } catch (IOException | RuntimeException | Error e) {
@@ -773,6 +768,13 @@ public final class TlsSocket implements AutoCloseable {
                     // Some ciphertext leftover from a previous partial record.
                     // Try to unwrap what we have; if it needs more, we'll read
                     // additional bytes.
+                }
+                if (peerAppData == idleAppIn) {
+                    // Ciphertext is in, and the idle buffer holds no
+                    // plaintext: take a full one now rather than through a
+                    // failed unwrap (not before the read, which would hold it
+                    // through a whole idle wait).
+                    peerAppData = enlarge(peerAppData, engine.getSession().getApplicationBufferSize());
                 }
                 peerNetData.flip();
                 SSLEngineResult r = engine.unwrap(peerNetData, peerAppData);

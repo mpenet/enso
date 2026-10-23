@@ -8,6 +8,7 @@ import com.s_exp.enso.api.Request;
 import com.s_exp.enso.api.RingHandler;
 import com.s_exp.enso.core.Drainable;
 import com.s_exp.enso.core.Exchange;
+import com.s_exp.enso.core.IdleWait;
 import com.s_exp.enso.core.LogLimiter;
 import com.s_exp.enso.core.MemoryBudget;
 import com.s_exp.enso.core.Service;
@@ -39,9 +40,10 @@ import java.util.logging.Logger;
  * connection is open the framer never blocks on output (at teardown it
  * waits for the active writer, bounded by the write watchdog). It reads
  * ahead into one input buffer and parses
- * frames in place, so one socket read serves every frame that arrived;
- * after a quiet second it gives back what the connection grew (buffers,
- * TLS records, closed streams) and waits for the next frame with ~64 bytes.
+ * frames in place, so one socket read serves every frame that arrived. It
+ * waits for frames with an untimed read on its initial 2 KiB input buffer,
+ * the TLS input records back in the pool; after a quiet second the rest of
+ * what the connection grew is given back ({@link FramerWait}).
  *
  * <p>Connection state machine ({@link #state}, CAS):
  * <pre>
@@ -111,9 +113,6 @@ public final class Http2Connection implements Runnable, Drainable {
     // up to the default maximum size (larger ones are read past it).
     private static final int INPUT_INITIAL = 2048;
     private static final int INPUT_MAX = Http2.DEFAULT_MAX_FRAME_SIZE + Http2.FRAME_HEADER_SIZE;
-    // Input buffer of an idle connection: room for the next read to land;
-    // the frame it starts grows the buffer back.
-    private static final int INPUT_IDLE = 64;
     // Quiet this long (no frame), the connection gives back what it grew
     // and waits for the next frame with only what that needs.
     private static final int IDLE_RELEASE_MILLIS = 1000;
@@ -208,16 +207,21 @@ public final class Http2Connection implements Runnable, Drainable {
     // Bytes read ahead: frames are parsed from inBuf[inPos, inLim), so a
     // read of the socket (a syscall, or a TLS record's plaintext under its
     // lock) yields as many frames as arrived.
-    private byte[] inBuf = new byte[INPUT_INITIAL];
+    private byte[] inBuf;
     private int inPos;
     private int inLim;
+    // inBuf at its initial size, kept: a frame that doesn't fit moves to a
+    // full-frame buffer from the server's pool (inFull), given back at the
+    // next wait between frames (releaseForWait).
+    private final byte[] inHome = new byte[INPUT_INITIAL];
+    private java.nio.ByteBuffer inFull;
+    // The framer's wait between frames, with the quiet-second release.
+    private final FramerWait framerWait;
     // A frame larger than INPUT_MAX is read here; null until one arrives.
     private byte[] large;
     // The frame being handled; its payload is payload[payloadOff, payloadOff + frameLength).
     private byte[] payload;
     private int payloadOff;
-    // Buffers were given back after a quiet second; restored by the next read.
-    private boolean idleReleased;
     private int frameLength;
     private int frameType;
     private int frameFlags;
@@ -312,6 +316,8 @@ public final class Http2Connection implements Runnable, Drainable {
         this.service = server.service();
         this.config = service.config;
         this.timer = service.timer;
+        this.inBuf = inHome;
+        this.framerWait = new FramerWait();
         this.ownInitialWindowSize = config.http2InitialWindowBytes;
         this.ownMaxFrameSize = config.http2MaxFrameBytes;
         this.ownMaxConcurrentStreams = config.http2MaxConcurrentStreams;
@@ -401,8 +407,8 @@ public final class Http2Connection implements Runnable, Drainable {
             // with the handshake timeout disabled. From now on streams may
             // legitimately stay quiet (long-poll, SSE): idleness is judged by
             // the deadline node, which knows whether any stream is in progress.
-            // A read timing out only means a quiet second (see fill).
-            socket.setSoTimeout(IDLE_RELEASE_MILLIS);
+            // Reads wait untimed from here (see fill).
+            socket.setSoTimeout(0);
             deadlines.handshake = 0;
             idleSinceNanos = System.nanoTime();
             // From here a server stop can GOAWAY it (beginDrain). A stop that
@@ -413,6 +419,9 @@ public final class Http2Connection implements Runnable, Drainable {
                 beginGracefulClose();
             }
             while (state() < CLOSING) {
+                if (inPos == inLim) {
+                    releaseForWait();
+                }
                 if (!readHeader()) {
                     return;
                 }
@@ -569,13 +578,13 @@ public final class Http2Connection implements Runnable, Drainable {
         while (inLim - inPos < n) {
             byte[] b = inBuf;
             if (b.length < n) {
-                int size = Math.max(b.length, INPUT_INITIAL);
-                while (size < n) size <<= 1;
-                byte[] bigger = new byte[Math.min(size, INPUT_MAX)];
+                java.nio.ByteBuffer full = service.readBuffers.acquire(INPUT_MAX);
+                byte[] bigger = full.array();
                 System.arraycopy(b, inPos, bigger, 0, inLim - inPos);
                 inLim -= inPos;
                 inPos = 0;
                 inBuf = bigger;
+                inFull = full;
             } else if (b.length - inPos < n) {
                 System.arraycopy(b, inPos, b, 0, inLim - inPos);
                 inLim -= inPos;
@@ -590,33 +599,30 @@ public final class Http2Connection implements Runnable, Drainable {
 
     /**
      * One read into the free end of {@link #inBuf}; false at the end of
-     * input. Once the connection is open a read times out after a quiet
-     * second: between frames the connection then gives its grown buffers
-     * back ({@link #releaseIdle}) and waits without a timeout; inside a
-     * frame it keeps waiting (the frame-level deadlines bound a slow peer).
+     * input. Once the connection is open the read is untimed: a timed read
+     * on a virtual thread parks through the JDK's single delay scheduler
+     * thread, which would cap the server's request rate. Idleness is judged
+     * by the deadline node; a quiet second between frames releases what the
+     * framer grew ({@link FramerWait}, on the server's timer).
      */
     private boolean fill() throws IOException {
-        while (true) {
-            int n;
-            try {
-                n = in.read(inBuf, inLim, inBuf.length - inLim);
-            } catch (java.net.SocketTimeoutException e) {
-                if (state() == HANDSHAKE) throw e;
-                if (inPos == inLim && !idleReleased) {
-                    releaseIdle();
-                }
-                continue;
-            }
-            if (n < 0) {
-                return false;
-            }
-            inLim += n;
-            if (idleReleased) {
-                idleReleased = false;
-                socket.setSoTimeout(IDLE_RELEASE_MILLIS);
-            }
-            return true;
+        boolean waiting = inPos == inLim && state() != HANDSHAKE;
+        if (waiting) {
+            framerWait.begin(IDLE_RELEASE_MILLIS);
         }
+        int n;
+        try {
+            n = in.read(inBuf, inLim, inBuf.length - inLim);
+        } finally {
+            if (waiting) {
+                framerWait.end();
+            }
+        }
+        if (n < 0) {
+            return false;
+        }
+        inLim += n;
+        return true;
     }
 
     /** Reads exactly {@code len} bytes into {@code dst} straight from the socket. */
@@ -638,29 +644,59 @@ public final class Http2Connection implements Runnable, Drainable {
     }
 
     /**
-     * Framer, a quiet second between frames: closed streams are forgotten
-     * and what grew is given back (input and header-block buffers, the
-     * HPACK scratch, the TLS input records, the writer's buffers); the
-     * next frame regrows what it needs. Reads wait without a timeout until then.
+     * Framer, about to wait for frames with nothing buffered: the input
+     * buffer goes back to its initial size and the TLS input records to the
+     * pool, so the wait holds small buffers (the blocked read uses them, so
+     * the quiet-second release can't).
      */
-    private void releaseIdle() throws IOException {
-        idleReleased = true;
-        socket.setSoTimeout(0);
-        retireClosed();
-        inBuf = new byte[INPUT_IDLE];
+    private void releaseForWait() {
         inPos = 0;
         inLim = 0;
-        large = null;
-        payload = null;
-        if (pendingStreamId == 0) {
-            pendingHeaderBytes = null;
-        }
-        hpackDecoder.releaseScratch();
-        exchange.releaseIdle();
+        releaseInput();
         if (tls != null) {
             tls.releaseIdleInputBuffers();
         }
-        writer.releaseIdle();
+    }
+
+    /** inBuf goes back to its initial size, a full-frame buffer to the pool. */
+    private void releaseInput() {
+        if (inFull != null) {
+            inBuf = inHome;
+            java.nio.ByteBuffer full = inFull;
+            inFull = null;
+            service.readBuffers.release(full);
+        }
+    }
+
+    /**
+     * The framer's wait between frames (see {@link IdleWait}): after a
+     * quiet second, closed streams are forgotten and what grew is given
+     * back (large-frame and header-block buffers, the HPACK scratch, the
+     * exchange's field array), the writer's buffers on a virtual thread
+     * since it takes the writer's lock. The next frame regrows what it
+     * needs.
+     */
+    private final class FramerWait extends IdleWait {
+        FramerWait() {
+            super(timer);
+        }
+
+        @Override
+        protected long expired(long waitedMillis) {
+            if (waitedMillis < IDLE_RELEASE_MILLIS) {
+                return IDLE_RELEASE_MILLIS - waitedMillis;
+            }
+            retireClosed();
+            large = null;
+            payload = null;
+            if (pendingStreamId == 0) {
+                pendingHeaderBytes = null;
+            }
+            hpackDecoder.releaseScratch();
+            exchange.releaseIdle();
+            Thread.ofVirtual().name("enso-h2-release").start(writer::releaseIdle);
+            return -1;
+        }
     }
 
     private int payloadInt(int off) {
@@ -2153,6 +2189,7 @@ public final class Http2Connection implements Runnable, Drainable {
         } finally {
             STATE.setVolatile(this, CLOSED);
             timer.retire(deadlines);
+            timer.retire(framerWait);
             if (writer != null) {
                 writer.retire(timer);
             }
@@ -2162,6 +2199,7 @@ public final class Http2Connection implements Runnable, Drainable {
             }
             streams.clear();
             pendingHeaderBytes = null;
+            releaseInput();
             awaitHandlers();
             releaseBudget();
         }
@@ -2172,8 +2210,7 @@ public final class Http2Connection implements Runnable, Drainable {
         deadlines.linger = System.nanoTime() + LINGER_NANOS;
         rearm();
         long read = 0;
-        // The input buffer, unless an idle connection gave it back.
-        byte[] discard = inBuf.length >= INPUT_INITIAL ? inBuf : new byte[INPUT_INITIAL];
+        byte[] discard = inBuf;
         try {
             while (read < LINGER_MAX_BYTES) {
                 int n = in.read(discard, 0, discard.length);

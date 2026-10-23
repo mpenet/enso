@@ -28,6 +28,8 @@ import com.s_exp.enso.api.WebSocketException;
 import com.s_exp.enso.api.WebSocketListener;
 import com.s_exp.enso.api.WebSocketSocket;
 import com.s_exp.enso.core.MemoryBudget;
+import com.s_exp.enso.core.BufferPool;
+import com.s_exp.enso.core.IdleWait;
 import com.s_exp.enso.core.Timer;
 import com.s_exp.enso.core.TlsSocket;
 
@@ -96,11 +98,15 @@ public final class WebSocketConnection {
     // frame costs one read() call, not one per header byte.
     private static final int READ_BUFFER_SIZE = 8192;
     // A connection without frames for this long gives back its grown
-    // buffers (see releaseIdleBuffers); the next message regrows them.
+    // message and send buffers (see Quiet); the next message regrows them.
     private static final int IDLE_RELEASE_MILLIS = 1000;
-    // The read buffer while idle: enough for a frame header and a small
-    // control frame.
-    private static final int IDLE_READ_BUFFER_SIZE = 512;
+    // The read buffer while waiting for a frame: in cleartext, a burst of
+    // small messages (a client keeping a few in flight) arrives in it with
+    // one read; one that fills it moves to a full read buffer
+    // (growReadBuffer). Over TLS it is filled from the decrypted record, a
+    // copy rather than a socket read, so it can be smaller.
+    private static final int WAIT_READ_BUFFER_BYTES = 2048;
+    private static final int TLS_WAIT_READ_BUFFER_BYTES = 512;
     // A frame's claimed length is only trusted as bytes arrive: payloads
     // are read in steps of at most this many bytes, and the message buffer
     // grows per step rather than up-front from the header.
@@ -212,6 +218,16 @@ public final class WebSocketConnection {
     // Gives back the grown buffer of the output stream (shared with the
     // HTTP/1.1 connection) while nothing is pending in it; or null.
     private final Runnable releaseIdleOutput;
+    // Full read buffers, borrowed for a burst of frames and given back at
+    // the next wait; null: allocated, and left to the GC.
+    private final BufferPool readBuffers;
+    // The TLS socket under the connection, null in cleartext.
+    private final TlsSocket tls;
+    // What happens while the read loop waits for a frame (Quiet).
+    private final Quiet quiet;
+    // The idle timeout closed the connection (Quiet, off the read loop):
+    // finish reports 1001 "idle timeout" unless the peer's CLOSE came.
+    private volatile boolean idleClosed;
     // Drops TCP if the peer never answers a CLOSE the server sent.
     private final Timer.Task closeTimer = new Timer.Task() {
         @Override
@@ -294,8 +310,11 @@ public final class WebSocketConnection {
     private long resyncSkip = -1;
     private long pendingSkip;
     // Buffered input. Bytes rbuf[rpos..rlim) have been read off the stream
-    // but not consumed. Small while idle.
-    private byte[] rbuf = new byte[READ_BUFFER_SIZE];
+    // but not consumed. The wait buffer between messages (waitBuf), or the
+    // full read buffer (fullBuf's array) during a burst.
+    private byte[] rbuf;
+    private final byte[] waitBuf;
+    private ByteBuffer fullBuf;
     private int rpos;
     private int rlim;
     // Unmasked payload of the current control frame (≤ 125 bytes).
@@ -336,9 +355,22 @@ public final class WebSocketConnection {
                                WebSocketListener listener, Config config,
                                PerMessageDeflate deflate, Timer timer, MemoryBudget budget,
                                Runnable releaseIdleOutput) {
+        this(socket, in, out, listener, config, deflate, timer, budget, releaseIdleOutput, null);
+    }
+
+    /** Full read buffers come from {@code readBuffers} (null: allocated). */
+    public WebSocketConnection(Socket socket, InputStream in, OutputStream out,
+                               WebSocketListener listener, Config config,
+                               PerMessageDeflate deflate, Timer timer, MemoryBudget budget,
+                               Runnable releaseIdleOutput, BufferPool readBuffers) {
         this.timer = timer;
         this.budget = budget;
         this.releaseIdleOutput = releaseIdleOutput;
+        this.readBuffers = readBuffers;
+        this.quiet = new Quiet();
+        this.tls = socket instanceof TlsSocket.AdapterSocket adapter ? adapter.tls() : null;
+        this.waitBuf = new byte[tls != null ? TLS_WAIT_READ_BUFFER_BYTES : WAIT_READ_BUFFER_BYTES];
+        this.rbuf = waitBuf;
         this.socket = socket;
         this.in = in;
         this.out = out;
@@ -459,12 +491,6 @@ public final class WebSocketConnection {
             if (frame == null) {
                 return;
             }
-            if (frame == IDLE) {
-                if (!closeOnIdle()) {
-                    return;
-                }
-                continue;
-            }
             if ((frame.opcode & 0x8) != 0) {
                 handleControlFrame(frame);
                 continue;
@@ -511,19 +537,18 @@ public final class WebSocketConnection {
 
     /**
      * The idle timeout passed with no frame: start the closing handshake
-     * with 1001. False when the server's CLOSE was already out, which ends
-     * the read loop.
+     * with 1001 (Quiet, on a virtual thread: it writes). The read loop
+     * keeps waiting for the peer's CLOSE, bounded by the close timer. A
+     * CLOSE already sent has its own close timer running.
      */
-    private boolean closeOnIdle() {
+    private void closeOnIdle() {
         if (closeSent) {
-            return false;
+            return;
         }
-        closeCode = CLOSE_GOING_AWAY;
-        closeReason = IDLE_TIMEOUT;
+        idleClosed = true;
         if (sendClose(CLOSE_GOING_AWAY, IDLE_TIMEOUT_REASON)) {
             startCloseTimer();
         }
-        return true;
     }
 
     private void handleControlFrame(Frame frame) throws IOException {
@@ -679,14 +704,22 @@ public final class WebSocketConnection {
     /** The read loop ended: release everything and report the close. */
     private void finish() {
         finished = true;
+        // An idle close the peer never answered (its CLOSE would carry the
+        // code reported).
+        if (idleClosed && !failed && !closeReceived) {
+            closeCode = CLOSE_GOING_AWAY;
+            closeReason = IDLE_TIMEOUT;
+        }
         if (closeReceived && closeSent && !socketClosed) {
             closeGracefully();
         }
         forceClose();
+        releaseReadBuffer();
         reader.releaseBudget();
         // retire: the wheel drops this connection on the next tick.
         timer.retire(closeTimer);
         timer.retire(heldFlush);
+        timer.retire(quiet);
         Outgoing left;
         Thread w;
         long dropped;
@@ -867,15 +900,11 @@ public final class WebSocketConnection {
 
     // ---- Reading ----------------------------------------------------------
 
-    // Returned by readFrame when the idle timeout passed between frames.
-    private static final Frame IDLE = new Frame();
-
     /**
      * Reads the next frame header. For control frames the unmasked payload
      * is left in {@link #controlIn}; for data frames the caller reads the
      * payload with {@link MessageReader#readPayload}. Returns null on a
-     * clean EOF between messages and {@link #IDLE} when the idle timeout
-     * passed before a frame began.
+     * clean EOF between messages.
      */
     private Frame readFrame() throws IOException {
         if (!inMessage) {
@@ -892,9 +921,6 @@ public final class WebSocketConnection {
                 }
             } else {
                 n = awaitFrame();
-                if (n == 0) {
-                    return IDLE;
-                }
                 if (n < 0) {
                     return null;
                 }
@@ -978,52 +1004,73 @@ public final class WebSocketConnection {
 
     /**
      * Waits between messages for the next frame's first bytes, read into
-     * rbuf: their count, -1 on EOF, 0 once {@code :idle-timeout} passed.
-     * The wait is cut at what happens along it: after
-     * {@link #IDLE_RELEASE_MILLIS} the connection gives back its grown
-     * buffers, every {@code :ws-ping-interval} it pings the client. Times
-     * are counted from the expired socket timeouts, which never fire
-     * early, so the wait takes no clock reads.
+     * rbuf: their count, or -1 on EOF. The wait is untimed: a timed read on
+     * a virtual thread parks through the JDK's single delay scheduler
+     * thread, shared by the whole process, which would cap a server's
+     * message rate. What happens along the wait (the release of idle
+     * buffers, the keepalive ping, the idle close) runs on the server's
+     * timer ({@link Quiet}). The wait holds small buffers: rbuf goes back to
+     * the wait buffer and the TLS input buffers to the pool. Over TLS it
+     * waits for the first ciphertext rather than a whole record, so a
+     * frame's arrival ends it however slowly the record comes; the read
+     * that decrypts it runs under the message deadline.
      */
     private int awaitFrame() throws IOException {
-        int idle = idleTimeoutMillis;
-        int ping = pingIntervalMillis;
-        boolean released = false;
-        long waited = 0;
-        long nextPing = ping;
-        while (true) {
-            long until = idle == 0 ? Long.MAX_VALUE : idle;
-            if (!released) {
-                until = Math.min(until, IDLE_RELEASE_MILLIS);
-            }
-            if (ping > 0) {
-                until = Math.min(until, nextPing);
-            }
-            int n;
-            try {
-                n = fill(rbuf, 0, rbuf.length, until == Long.MAX_VALUE ? 0 : (int) (until - waited));
-            } catch (SocketTimeoutException e) {
-                waited = until;
-                if (idle != 0 && waited >= idle) {
-                    return 0;
-                }
-                if (!released && waited >= IDLE_RELEASE_MILLIS) {
-                    releaseIdleBuffers();
-                    released = true;
-                }
-                if (ping > 0 && waited >= nextPing) {
-                    keepalivePing();
-                    nextPing += ping;
-                }
-                continue;
-            }
-            if (n > 0 && rbuf.length < READ_BUFFER_SIZE) {
-                byte[] full = new byte[READ_BUFFER_SIZE];
-                System.arraycopy(rbuf, 0, full, 0, n);
-                rbuf = full;
-            }
-            return n;
+        // Replies held for the frames read so far go out before waiting.
+        if (outputHeld) {
+            flushHeld();
         }
+        releaseReadBuffer();
+        if (tls != null) {
+            tls.releaseIdleInputBuffers();
+        }
+        quiet.arm();
+        int n;
+        try {
+            if (tls != null) {
+                if (soTimeout != 0) {
+                    socket.setSoTimeout(0);
+                    soTimeout = 0;
+                }
+                if (!tls.awaitInput()) {
+                    return -1;
+                }
+                quiet.end();
+                n = fill(rbuf, 0, rbuf.length, messageReadTimeout());
+            } else {
+                n = fill(rbuf, 0, rbuf.length, 0);
+            }
+        } finally {
+            quiet.end();
+        }
+        if (n == rbuf.length && rbuf == waitBuf) {
+            growReadBuffer(n);
+        }
+        return n;
+    }
+
+    /** rbuf, empty, goes back to the wait buffer; a full one goes back to the pool. */
+    private void releaseReadBuffer() {
+        if (rbuf != waitBuf) {
+            rbuf = waitBuf;
+            ByteBuffer full = fullBuf;
+            fullBuf = null;
+            if (readBuffers != null) {
+                readBuffers.release(full);
+            }
+        }
+    }
+
+    /**
+     * The wait buffer filled up: a burst is arriving, its first {@code n}
+     * bytes move to a full read buffer so the rest comes in larger reads.
+     */
+    private void growReadBuffer(int n) {
+        ByteBuffer full = readBuffers != null
+            ? readBuffers.acquire(READ_BUFFER_SIZE) : ByteBuffer.allocate(READ_BUFFER_SIZE);
+        System.arraycopy(waitBuf, 0, full.array(), 0, n);
+        fullBuf = full;
+        rbuf = full.array();
     }
 
     /**
@@ -1043,18 +1090,23 @@ public final class WebSocketConnection {
     }
 
     /**
-     * An idle connection keeps only small buffers: the read buffer shrinks,
-     * message assembly, compression and staging buffers and the TLS record
-     * buffers are dropped, and the output stream gives back what it grew
-     * to (allocated again by the next message that needs them). The send
-     * side is only touched when no write is in progress: a writer stalled
-     * on the peer holds the lock.
+     * A quiet connection keeps only small buffers: message assembly and
+     * inflate input are dropped (Quiet, on the timer thread, while the read
+     * loop waits for a frame and can't use them), then the send side.
      */
-    private void releaseIdleBuffers() {
-        if (rbuf.length > IDLE_READ_BUFFER_SIZE) {
-            rbuf = new byte[IDLE_READ_BUFFER_SIZE];
-        }
+    private void releaseIdleReadState() {
         reader.releaseIdle();
+    }
+
+    /**
+     * The send side of a quiet connection: staging and compression output
+     * buffers, the output stream's grown buffer and the TLS output record
+     * buffer are dropped (allocated again by the next send that needs
+     * them). Only when no write is in progress: a writer stalled on the
+     * peer holds the lock. Off the timer thread: the TLS buffer's own lock
+     * may be held by a close in progress.
+     */
+    private void releaseIdleSendBuffers() {
         if (writeLock.tryLock()) {
             try {
                 gatherOut = null;
@@ -1062,12 +1114,79 @@ public final class WebSocketConnection {
                 if (releaseIdleOutput != null && !outputHeld) {
                     releaseIdleOutput.run();
                 }
-                if (socket instanceof TlsSocket.AdapterSocket tls) {
-                    tls.tls().releaseIdleBuffers();
+                if (tls != null) {
+                    tls.releaseOutputBuffer();
                 }
             } finally {
                 unlockWrites();
             }
+        }
+    }
+
+    /**
+     * What happens while the read loop waits for a frame (see
+     * {@link IdleWait}): after {@link #IDLE_RELEASE_MILLIS} the read state's
+     * buffers are released and the send side's handed to a virtual thread,
+     * every {@code :ws-ping-interval} a keepalive PING goes out, and after
+     * {@code :idle-timeout} the closing handshake starts (both on virtual
+     * threads: they write).
+     */
+    private final class Quiet extends IdleWait {
+        // State of the current wait: set by the read loop before it begins,
+        // then only touched by expiries.
+        private boolean released;
+        private boolean closing;
+        private long nextPingMillis;
+
+        Quiet() {
+            super(timer);
+        }
+
+        /** The read loop is about to wait for a frame. */
+        void arm() {
+            released = false;
+            closing = false;
+            nextPingMillis = pingIntervalMillis;
+            begin(nextDueMillis(0));
+        }
+
+        @Override
+        protected long expired(long waitedMillis) {
+            if (closing) {
+                return -1;
+            }
+            if (!released && waitedMillis >= IDLE_RELEASE_MILLIS) {
+                released = true;
+                releaseIdleReadState();
+                Thread.ofVirtual().name("enso-ws-release").start(WebSocketConnection.this::releaseIdleSendBuffers);
+            }
+            if (idleTimeoutMillis > 0 && waitedMillis >= idleTimeoutMillis) {
+                closing = true;
+                Thread.ofVirtual().name("enso-ws-idle-close").start(WebSocketConnection.this::closeOnIdle);
+                return -1;
+            }
+            if (pingIntervalMillis > 0 && waitedMillis >= nextPingMillis) {
+                while (nextPingMillis <= waitedMillis) {
+                    nextPingMillis += pingIntervalMillis;
+                }
+                Thread.ofVirtual().name("enso-ws-ping").start(WebSocketConnection.this::keepalivePing);
+            }
+            return nextDueMillis(waitedMillis);
+        }
+
+        /** Milliseconds from {@code waited} to the next thing due in this wait, -1 for none. */
+        private long nextDueMillis(long waited) {
+            long next = Long.MAX_VALUE;
+            if (!released) {
+                next = Math.min(next, IDLE_RELEASE_MILLIS - waited);
+            }
+            if (pingIntervalMillis > 0) {
+                next = Math.min(next, nextPingMillis - waited);
+            }
+            if (idleTimeoutMillis > 0) {
+                next = Math.min(next, idleTimeoutMillis - waited);
+            }
+            return next == Long.MAX_VALUE ? -1 : Math.max(0, next);
         }
     }
 

@@ -179,6 +179,7 @@ its other deadlines live in each event loop's heap.
 - `schedule(task, ms)` arms or re-arms. Expiry is never early and at most about a tick late. Shortening, or arming a disarmed task, pushes the node on a lock-free stack for the timer thread. Lengthening only moves the deadline with one CAS, and the timer thread re-buckets the node when its old slot comes up, so re-arming per keep-alive request costs one timer visit per timeout period.
 - `cancel(task)` is one CAS, and exactly one of cancel and expiry wins. The node stays in its slot until the wheel passes, keeping what it references reachable for up to one rotation. `retire(task)` also unlinks it on the next tick; use it for per-request nodes and for a closing connection's nodes.
 - `onTimeout()` runs on the timer thread and must not block: flip state, interrupt, enqueue, or start a virtual thread. Exceptions are logged and swallowed, and an error escaping the loop restarts it after 10 ms, so the server never runs without timeouts.
+- `IdleWait` is the node behind a connection's wait for input. HTTP/1.1, HTTP/2 and WebSocket connections read untimed, because a timed read on a virtual thread parks through the JDK's delay scheduler, one thread for the whole process, which would cap a large machine's request or message rate. `begin(ms)` arms the node as a wait starts (one CAS when it only moves the deadline), and an expiry claims the wait with one CAS before calling `expired(waited)`. The waiting thread ends a wait, or begins the next, only once no claim is in progress, so `expired` may release what that thread owns as long as the blocked read doesn't use it.
 
 Nothing is allocated to schedule, cancel or expire.
 
@@ -370,26 +371,28 @@ had to grow it again after such a release (its requests need it); over
 TLS its record buffers go back to the pool. Its parse buffer starts at
 4 KiB in cleartext, enough for most heads in one read, and at 1 KiB over
 TLS, where it is filled from the decrypted record without a syscall.
-Other connections idle for a second give back what they grew. HTTP/2
-forgets retired streams and shrinks
-its input, header-block, HPACK, field, TLS and writer buffers
-(`h2-idle-connection-gives-back-its-buffers`). A WebSocket keeps a
-512-byte read buffer (`ws-idle-connection-gives-back-its-buffers`) and
-shrinks the HTTP/1.1 output buffer it writes through back to 1 KiB. An
-HTTP/3 connection keeps its scratch space on its event loop and replaces a
+HTTP/2 and WebSocket connections wait for frames with untimed reads too.
+As a wait starts they give back what the blocked read would otherwise
+hold: the input buffer goes back to its initial size (2 KiB; a burst that
+needs more borrows a 16 KiB buffer from the server's pool) and the TLS
+input records go back to the pool. After a quiet second (`IdleWait`)
+HTTP/2 forgets retired streams and shrinks its header-block, HPACK, field
+and writer buffers (`h2-idle-connection-gives-back-its-buffers`), and a
+WebSocket drops message assembly and compression buffers, its TLS output
+record, and shrinks the HTTP/1.1 output buffer it writes through back to
+1 KiB (`ws-idle-connection-gives-back-its-buffers`). An HTTP/3 connection keeps its scratch space on its event loop and replaces a
 stream map that grew past 16 entries.
 
 Heap per idle connection, measured with 2000 connections against
 `s-exp.enso-test-server` (heap after full GC divided by the count, virtual
-thread stacks included; not asserted by a test). The HTTP/1.1 figures
-were measured on Temurin 25 after its idle wait became untimed; the
-others earlier:
+thread stacks included; not asserted by a test). Measured on Temurin 25,
+HTTP/3 earlier:
 
 | Protocol | Plain | TLS 1.3 |
 |---|---:|---:|
 | HTTP/1.1 keep-alive | 9.9 KiB | 15.3 KiB |
-| HTTP/2 (h2c / h2) | about 11 KB | about 23 KB |
-| WebSocket | 16 KiB | 25 KiB |
+| HTTP/2 (h2c / h2) | 9.4 KiB | 18.2 KiB |
+| WebSocket | 15.8 KiB | 19.3 KiB |
 | HTTP/3 | – | about 3 KB |
 
 ## HTTP/1.1

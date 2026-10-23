@@ -2225,6 +2225,7 @@
      :deflater (some? (some-> deflate (field-value "deflater")))
      :inflater (some? (some-> deflate (field-value "inflater")))
      :tls-in (some-> tls (field-value "peerNetData") (#(.capacity ^ByteBuffer %)))
+     :tls-app (some-> tls (field-value "peerAppData") (#(.capacity ^ByteBuffer %)))
      :tls-out (some-> tls (field-value "myNetData") (#(.capacity ^ByteBuffer %)))}))
 
 (defn- idle-release-check
@@ -2268,7 +2269,13 @@
               socket (deref socket-p 2000 nil)]
           (is (= text (send!)))
           (let [busy (idle-footprint socket)
-                idle (do (support/await-condition #(= 0 (:message-buffer (idle-footprint socket))) 5000 50)
+                ;; The send side is released on a virtual thread right after
+                ;; the read side: wait for both.
+                idle (do (support/await-condition
+                          #(let [f (idle-footprint socket)]
+                             (and (= 0 (:message-buffer f)) (nil? (:gather f)) (= 0 (:deflate-output f))
+                                  (contains? #{nil 0} (:tls-out f))))
+                          5000 50)
                          (idle-footprint socket))]
             [busy idle (= text (send!))])))
       (finally (enso/stop srv)))))
@@ -2302,21 +2309,67 @@
             (.flush out)
             (is (= "again" (frame-text (update (read-frame in) :payload vec))))))))))
 
+(defn- idle-wait-so-timeout
+  "Opens a WebSocket on a server started with `opts`, echoes one small
+  message, and returns the server socket's SO_TIMEOUT once the connection
+  waits for its next frame (polled, nil if it never settles on 0)."
+  [opts]
+  (let [socket-p (promise)
+        handler (fn [_]
+                  {:ring.websocket/listener
+                   {:on-open (fn [s] (deliver socket-p s))
+                    :on-message (fn [^WebSocketSocket s m] (.sendText s ^String m))}})
+        srv (enso/run-server handler (merge {:host "127.0.0.1" :port 0} opts))]
+    (try
+      (with-open [^Socket sock (if (:ssl-context opts)
+                                 (let [^javax.net.ssl.SSLSocket ss
+                                       (.createSocket (.getSocketFactory (support/trust-all-ssl-context))
+                                                      "127.0.0.1" (int (enso/port srv)))]
+                                   (.startHandshake ss)
+                                   ss)
+                                 (Socket. "127.0.0.1" (int (enso/port srv))))]
+        (.setSoTimeout sock 5000)
+        (let [[in ^java.io.OutputStream out] (ws-handshake! sock {})]
+          (.write out ^bytes (mask-frame 0x1 true (utf8 "hi")))
+          (.flush out)
+          (is (= "hi" (String. ^bytes (:payload (read-frame in)) StandardCharsets/UTF_8)))
+          (let [conn (field-value (deref socket-p 2000 nil) "this$0")
+                raw (let [s (field-value conn "socket")]
+                      (if (instance? com.s_exp.enso.core.TlsSocket$AdapterSocket s)
+                        (.socket ^java.nio.channels.SocketChannel
+                                 (field-value (.tls ^com.s_exp.enso.core.TlsSocket$AdapterSocket s) "channel"))
+                        s))
+                timeout #(.getSoTimeout ^Socket raw)]
+            (when (support/await-condition #(zero? (timeout)) 2000 10)
+              (timeout)))))
+      (finally (enso/stop srv)))))
+
+(deftest ws-idle-wait-sets-no-socket-timeout
+  ;; As on HTTP/1.1: a timed read per wait would park through the JDK's
+  ;; one delay-scheduler thread. :idle-timeout, the keepalive ping and the
+  ;; release of idle buffers run on the server's timer instead.
+  (testing "plain"
+    (is (= 0 (idle-wait-so-timeout {:ws-ping-interval 30000}))))
+  (testing "TLS"
+    (is (= 0 (idle-wait-so-timeout {:ssl-context (support/server-ssl-context) :ws-ping-interval 30000})))))
+
 (deftest ws-idle-connection-gives-back-its-buffers
-  ;; After a second without frames a WebSocket keeps only small buffers:
-  ;; message assembly, staging and TLS record buffers grow back when the
-  ;; next message arrives.
+  ;; Waiting for a frame, a WebSocket reads into a small buffer and gives
+  ;; its TLS input buffers back at once; after a second without frames it
+  ;; also drops message assembly, staging and the TLS output buffer. All
+  ;; grow back when the next message arrives.
   (testing "plain"
     (let [[busy idle echoed] (idle-release-check {} nil)]
-      (is (= {:read-buffer 8192 :gather 16384} (select-keys busy [:read-buffer :gather])))
+      (is (= {:read-buffer 2048 :gather 16384} (select-keys busy [:read-buffer :gather])))
       (is (< 100000 (:message-buffer busy)))
-      (is (= {:read-buffer 512 :message-buffer 0 :gather nil}
+      (is (= {:read-buffer 2048 :message-buffer 0 :gather nil}
              (select-keys idle [:read-buffer :message-buffer :gather])))
       (is echoed "the next message is served")))
   (testing "TLS"
     (let [[busy idle echoed] (idle-release-check {:ssl-context (support/server-ssl-context)} nil)]
-      (is (< 2048 (:tls-in busy)))
-      (is (= {:tls-in 2048 :tls-out 0} (select-keys idle [:tls-in :tls-out])))
+      (is (= 2048 (:tls-in busy)) "input given back as the wait starts")
+      (is (< 0 (:tls-out busy)))
+      (is (= {:tls-in 2048 :tls-app 0 :tls-out 0} (select-keys idle [:tls-in :tls-app :tls-out])))
       (is echoed)))
   (testing "compressed, context takeover: the Deflater and Inflater keep their windows"
     (let [[busy idle echoed] (idle-release-check {:ws-compression true} "permessage-deflate")]

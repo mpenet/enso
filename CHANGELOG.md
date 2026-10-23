@@ -4,10 +4,10 @@
 
 ### Performance
 
-- HTTP/1.1 waits for the next request on a keep-alive connection with an untimed read, in cleartext and over TLS, and `:idle-timeout` runs on the server's own timer. On JDK 25 and later a timed read on a virtual thread parks through the JDK's delay scheduler, a single thread for the whole process, which capped keep-alive throughput on large machines at a few hundred thousand requests per second. Each request also allocates about 90 bytes less in cleartext and about 120 less over TLS.
-- TLS record buffers (about 16 KiB each) come from a server-wide pool. An idle HTTP/1.1 connection gives them back when it goes idle instead of after a second, and the next request takes them from the pool instead of allocating them. A new TLS connection takes its handshake buffers from the pool too.
-- Memory per idle HTTP/1.1 connection: about 15 KiB over TLS (from about 17 KiB), held from the moment the connection goes idle. In cleartext the connection keeps its 4 KiB parse buffer, about 2 KiB more than before.
-- Over TLS, the arrival of a request record ends an idle wait as soon as its first bytes are in, as in cleartext, so `:header-timeout` runs from then rather than from up to a second later.
+- HTTP/1.1, HTTP/2 and WebSocket connections wait for input with untimed reads, in cleartext and over TLS. `:idle-timeout`, the WebSocket keepalive ping and the release of idle buffers run on the server's own timer. On JDK 25 and later a timed read on a virtual thread parks through the JDK's delay scheduler, a single thread for the whole process, which capped a large machine at a few hundred thousand keep-alive requests or WebSocket messages per second, whatever its core count. Allocation also drops: about 90 bytes per request for HTTP/1.1 in cleartext and 120 over TLS, about 30 per HTTP/2 request and up to 90 per WebSocket message.
+- TLS record buffers (about 16 KiB each) come from a server-wide pool. A connection gives them back as it waits for input instead of after a second, and the next request takes them from the pool instead of allocating them. A new TLS connection takes its handshake buffers from the pool too.
+- Memory per idle connection, from the moment it goes idle: HTTP/1.1 about 15 KiB over TLS (from about 17 KiB), HTTP/2 about 9 KiB in cleartext and 18 KiB over TLS (from 11 and 23), WebSocket about 19 KiB over TLS (from 25). In cleartext an HTTP/1.1 connection keeps its 4 KiB parse buffer, about 2 KiB more than before.
+- Over TLS, the arrival of a request record ends an HTTP/1.1 idle wait as soon as its first bytes are in, as in cleartext, so `:header-timeout` runs from then rather than from up to a second later. A WebSocket frame ends the wait the same way.
 
 ## 1.0.0-alpha85 — 2026-10-12
 
