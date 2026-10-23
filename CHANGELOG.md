@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- HTTP/1.1 in cleartext waits for the next request on a keep-alive connection with an untimed read, and `:idle-timeout` runs on the server's own timer. On JDK 25 and later a timed read on a virtual thread parks through the JDK's delay scheduler, a single thread for the whole process, which capped keep-alive throughput on large machines at a few hundred thousand requests per second. Each request also allocates about 90 bytes less.
+- An idle cleartext HTTP/1.1 connection gives back grown buffers when it goes idle instead of after a second, and keeps its 4 KiB parse buffer: about 2 KiB more per idle connection.
+
 ## 1.0.0-alpha85 — 2026-10-12
 
 Changes since 1.0.0-alpha56. This release reworks the server core. HTTP/1.1,

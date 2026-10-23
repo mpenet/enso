@@ -106,6 +106,11 @@ final class ResponseWriter {
     private final OutputStream out = new Output();
     private byte[] hbuf = new byte[OUTPUT_BUFFER_BYTES];
     private int hlen;
+    // Cleartext: an idle connection gave a grown hbuf back
+    // (releaseGrownOutput), and whether a later response grew it again, i.e.
+    // this connection's responses need it and it keeps it from then on.
+    private boolean releasedGrownOutput;
+    private boolean keepGrownOutput;
     private byte[] chunkBuf;
     @SuppressWarnings("unused") // accessed through HELD_STATE
     private volatile int heldState;
@@ -158,6 +163,18 @@ final class ResponseWriter {
             hbuf = new byte[OUTPUT_BUFFER_BYTES];
         }
         chunkBuf = null;
+    }
+
+    /**
+     * A cleartext connection going idle: gives back an output buffer grown
+     * past its initial size while nothing is pending in it, unless an
+     * earlier release was followed by growing it again. Connection thread.
+     */
+    void releaseGrownOutput() {
+        if (!keepGrownOutput && hbuf.length > OUTPUT_BUFFER_BYTES && hlen == 0) {
+            hbuf = new byte[OUTPUT_BUFFER_BYTES];
+            releasedGrownOutput = true;
+        }
     }
 
     private void flushHbuf() throws IOException {
@@ -692,6 +709,9 @@ final class ResponseWriter {
 
     private void hEnsure(int extra) {
         if (hlen + extra > hbuf.length) {
+            if (releasedGrownOutput) {
+                keepGrownOutput = true;
+            }
             hbuf = Arrays.copyOf(hbuf, Math.max(hbuf.length * 2, hlen + extra));
         }
     }

@@ -355,9 +355,13 @@ blocking read that honours `SO_TIMEOUT`.
 
 ### Idle connections
 
-A connection idle for a second gives back what it grew. HTTP/1.1 shrinks
-its parse buffer to 1 KiB and drops its grown output and body buffers,
-cached values and TLS records. HTTP/2 forgets retired streams and shrinks
+A connection idle for a second gives back what it grew. Over TLS,
+HTTP/1.1 shrinks its parse buffer to 1 KiB and drops its grown output and
+body buffers, cached values and TLS records. A cleartext HTTP/1.1
+connection has no such wakeup, since its wait for a request is an untimed
+read: it gives back a parse or output buffer grown past its initial size
+as it goes idle, and keeps it instead once it had to grow it again after
+such a release (its requests need it). HTTP/2 forgets retired streams and shrinks
 its input, header-block, HPACK, field, TLS and writer buffers
 (`h2-idle-connection-gives-back-its-buffers`). A WebSocket keeps a
 512-byte read buffer (`ws-idle-connection-gives-back-its-buffers`) and
@@ -365,13 +369,15 @@ shrinks the HTTP/1.1 output buffer it writes through back to 1 KiB. An
 HTTP/3 connection keeps its scratch space on its event loop and replaces a
 stream map that grew past 16 entries.
 
-Heap per idle connection, measured once with 2000 connections against
+Heap per idle connection, measured with 2000 connections against
 `s-exp.enso-test-server` (heap after full GC divided by the count, virtual
-thread stacks included; not asserted by a test):
+thread stacks included; not asserted by a test). The cleartext HTTP/1.1
+figure was measured on Temurin 25 after its idle wait became untimed; the
+others earlier:
 
 | Protocol | Plain | TLS 1.3 |
 |---|---:|---:|
-| HTTP/1.1 keep-alive | 9.7 KiB | 16.1 KiB |
+| HTTP/1.1 keep-alive | 9.9 KiB | 16.1 KiB |
 | HTTP/2 (h2c / h2) | about 11 KB | about 23 KB |
 | WebSocket | 16 KiB | 25 KiB |
 | HTTP/3 | – | about 3 KB |
@@ -387,11 +393,18 @@ head parsing, request bodies, the lingering-close discard loop) and
 `ResponseWriter` the output side (output buffer, response head and body
 encodings, 100 Continue, 101, pipelined output).
 
-Timeouts are socket read timeouts per phase, with no timer operation on
-the common path: `:idle-timeout` before a request's first byte (after one
-second the connection gives back its buffers, then waits out the rest),
-then the rest of `:header-timeout`, then `:read-timeout` for body reads.
-Over TLS each read also gets a wall-clock deadline through
+In cleartext the wait for a request's first byte is an untimed read. A
+timed read on a virtual thread parks through the JDK's delay scheduler,
+one thread for the whole process, and one per request would cap a large
+machine's keep-alive throughput. `:idle-timeout` runs on the server's
+`Timer` instead: each idle period moves the connection's deadline with
+one CAS, and an expiry closes the connection the way a drain does (one
+CAS from IDLE, so a request's first byte and the close can't both win).
+Over TLS that wait is a socket read timeout (after one second the
+connection gives back its buffers, then waits out the rest). Then come
+the rest of `:header-timeout` and `:read-timeout` for body reads, both
+socket read timeouts, which a request arriving in one read never waits
+on. Over TLS each read also gets a wall-clock deadline through
 `TlsSocket.setReadDeadline`.
 
 Output goes through one buffer. The response head is built in it, small

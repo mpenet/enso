@@ -1839,6 +1839,62 @@
                             "\r\nConnection: close\r\n\r\n" body))
           (is (clojure.string/ends-with? (read-until-quiet! sock 2000) (str "9000|" body))))))))
 
+(defn- server-sockets
+  "The server-side sockets of `srv`'s open connections."
+  [srv]
+  (let [field (fn [^Class c obj ^String n] (.get (doto (.getDeclaredField c n) (.setAccessible true)) obj))
+        registry (field com.s_exp.enso.EnsoServer srv "registry")
+        live (field com.s_exp.enso.core.ConnectionRegistry registry "live")
+        accepted (Class/forName "com.s_exp.enso.EnsoServer$Accepted")]
+    (keep #(field accepted % "socket") live)))
+
+(deftest idle-keep-alive-wait-sets-no-socket-timeout
+  ;; A timed socket read on a virtual thread parks through the JDK's one
+  ;; delay-scheduler thread, so a timed read per request caps a large
+  ;; machine's throughput. The wait for the next request is untimed and
+  ;; :idle-timeout runs on the server's own timer.
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {}
+    (fn []
+      (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+        (write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        (is (clojure.string/ends-with? (read-available! sock 2000) "ok"))
+        (is (support/await-condition
+             #(= [0] (map (fn [^Socket s] (.getSoTimeout s)) (server-sockets (:server *server*))))
+             2000 10)
+            "the idle read has no socket timeout")))))
+
+(deftest idle-timeout-spares-a-busy-connection
+  ;; A handler that outlasts :idle-timeout is not idle: the connection
+  ;; answers it and serves the next request.
+  (with-server
+    (fn [_] (Thread/sleep 700) {:status 200 :body "ok"})
+    {:idle-timeout 250}
+    (fn []
+      (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+        (write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        (is (clojure.string/ends-with? (read-available! sock 3000) "ok"))
+        (write! sock "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        (let [[resp _] (read-all-timed sock 3000)]
+          (is (clojure.string/starts-with? resp "HTTP/1.1 200") (pr-str resp)))))))
+
+(deftest idle-timeout-counts-from-the-last-response
+  ;; Requests closer together than :idle-timeout keep the connection open
+  ;; for longer than the timeout in total; after the last one it closes.
+  (with-server
+    (fn [_] {:status 200 :body "ok"})
+    {:idle-timeout 300}
+    (fn []
+      (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+        (dotimes [_ 6]
+          (write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+          (is (clojure.string/ends-with? (read-available! sock 2000) "ok"))
+          (Thread/sleep 150))
+        (let [[resp ms] (read-all-timed sock 3000)]
+          (is (= "" resp) "closed without another response")
+          (is (< ms 1000) "closed by the idle timeout"))))))
+
 ;; ---- Connection end: interrupts, drains, aborts, closes ----------------------
 
 (defn- read-until-includes!

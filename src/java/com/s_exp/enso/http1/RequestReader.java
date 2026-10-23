@@ -33,9 +33,11 @@ import com.s_exp.enso.util.RingHeaders;
  * Reads requests off one connection's socket, on the connection thread.
  *
  * <p>Each socket read is bounded by the current phase's timeout (see
- * {@link HttpConnection}): {@code :idle-timeout} while waiting for the
- * first byte of a request, the remaining {@code :header-timeout} budget
- * while the head is incomplete, {@code :read-timeout} for body reads.
+ * {@link HttpConnection}): the remaining {@code :header-timeout} budget
+ * while the head is incomplete, {@code :read-timeout} for body reads, and
+ * over TLS {@code :idle-timeout} while waiting for the first byte of a
+ * request. In cleartext that wait is untimed: the connection's timer
+ * closes it at {@code :idle-timeout}.
  * Over TLS a read returns only whole records, which a client can trickle
  * a byte per socket timeout, so the TLS socket is also held to the wall
  * clock of the phase ({@link TlsSocket#setReadDeadline}): the idle wait,
@@ -48,12 +50,14 @@ final class RequestReader {
     // Initial request parse buffer, enough for most request heads; grows
     // up to :max-header-bytes.
     private static final int REQUEST_BUFFER_BYTES = 4096;
-    // Parse buffer kept by an idle connection, enough to start reading the
-    // next request.
+    // Parse buffer kept by an idle TLS connection, enough to start reading
+    // the next request.
     private static final int IDLE_REQUEST_BUFFER_BYTES = 1024;
-    // A keep-alive connection idle this long gives back what its last
+    // A TLS keep-alive connection idle this long gives back what its last
     // requests grew (buffers, cached values, TLS buffers) and waits out the
-    // rest of :idle-timeout holding only the initial buffers.
+    // rest of :idle-timeout holding only the initial buffers. A cleartext
+    // connection gives back grown buffers as it goes idle instead
+    // (startIdle), so its idle wait needs no timed read.
     private static final int IDLE_SHRINK_MILLIS = 1000;
     // Lingering close (nginx lingering_time): how long input is read and
     // discarded after the output is shut down.
@@ -108,6 +112,13 @@ final class RequestReader {
 
     private InputStream in;
     private byte[] buf;
+    // Size of buf before any request grew it.
+    private final int initialBufferBytes;
+    // Cleartext: an idle connection gave a grown buf back (startIdle), and
+    // whether a later request grew it again, i.e. this connection's requests
+    // need the larger buffer and it keeps it from then on.
+    private boolean releasedGrownBuffer;
+    private boolean keepGrownBuffer;
     private int pos;
     private int limit;
     private RequestBody currentBody;
@@ -128,7 +139,8 @@ final class RequestReader {
     // (:remote-addr, :server-name, ...) is handed to the next one.
     private Request lastRequest;
     private int phase;
-    // This idle period already gave its buffers back (see IDLE_SHRINK_MILLIS).
+    // TLS: this idle period already gave its buffers back (see
+    // IDLE_SHRINK_MILLIS).
     private boolean idleShrunk;
     // Bytes of the request head consumed so far (request line, field
     // lines, their CRLFs): :max-header-bytes bounds their sum.
@@ -153,7 +165,8 @@ final class RequestReader {
         this.writer = writer;
         this.socket = socket;
         this.config = config;
-        this.buf = new byte[Math.min(REQUEST_BUFFER_BYTES, config.maxHeaderBytes)];
+        this.initialBufferBytes = Math.min(REQUEST_BUFFER_BYTES, config.maxHeaderBytes);
+        this.buf = new byte[initialBufferBytes];
         this.remoteAddress = socket.getInetAddress();
         this.localPort = socket.getLocalPort();
         this.tls = socket instanceof TlsSocket.AdapterSocket adapter ? adapter.tls() : null;
@@ -206,6 +219,13 @@ final class RequestReader {
     /** The next read waits for a request under :idle-timeout. */
     void startIdle() {
         phase = PHASE_IDLE;
+        if (tls == null && !keepGrownBuffer && buf.length > initialBufferBytes && limit == 0) {
+            buf = new byte[initialBufferBytes];
+            releasedGrownBuffer = true;
+        }
+        if (tls == null) {
+            writer.releaseGrownOutput();
+        }
     }
 
     /**
@@ -436,10 +456,11 @@ final class RequestReader {
     }
 
     /**
-     * Waits for the first bytes of the next request; false on EOF. The
-     * wait is split: after {@link #IDLE_SHRINK_MILLIS} the connection
-     * gives back what it grew (see {@link #shrinkIdle}), then waits out the
-     * rest of :idle-timeout.
+     * Waits for the first bytes of the next request; false on EOF. Over
+     * TLS the wait is split: after {@link #IDLE_SHRINK_MILLIS} the
+     * connection gives back what it grew (see {@link #shrinkIdle}), then
+     * waits out the rest of :idle-timeout. In cleartext it is one untimed
+     * read (class doc).
      */
     boolean awaitRequest() throws IOException {
         idleShrunk = false;
@@ -476,6 +497,10 @@ final class RequestReader {
 
     /** Socket timeout for the current stage of the idle wait (0 = none). */
     private int idleReadTimeout() {
+        if (tls == null) {
+            // The connection's timer enforces :idle-timeout (class doc).
+            return 0;
+        }
         int idleMs = config.idleTimeoutMillis;
         if (!shrinksWhenIdle()) {
             return idleMs;
@@ -517,12 +542,13 @@ final class RequestReader {
 
     /**
      * The first byte of a request is here: no longer idle, header clock
-     * starts. Fails when a drain closed the idle connection first (see
-     * {@link HttpConnection#leaveIdle}): the request is not served.
+     * starts. Fails when a drain or the idle timeout closed the idle
+     * connection first (see {@link HttpConnection#leaveIdle}): the request
+     * is not served.
      */
     void startHead() throws IOException {
         if (!connection.leaveIdle()) {
-            throw new IOException("connection closed by a drain");
+            throw new IOException("connection closed while idle");
         }
         phase = PHASE_HEAD;
         headerDeadlineNanos = config.headerTimeoutMillis > 0
@@ -749,7 +775,7 @@ final class RequestReader {
                         if (buf.length >= config.maxHeaderBytes) {
                             throw new HttpError(431, "Request Header Fields Too Large");
                         }
-                        buf = Arrays.copyOf(buf, Math.min(buf.length * 2, config.maxHeaderBytes));
+                        growBuffer();
                     }
                 }
                 if (headBytes + (limit - start) >= config.maxHeaderBytes) {
@@ -897,6 +923,18 @@ final class RequestReader {
     }
 
     /**
+     * Doubles buf, up to :max-header-bytes. Growing again after an idle
+     * connection gave a grown buf back means this connection's requests
+     * need it: it is kept from then on (startIdle).
+     */
+    private void growBuffer() {
+        if (releasedGrownBuffer) {
+            keepGrownBuffer = true;
+        }
+        buf = Arrays.copyOf(buf, Math.min(buf.length * 2, config.maxHeaderBytes));
+    }
+
+    /**
      * Returns the index of the CR of the next CRLF, or -1 on EOF. A line
      * that can't end within {@code maxLineBytes} (CRLF included) fails
      * with {@code status} before more bytes are read for it; a bare LF
@@ -940,7 +978,7 @@ final class RequestReader {
                     if (buf.length >= config.maxHeaderBytes) {
                         throw new HttpError(431, "Request Header Fields Too Large");
                     }
-                    buf = Arrays.copyOf(buf, Math.min(buf.length * 2, config.maxHeaderBytes));
+                    growBuffer();
                 }
             }
             int n = socketRead(buf, limit, buf.length - limit);

@@ -30,6 +30,7 @@ import com.s_exp.enso.core.RequestBodyException;
 import com.s_exp.enso.core.RequestBodyTimeoutException;
 import com.s_exp.enso.core.Service;
 import com.s_exp.enso.core.Timer;
+import com.s_exp.enso.core.TlsSocket;
 import com.s_exp.enso.core.WatchedOutputStream;
 import com.s_exp.enso.core.WriteWatchdog;
 import com.s_exp.enso.websocket.PerMessageDeflate;
@@ -39,13 +40,18 @@ import com.s_exp.enso.websocket.WebSocketHandshake;
 /**
  * One HTTP/1.1 connection, run on its own virtual thread.
  *
- * <p>Timeouts are socket read timeouts set per phase, so the common path
- * costs no timer operation: {@code :idle-timeout} while waiting for the
- * first byte of a request, the remaining {@code :header-timeout} budget
- * (wall clock from that byte) while the head is incomplete, and
- * {@code :read-timeout} for body reads. Writes go through a
- * {@link WatchedOutputStream} ({@code :write-timeout}); the opt-in
- * {@code :handler-timeout} uses the server's {@link Timer}.
+ * <p>The wait for the next request is an untimed read in cleartext: a
+ * timed read on a virtual thread parks through the JDK's single delay
+ * scheduler thread, shared by the whole process, which would cap a large
+ * machine's keep-alive throughput. {@code :idle-timeout} runs on the
+ * server's {@link Timer} instead ({@link IdleTimeout}), at one CAS per
+ * request. Over TLS that wait is a socket read timeout. The other phases
+ * use socket read timeouts, which a request that arrives in one read never
+ * waits on: the remaining {@code :header-timeout} budget (wall clock from
+ * the first byte) while the head is incomplete, and {@code :read-timeout}
+ * for body reads. Writes go through a {@link WatchedOutputStream}
+ * ({@code :write-timeout}); the opt-in {@code :handler-timeout} uses the
+ * server's {@link Timer}.
  *
  * <p>Requests are read by a {@link RequestReader}, responses written by a
  * {@link ResponseWriter}; this class runs the request loop: handler,
@@ -74,12 +80,14 @@ public final class HttpConnection implements Runnable, Drainable {
     private static final int CLOSING = 2;
     private static final VarHandle STATE;
     private static final VarHandle TIMED_SINCE;
+    private static final VarHandle IDLE_SINCE;
 
     static {
         try {
             MethodHandles.Lookup lookup = MethodHandles.lookup();
             STATE = lookup.findVarHandle(HttpConnection.class, "state", int.class);
             TIMED_SINCE = lookup.findVarHandle(HandlerTimeout.class, "timedSince", long.class);
+            IDLE_SINCE = lookup.findVarHandle(IdleTimeout.class, "idleSince", long.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -93,6 +101,9 @@ public final class HttpConnection implements Runnable, Drainable {
     private final Timer timer;
     // :write-timeout, null when disabled.
     private final Watchdog watchdog;
+    // :idle-timeout of a cleartext connection, whose wait for a request is
+    // an untimed read; null over TLS (a timed read there) or when disabled.
+    private final IdleTimeout idleTimeout;
     private final ResponseWriter writer;
     private final RequestReader reader;
     // The exchange of the request in flight, reused for every request.
@@ -102,12 +113,13 @@ public final class HttpConnection implements Runnable, Drainable {
 
     /**
      * {@link #IDLE} between requests: the previous response is on the wire
-     * and no byte of the next request has been read. A drain closes an idle
-     * connection ({@link #beginDrain}: IDLE to {@link #CLOSING}); the first
-     * byte of a request makes it {@link #ACTIVE} ({@link #leaveIdle}: IDLE
-     * to ACTIVE). Both are one CAS from IDLE, so exactly one wins: a drain
-     * never closes a connection that started a request, and a request is
-     * never served on a connection a drain is closing.
+     * and no byte of the next request has been read. A drain or the idle
+     * timeout closes an idle connection ({@link #beginDrain},
+     * {@link IdleTimeout}: IDLE to {@link #CLOSING}); the first byte of a
+     * request makes it {@link #ACTIVE} ({@link #leaveIdle}: IDLE to
+     * ACTIVE). Both are one CAS from IDLE, so exactly one wins: a close
+     * never cuts a connection that started a request, and a request is
+     * never served on a connection being closed.
      */
     @SuppressWarnings("unused") // accessed through STATE
     private volatile int state;
@@ -151,6 +163,8 @@ public final class HttpConnection implements Runnable, Drainable {
         this.config = service.config;
         this.timer = service.timer;
         this.watchdog = config.writeTimeoutMillis > 0 ? new Watchdog() : null;
+        this.idleTimeout = config.idleTimeoutMillis > 0 && !(socket instanceof TlsSocket.AdapterSocket)
+            ? new IdleTimeout() : null;
         this.writer = new ResponseWriter(socket, service, watchdog);
         this.reader = new RequestReader(this, writer, socket, config);
     }
@@ -191,6 +205,7 @@ public final class HttpConnection implements Runnable, Drainable {
             // on the next tick.
             if (watchdog != null) timer.retire(watchdog);
             if (handlerTimeout != null) timer.retire(handlerTimeout);
+            if (idleTimeout != null) timer.retire(idleTimeout);
             writer.retireTimers();
         }
     }
@@ -243,14 +258,21 @@ public final class HttpConnection implements Runnable, Drainable {
         }
     }
 
-    /** About to wait for the next request: a drain may close the connection from now on. */
+    /**
+     * About to wait for the next request: a drain or the idle timeout may
+     * close the connection from now on.
+     */
     private void enterIdle() {
+        if (idleTimeout != null) {
+            idleTimeout.arm();
+        }
         STATE.setVolatile(this, IDLE);
     }
 
     /**
-     * The first byte of a request is in: no drain may close the connection
-     * now. False when one already did (the request is not served).
+     * The first byte of a request is in: no drain or idle timeout may close
+     * the connection now. False when one already did (the request is not
+     * served).
      */
     boolean leaveIdle() {
         return STATE.compareAndSet(this, IDLE, ACTIVE) || (int) STATE.getVolatile(this) == ACTIVE;
@@ -670,6 +692,59 @@ public final class HttpConnection implements Runnable, Drainable {
             ? (reader.inBody() ? "read-timeout" : "header-timeout")
             : Exchange.clientErrorKind(status);
         service.protocolError(EnsoServer.HTTP_1_1, kind);
+    }
+
+    /**
+     * The {@code :idle-timeout} node of a cleartext connection, armed each
+     * time the connection goes idle but never cancelled: the next idle
+     * period only moves its deadline (one CAS on this node, no timer thread
+     * visit per request, as for {@link HandlerTimeout}). So an expiry may
+     * come while a request is in flight, or be left over from an earlier
+     * idle period; {@link #idleSince} tells: when the connection went idle,
+     * or {@link #NONE}. An expiry claims that idle period through one CAS on
+     * it, and only once it has lasted the whole timeout, then closes the
+     * connection as a drain would (IDLE to CLOSING, see {@link #state}). A
+     * new idle period waits for a claim in progress to finish (it never
+     * blocks), so the claim can't land on it.
+     */
+    private final class IdleTimeout extends Timer.Task {
+        private static final long NONE = 0;
+        private static final long EXPIRING = Long.MIN_VALUE;
+        private final long timeoutNanos = config.idleTimeoutMillis * 1_000_000L;
+        private volatile long idleSince;
+
+        /** The connection is about to go idle (connection thread). */
+        void arm() {
+            while (idleSince == EXPIRING) {
+                Thread.onSpinWait();
+            }
+            long now = System.nanoTime();
+            if (now == NONE || now == EXPIRING) {
+                now++;
+            }
+            idleSince = now;
+            timer.schedule(this, config.idleTimeoutMillis);
+        }
+
+        @Override
+        protected void onTimeout() {
+            long since = idleSince;
+            if (since == NONE || since == EXPIRING || System.nanoTime() - since < timeoutNanos) {
+                // An expiry armed for an earlier idle period: the current
+                // one armed its own after setting since.
+                return;
+            }
+            if (IDLE_SINCE.compareAndSet(this, since, EXPIRING)) {
+                try {
+                    // A request already started wins (state ACTIVE).
+                    if (STATE.compareAndSet(HttpConnection.this, IDLE, CLOSING)) {
+                        Thread.ofVirtual().name("enso-h1-idle-close").start(HttpConnection.this::closeWatched);
+                    }
+                } finally {
+                    idleSince = NONE;
+                }
+            }
+        }
     }
 
     private final class Watchdog extends WriteWatchdog {
