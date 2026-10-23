@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-beta105 — 2026-10-23
 
 ### Performance
 
@@ -8,7 +8,20 @@
 - TLS record buffers (about 16 KiB each) come from a server-wide pool. A connection gives the input buffers back as it waits for input instead of after a second (an HTTP/1.1 connection its output buffer too; a WebSocket still after a quiet second), and the next request takes them from the pool instead of allocating them. A new TLS connection takes its handshake buffers from the pool too. The pool, and a second one for the HTTP/2 and WebSocket read buffers borrowed during bursts, keep at most 8 buffers of about 16 KiB per CPU each.
 - Memory per idle connection, from the moment it goes idle: HTTP/1.1 about 15 KiB over TLS (from about 17 KiB), HTTP/2 about 9 KiB in cleartext and 18 KiB over TLS (from 11 and 23), WebSocket about 19 KiB over TLS (from 25). In cleartext an HTTP/1.1 connection keeps its 4 KiB parse buffer (it used to shrink to 1 KiB after a second) and the values it caches from the last request: about 2 KiB more per idle connection, measured with small requests. After a streamed response it also keeps its 8 KiB chunk buffer.
 - Over TLS, the arrival of a request record ends an HTTP/1.1 idle wait as soon as its first bytes are in, as in cleartext, so `:header-timeout` runs from then rather than from up to a second later. A WebSocket frame ends the wait the same way.
+
+### Features and behaviour changes
+
 - WebSocket: once the idle close is sent, the connection waits up to `:ws-close-timeout` for the client's CLOSE, as documented, instead of being cut at the next idle timeout. Over TLS a frame trickled a byte at a time is now held to `:read-timeout` (1008 "message timeout", as in cleartext).
+
+### Documentation
+
+- GraalVM native image: [doc/graalvm.md](doc/graalvm.md), with two working examples, `examples/graalvm-clojure` (`run-server`) and `examples/graalvm` (from Java). HTTP/1.1, HTTP/2 and WebSocket need no reflection or resource metadata. HTTP/3 is left out of the image, since it calls the quiche shim through JNI.
+
+## 1.0.0-beta94 — 2026-10-12
+
+### New options
+
+- File-based TLS: `:ssl-cert-path` and `:ssl-key-path` (PEM) make the TCP listener speak TLS, and `:ssl-ca-path` adds a CA bundle for client certificates. The files are checked every `:ssl-cert-reload-interval` (10 s, 0 turns it off): a changed certificate, key or bundle serves the next handshakes, existing connections keep theirs, and a bad or half-written file is logged and kept out. Keys are unencrypted RSA or EC in PKCS8, PKCS1 or SEC1 encoding. HTTP/3 shares the files unless `:http3-cert-path` is set. Exclusive with `:ssl-context` and `:ssl-context-provider`.
 
 ## 1.0.0-alpha85 — 2026-10-12
 
