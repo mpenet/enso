@@ -4,7 +4,7 @@
   (:require [clojure.test :refer [are deftest testing is]]
             [s-exp.enso-test-support :as support])
   (:import (com.s_exp.enso.api Response RingErrorHandler ServerEvents StreamingBody)
-           (com.s_exp.enso.core ConnectionLimiter ConnectionRegistry DataRate Drainable GuardedEvents Jfr MemoryBudget
+           (com.s_exp.enso.core BufferPool ConnectionLimiter ConnectionRegistry DataRate Drainable GuardedEvents Jfr MemoryBudget
                                 MemoryBudget$Waiter RequestHead ResponseHead Timer Timer$Task
                                 WatchedOutputStream WriteWatchdog)
            (java.net InetAddress)
@@ -12,6 +12,7 @@
            (com.s_exp.enso.api WebSocketListener)
            (java.io ByteArrayInputStream File OutputStream)
            (java.lang.management ManagementFactory)
+           (java.nio ByteBuffer)
            (java.util.concurrent CountDownLatch TimeUnit)
            (java.util.concurrent.atomic AtomicInteger)))
 
@@ -921,3 +922,57 @@
     (is (> 1.0 (bytes-per-op 100000 (fn [] (.tryReserve a 100) (.charge a 10) (.release a 110) (.throttled a)))))
     (let [w (recording-waiter (AtomicInteger.) (atom nil))]
       (is (> 1.0 (bytes-per-op 100000 (fn [] (.enterLane b w) (.leaveLane b w))))))))
+
+;; ---- BufferPool ---------------------------------------------------------------
+
+(deftest buffer-pool-hands-out-cleared-buffers-and-reuses-released-ones
+  (let [pool (BufferPool. 1024 2 4)
+        ^ByteBuffer b (.acquire pool 512)]
+    (is (= 1024 (.capacity b)) "a pooled buffer has the pool's size")
+    (is (= 0 (.position b)))
+    (is (= 1024 (.limit b)))
+    (.put b (byte 7))
+    (.release pool b)
+    (let [^ByteBuffer again (.acquire pool 1024)]
+      (is (identical? b again) "the released buffer comes back")
+      (is (= 0 (.position again)) "cleared"))))
+
+(deftest buffer-pool-allocates-what-it-cannot-pool
+  (let [pool (BufferPool. 1024 1 2)
+        ^ByteBuffer big (.acquire pool 4096)]
+    (is (= 4096 (.capacity big)) "larger than the pool's size: allocated to fit")
+    (.release pool big)
+    (is (= 0 (.pooled pool)) "a buffer of another size is not kept")
+    (.release pool (ByteBuffer/allocateDirect 1024))
+    (is (= 0 (.pooled pool)) "a direct buffer is not kept")))
+
+(deftest buffer-pool-is-bounded
+  (let [pool (BufferPool. 64 2 3)]
+    (dotimes [_ 20] (.release pool (ByteBuffer/allocate 64)))
+    (is (<= (.pooled pool) 6) "at most stripes x slots buffers are kept")
+    (is (pos? (.pooled pool)))))
+
+(deftest buffer-pool-never-hands-one-buffer-to-two-holders
+  ;; Each holder stamps its buffer with a value of its own and checks it
+  ;; after yielding: a second holder of the same buffer would overwrite it.
+  (let [pool (BufferPool. 256 4 8)
+        stamps (java.util.concurrent.atomic.AtomicLong.)
+        failures (AtomicInteger.)
+        threads (vec (for [_ (range 16)]
+                       (Thread/startVirtualThread
+                        (fn []
+                          (dotimes [_ 5000]
+                            (let [^ByteBuffer b (.acquire pool 256)
+                                  stamp (.incrementAndGet stamps)]
+                              (.putLong b 0 stamp)
+                              (Thread/yield)
+                              (when-not (= stamp (.getLong b 0))
+                                (.incrementAndGet failures))
+                              (.release pool b)))))))]
+    (doseq [^Thread t threads] (.join t))
+    (is (zero? (.get failures)) "no buffer was held twice at once")))
+
+(deftest buffer-pool-reuse-allocates-nothing
+  (let [pool (BufferPool. 1024 2 4)]
+    (.release pool (ByteBuffer/allocate 1024))
+    (is (> 1.0 (bytes-per-op 100000 (fn [] (.release pool (.acquire pool 1024))))))))

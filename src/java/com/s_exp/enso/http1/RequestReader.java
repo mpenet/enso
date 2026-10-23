@@ -32,33 +32,26 @@ import com.s_exp.enso.util.RingHeaders;
 /**
  * Reads requests off one connection's socket, on the connection thread.
  *
- * <p>Each socket read is bounded by the current phase's timeout (see
- * {@link HttpConnection}): the remaining {@code :header-timeout} budget
- * while the head is incomplete, {@code :read-timeout} for body reads, and
- * over TLS {@code :idle-timeout} while waiting for the first byte of a
- * request. In cleartext that wait is untimed: the connection's timer
- * closes it at {@code :idle-timeout}.
+ * <p>The wait for the first byte of a request is untimed: the
+ * connection's timer closes it at {@code :idle-timeout} (see
+ * {@link HttpConnection}). Every other socket read is bounded by the
+ * current phase's timeout: the remaining {@code :header-timeout} budget
+ * while the head is incomplete, {@code :read-timeout} for body reads.
  * Over TLS a read returns only whole records, which a client can trickle
  * a byte per socket timeout, so the TLS socket is also held to the wall
- * clock of the phase ({@link TlsSocket#setReadDeadline}): the idle wait,
- * the header deadline, a body read's {@code :min-data-rate-bytes}
- * allowance. The parse buffer and its cursors live here, so the parsing
+ * clock of the phase ({@link TlsSocket#setReadDeadline}): the header
+ * deadline, a body read's {@code :min-data-rate-bytes} allowance. The parse buffer and its cursors live here, so the parsing
  * loops touch only this object's fields.
  */
 final class RequestReader {
 
-    // Initial request parse buffer, enough for most request heads; grows
-    // up to :max-header-bytes.
+    // Initial request parse buffer, enough for most request heads in one
+    // socket read; grows up to :max-header-bytes.
     private static final int REQUEST_BUFFER_BYTES = 4096;
-    // Parse buffer kept by an idle TLS connection, enough to start reading
-    // the next request.
-    private static final int IDLE_REQUEST_BUFFER_BYTES = 1024;
-    // A TLS keep-alive connection idle this long gives back what its last
-    // requests grew (buffers, cached values, TLS buffers) and waits out the
-    // rest of :idle-timeout holding only the initial buffers. A cleartext
-    // connection gives back grown buffers as it goes idle instead
-    // (startIdle), so its idle wait needs no timed read.
-    private static final int IDLE_SHRINK_MILLIS = 1000;
+    // Over TLS it is filled from the decrypted record, a copy rather than a
+    // socket read, so a smaller one costs no syscalls and holds less while
+    // idle; it grows only for a field line longer than it.
+    private static final int TLS_REQUEST_BUFFER_BYTES = 1024;
     // Lingering close (nginx lingering_time): how long input is read and
     // discarded after the output is shut down.
     private static final int LINGER_MILLIS = 2000;
@@ -114,9 +107,9 @@ final class RequestReader {
     private byte[] buf;
     // Size of buf before any request grew it.
     private final int initialBufferBytes;
-    // Cleartext: an idle connection gave a grown buf back (startIdle), and
-    // whether a later request grew it again, i.e. this connection's requests
-    // need the larger buffer and it keeps it from then on.
+    // An idle connection gave a grown buf back (startIdle), and whether a
+    // later request grew it again, i.e. this connection's requests need the
+    // larger buffer and it keeps it from then on.
     private boolean releasedGrownBuffer;
     private boolean keepGrownBuffer;
     private int pos;
@@ -139,9 +132,6 @@ final class RequestReader {
     // (:remote-addr, :server-name, ...) is handed to the next one.
     private Request lastRequest;
     private int phase;
-    // TLS: this idle period already gave its buffers back (see
-    // IDLE_SHRINK_MILLIS).
-    private boolean idleShrunk;
     // Bytes of the request head consumed so far (request line, field
     // lines, their CRLFs): :max-header-bytes bounds their sum.
     private int headBytes;
@@ -165,11 +155,12 @@ final class RequestReader {
         this.writer = writer;
         this.socket = socket;
         this.config = config;
-        this.initialBufferBytes = Math.min(REQUEST_BUFFER_BYTES, config.maxHeaderBytes);
+        this.tls = socket instanceof TlsSocket.AdapterSocket adapter ? adapter.tls() : null;
+        this.initialBufferBytes = Math.min(tls != null ? TLS_REQUEST_BUFFER_BYTES : REQUEST_BUFFER_BYTES,
+                                           config.maxHeaderBytes);
         this.buf = new byte[initialBufferBytes];
         this.remoteAddress = socket.getInetAddress();
         this.localPort = socket.getLocalPort();
-        this.tls = socket instanceof TlsSocket.AdapterSocket adapter ? adapter.tls() : null;
         this.scheme = tls != null ? Request.K_HTTPS : Request.K_HTTP;
         this.interruptible = config.handlerTimeoutMillis > 0;
     }
@@ -216,15 +207,20 @@ final class RequestReader {
         bodyWaitedNanos = 0;
     }
 
-    /** The next read waits for a request under :idle-timeout. */
+    /**
+     * The next read waits for a request under :idle-timeout. Going idle
+     * gives back what the last request grew (see {@link #growBuffer}) and
+     * the TLS record buffers, so the wait holds small buffers.
+     */
     void startIdle() {
         phase = PHASE_IDLE;
-        if (tls == null && !keepGrownBuffer && buf.length > initialBufferBytes && limit == 0) {
+        if (!keepGrownBuffer && buf.length > initialBufferBytes && limit == 0) {
             buf = new byte[initialBufferBytes];
             releasedGrownBuffer = true;
         }
-        if (tls == null) {
-            writer.releaseGrownOutput();
+        writer.releaseGrownOutput();
+        if (tls != null) {
+            tls.releaseIdleBuffers();
         }
     }
 
@@ -312,10 +308,8 @@ final class RequestReader {
         // Wall-clock end of this read for a TLS socket (class doc), 0 = none.
         long deadline = 0;
         if (phase == PHASE_IDLE) {
-            timeout = idleReadTimeout();
-            if (tls != null && timeout > 0) {
-                deadline = System.nanoTime() + timeout * 1_000_000L;
-            }
+            // The connection's timer enforces :idle-timeout (class doc).
+            timeout = 0;
         } else if (phase == PHASE_HEAD && headerDeadlineNanos != 0) {
             long remainingNs = headerDeadlineNanos - System.nanoTime();
             if (remainingNs <= 0) {
@@ -456,88 +450,32 @@ final class RequestReader {
     }
 
     /**
-     * Waits for the first bytes of the next request; false on EOF. Over
-     * TLS the wait is split: after {@link #IDLE_SHRINK_MILLIS} the
-     * connection gives back what it grew (see {@link #shrinkIdle}), then
-     * waits out the rest of :idle-timeout. In cleartext it is one untimed
-     * read (class doc).
+     * Waits for the first bytes of the next request; false on EOF. The wait
+     * is untimed: the connection's timer closes the connection at
+     * :idle-timeout (class doc). Over TLS it waits for the first ciphertext
+     * rather than a whole record, so the request's arrival ends it (the
+     * header clock runs from its first byte, as in cleartext) however
+     * slowly the record comes; the read that decrypts it runs under the
+     * header clock.
      */
     boolean awaitRequest() throws IOException {
-        idleShrunk = false;
-        while (true) {
-            int n;
-            try {
-                n = socketRead(buf, limit, buf.length - limit);
-            } catch (SocketTimeoutException e) {
-                if (phase == PHASE_IDLE && tls != null && tls.inputPending()) {
-                    // Part of a record is in: a request is arriving, under
-                    // the header clock from now on.
-                    startHead();
-                    continue;
-                }
-                if (idleShrunk || !shrinksWhenIdle()) {
-                    throw e;
-                }
-                shrinkIdle();
-                idleShrunk = true;
-                continue;
+        if (tls != null) {
+            if (currentSoTimeout != 0) {
+                socket.setSoTimeout(0);
+                currentSoTimeout = 0;
             }
-            if (n < 0) {
+            tls.setReadDeadline(0);
+            if (!tls.awaitInput()) {
                 return false;
             }
-            limit += n;
-            return true;
+            startHead();
         }
-    }
-
-    private boolean shrinksWhenIdle() {
-        int idleMs = config.idleTimeoutMillis;
-        return idleMs == 0 || idleMs > IDLE_SHRINK_MILLIS;
-    }
-
-    /** Socket timeout for the current stage of the idle wait (0 = none). */
-    private int idleReadTimeout() {
-        if (tls == null) {
-            // The connection's timer enforces :idle-timeout (class doc).
-            return 0;
+        int n = socketRead(buf, limit, buf.length - limit);
+        if (n < 0) {
+            return false;
         }
-        int idleMs = config.idleTimeoutMillis;
-        if (!shrinksWhenIdle()) {
-            return idleMs;
-        }
-        if (!idleShrunk) {
-            return IDLE_SHRINK_MILLIS;
-        }
-        return idleMs == 0 ? 0 : idleMs - IDLE_SHRINK_MILLIS;
-    }
-
-    /**
-     * An idle connection keeps only its initial buffers: grown parse and
-     * output buffers, the body copy buffer, the cached values of the last
-     * request and the TLS record buffers are dropped (allocated again by
-     * the next request that needs them).
-     */
-    private void shrinkIdle() {
-        if (buf.length > IDLE_REQUEST_BUFFER_BYTES) {
-            buf = new byte[Math.min(IDLE_REQUEST_BUFFER_BYTES, config.maxHeaderBytes)];
-        }
-        writer.shrinkIdle();
-        if (headerScratch.length > 32) {
-            headerScratch = new Object[32];
-        } else {
-            Arrays.fill(headerScratch, null);
-        }
-        Arrays.fill(lastValues, null);
-        lastUri = null;
-        lastQuery = null;
-        if (unknownNames != null) {
-            Arrays.fill(unknownNames, null);
-            Arrays.fill(unknownValues, null);
-        }
-        lastRequest = null;
-        if (tls != null) {
-            tls.releaseIdleBuffers();
-        }
+        limit += n;
+        return true;
     }
 
     /**

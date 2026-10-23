@@ -79,8 +79,14 @@ TLS goes through `TlsSocket`, an `SSLEngine` over the channel. TLS 1.2
 client renegotiation is refused. A TLS 1.3 KeyUpdate asking for ours stays
 queued in the engine and goes out ahead of the next record written
 (RFC 8446 §4.6.3), so the read path never writes and never waits behind a
-writer blocked on a peer that doesn't read. While a connection is idle,
-`releaseIdleBuffers()` swaps the ~16 KiB record buffers for 512-byte ones.
+writer blocked on a peer that doesn't read. Record buffers of the
+session's size (about 16 KiB) come from a server-wide `BufferPool`. As a
+connection goes idle, `releaseIdleBuffers()` gives them back and keeps a
+2 KiB ciphertext buffer, which a typical request's first record arrives in
+with one read, and empty plaintext and output buffers. The next request
+takes full buffers from the pool, so it allocates none. The pool is
+striped and bounded, and never waits: a busy or empty stripe means an
+allocation, a full one drops the buffer.
 
 Other `TlsSocket` calls drivers use:
 
@@ -88,6 +94,8 @@ Other `TlsSocket` calls drivers use:
 - `shutdownOutput()` sends close_notify and half-closes, keeping input readable for a lingering close.
 - `setReadDeadline(nanos)` puts a wall-clock bound on a read. SO_TIMEOUT alone bounds one wait for ciphertext, and a read only returns whole records, so a peer trickling a record a byte at a time could otherwise hold a read forever.
 - `inputPending()` tells whether closing now would be answered with a reset.
+- `awaitInput()` waits for the first ciphertext without decrypting it, so HTTP/1.1 ends its idle wait on a request's first byte rather than once a whole record is in.
+- `free()` gives the record buffers back to the pool when the connection is over.
 
 `isHealthy()` checks that the acceptor, the timer and every HTTP/3 event
 loop are alive.
@@ -345,8 +353,8 @@ Nothing is allocated per request for timeouts, the write watchdog,
 response validation, Date (cached bytes), status lines, the response head
 (reused buffer), HPACK encoding or HTTP/2 framing (pooled batch buffers).
 
-HTTP/1.1 over TLS 1.3 allocates about 3280 bytes per request, mostly in
-the JDK's `SSLEngine`. A direct outbound record buffer was tried: about 5%
+HTTP/1.1 over TLS 1.3 allocates about 3460 bytes per request (wrk, 64
+keep-alive connections, Temurin 25), mostly in the JDK's `SSLEngine`. A direct outbound record buffer was tried: about 5%
 more throughput, but about 370 B/req more allocation (the cipher copies
 through a heap array for a direct destination) and a costly
 re-allocation after each idle release. Inbound records need a heap array
@@ -355,13 +363,15 @@ blocking read that honours `SO_TIMEOUT`.
 
 ### Idle connections
 
-A connection idle for a second gives back what it grew. Over TLS,
-HTTP/1.1 shrinks its parse buffer to 1 KiB and drops its grown output and
-body buffers, cached values and TLS records. A cleartext HTTP/1.1
-connection has no such wakeup, since its wait for a request is an untimed
-read: it gives back a parse or output buffer grown past its initial size
-as it goes idle, and keeps it instead once it had to grow it again after
-such a release (its requests need it). HTTP/2 forgets retired streams and shrinks
+An HTTP/1.1 connection has no wakeup to shrink on, since its wait for a
+request is an untimed read. As it goes idle it gives back a parse or
+output buffer grown past its initial size, and keeps it instead once it
+had to grow it again after such a release (its requests need it); over
+TLS its record buffers go back to the pool. Its parse buffer starts at
+4 KiB in cleartext, enough for most heads in one read, and at 1 KiB over
+TLS, where it is filled from the decrypted record without a syscall.
+Other connections idle for a second give back what they grew. HTTP/2
+forgets retired streams and shrinks
 its input, header-block, HPACK, field, TLS and writer buffers
 (`h2-idle-connection-gives-back-its-buffers`). A WebSocket keeps a
 512-byte read buffer (`ws-idle-connection-gives-back-its-buffers`) and
@@ -371,13 +381,13 @@ stream map that grew past 16 entries.
 
 Heap per idle connection, measured with 2000 connections against
 `s-exp.enso-test-server` (heap after full GC divided by the count, virtual
-thread stacks included; not asserted by a test). The cleartext HTTP/1.1
-figure was measured on Temurin 25 after its idle wait became untimed; the
+thread stacks included; not asserted by a test). The HTTP/1.1 figures
+were measured on Temurin 25 after its idle wait became untimed; the
 others earlier:
 
 | Protocol | Plain | TLS 1.3 |
 |---|---:|---:|
-| HTTP/1.1 keep-alive | 9.9 KiB | 16.1 KiB |
+| HTTP/1.1 keep-alive | 9.9 KiB | 15.3 KiB |
 | HTTP/2 (h2c / h2) | about 11 KB | about 23 KB |
 | WebSocket | 16 KiB | 25 KiB |
 | HTTP/3 | – | about 3 KB |
@@ -393,15 +403,16 @@ head parsing, request bodies, the lingering-close discard loop) and
 `ResponseWriter` the output side (output buffer, response head and body
 encodings, 100 Continue, 101, pipelined output).
 
-In cleartext the wait for a request's first byte is an untimed read. A
-timed read on a virtual thread parks through the JDK's delay scheduler,
-one thread for the whole process, and one per request would cap a large
-machine's keep-alive throughput. `:idle-timeout` runs on the server's
-`Timer` instead: each idle period moves the connection's deadline with
-one CAS, and an expiry closes the connection the way a drain does (one
-CAS from IDLE, so a request's first byte and the close can't both win).
-Over TLS that wait is a socket read timeout (after one second the
-connection gives back its buffers, then waits out the rest). Then come
+The wait for a request's first byte is an untimed read. A timed read on
+a virtual thread parks through the JDK's delay scheduler, one thread for
+the whole process, and one per request would cap a large machine's
+keep-alive throughput. `:idle-timeout` runs on the server's `Timer`
+instead: each idle period moves the connection's deadline with one CAS,
+and an expiry closes the connection the way a drain does (one CAS from
+IDLE, so a request's first byte and the close can't both win). Over TLS
+the wait is for the first ciphertext (`TlsSocket.awaitInput`), not a
+whole record, so a request's arrival ends it as in cleartext and the read
+that decrypts the record runs under the header clock. Then come
 the rest of `:header-timeout` and `:read-timeout` for body reads, both
 socket read timeouts, which a request arriving in one read never waits
 on. Over TLS each read also gets a wall-clock deadline through

@@ -6,6 +6,7 @@ import com.s_exp.enso.api.Config;
 import com.s_exp.enso.api.RingErrorHandler;
 import com.s_exp.enso.api.RingHandler;
 import com.s_exp.enso.api.ServerEvents;
+import com.s_exp.enso.core.BufferPool;
 import com.s_exp.enso.core.ConnectionLimiter;
 import com.s_exp.enso.core.ConnectionRegistry;
 import com.s_exp.enso.core.Drainable;
@@ -35,6 +36,7 @@ import java.util.logging.Logger;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSession;
 
 /**
  * Lifecycle: the constructor only records its arguments; {@link #start}
@@ -96,6 +98,11 @@ public final class EnsoServer implements AutoCloseable {
     // Whether the TCP listener speaks TLS: a prebuilt context (static or the
     // provider's seed) or the PEM file source.
     private final boolean tcpTls;
+    // Session-sized TLS record buffers, borrowed by the TCP connections
+    // while busy (TlsSocket). Sized by the first connection's session, so a
+    // provider's context is not called early; connections racing to create
+    // it at startup may each make one, which only costs a few reuses.
+    private volatile BufferPool tlsRecords;
 
     public EnsoServer(RingHandler handler, Config config) {
         this(handler, null, config);
@@ -356,6 +363,16 @@ public final class EnsoServer implements AutoCloseable {
     }
 
     /** A fresh server-side engine from the live context (rotation via the provider). */
+    private BufferPool tlsRecords(SSLEngine engine) {
+        BufferPool p = tlsRecords;
+        if (p == null) {
+            SSLSession session = engine.getSession();
+            p = new BufferPool(Math.max(session.getPacketBufferSize(), session.getApplicationBufferSize()));
+            tlsRecords = p;
+        }
+        return p;
+    }
+
     private SSLEngine newEngine() throws IOException {
         SSLContext ctx = config.sslContextProvider != null
             ? config.sslContextProvider.get()
@@ -423,7 +440,8 @@ public final class EnsoServer implements AutoCloseable {
                 Socket s;
                 long handshakeDeadline = 0;
                 if (tcpTls) {
-                    tls = new TlsSocket(channel, newEngine());
+                    SSLEngine engine = newEngine();
+                    tls = new TlsSocket(channel, engine, tlsRecords(engine));
                     s = tls.asSocket();
                     socket = s;
                     if (config.handshakeTimeoutMillis > 0) {
@@ -484,8 +502,11 @@ public final class EnsoServer implements AutoCloseable {
                 }
             } finally {
                 forceClose();
-                if (tls != null && tls.renegotiationRefused()) {
-                    tlsError("renegotiation");
+                if (tls != null) {
+                    tls.free();
+                    if (tls.renegotiationRefused()) {
+                        tlsError("renegotiation");
+                    }
                 }
                 registry.unregister(this);
                 limiter.release(remote);

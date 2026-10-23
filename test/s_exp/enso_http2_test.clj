@@ -2988,8 +2988,8 @@
       (let [c (server-h2-connection srv)
             tls (.tls ^com.s_exp.enso.core.TlsSocket$AdapterSocket (field-of c "socket"))
             writer (field-of c "writer")]
-        (is (= 512 (capacity (field-of tls "peerNetData"))) "TLS input record buffer")
-        (is (= 512 (capacity (field-of tls "myNetData"))) "TLS output record buffer")
+        (is (= 2048 (capacity (field-of tls "peerNetData"))) "TLS input record buffer")
+        (is (= 0 (capacity (field-of tls "myNetData"))) "TLS output record buffer")
         (is (>= 64 (alength ^bytes (field-of c "inBuf"))) "framer input buffer")
         (is (nil? (field-of c "pendingHeaderBytes")) "header block buffer")
         (is (nil? (field-of c "retired")) "closed streams forgotten")

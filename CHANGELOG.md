@@ -4,8 +4,10 @@
 
 ### Performance
 
-- HTTP/1.1 in cleartext waits for the next request on a keep-alive connection with an untimed read, and `:idle-timeout` runs on the server's own timer. On JDK 25 and later a timed read on a virtual thread parks through the JDK's delay scheduler, a single thread for the whole process, which capped keep-alive throughput on large machines at a few hundred thousand requests per second. Each request also allocates about 90 bytes less.
-- An idle cleartext HTTP/1.1 connection gives back grown buffers when it goes idle instead of after a second, and keeps its 4 KiB parse buffer: about 2 KiB more per idle connection.
+- HTTP/1.1 waits for the next request on a keep-alive connection with an untimed read, in cleartext and over TLS, and `:idle-timeout` runs on the server's own timer. On JDK 25 and later a timed read on a virtual thread parks through the JDK's delay scheduler, a single thread for the whole process, which capped keep-alive throughput on large machines at a few hundred thousand requests per second. Each request also allocates about 90 bytes less in cleartext and about 120 less over TLS.
+- TLS record buffers (about 16 KiB each) come from a server-wide pool. An idle HTTP/1.1 connection gives them back when it goes idle instead of after a second, and the next request takes them from the pool instead of allocating them. A new TLS connection takes its handshake buffers from the pool too.
+- Memory per idle HTTP/1.1 connection: about 15 KiB over TLS (from about 17 KiB), held from the moment the connection goes idle. In cleartext the connection keeps its 4 KiB parse buffer, about 2 KiB more than before.
+- Over TLS, the arrival of a request record ends an idle wait as soon as its first bytes are in, as in cleartext, so `:header-timeout` runs from then rather than from up to a second later.
 
 ## 1.0.0-alpha85 — 2026-10-12
 

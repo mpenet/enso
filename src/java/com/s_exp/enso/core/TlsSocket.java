@@ -41,13 +41,29 @@ import javax.net.ssl.SSLSession;
 public final class TlsSocket implements AutoCloseable {
 
     private static final ByteBuffer EMPTY = ByteBuffer.allocate(0);
-    // Record buffers of an idle connection (releaseIdleBuffers): enough
-    // for a record header and a close_notify; they grow back to the
-    // session's sizes through the BUFFER_UNDERFLOW / BUFFER_OVERFLOW paths.
-    private static final int IDLE_BUFFER_BYTES = 512;
+    // Ciphertext buffer of an idle connection (releaseIdleInputBuffers): a
+    // typical request's first record arrives in it with one read; a larger
+    // record grows it back to the session's size (BUFFER_UNDERFLOW), at the
+    // cost of another read. The idle plaintext and output buffers hold
+    // nothing: growing those needs no read (unwrap's BUFFER_OVERFLOW is
+    // retried in memory, and wrap() wants a whole packet of room for any
+    // record, a close_notify included).
+    private static final int IDLE_INPUT_BYTES = 2048;
+    // An idle connection keeps the output stream's cached wrapper only over
+    // an array this small: the driver's own output buffer, which its next
+    // response writes again. A larger one is a body array it would pin.
+    private static final int IDLE_KEPT_WRAPPED_ARRAY = 8 * 1024;
 
     private final SocketChannel channel;
     private final SSLEngine engine;
+    // Where session-sized record buffers come from and go back to; null:
+    // allocated, and left to the GC.
+    private final BufferPool pool;
+    // The record buffers an idle connection waits on, allocated by its
+    // first release and reused after.
+    private ByteBuffer idleNetIn;
+    private ByteBuffer idleAppIn;
+    private ByteBuffer idleNetOut;
 
     // Cached at construction: `channel.getRemoteAddress()` /
     // `getLocalAddress()` each cost a getsockname/getpeername syscall,
@@ -96,17 +112,23 @@ public final class TlsSocket implements AutoCloseable {
     private volatile int packetSize;
 
     public TlsSocket(SocketChannel channel, SSLEngine engine) throws IOException {
+        this(channel, engine, null);
+    }
+
+    /** Record buffers of the session's sizes come from {@code pool} (null: allocated). */
+    public TlsSocket(SocketChannel channel, SSLEngine engine, BufferPool pool) throws IOException {
         this.channel = channel;
         this.engine = engine;
+        this.pool = pool;
         this.netIn = channel.socket().getInputStream();
         engine.setUseClientMode(false);
         SSLSession session = engine.getSession();
         int netSize = session.getPacketBufferSize();
         int appSize = session.getApplicationBufferSize();
-        this.peerNetData = ByteBuffer.allocate(netSize);
-        this.peerAppData = ByteBuffer.allocate(appSize);
+        this.peerNetData = take(netSize);
+        this.peerAppData = take(appSize);
         this.peerAppData.flip(); // start empty
-        this.myNetData = ByteBuffer.allocate(netSize);
+        this.myNetData = take(netSize);
         this.in = new RecordInputStream();
         this.out = new RecordOutputStream();
         // Snapshot connection-scoped addresses once.
@@ -189,8 +211,8 @@ public final class TlsSocket implements AutoCloseable {
                 myNetData.flip();
                 writeFully(myNetData);
                 if (r.getStatus() == Status.BUFFER_OVERFLOW) {
-                    myNetData = ByteBuffer.allocate(Math.max(myNetData.capacity() * 2,
-                                                             engine.getSession().getPacketBufferSize()));
+                    myNetData = replace(myNetData, Math.max(myNetData.capacity() * 2,
+                                                            engine.getSession().getPacketBufferSize()));
                     return hs;
                 }
                 return r.getHandshakeStatus();
@@ -237,6 +259,27 @@ public final class TlsSocket implements AutoCloseable {
      */
     public void setReadDeadline(long deadlineNanos) {
         readDeadlineNanos = deadlineNanos;
+    }
+
+    /**
+     * Waits until the peer sends anything, without decrypting it: true once
+     * ciphertext is read into the record buffer (or input was already
+     * buffered), false on EOF. Bounded only by SO_TIMEOUT, so an idle
+     * connection waits untimed. A read afterwards decrypts what arrived
+     * under its own deadline. A record decrypts only once whole, so this is
+     * what lets a driver end its idle wait on a request's first byte, as in
+     * cleartext, however slowly the rest of the record comes.
+     */
+    public boolean awaitInput() throws IOException {
+        readLock.lock();
+        try {
+            if (peerAppData.hasRemaining() || peerNetData.position() > 0) {
+                return true;
+            }
+            return readNet() >= 0;
+        } finally {
+            readLock.unlock();
+        }
     }
 
     /**
@@ -308,22 +351,48 @@ public final class TlsSocket implements AutoCloseable {
         }
     }
 
-    private static ByteBuffer enlarge(ByteBuffer src, int minCap) {
-        int cap = Math.max(src.capacity() * 2, minCap);
-        ByteBuffer bigger = ByteBuffer.allocate(cap);
+    /** A write-mode copy of write-mode {@code src} with room for at least {@code minCap}; src is given back. */
+    private ByteBuffer enlarge(ByteBuffer src, int minCap) {
+        ByteBuffer bigger = take(Math.max(src.capacity() * 2, minCap));
         src.flip();
         bigger.put(src);
+        give(src);
         return bigger;
+    }
+
+    /** An empty buffer of at least {@code minCap} replacing {@code old}, whose content is dropped; old is given back. */
+    private ByteBuffer replace(ByteBuffer old, int minCap) {
+        give(old);
+        return take(minCap);
+    }
+
+    private ByteBuffer take(int minCap) {
+        return pool != null ? pool.acquire(minCap) : ByteBuffer.allocate(minCap);
+    }
+
+    /** Back to the pool, unless it is one of this connection's idle buffers (kept) or there is no pool. */
+    private void give(ByteBuffer b) {
+        if (pool != null && b != idleNetIn && b != idleAppIn && b != idleNetOut) {
+            pool.release(b);
+        }
     }
 
     /**
      * Swaps the record buffers (about 16 KiB each) for small ones while the
      * connection is idle, when they hold nothing: no ciphertext pending,
-     * no plaintext unread. Called by the reading thread between requests.
+     * no plaintext unread. The large ones go back to the pool, so a request
+     * growing them again costs no allocation. Called by the reading thread
+     * as the connection goes idle.
      */
     public void releaseIdleBuffers() {
         releaseIdleInputBuffers();
-        releaseOutputBuffer();
+        writeLock.lock();
+        try {
+            releaseOutput();
+            ((RecordOutputStream) out).forgetWrappedLargerThan(IDLE_KEPT_WRAPPED_ARRAY);
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     /**
@@ -334,10 +403,8 @@ public final class TlsSocket implements AutoCloseable {
         readLock.lock();
         try {
             if (peerNetData.position() == 0 && !peerAppData.hasRemaining()
-                && peerNetData.capacity() > IDLE_BUFFER_BYTES) {
-                peerNetData = ByteBuffer.allocate(IDLE_BUFFER_BYTES);
-                peerAppData = ByteBuffer.allocate(IDLE_BUFFER_BYTES);
-                peerAppData.flip();
+                && (peerNetData != idleNetIn || peerAppData != idleAppIn)) {
+                swapInputForIdle();
             }
         } finally {
             readLock.unlock();
@@ -345,20 +412,71 @@ public final class TlsSocket implements AutoCloseable {
     }
 
     /**
-     * The output half of {@link #releaseIdleBuffers}: the output record
-     * buffer becomes a small one (it grows back on the next write). A
-     * driver writing through {@link #writeRecords} with its own buffers
-     * calls it once, so the connection only keeps room for a close_notify.
+     * The output record buffer becomes an empty one (it grows back on the
+     * next write). A driver writing through {@link #writeRecords} with its
+     * own buffers calls it once, so the connection keeps none.
      */
     public void releaseOutputBuffer() {
         writeLock.lock();
         try {
-            if (myNetData.capacity() > IDLE_BUFFER_BYTES) {
-                myNetData = ByteBuffer.allocate(IDLE_BUFFER_BYTES);
-            }
+            releaseOutput();
             ((RecordOutputStream) out).forgetWrapped();
         } finally {
             writeLock.unlock();
+        }
+    }
+
+    /** Under writeLock. */
+    private void releaseOutput() {
+        if (myNetData.capacity() > 0) {
+            swapOutputForIdle();
+        }
+    }
+
+    /** The input record buffers become the idle ones, the old ones given back. Under readLock. */
+    private void swapInputForIdle() {
+        if (idleNetIn == null) {
+            idleNetIn = ByteBuffer.allocate(IDLE_INPUT_BYTES);
+            idleAppIn = ByteBuffer.allocate(0);
+        }
+        ByteBuffer net = peerNetData;
+        ByteBuffer app = peerAppData;
+        peerNetData = idleNetIn.clear();
+        peerAppData = idleAppIn.clear().flip();
+        give(net);
+        give(app);
+    }
+
+    /** The output record buffer becomes the idle one, the old one given back. Under writeLock. */
+    private void swapOutputForIdle() {
+        if (idleNetOut == null) {
+            idleNetOut = ByteBuffer.allocate(0);
+        }
+        ByteBuffer net = myNetData;
+        myNetData = idleNetOut.clear();
+        give(net);
+    }
+
+    /**
+     * Gives the record buffers back to the pool once the connection is
+     * over: called by the thread that ran it, after {@link #close} or
+     * {@link #abort}. Waits for a reader or writer still inside (their
+     * calls fail fast on the closed channel); later reads and writes see
+     * the small idle buffers.
+     */
+    public void free() {
+        if (pool == null) return;
+        readLock.lock();
+        try {
+            writeLock.lock();
+            try {
+                swapInputForIdle();
+                swapOutputForIdle();
+            } finally {
+                writeLock.unlock();
+            }
+        } finally {
+            readLock.unlock();
         }
     }
 
@@ -435,7 +553,7 @@ public final class TlsSocket implements AutoCloseable {
                     writeFully(myNetData);
                     if (r.getStatus() == Status.CLOSED) break;
                     if (r.getStatus() == Status.BUFFER_OVERFLOW) {
-                        myNetData = ByteBuffer.allocate(engine.getSession().getPacketBufferSize());
+                        myNetData = replace(myNetData, engine.getSession().getPacketBufferSize());
                     }
                 }
                 // Half-close outbound (send FIN) after the close_notify
@@ -627,6 +745,11 @@ public final class TlsSocket implements AutoCloseable {
          */
         private boolean fillPlaintext() throws IOException {
             peerAppData.compact();
+            if (peerAppData == idleAppIn) {
+                // The idle buffer holds no plaintext: take a full one now
+                // rather than through a failed unwrap.
+                peerAppData = enlarge(peerAppData, engine.getSession().getApplicationBufferSize());
+            }
             try {
                 return unwrapUntilPlaintext();
             } catch (IOException | RuntimeException | Error e) {
@@ -768,6 +891,11 @@ public final class TlsSocket implements AutoCloseable {
                 } else {
                     app = ByteBuffer.wrap(src, off, len);
                 }
+                if (myNetData == idleNetOut) {
+                    // The idle buffer has no room for a record: take a full
+                    // one now rather than through a failed wrap.
+                    myNetData = replace(myNetData, engine.getSession().getPacketBufferSize());
+                }
                 while (app.hasRemaining()) {
                     myNetData.clear();
                     SSLEngineResult r = engine.wrap(app, myNetData);
@@ -777,7 +905,7 @@ public final class TlsSocket implements AutoCloseable {
                         throw new IOException("SSL engine outbound closed");
                     }
                     if (r.getStatus() == Status.BUFFER_OVERFLOW) {
-                        myNetData = ByteBuffer.allocate(
+                        myNetData = replace(myNetData,
                             Math.max(myNetData.capacity() * 2,
                                      engine.getSession().getPacketBufferSize()));
                     }
@@ -797,6 +925,13 @@ public final class TlsSocket implements AutoCloseable {
         void forgetWrapped() {
             wrapped = null;
             wrappedArray = null;
+        }
+
+        /** {@link #forgetWrapped} when the pinned array is larger than {@code bytes}. Under writeLock. */
+        void forgetWrappedLargerThan(int bytes) {
+            if (wrappedArray != null && wrappedArray.length > bytes) {
+                forgetWrapped();
+            }
         }
     }
 }

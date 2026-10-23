@@ -30,7 +30,6 @@ import com.s_exp.enso.core.RequestBodyException;
 import com.s_exp.enso.core.RequestBodyTimeoutException;
 import com.s_exp.enso.core.Service;
 import com.s_exp.enso.core.Timer;
-import com.s_exp.enso.core.TlsSocket;
 import com.s_exp.enso.core.WatchedOutputStream;
 import com.s_exp.enso.core.WriteWatchdog;
 import com.s_exp.enso.websocket.PerMessageDeflate;
@@ -40,18 +39,17 @@ import com.s_exp.enso.websocket.WebSocketHandshake;
 /**
  * One HTTP/1.1 connection, run on its own virtual thread.
  *
- * <p>The wait for the next request is an untimed read in cleartext: a
- * timed read on a virtual thread parks through the JDK's single delay
- * scheduler thread, shared by the whole process, which would cap a large
- * machine's keep-alive throughput. {@code :idle-timeout} runs on the
- * server's {@link Timer} instead ({@link IdleTimeout}), at one CAS per
- * request. Over TLS that wait is a socket read timeout. The other phases
- * use socket read timeouts, which a request that arrives in one read never
- * waits on: the remaining {@code :header-timeout} budget (wall clock from
- * the first byte) while the head is incomplete, and {@code :read-timeout}
- * for body reads. Writes go through a {@link WatchedOutputStream}
- * ({@code :write-timeout}); the opt-in {@code :handler-timeout} uses the
- * server's {@link Timer}.
+ * <p>The wait for the next request is an untimed read: a timed read on a
+ * virtual thread parks through the JDK's single delay scheduler thread,
+ * shared by the whole process, which would cap a large machine's
+ * keep-alive throughput. {@code :idle-timeout} runs on the server's
+ * {@link Timer} instead ({@link IdleTimeout}), at one CAS per request.
+ * The other phases use socket read timeouts, which a request that arrives
+ * in one read never waits on: the remaining {@code :header-timeout} budget
+ * (wall clock from the first byte) while the head is incomplete, and
+ * {@code :read-timeout} for body reads. Writes go through a
+ * {@link WatchedOutputStream} ({@code :write-timeout}); the opt-in
+ * {@code :handler-timeout} uses the server's {@link Timer}.
  *
  * <p>Requests are read by a {@link RequestReader}, responses written by a
  * {@link ResponseWriter}; this class runs the request loop: handler,
@@ -101,8 +99,8 @@ public final class HttpConnection implements Runnable, Drainable {
     private final Timer timer;
     // :write-timeout, null when disabled.
     private final Watchdog watchdog;
-    // :idle-timeout of a cleartext connection, whose wait for a request is
-    // an untimed read; null over TLS (a timed read there) or when disabled.
+    // :idle-timeout, whose wait for a request is an untimed read; null when
+    // disabled.
     private final IdleTimeout idleTimeout;
     private final ResponseWriter writer;
     private final RequestReader reader;
@@ -163,8 +161,7 @@ public final class HttpConnection implements Runnable, Drainable {
         this.config = service.config;
         this.timer = service.timer;
         this.watchdog = config.writeTimeoutMillis > 0 ? new Watchdog() : null;
-        this.idleTimeout = config.idleTimeoutMillis > 0 && !(socket instanceof TlsSocket.AdapterSocket)
-            ? new IdleTimeout() : null;
+        this.idleTimeout = config.idleTimeoutMillis > 0 ? new IdleTimeout() : null;
         this.writer = new ResponseWriter(socket, service, watchdog);
         this.reader = new RequestReader(this, writer, socket, config);
     }
@@ -305,8 +302,8 @@ public final class HttpConnection implements Runnable, Drainable {
                     return false;
                 }
             } catch (HttpError e) {
-                // A request began arriving (a TLS record at a time) and its
-                // head ran out of time.
+                // A request began arriving over TLS (its first record not
+                // whole yet) and its head ran out of time.
                 headError(e.status);
                 writeError(e.status, e.getMessage());
                 return false;
@@ -695,7 +692,7 @@ public final class HttpConnection implements Runnable, Drainable {
     }
 
     /**
-     * The {@code :idle-timeout} node of a cleartext connection, armed each
+     * The {@code :idle-timeout} node of a connection, armed each
      * time the connection goes idle but never cancelled: the next idle
      * period only moves its deadline (one CAS on this node, no timer thread
      * visit per request, as for {@link HandlerTimeout}). So an expiry may

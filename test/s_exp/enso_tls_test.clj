@@ -632,6 +632,102 @@
             (post 50000)
             (is (.endsWith ^String (read-response) "\r\n\r\n50000"))))))))
 
+
+(defn- private-field [obj ^String n]
+  (.get (doto (.getDeclaredField (class obj) n) (.setAccessible true)) obj))
+
+(defn- server-tls-sockets
+  "The TlsSockets of `srv`'s open TLS connections."
+  [srv]
+  (let [registry (private-field srv "registry")
+        live (private-field registry "live")]
+    (keep #(when-let [s (private-field % "socket")]
+             (when (instance? com.s_exp.enso.core.TlsSocket$AdapterSocket s)
+               (.tls ^com.s_exp.enso.core.TlsSocket$AdapterSocket s)))
+          live)))
+
+(defn- tls-client
+  "A keep-alive HTTP/1.1 client over TLS to `port`: {:post (fn [n]) :read
+  (fn [] response) :socket}. `post` sends a POST with an `n`-byte body."
+  [port]
+  (let [factory (.getSocketFactory (capturing-trust-context (atom [])))
+        ^javax.net.ssl.SSLSocket sock (.createSocket factory "127.0.0.1" (int port))
+        _ (.startHandshake sock)
+        _ (.setSoTimeout sock 4000)
+        out (.getOutputStream sock)
+        in (.getInputStream sock)]
+    {:socket sock
+     :post (fn [n]
+             (.write out (.getBytes (str "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: " n "\r\n\r\n"
+                                         (apply str (repeat n "q")))
+                                    java.nio.charset.StandardCharsets/ISO_8859_1))
+             (.flush out))
+     :read (fn []
+             (let [sb (StringBuilder.)]
+               (loop []
+                 (let [b (.read in)]
+                   (when (>= b 0)
+                     (.append sb (char b))
+                     (when-not (.endsWith (str sb) "\r\n\r\n")
+                       (recur)))))
+               (let [n (Long/parseLong (second (re-find #"Content-Length: (\d+)" (str sb))))]
+                 (dotimes [_ n] (.append sb (char (.read in)))))
+               (str sb)))}))
+
+(defn- with-tls-server* [opts f]
+  (let [srv (enso/run-server (:handler opts (fn [req] {:status 200 :body (str (count (slurp (:body req))))}))
+                             (merge {:host "127.0.0.1" :port 0 :http2 true :ssl-context (keytool-gen! "idle")}
+                                    (dissoc opts :handler)))]
+    (try (f srv) (finally (enso/stop srv)))))
+
+(deftest tls-idle-keep-alive-wait-sets-no-socket-timeout
+  ;; As in cleartext: a timed read per request would park through the
+  ;; JDK's one delay-scheduler thread; :idle-timeout runs on the server's
+  ;; timer instead.
+  (with-tls-server* {}
+    (fn [srv]
+      (let [{:keys [post read ^java.net.Socket socket]} (tls-client (enso/port srv))]
+        (try
+          (post 10)
+          (is (.endsWith ^String (read) "\r\n\r\n10"))
+          (is (support/await-condition
+               #(= [0] (map (fn [tls] (.getSoTimeout (.socket ^java.nio.channels.SocketChannel
+                                                               (private-field tls "channel"))))
+                            (server-tls-sockets srv)))
+               2000 10)
+              "the idle read has no socket timeout")
+          (finally (.close socket)))))))
+
+(deftest tls-idle-connection-gives-back-its-record-buffers-at-once
+  ;; Going idle hands the record buffers (about 16 KiB each) back to the
+  ;; pool; the connection waits on small ones, with no delay.
+  (with-tls-server* {}
+    (fn [srv]
+      (let [{:keys [post read ^java.net.Socket socket]} (tls-client (enso/port srv))
+            capacities (fn [] (map (fn [tls] (mapv #(.capacity ^java.nio.ByteBuffer (private-field tls %))
+                                                   ["peerNetData" "peerAppData" "myNetData"]))
+                                   (server-tls-sockets srv)))]
+        (try
+          (post 10)
+          (is (.endsWith ^String (read) "\r\n\r\n10"))
+          (is (support/await-condition
+               #(let [[[net app out]] (capacities)]
+                  (and net (<= net 2048) (<= app 2048) (<= out 512)))
+               600 10)
+              (str "small record buffers within 600 ms of going idle: " (pr-str (capacities))))
+          (finally (.close socket)))))))
+
+(deftest tls-large-request-right-after-a-small-one
+  ;; A multi-record request on a connection that just went idle grows the
+  ;; record buffers back from the small idle ones, then small again.
+  (with-tls-server* {}
+    (fn [srv]
+      (let [{:keys [post read ^java.net.Socket socket]} (tls-client (enso/port srv))]
+        (try
+          (doseq [n [10 50000 10 70000 3 20000]]
+            (post n)
+            (is (.endsWith ^String (read) (str "\r\n\r\n" n)) (str n)))
+          (finally (.close socket)))))))
 ;; ---- Records trickled under the timeouts -------------------------------------
 
 (defn- drip-proxy

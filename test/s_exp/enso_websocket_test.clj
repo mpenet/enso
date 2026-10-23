@@ -2315,8 +2315,8 @@
       (is echoed "the next message is served")))
   (testing "TLS"
     (let [[busy idle echoed] (idle-release-check {:ssl-context (support/server-ssl-context)} nil)]
-      (is (< 512 (:tls-in busy)))
-      (is (= {:tls-in 512 :tls-out 512} (select-keys idle [:tls-in :tls-out])))
+      (is (< 2048 (:tls-in busy)))
+      (is (= {:tls-in 2048 :tls-out 0} (select-keys idle [:tls-in :tls-out])))
       (is echoed)))
   (testing "compressed, context takeover: the Deflater and Inflater keep their windows"
     (let [[busy idle echoed] (idle-release-check {:ws-compression true} "permessage-deflate")]
