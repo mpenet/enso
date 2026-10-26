@@ -81,17 +81,25 @@ queued in the engine and goes out ahead of the next record written
 (RFC 8446 §4.6.3), so the read path never writes and never waits behind a
 writer blocked on a peer that doesn't read. Record buffers of the
 session's size (about 16 KiB) come from a server-wide `BufferPool`. A
-connection waiting for input gives the input ones back
-(`releaseIdleInputBuffers()`) and keeps a 2 KiB ciphertext buffer, which a
+connection about to wait for input gives the input ones back
+(`releaseIdleInputBuffers()`), unless its socket already holds bytes the
+next read takes at once, and keeps a 2 KiB ciphertext buffer, which a
 typical request's first record arrives in with one read, and an empty
-plaintext buffer. HTTP/1.1 gives the output buffer back at the same time
-(`releaseIdleBuffers()`), a WebSocket after a quiet second, and HTTP/2
-writes through its own buffers. The next request takes full buffers from
-the pool, so it allocates none. The pool is striped and bounded, and never
-waits: a busy or empty stripe means an allocation, a full one drops the
-buffer. It keeps at most 8 buffers per CPU (about 130 KiB per CPU), and a
-second pool of the same shape holds the read buffers HTTP/2 and WebSocket
-borrow for bursts; neither shrinks once filled.
+plaintext buffer. A read that fills the 2 KiB buffer leaves more pending,
+so the buffer becomes a full one: small records alone would never grow it,
+and a busy connection would read 2 KiB at a time. HTTP/1.1 gives the
+output buffer back at the same time (`releaseIdleBuffers()`), a WebSocket
+after a quiet second, and HTTP/2 writes through its own buffers. The next
+request takes full buffers from the pool, so it allocates none. The pool
+is striped and never waits: a locked stripe moves on to the next, and an
+empty one means an allocation. A stripe grows to hold whatever is given
+back: a pool capped at a fixed count drops what is given back past it,
+then allocates whenever more connections turn busy at once than it holds.
+What it keeps is bounded in time: a pass on the server's timer every
+500 ms, armed only while the pool keeps buffers, drops the buffers given
+back before the previous pass, so a buffer unused for 0.5 to 1 s goes to
+the GC. A second pool of the same shape holds the read buffers HTTP/2 and
+WebSocket borrow for bursts.
 
 Other `TlsSocket` calls drivers use:
 

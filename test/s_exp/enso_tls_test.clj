@@ -815,6 +815,19 @@
       (let [^com.s_exp.enso.core.BufferPool pool (private-field srv "tlsRecords")]
         (is (support/await-condition #(pos? (.pooled pool)) 2000 10) "buffers back in the pool")))))
 
+(deftest tls-record-pool-lets-unused-buffers-go
+  ;; The pool keeps what connections give back only while it is reused:
+  ;; once no connection takes them for a second or so, they go to the GC.
+  (with-tls-server* {}
+    (fn [srv]
+      (let [{:keys [post read ^java.net.Socket socket]} (tls-client (enso/port srv))]
+        (post 10)
+        (read)
+        (.close socket))
+      (let [^com.s_exp.enso.core.BufferPool pool (private-field srv "tlsRecords")]
+        (is (support/await-condition #(pos? (.pooled pool)) 2000 5) "given back at close")
+        (is (support/await-condition #(zero? (.pooled pool)) 3000 50) "dropped once unused")))))
+
 (deftest tls-large-request-right-after-a-small-one
   ;; A multi-record request on a connection that just went idle grows the
   ;; record buffers back from the small idle ones, then small again.
@@ -1118,6 +1131,89 @@
               (.inputPending tls) true
               (< n 200) (do (Thread/sleep 10) (recur (inc n)))
               :else false))))))
+
+(deftest tls-input-buffers-stay-while-input-is-waiting
+  ;; The record buffers go back for a connection about to wait. With bytes
+  ;; already in the socket the next read takes them at once, and a swap
+  ;; would only move buffers to the pool and back.
+  (with-open [server-ch (doto (java.nio.channels.ServerSocketChannel/open)
+                          (.bind (java.net.InetSocketAddress. "127.0.0.1" 0)))
+              client (java.nio.channels.SocketChannel/open (.getLocalAddress server-ch))
+              accepted (.accept server-ch)
+              quiet-client (java.nio.channels.SocketChannel/open (.getLocalAddress server-ch))
+              accepted-quiet (.accept server-ch)]
+    (let [busy (com.s_exp.enso.core.TlsSocket. accepted (.createSSLEngine (SSLContext/getDefault)))
+          quiet (com.s_exp.enso.core.TlsSocket. accepted-quiet (.createSSLEngine (SSLContext/getDefault)))
+          busy-net (private-field busy "peerNetData")
+          quiet-net (private-field quiet "peerNetData")]
+      (.write client (java.nio.ByteBuffer/wrap (byte-array [22 3 3])))
+      (is (support/await-condition #(.inputPending busy) 2000 10))
+      (.releaseIdleInputBuffers busy)
+      (is (identical? busy-net (private-field busy "peerNetData")) "kept while bytes wait in the socket")
+      (.releaseIdleInputBuffers quiet)
+      (is (not (identical? quiet-net (private-field quiet "peerNetData"))) "given back with nothing to read"))))
+
+(defn- client-handshake!
+  "Runs `engine`'s client handshake over the blocking channel `ch`."
+  [^javax.net.ssl.SSLEngine engine ^java.nio.channels.SocketChannel ch]
+  (let [net-out (java.nio.ByteBuffer/allocate 32768)
+        net-in (java.nio.ByteBuffer/allocate 32768)
+        app (java.nio.ByteBuffer/allocate 32768)
+        empty (java.nio.ByteBuffer/allocate 0)]
+    (.beginHandshake engine)
+    (loop []
+      (let [hs (.getHandshakeStatus engine)]
+        (cond
+          (= hs javax.net.ssl.SSLEngineResult$HandshakeStatus/NEED_WRAP)
+          (do (.clear net-out)
+              (.wrap engine empty net-out)
+              (.flip net-out)
+              (while (.hasRemaining net-out) (.write ch net-out))
+              (recur))
+
+          (#{javax.net.ssl.SSLEngineResult$HandshakeStatus/NEED_UNWRAP
+             javax.net.ssl.SSLEngineResult$HandshakeStatus/NEED_UNWRAP_AGAIN} hs)
+          (let [_ (.flip net-in)
+                r (.unwrap engine net-in app)]
+            (.compact net-in)
+            (when (= javax.net.ssl.SSLEngineResult$Status/BUFFER_UNDERFLOW (.getStatus r))
+              (.read ch net-in))
+            (recur))
+
+          (= hs javax.net.ssl.SSLEngineResult$HandshakeStatus/NEED_TASK)
+          (do (loop [] (when-let [^Runnable t (.getDelegatedTask engine)] (.run t) (recur)))
+              (recur))
+
+          :else :done)))))
+
+(deftest tls-burst-after-a-wait-reads-into-a-full-record-buffer
+  ;; A waiting connection reads into a small ciphertext buffer, and small
+  ;; records never need a larger one to decrypt: once a read fills it, more
+  ;; is pending, and it becomes a full one so the reads that follow get
+  ;; more than the small size each.
+  (with-open [server-ch (doto (java.nio.channels.ServerSocketChannel/open)
+                          (.bind (java.net.InetSocketAddress. "127.0.0.1" 0)))
+              client (java.nio.channels.SocketChannel/open (.getLocalAddress server-ch))
+              accepted (.accept server-ch)]
+    (let [server-engine (doto (.createSSLEngine (support/server-ssl-context)) (.setUseClientMode false))
+          tls (com.s_exp.enso.core.TlsSocket. accepted server-engine)
+          engine (doto (.createSSLEngine (support/trust-all-ssl-context) "127.0.0.1" 443) (.setUseClientMode true))
+          server-side (future (.handshake tls 5000))]
+      (client-handshake! engine client)
+      @server-side
+      (.releaseIdleInputBuffers tls)
+      (is (= 2048 (.capacity ^java.nio.ByteBuffer (private-field tls "peerNetData"))) "waiting on the small buffer")
+      ;; 100 small records in one socket write: all in the server's socket
+      ;; when its read comes.
+      (let [out (java.nio.ByteBuffer/allocate 65536)
+            record (.getBytes "GET /x HTTP/1.1\r\nHost: x\r\n\r\n" java.nio.charset.StandardCharsets/ISO_8859_1)]
+        (dotimes [_ 100] (.wrap engine (java.nio.ByteBuffer/wrap record) out))
+        (.flip out)
+        (while (.hasRemaining out) (.write client out)))
+      (is (support/await-condition #(.inputPending tls) 2000 5))
+      (is (pos? (.read (.getInputStream tls) (byte-array 1) 0 1)))
+      (let [net (.capacity ^java.nio.ByteBuffer (private-field tls "peerNetData"))]
+        (is (< 2048 net) (str "ciphertext buffer of " net " bytes"))))))
 
 ;; ---- File-based certificate source --------------------------------------------
 

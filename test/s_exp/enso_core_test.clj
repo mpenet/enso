@@ -946,11 +946,52 @@
     (.release pool (ByteBuffer/allocateDirect 1024))
     (is (= 0 (.pooled pool)) "a direct buffer is not kept")))
 
-(deftest buffer-pool-is-bounded
-  (let [pool (BufferPool. 64 2 3)]
-    (dotimes [_ 20] (.release pool (ByteBuffer/allocate 64)))
-    (is (<= (.pooled pool) 6) "at most stripes x slots buffers are kept")
-    (is (pos? (.pooled pool)))))
+(deftest buffer-pool-keeps-what-waiting-holders-give-back
+  ;; However many holders give their buffer back to wait at once, each gets
+  ;; one back without an allocation: a stripe grows past its initial slots.
+  (let [pool (BufferPool. 64 1 2)
+        given (vec (repeatedly 100 #(ByteBuffer/allocate 64)))
+        released (java.util.Collections/newSetFromMap (java.util.IdentityHashMap.))]
+    (doseq [^ByteBuffer b given]
+      (.add released b)
+      (.release pool b))
+    (is (= 100 (.pooled pool)))
+    (is (= 100 (count (filter #(.contains released %) (repeatedly 100 #(.acquire pool 64)))))
+        "each one a released buffer")))
+
+(deftest buffer-pool-trim-drops-buffers-unused-since-the-previous-pass
+  (let [pool (BufferPool. 64 2 2)]
+    (dotimes [_ 10] (.release pool (ByteBuffer/allocate 64)))
+    (.trim pool)
+    (is (= 10 (.pooled pool)) "given back since the previous pass: kept")
+    (.release pool (.acquire pool 64))
+    (.trim pool)
+    (is (= 1 (.pooled pool)) "only the one given back since the previous pass is left")
+    (.trim pool)
+    (is (= 0 (.pooled pool)))))
+
+(deftest buffer-pool-trims-itself-on-the-timer
+  (with-open [timer (Timer.)]
+    (let [pool (BufferPool. 64 1 2)]
+      (.trimEvery pool timer 20)
+      (.release pool (ByteBuffer/allocate 64))
+      (is (support/await-condition #(zero? (.pooled pool)) 2000 10)
+          "an unused buffer is dropped after two passes"))))
+
+(deftest buffer-pool-holding-nothing-leaves-the-timer-idle
+  ;; A timer with any task armed wakes every tick: the trim pass is armed
+  ;; only while the pool holds buffers, so an idle server's timer sleeps.
+  (with-open [timer (Timer.)]
+    (let [pool (BufferPool. 64 1 2)
+          ^java.lang.reflect.Field field (doto (.getDeclaredField Timer "linked") (.setAccessible true))
+          linked #(.getInt field timer)]
+      (.trimEvery pool timer 20)
+      (Thread/sleep 50)
+      (is (zero? (linked)) "nothing armed while empty")
+      (.release pool (ByteBuffer/allocate 64))
+      (is (support/await-condition #(pos? (linked)) 1000 5) "armed by a release")
+      (is (support/await-condition #(and (zero? (.pooled pool)) (zero? (linked))) 2000 10)
+          "disarmed once trimmed empty"))))
 
 (deftest buffer-pool-never-hands-one-buffer-to-two-holders
   ;; Each holder stamps its buffer with a value of its own and checks it

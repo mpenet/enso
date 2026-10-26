@@ -59,6 +59,11 @@ public final class TlsSocket implements AutoCloseable {
     // Where session-sized record buffers come from and go back to; null:
     // allocated, and left to the GC.
     private final BufferPool pool;
+    // Record buffer sizes the connection started with, for taking full
+    // buffers back on every wait without engine.getSession(), which takes
+    // the engine lock a writer holds while it encrypts.
+    private final int fullNetSize;
+    private final int fullAppSize;
     // The record buffers an idle connection waits on, allocated by its
     // first release and reused after.
     private ByteBuffer idleNetIn;
@@ -125,6 +130,8 @@ public final class TlsSocket implements AutoCloseable {
         SSLSession session = engine.getSession();
         int netSize = session.getPacketBufferSize();
         int appSize = session.getApplicationBufferSize();
+        this.fullNetSize = netSize;
+        this.fullAppSize = appSize;
         this.peerNetData = take(netSize);
         this.peerAppData = take(appSize);
         this.peerAppData.flip(); // start empty
@@ -296,11 +303,7 @@ public final class TlsSocket implements AutoCloseable {
         } finally {
             readLock.unlock();
         }
-        try {
-            return netIn.available() > 0;
-        } catch (IOException e) {
-            return false;
-        }
+        return socketHasInput();
     }
 
     /**
@@ -334,12 +337,18 @@ public final class TlsSocket implements AutoCloseable {
     /**
      * Reads ciphertext into peerNetData (write-mode, heap-backed) through
      * {@link #netIn} so SO_TIMEOUT applies. Returns the byte count or -1.
+     * A read that fills the small idle buffer leaves more pending: the
+     * buffer becomes a full one, or every read after it would get no more
+     * than the idle size (small records never need a larger one to decrypt).
      */
     private int readNet() throws IOException {
         ByteBuffer b = peerNetData;
         int n = netIn.read(b.array(), b.arrayOffset() + b.position(), b.remaining());
         if (n > 0) {
             b.position(b.position() + n);
+            if (b == idleNetIn && !b.hasRemaining()) {
+                peerNetData = enlarge(b, fullNetSize);
+            }
         }
         return n;
     }
@@ -401,16 +410,29 @@ public final class TlsSocket implements AutoCloseable {
     /**
      * The input half of {@link #releaseIdleBuffers}, for a reader that must
      * not wait for a writer (the HTTP/2 framer): only takes the read lock.
+     * Only for a read that would wait: with bytes already in the socket the
+     * next read takes them at once, and a busy connection would move its
+     * buffers to the pool and back between every two reads.
      */
     public void releaseIdleInputBuffers() {
         readLock.lock();
         try {
             if (peerNetData.position() == 0 && !peerAppData.hasRemaining()
-                && (peerNetData != idleNetIn || peerAppData != idleAppIn)) {
+                && (peerNetData != idleNetIn || peerAppData != idleAppIn)
+                && !socketHasInput()) {
                 swapInputForIdle();
             }
         } finally {
             readLock.unlock();
+        }
+    }
+
+    /** Whether the socket has received bytes not read yet (false when it can't tell). */
+    private boolean socketHasInput() {
+        try {
+            return netIn.available() > 0;
+        } catch (IOException e) {
+            return false;
         }
     }
 
@@ -777,7 +799,7 @@ public final class TlsSocket implements AutoCloseable {
                     // plaintext: take a full one now rather than through a
                     // failed unwrap (not before the read, which would hold it
                     // through a whole idle wait).
-                    peerAppData = enlarge(peerAppData, engine.getSession().getApplicationBufferSize());
+                    peerAppData = enlarge(peerAppData, fullAppSize);
                 }
                 peerNetData.flip();
                 SSLEngineResult r = engine.unwrap(peerNetData, peerAppData);

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- The server-wide pools of TLS record buffers and of HTTP/2 and WebSocket read buffers keep everything connections give back, instead of at most 8 buffers per CPU, and drop what goes unused for 0.5 to 1 s. A capped pool dropped what it could not hold, then allocated 16 KiB buffers whenever more connections turned busy at once than it held, as a server with many connections does on every burst.
+- Over TLS, a connection gives its record buffers back only when its next read would wait. An HTTP/2 connection used to do it each time its framer had read everything decrypted so far, so under load it moved its buffers to the pool and back between reads.
+- Over TLS, a read that fills the small buffer a waiting connection keeps switches to a full-size one, so a burst of small records after a wait is read 16 KiB at a time instead of 2 KiB.
+- A TLS connection takes the `SSLEngine` lock once less each time input arrives after a wait. On HTTP/2 its writer holds that lock while it encrypts.
+
 ## 1.0.0-beta105 — 2026-10-23
 
 ### Performance

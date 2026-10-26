@@ -100,8 +100,8 @@ public final class EnsoServer implements AutoCloseable {
     private final boolean tcpTls;
     // Session-sized TLS record buffers, borrowed by the TCP connections
     // while busy (TlsSocket). Sized by the first connection's session, so a
-    // provider's context is not called early; connections racing to create
-    // it at startup may each make one, which only costs a few reuses.
+    // provider's context is not called early; made once, trimmed on the
+    // timer.
     private volatile BufferPool tlsRecords;
 
     public EnsoServer(RingHandler handler, Config config) {
@@ -362,17 +362,23 @@ public final class EnsoServer implements AutoCloseable {
         configuredContext = ctx;
     }
 
-    /** A fresh server-side engine from the live context (rotation via the provider). */
     private BufferPool tlsRecords(SSLEngine engine) {
         BufferPool p = tlsRecords;
         if (p == null) {
-            SSLSession session = engine.getSession();
-            p = new BufferPool(Math.max(session.getPacketBufferSize(), session.getApplicationBufferSize()));
-            tlsRecords = p;
+            synchronized (this) {
+                p = tlsRecords;
+                if (p == null) {
+                    SSLSession session = engine.getSession();
+                    p = new BufferPool(Math.max(session.getPacketBufferSize(), session.getApplicationBufferSize()));
+                    p.trimEvery(timer, BufferPool.TRIM_PERIOD_MILLIS);
+                    tlsRecords = p;
+                }
+            }
         }
         return p;
     }
 
+    /** A fresh server-side engine from the live context (rotation via the provider). */
     private SSLEngine newEngine() throws IOException {
         SSLContext ctx = config.sslContextProvider != null
             ? config.sslContextProvider.get()

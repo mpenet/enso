@@ -39,6 +39,7 @@ public final class Service {
         this.errorHandler = errorHandler;
         this.config = config;
         this.timer = timer;
+        readBuffers.trimEvery(timer, BufferPool.TRIM_PERIOD_MILLIS);
         this.events = GuardedEvents.of(config.serverEvents);
         this.budget = new MemoryBudget(config.maxBufferedBytes > 0
                                        ? config.maxBufferedBytes : MemoryBudget.defaultLimit());
