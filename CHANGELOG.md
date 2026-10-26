@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-beta107 — 2026-10-26
 
 ### Performance
 
