@@ -27,6 +27,7 @@ import java.net.Socket;
 import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -663,6 +664,10 @@ public final class EnsoServer implements AutoCloseable {
         if (channel != null) {
             channel.close();
         }
+        // On Linux the listening socket is only released once the
+        // acceptor blocked in accept() returns; joining it frees the port
+        // before close() does.
+        joinAcceptor(drainDeadline);
         Thread h3Close = null;
         if (http3Listener != null) {
             AutoCloseable h3 = http3Listener;
@@ -707,6 +712,16 @@ public final class EnsoServer implements AutoCloseable {
             }
         }
         releaseResources();
+    }
+
+    private void joinAcceptor(long deadlineNanos) {
+        Thread a = acceptor;
+        if (a == null) return;
+        try {
+            a.join(Duration.ofNanos(Math.max(0, deadlineNanos - System.nanoTime())));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void awaitExecutor(long deadlineNanos) {

@@ -1244,6 +1244,23 @@
           (let [elapsed-ms (/ (- (System/nanoTime) t0) 1e6)]
             (is (< elapsed-ms 500) (str "stop should be fast on idle conn, took " elapsed-ms "ms"))))))))
 
+(deftest stop-releases-port
+  ;; On Linux the listening socket is only released once the acceptor
+  ;; blocked in accept() returns, so stop must wait for it: a server
+  ;; started on the same port right after stop binds.
+  (let [handler (fn [_] {:status 200 :body "ok"})
+        port (let [srv (enso/run-server handler {:host "127.0.0.1" :port 0})]
+               (try (enso/port srv) (finally (enso/stop srv))))]
+    (dotimes [_ 100]
+      (let [srv (enso/run-server handler {:host "127.0.0.1" :port port})]
+        (with-open [sock (Socket. "127.0.0.1" (int port))]
+          (let [out (.getOutputStream sock)]
+            (.write out (.getBytes "GET / HTTP/1.1\r\nHost: x\r\n\r\n" StandardCharsets/ISO_8859_1))
+            (.flush out)
+            (.read (.getInputStream sock) (byte-array 4096))))
+        (enso/stop srv)))
+    (is true "100 stop/start cycles bound the same port")))
+
 ;; ============================================================================
 ;; HTTP/3 unit tests — RetryToken, H3BodyPipe, Sockaddr, Config
 ;; ============================================================================
