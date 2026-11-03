@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0-beta111 — 2026-11-03
+
+### Fixes
+
+- `stop` returns only once the listening port is released. On Linux the JDK closes a listening socket only when the thread blocked in its `accept()` returns, and `stop` did not wait for that thread, so a server started on the same port right after `stop` could fail with `BindException: Address already in use`, as test suites that start a server per test do.
+
 ## 1.0.0-beta107 — 2026-10-26
 
 ### Performance
