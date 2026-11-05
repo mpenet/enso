@@ -511,8 +511,9 @@ Incoming messages are assembled in a scratch buffer that grows by
 doubling and is kept for the next message up to 256 KiB. Its capacity past
 64 KiB is charged to the memory budget. Before it grows past what is
 charged, a reader finding the budget exhausted takes the progress lane or
-waits, parked untimed, for room or the lane; its message deadline moves
-by the time waited. Reading into capacity already held never waits. The
+waits for room or the lane; its message deadline moves by the time
+waited, up to one more `:read-timeout` per message, and the wait ends
+there with 1008. Reading into capacity already held never waits. The
 lane is given up once the listener returned. Compressed messages are
 charged as they inflate.
 
