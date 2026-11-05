@@ -1529,6 +1529,15 @@
             (let [resp (read-until-quiet! sock 1000)]
               (is (= 2 (count (re-seq #"HTTP/1.1 200" resp))) label))))))))
 
+(deftest fragment-in-request-target-is-400
+  ;; RFC 9112 §3.2: a request-target has no fragment; one with '#' is
+  ;; invalid, whatever its form.
+  (with-server echo-body {}
+    (fn []
+      (doseq [target ["/a#frag" "/a?q=1#frag" "http://x/a#frag"]]
+        (is (= 400 (status-of (send-and-read! (str "GET " target " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))))
+            target)))))
+
 (deftest unknown-header-names-lowercased
   (let [captured (atom nil)]
     (with-server (fn [req] (reset! captured (:headers req)) {:status 200 :body ""}) {}

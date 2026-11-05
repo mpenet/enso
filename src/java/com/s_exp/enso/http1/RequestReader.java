@@ -1000,7 +1000,8 @@ final class RequestReader {
         int q = -1;
         for (int i = from; i < to; i++) {
             int c = buf[i] & 0xFF;
-            if (c <= 0x20 || c == 0x7F) {
+            // A request-target has no fragment (RFC 9112 §3.2).
+            if (c <= 0x20 || c == 0x7F || c == '#') {
                 throw new HttpError(400, "Bad Request");
             }
             if (c == '?' && q < 0) {

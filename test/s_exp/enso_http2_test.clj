@@ -1401,12 +1401,13 @@
                    [15 "asterisk :path for GET" (request-headers "GET" "*")]
                    [17 "non-token :method" (request-headers "G T" "/17")]
                    [19 "signed content-length" (request-headers "POST" "/19" [["content-length" "+0"]])]
-                   [21 "CR in :path" (request-headers "GET" "/2\r1")]]]
+                   [21 "CR in :path" (request-headers "GET" "/2\r1")]
+                   [23 "fragment in :path" (request-headers "GET" "/23#frag")]]]
             (send-request! conn sid pairs true)
             (is (= 0x1 (some-> (read-until conn (frame-on sid frame-rst) nil 1000) rst-code))
                 label))
-          (send-request! conn 23 (request-headers "OPTIONS" "*") true)
-          (is (= "200" (get (response-on conn 23) ":status")) "OPTIONS * is valid")
+          (send-request! conn 25 (request-headers "OPTIONS" "*") true)
+          (is (= "200" (get (response-on conn 25) ":status")) "OPTIONS * is valid")
           (is (= ["*"] @called) "only the valid request reached the handler"))))))
 
 (deftest h2-host-header-kept-without-authority

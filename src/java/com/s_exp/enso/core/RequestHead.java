@@ -264,13 +264,13 @@ public final class RequestHead {
         return true;
     }
 
-    /** origin-form: "/" then no CTL, SP, DEL or char above U+00FF (RFC 9112 §3.2.1). */
+    /** origin-form: "/" then no CTL, SP, DEL, '#' or char above U+00FF (RFC 9112 §3.2.1). */
     public static boolean isOriginForm(String p) {
         int n = p.length();
         if (n == 0 || p.charAt(0) != '/') return false;
         for (int i = 1; i < n; i++) {
             char c = p.charAt(i);
-            if (c <= 0x20 || c == 0x7F || c > 0xFF) return false;
+            if (c <= 0x20 || c == 0x7F || c > 0xFF || c == '#') return false;
         }
         return true;
     }
