@@ -925,6 +925,39 @@
     (is (= 1 @errors))
     (is (= [1006] @closes))))
 
+(deftest ws-writer-error-fails-the-sends
+  ;; An Error while writing (here thrown by the transport) fails the
+  ;; connection like an I/O error: the send's callback learns it, and a
+  ;; later send is refused at once instead of waiting in the queue.
+  (let [first-failure (promise)
+        second-failure (promise)
+        feed (java.io.PipedOutputStream.)
+        in (java.io.PipedInputStream. feed)
+        out (proxy [java.io.OutputStream] []
+              (write ([_] (throw (AssertionError. "writer bug")))
+                     ([_ _ _] (throw (AssertionError. "writer bug"))))
+              (flush []))
+        cb (fn [p] (reify WebSocketSocket$SendCallback
+                     (onSuccess [_] (deliver p :sent))
+                     (onFailure [_ t] (deliver p t))))
+        listener (reify WebSocketListener
+                   (onOpen [_ s]
+                     (.sendTextAsync ^WebSocketSocket s "one" (cb first-failure)))
+                   (onMessage [_ _ _])
+                   (onError [_ _ _])
+                   (onClose [_ _ _ _]))
+        conn (WebSocketConnection. (Socket.) in out listener (ws-config {}) nil test-timer
+                                   (MemoryBudget. Long/MAX_VALUE) nil)
+        done (future (.run conn))]
+    (try
+      (let [t (deref first-failure 2000 :pending)]
+        (is (instance? Throwable t) (pr-str t)))
+      (.sendTextAsync ^WebSocketSocket (.socket conn) "two" (cb second-failure))
+      (is (instance? Throwable (deref second-failure 2000 :pending)))
+      (finally
+        (.close feed)
+        (deref done 2000 nil)))))
+
 (deftest ws-send-large-frame-length-encoding
   ;; Frames of 64 KiB and more use the 8-byte extended length.
   (let [size 70000

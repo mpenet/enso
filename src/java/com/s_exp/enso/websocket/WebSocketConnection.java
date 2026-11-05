@@ -1629,7 +1629,7 @@ public final class WebSocketConnection {
                 writeFrameLocked(o.opcode, o.array, o.offset, o.length, o.direct);
             }
             out.flush();
-        } catch (IOException | RuntimeException e) {
+        } catch (Throwable e) {
             writeFailed(e);
             for (Outgoing o = chain; o != null; o = o.next) {
                 o.failure = e;
@@ -1678,7 +1678,7 @@ public final class WebSocketConnection {
             try {
                 writeFrameLocked(opcode, a, off, len, direct);
                 flushOrHold();
-            } catch (IOException | RuntimeException e) {
+            } catch (Throwable e) {
                 writeFailed(e);
                 throw e;
             }
@@ -1736,7 +1736,7 @@ public final class WebSocketConnection {
                 outputHeld = false;
                 out.flush();
             }
-        } catch (IOException | RuntimeException e) {
+        } catch (Throwable e) {
             writeFailed(e);
         } finally {
             writeLock.unlock();
@@ -1763,7 +1763,7 @@ public final class WebSocketConnection {
                 outputHeld = false;
                 out.flush();
             }
-        } catch (IOException | RuntimeException e) {
+        } catch (Throwable e) {
             writeFailed(e);
         } finally {
             writeLock.unlock();
@@ -1800,7 +1800,7 @@ public final class WebSocketConnection {
                     writeHeader(FIN | opcode, len);
                     out.write(controlOut, 0, len);
                     flushOrHold();
-                } catch (IOException | RuntimeException e) {
+                } catch (Throwable e) {
                     writeFailed(e);
                     throw e;
                 }
