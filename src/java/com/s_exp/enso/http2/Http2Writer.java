@@ -85,6 +85,10 @@ final class Http2Writer {
 
     /** Most bytes packed per socket write: four full TLS records. */
     static final int BATCH_SIZE = 64 * 1024;
+    // Longest 100 (Continue) header block (packContinue): the two
+    // Dynamic Table Size Updates a block can open with, at most 5 octets
+    // each as headerBound counts them, then :status 100 (5 octets).
+    static final int CONTINUE_BLOCK_BOUND = 10 + 5;
     // Encrypted batch: four records of at most 16 KiB + 256 bytes each
     // (RFC 8446 §5.2, TLS 1.2 similar), what TlsSocket.writeRecords needs to
     // send a whole batch in one channel write.
@@ -1490,7 +1494,7 @@ final class Http2Writer {
             return p;
         }
         if (s.continueQueued) {
-            if (buf.length - p < Http2.FRAME_HEADER_SIZE + 8) {
+            if (buf.length - p < Http2.FRAME_HEADER_SIZE + CONTINUE_BLOCK_BOUND) {
                 return full(s, p);
             }
             p = packContinue(s, buf, p);

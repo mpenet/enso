@@ -237,3 +237,19 @@
         "an entry over 3/4 of the table")
     (is (= 0x40 (bit-and 0xC0 (first-byte "x-medium" (apply str (repeat 1000 "v")))))
         "smaller ones are still indexed")))
+
+(deftest continue-block-fits-the-writer-reserve
+  ;; The writer keeps Http2Writer/CONTINUE_BLOCK_BOUND octets free for a
+  ;; 100 (Continue) block. It must hold :status 100 behind the size updates
+  ;; a block can open with: the smallest table size since the last block,
+  ;; then the current one, each at most 4096 (the peer's value is capped).
+  (let [bound (-> (Class/forName "com.s_exp.enso.http2.Http2Writer")
+                  (.getDeclaredField "CONTINUE_BLOCK_BOUND")
+                  (doto (.setAccessible true))
+                  (.getInt nil))]
+    (doseq [sizes [[] [4096] [0 4096] [4000 4096] [159 4096] [4095 4096]]]
+      (let [enc (Hpack$Encoder. 4096)]
+        (doseq [s sizes] (.setMaxTableSize enc (int s)))
+        (.beginBlock enc)
+        (.status enc 100)
+        (is (<= (.length enc) bound) (str sizes ": " (.length enc) " octets"))))))
