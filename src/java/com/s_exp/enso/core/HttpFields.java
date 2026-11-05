@@ -66,8 +66,33 @@ public final class HttpFields {
     public static void checkResponseName(String s) {
         if (!isToken(s)) {
             throw new IllegalArgumentException(
-                "response header name is empty or contains a non-token character");
+                "response header name is empty or not a token: \"" + printable(s) + "\"");
         }
+    }
+
+    // Longest part of a rejected name quoted in its error.
+    private static final int QUOTED_NAME_MAX = 64;
+
+    /**
+     * {@code s} safe to log: chars outside printable ASCII escaped as
+     * \\uXXXX (a CR or LF can't start a forged log line), cut at
+     * {@link #QUOTED_NAME_MAX}.
+     */
+    private static String printable(String s) {
+        int n = Math.min(s.length(), QUOTED_NAME_MAX);
+        StringBuilder b = new StringBuilder(n + 8);
+        for (int i = 0; i < n; i++) {
+            char c = s.charAt(i);
+            if (c >= 0x20 && c < 0x7F && c != '\\' && c != '"') {
+                b.append(c);
+            } else {
+                b.append(String.format("\\u%04x", (int) c));
+            }
+        }
+        if (s.length() > n) {
+            b.append("...");
+        }
+        return b.toString();
     }
 
     /**
@@ -213,13 +238,18 @@ public final class HttpFields {
         return c == ' ' || c == '\t';
     }
 
-    /** Rejects a response field value outside RFC 9110 §5.5: VCHAR / obs-text / SP / HTAB. */
-    public static void checkResponseValue(String s) {
+    /**
+     * Rejects a response field value outside RFC 9110 §5.5: VCHAR /
+     * obs-text / SP / HTAB. The error names the field ({@code name}, a
+     * valid token) and the character, never the value, which may be a
+     * secret.
+     */
+    public static void checkResponseValue(String name, String s) {
         for (int i = 0, n = s.length(); i < n; i++) {
             char c = s.charAt(i);
             if (c > 0xFF || (c < 0x20 && c != '\t') || c == 0x7F) {
-                throw new IllegalArgumentException(
-                    "response header value contains illegal character");
+                throw new IllegalArgumentException(String.format(
+                    "response header %s: value has illegal character U+%04X at index %d", name, (int) c, i));
             }
         }
     }

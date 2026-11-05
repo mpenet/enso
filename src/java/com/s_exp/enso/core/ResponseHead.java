@@ -407,7 +407,7 @@ public final class ResponseHead {
         }
         // Snapshot once: the exact String validated is the one sent.
         String v = value instanceof String s ? s : String.valueOf(value);
-        HttpFields.checkResponseValue(v);
+        HttpFields.checkResponseValue(name, v);
         addField(name, v);
     }
 

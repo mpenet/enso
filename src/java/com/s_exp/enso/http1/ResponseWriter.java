@@ -838,7 +838,7 @@ final class ResponseWriter {
     private void hHeader(String name, Object value) {
         HttpFields.checkResponseName(name);
         if (!(value instanceof Long) && !(value instanceof Integer)) {
-            HttpFields.checkResponseValue((String) value);
+            HttpFields.checkResponseValue(name, (String) value);
         }
         appendField(name, value);
     }

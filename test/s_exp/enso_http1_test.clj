@@ -1558,6 +1558,22 @@
       (is (every? #(= level (.getLevel ^java.util.logging.LogRecord %)) refusals)
           (str label ": " (pr-str (map #(str (.getLevel ^java.util.logging.LogRecord %)) refusals)))))))
 
+(deftest invalid-response-header-log-names-the-field
+  ;; The log says which field was rejected and why, without the value (it
+  ;; may be a secret) and without raw control characters (log injection).
+  (doseq [[label headers expect] [["value" {"x-evil" "a\r\nInjected: 1"} #"x-evil.*U\+000D"]
+                                  ["name" {"bad\nname" "v"} #"bad\\u000aname"]]]
+    (Thread/sleep 1100)
+    (let [records (support/capture-logs
+                   "com.s_exp.enso"
+                   #(with-server (fn [_] {:status 200 :headers headers :body "ok"}) {}
+                      (fn [] (send-and-read! close-req))))
+          msgs (keep (fn [^java.util.logging.LogRecord r]
+                       (some-> (.getThrown r) .getMessage))
+                     records)]
+      (is (some #(re-find expect %) msgs) (str label ": " (pr-str msgs)))
+      (is (not-any? #(re-find #"[\r\n]|Injected" %) msgs) label))))
+
 (deftest unknown-header-names-lowercased
   (let [captured (atom nil)]
     (with-server (fn [req] (reset! captured (:headers req)) {:status 200 :body ""}) {}
