@@ -109,7 +109,8 @@ public final class WebSocketConnection {
     private static final int TLS_WAIT_READ_BUFFER_BYTES = 512;
     // A frame's claimed length is only trusted as bytes arrive: payloads
     // are read in steps of at most this many bytes, and the message buffer
-    // grows per step rather than up-front from the header.
+    // grows for the bytes received so far (see arrived), never up-front
+    // from the header.
     private static final int READ_STEP = 64 * 1024;
     // Assembly buffers up to this many bytes are kept for the next
     // message; larger ones are released after each message.
@@ -1337,6 +1338,25 @@ public final class WebSocketConnection {
         return n;
     }
 
+    /**
+     * Bytes received and not read yet, as far as can be told without
+     * waiting: what the read buffer holds plus what the socket (or TLS
+     * layer) has. Sizes message buffers for what the peer actually sent.
+     */
+    private int arrived() {
+        long more;
+        if (tls != null) {
+            more = tls.receivedUnread();
+        } else {
+            try {
+                more = in.available();
+            } catch (IOException e) {
+                more = 0;
+            }
+        }
+        return (int) Math.min(Integer.MAX_VALUE, (rlim - rpos) + more);
+    }
+
     private void readFully(byte[] dst, int off, int len) throws IOException {
         while (len > 0) {
             int n = readSome(dst, off, len);
@@ -2077,11 +2097,13 @@ public final class WebSocketConnection {
             this.windowMark = 0;
             this.utf8State = Utf8.ACCEPT;
             if (opcode == OP_BINARY && !compressed && fin
-                && firstFrameLength <= READ_STEP && firstFrameLength <= limit) {
-                // A single-frame binary message of trusted size gets its
-                // own exact array so finish() can hand it over without
-                // copying. At most READ_STEP bytes, handed to the listener:
-                // part of the connection's uncharged allowance.
+                && firstFrameLength <= READ_STEP && firstFrameLength <= limit
+                && (firstFrameLength <= MessageReader.INITIAL || firstFrameLength <= arrived())) {
+                // A single-frame binary message of trusted size (small, or
+                // already received) gets its own exact array so finish()
+                // can hand it over without copying. At most READ_STEP
+                // bytes, handed to the listener: part of the connection's
+                // uncharged allowance.
                 buf = firstFrameLength == 0 ? EMPTY : new byte[(int) firstFrameLength];
             } else {
                 buf = scratch;
@@ -2101,9 +2123,11 @@ public final class WebSocketConnection {
             long done = 0;
             while (remaining > 0) {
                 int step = (int) Math.min(remaining, READ_STEP);
-                ensureCapacity(len + step);
+                if (buf.length - len < step) {
+                    ensureCapacity(len + Math.min(step, Math.max(INITIAL, arrived())));
+                }
                 int from = len;
-                int n = readSome(buf, from, step);
+                int n = readSome(buf, from, Math.min(step, buf.length - len));
                 unmask(buf, from, n, mask, done);
                 len += n;
                 done += n;

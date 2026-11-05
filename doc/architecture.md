@@ -508,7 +508,8 @@ TLS sends close_notify first, bounded by the close timer. Every other end
 aborts the socket.
 
 Incoming messages are assembled in a scratch buffer that grows by
-doubling and is kept for the next message up to 256 KiB. Its capacity past
+doubling, for the bytes received so far rather than a frame's claimed
+length, and is kept for the next message up to 256 KiB. Its capacity past
 64 KiB is charged to the memory budget. Before it grows past what is
 charged, a reader finding the budget exhausted takes the progress lane or
 waits for room or the lane; its message deadline moves by the time

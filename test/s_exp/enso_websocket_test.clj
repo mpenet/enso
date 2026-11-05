@@ -1524,6 +1524,40 @@
                    (int n))
                -1))))))))
 
+(defn- stalling-input
+  "An InputStream over `bs` that stops for good after `cut` bytes, first
+  delivering to `allocated` what the reading thread allocated from its
+  first read until then."
+  ^InputStream [^bytes bs cut allocated]
+  (let [pos (atom 0)
+        start (atom nil)]
+    (proxy [InputStream] []
+      (read
+        ([] (throw (UnsupportedOperationException.)))
+        ([^bytes b off len]
+         (when (nil? @start) (reset! start (thread-allocated-bytes)))
+         (let [p (long @pos)]
+           (when (= p cut)
+             (deliver allocated (- (thread-allocated-bytes) (long @start)))
+             (throw (java.io.EOFException. "stalled")))
+           (let [n (min (long len) (- (long cut) p))]
+             (System/arraycopy bs p b off n)
+             (reset! pos (+ p n))
+             (int n))))))))
+
+(deftest ws-message-buffer-grows-with-the-bytes-received
+  ;; A frame's claimed length is not trusted: a header announcing a large
+  ;; payload followed by a few bytes doesn't make the server allocate for
+  ;; the claim, in the shared message buffer or in the exact-size array a
+  ;; single-frame binary message gets.
+  (doseq [[label fin size] [["fragment" false 100000] ["single frame" true 60000]]]
+    (let [input (frames [0x2 fin (byte-array size)])
+          header (- (alength input) size)
+          allocated (promise)]
+      (future (run-ws (stalling-input input (+ header 14) allocated) {}))
+      (let [n (deref allocated 2000 :stalled)]
+        (is (and (number? n) (< n 32768)) (str label ": " n " bytes"))))))
+
 (deftest ws-readers-waiting-on-each-other-for-the-budget-all-complete
   ;; Two connections each hold part of a large message when the budget
   ;; runs out, and each would wait for room only the other's delivery

@@ -427,6 +427,26 @@ public final class TlsSocket implements AutoCloseable {
         }
     }
 
+    /**
+     * Bytes received and not read yet: plaintext already decrypted, plus
+     * ciphertext buffered here and in the socket (each record's overhead
+     * included, so a little more than the plaintext it holds).
+     */
+    public long receivedUnread() {
+        readLock.lock();
+        try {
+            long n = peerAppData.remaining() + peerNetData.position();
+            try {
+                n += netIn.available();
+            } catch (IOException e) {
+                // Only what is buffered here then.
+            }
+            return n;
+        } finally {
+            readLock.unlock();
+        }
+    }
+
     /** Whether the socket has received bytes not read yet (false when it can't tell). */
     private boolean socketHasInput() {
         try {
