@@ -8,7 +8,7 @@
   (:require [clojure.test :refer [deftest testing is]]
             [s-exp.enso :as enso]
             [s-exp.enso-test-support :as support])
-  (:import (com.s_exp.enso.api RingHandler)
+  (:import (com.s_exp.enso.api ChunkedWriter RingHandler)
            (com.s_exp.enso.http1 HttpConnection)
            (java.io ByteArrayInputStream OutputStream SequenceInputStream)
            (java.lang.management ManagementFactory)
@@ -1275,6 +1275,36 @@
               sep (clojure.string/index-of resp "\r\n\r\n")]
           (is (clojure.string/includes? resp "Transfer-Encoding: chunked\r\n"))
           (is (= body (dechunk (subs resp (+ sep 4))))))))))
+
+(defn- response-body [^String resp]
+  (let [sep (clojure.string/index-of resp "\r\n\r\n")
+        body (subs resp (+ sep 4))]
+    (if (clojure.string/includes? (subs resp 0 sep) "Transfer-Encoding: chunked")
+      (dechunk body)
+      body)))
+
+(deftest lazy-response-body-reads-the-whole-request-body
+  ;; A response body that reads the request body as it is written (the
+  ;; request's own stream, a fn body) sees every byte, however the request
+  ;; arrived: nothing is drained before it runs.
+  (doseq [[label handler] [["stream" (fn [req] {:status 200 :body (:body req)})]
+                           ["fn" (fn [req] {:status 200
+                                            :body (fn [^ChunkedWriter w]
+                                                    (.write w ^String (slurp (:body req))))})]]
+          [framing head parts] [["fixed" "Content-Length: 11\r\n" ["hello world"]]
+                                ["fixed split" "Content-Length: 11\r\n" ["hello" " world"]]
+                                ["chunked" "Transfer-Encoding: chunked\r\n" ["5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"]]
+                                ["chunked split" "Transfer-Encoding: chunked\r\n" ["5\r\nhello\r\n" "6\r\n world\r\n0\r\n\r\n"]]]]
+    (with-server handler {}
+      (fn []
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (write! sock (str "POST / HTTP/1.1\r\nHost: x\r\n" head "Connection: close\r\n\r\n" (first parts)))
+          (doseq [p (rest parts)]
+            (Thread/sleep 200)
+            (write! sock p))
+          (let [resp (read-until-quiet! sock 2000)]
+            (is (= 200 (status-of resp)) [label framing])
+            (is (= "hello world" (response-body resp)) [label framing])))))))
 
 (deftest unknown-header-names-lowercased
   (let [captured (atom nil)]

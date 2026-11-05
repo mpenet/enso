@@ -387,15 +387,15 @@ public final class HttpConnection implements Runnable, Drainable {
             return false;
         }
 
-        // Decided before the head is written, so a connection that won't
-        // survive the unread body says Connection: close (RFC 9112 §9.6).
-        boolean bodyAllowsReuse = settleBody();
         if (!writer.prepare(response, request.method.equals("HEAD"))) {
             Exchange.closeBody(response.body);
             writeError(request, 500, HttpStatus.reason(500));
             return false;
         }
         int status = writer.head.status();
+        // Decided before the head is written, so a connection that won't
+        // survive the unread body says Connection: close (RFC 9112 §9.6).
+        boolean bodyAllowsReuse = settleBody(writer.head.bodyAllowed() && writer.head.streamed());
         boolean keepAlive;
         try {
             keepAlive = writeResponse(request, bodyAllowsReuse);
@@ -443,15 +443,21 @@ public final class HttpConnection implements Runnable, Drainable {
      * what's left is already buffered, or it is a known length small
      * enough to drain after the response. Not when the client still waits
      * for a 100 Continue (it may never send the body) or the rest of a
-     * chunked body is still to come.
+     * chunked body is still to come. {@code responseReadsBody}: the
+     * response body is produced as it is written and may read the request
+     * body then, so buffered bytes are left for it rather than discarded.
      */
-    private boolean settleBody() throws IOException {
+    private boolean settleBody(boolean responseReadsBody) throws IOException {
         RequestReader.RequestBody body = reader.body();
         if (body == null || body.isFinished()) {
             return true;
         }
         if (body.continuePending) {
             return false;
+        }
+        if (responseReadsBody) {
+            long remaining = body.remaining();
+            return remaining >= 0 && remaining <= MAX_DRAIN_BYTES;
         }
         try {
             if (body.drainBuffered()) {

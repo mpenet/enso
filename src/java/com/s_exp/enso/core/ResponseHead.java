@@ -466,6 +466,9 @@ public final class ResponseHead {
 
     public int bodyKind() { return bodyKind; }
 
+    /** The body is produced as it is written (a stream or streaming body). */
+    public boolean streamed() { return bodyKind == BODY_STREAM || bodyKind == BODY_STREAMING; }
+
     public byte[] bytes() { return bytes; }
 
     /** {@link #BODY_ASCII} text, one byte per char. */

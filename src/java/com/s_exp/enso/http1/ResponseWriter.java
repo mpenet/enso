@@ -367,7 +367,7 @@ final class ResponseWriter {
         try {
             int status = h.status();
             int kind = h.bodyKind();
-            boolean streamed = kind == ResponseHead.BODY_STREAM || kind == ResponseHead.BODY_STREAMING;
+            boolean streamed = h.streamed();
             long contentLength = h.contentLength();
             boolean chunked = false;
             // The body ends with the connection: nothing else marks its end.
