@@ -449,15 +449,15 @@ public final class EnsoServer implements AutoCloseable {
                 if (!running) return;
                 applySocketOptions(channel);
                 Socket s;
-                long handshakeDeadline = 0;
+                // From accept to the first request's first byte (the HTTP/2
+                // preface): the TLS handshake and the wait for a request.
+                long handshakeDeadline = config.handshakeTimeoutMillis > 0
+                    ? System.nanoTime() + config.handshakeTimeoutMillis * 1_000_000L : 0;
                 if (tcpTls) {
                     SSLEngine engine = newEngine();
                     tls = new TlsSocket(channel, engine, tlsRecords(engine));
                     s = tls.asSocket();
                     socket = s;
-                    if (config.handshakeTimeoutMillis > 0) {
-                        handshakeDeadline = System.nanoTime() + config.handshakeTimeoutMillis * 1_000_000L;
-                    }
                     // A silent peer is still bounded with the handshake
                     // timeout disabled.
                     s.setSoTimeout(config.idleTimeoutMillis);
@@ -468,11 +468,8 @@ public final class EnsoServer implements AutoCloseable {
                     socket = s;
                     protocol = HTTP_1_1;
                     if (config.http2c) {
-                        if (config.handshakeTimeoutMillis > 0) {
-                            handshakeDeadline = System.nanoTime() + config.handshakeTimeoutMillis * 1_000_000L;
-                        }
                         prefix = new byte[Http2Connection.PREFACE_LENGTH];
-                        prefixLen = readPrefix(s, prefix);
+                        prefixLen = readPrefix(s, prefix, handshakeDeadline);
                         if (prefixLen < 0) return;
                         if (Http2Connection.isPreface(prefix, prefixLen)) {
                             protocol = H2C;
@@ -496,7 +493,8 @@ public final class EnsoServer implements AutoCloseable {
                     driver = c;
                     c.run();
                 } else {
-                    HttpConnection c = new HttpConnection(s, handler, EnsoServer.this, prefix, prefixLen);
+                    HttpConnection c = new HttpConnection(s, handler, EnsoServer.this, prefix, prefixLen,
+                                                          handshakeDeadline);
                     driver = c;
                     c.run();
                 }
@@ -581,12 +579,12 @@ public final class EnsoServer implements AutoCloseable {
          * the rest is bounded by :header-timeout as an HTTP/1.1 head is.
          * The socket's timeout is left at 0, as the drivers expect it.
          */
-        private int readPrefix(Socket s, byte[] buf) throws IOException {
+        private int readPrefix(Socket s, byte[] buf, long handshakeDeadline) throws IOException {
             java.io.InputStream in = s.getInputStream();
             int n = 0;
             long deadline = 0;
             try {
-                s.setSoTimeout(config.idleTimeoutMillis);
+                s.setSoTimeout(firstByteTimeout(handshakeDeadline));
                 while (n < buf.length) {
                     int r;
                     try {
@@ -611,6 +609,20 @@ public final class EnsoServer implements AutoCloseable {
             } finally {
                 s.setSoTimeout(0);
             }
+        }
+
+        /**
+         * SO_TIMEOUT for the wait for a connection's first byte: the idle
+         * timeout, or what is left of the handshake deadline if sooner. 0
+         * when neither applies.
+         */
+        private int firstByteTimeout(long handshakeDeadline) {
+            int idle = config.idleTimeoutMillis;
+            if (handshakeDeadline == 0) {
+                return idle;
+            }
+            long left = Math.max(1, (handshakeDeadline - System.nanoTime()) / 1_000_000L);
+            return (int) (idle > 0 ? Math.min(idle, left) : Math.min(left, Integer.MAX_VALUE));
         }
 
         @Override

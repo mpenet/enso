@@ -1496,6 +1496,39 @@
           (is (= 500 (status-of (send-and-read! (str method " / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))))
               (str label " " method)))))))
 
+(defn- ms-until-closed
+  "Milliseconds until the server closes `sock`, or nil if it is still open
+  after `limit-ms`."
+  [^Socket sock limit-ms]
+  (let [t0 (System/nanoTime)
+        in (.getInputStream sock)]
+    (.setSoTimeout sock (int limit-ms))
+    (try
+      (loop []
+        (when (>= (.read in) 0)
+          (recur)))
+      (/ (- (System/nanoTime) t0) 1e6)
+      (catch java.net.SocketTimeoutException _ nil)
+      (catch java.net.SocketException _ (/ (- (System/nanoTime) t0) 1e6)))))
+
+(deftest first-request-bounded-by-handshake-timeout
+  ;; With :idle-timeout 0 a connection waits without limit between
+  ;; requests, but not for its first: :handshake-timeout runs from accept
+  ;; to the first request's first byte (or the HTTP/2 preface).
+  (doseq [[label opts] [["http/1.1" {}] ["h2c listener" {:http2c true}]]]
+    (with-server echo-body (merge {:idle-timeout 0 :handshake-timeout 300} opts)
+      (fn []
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (let [ms (ms-until-closed sock 3000)]
+            (is (and ms (< ms 2000)) (str label ": " ms))))
+        (testing "a connection that served a request waits on"
+          (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+            (write! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            (Thread/sleep 800)
+            (write! sock "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            (let [resp (read-until-quiet! sock 1000)]
+              (is (= 2 (count (re-seq #"HTTP/1.1 200" resp))) label))))))))
+
 (deftest unknown-header-names-lowercased
   (let [captured (atom nil)]
     (with-server (fn [req] (reset! captured (:headers req)) {:status 200 :body ""}) {}

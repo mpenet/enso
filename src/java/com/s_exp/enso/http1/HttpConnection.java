@@ -141,19 +141,24 @@ public final class HttpConnection implements Runnable, Drainable {
     private Thread connectionThread;
     private final byte[] prefix;
     private final int prefixLen;
+    private final long firstRequestDeadline;
 
     public HttpConnection(Socket socket, RingHandler handler, EnsoServer server) {
-        this(socket, handler, server, null, 0);
+        this(socket, handler, server, null, 0, 0);
     }
 
     /**
      * {@code prefix[0, prefixLen)}: the first bytes of the connection,
      * already read by the listener (to rule out the HTTP/2 preface); they
-     * are parsed before anything read from the socket.
+     * are parsed before anything read from the socket. {@code
+     * firstRequestDeadline} (System.nanoTime, 0 for none): the first
+     * request must have begun by then (:handshake-timeout).
      */
-    public HttpConnection(Socket socket, RingHandler handler, EnsoServer server, byte[] prefix, int prefixLen) {
+    public HttpConnection(Socket socket, RingHandler handler, EnsoServer server, byte[] prefix, int prefixLen,
+                          long firstRequestDeadline) {
         this.prefix = prefix;
         this.prefixLen = prefixLen;
+        this.firstRequestDeadline = firstRequestDeadline;
         this.socket = socket;
         this.handler = handler;
         this.server = server;
@@ -161,7 +166,7 @@ public final class HttpConnection implements Runnable, Drainable {
         this.config = service.config;
         this.timer = service.timer;
         this.watchdog = config.writeTimeoutMillis > 0 ? new Watchdog() : null;
-        this.idleTimeout = config.idleTimeoutMillis > 0 ? new IdleTimeout() : null;
+        this.idleTimeout = config.idleTimeoutMillis > 0 || firstRequestDeadline != 0 ? new IdleTimeout() : null;
         this.writer = new ResponseWriter(socket, service, watchdog, server);
         this.reader = new RequestReader(this, writer, socket, config);
     }
@@ -268,7 +273,20 @@ public final class HttpConnection implements Runnable, Drainable {
      */
     private void enterIdle() {
         if (idleTimeout != null) {
-            idleTimeout.begin(config.idleTimeoutMillis);
+            long limit = config.idleTimeoutMillis;
+            if (servedRequests == 0 && firstRequestDeadline != 0) {
+                // The first request is held to the handshake deadline too.
+                long left = Math.max(1, (firstRequestDeadline - System.nanoTime()) / 1_000_000L);
+                limit = limit > 0 ? Math.min(limit, left) : left;
+            }
+            if (limit > 0) {
+                idleTimeout.limitMillis = limit;
+                idleTimeout.begin(limit);
+            } else {
+                // No bound on this wait: the first one's expiry, still
+                // armed, must not judge it.
+                idleTimeout.end();
+            }
         }
         STATE.setVolatile(this, IDLE);
     }
@@ -745,14 +763,17 @@ public final class HttpConnection implements Runnable, Drainable {
      * period finds the connection busy, or idle for less than the timeout.
      */
     private final class IdleTimeout extends IdleWait {
+        // The bound of the wait in progress, set before it begins.
+        long limitMillis;
+
         IdleTimeout() {
             super(timer);
         }
 
         @Override
         protected long expired(long waitedMillis) {
-            if (waitedMillis < config.idleTimeoutMillis) {
-                return config.idleTimeoutMillis - waitedMillis;
+            if (waitedMillis < limitMillis) {
+                return limitMillis - waitedMillis;
             }
             if (STATE.compareAndSet(HttpConnection.this, IDLE, CLOSING)) {
                 Thread.ofVirtual().name("enso-h1-idle-close").start(HttpConnection.this::closeWatched);

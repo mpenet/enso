@@ -184,6 +184,22 @@
       (let [ms (ms-until-server-closes port 4000 (fn [_]))]
         (is (some? ms) "server never closed a silent TLS connection")))))
 
+(deftest tls-first-request-bounded-by-handshake-timeout
+  ;; :idle-timeout 0 doesn't leave a connection that handshook but sent no
+  ;; request unbounded: :handshake-timeout runs until its first request.
+  (with-tls-server {:idle-timeout 0 :handshake-timeout 500 :http2 false}
+    (fn [port]
+      (let [factory (.getSocketFactory (capturing-trust-context (atom [])))]
+        (with-open [^javax.net.ssl.SSLSocket sock (.createSocket factory "127.0.0.1" (int port))]
+          (.startHandshake sock)
+          (.setSoTimeout sock 3000)
+          (let [t0 (System/nanoTime)
+                closed (try (loop [] (when (>= (.read (.getInputStream sock)) 0) (recur))) true
+                            (catch java.net.SocketTimeoutException _ false)
+                            (catch java.io.IOException _ true))]
+            (is closed "still open")
+            (is (< (/ (- (System/nanoTime) t0) 1e6) 2000))))))))
+
 (deftest tls-drip-fed-handshake-bounded-by-handshake-timeout
   ;; One byte every 100ms keeps every read under the idle timeout; only a
   ;; wall-clock handshake deadline stops it.

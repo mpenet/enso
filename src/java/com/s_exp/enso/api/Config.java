@@ -517,9 +517,10 @@ public final class Config {
             requireAtLeast(":min-data-rate-grace", minDataRateGraceMillis, 0);
             requireAtLeast(":write-timeout", writeTimeoutMillis, 0);
             requireAtLeast(":idle-timeout", idleTimeoutMillis, 0);
-            // Both 0 leaves a half-open connection (one that handshook but
-            // sent no request) with no bound at all: no handshake deadline
-            // and no idle deadline. At least one must stay on.
+            // :handshake-timeout bounds a connection until its first
+            // request begins, :idle-timeout every wait for a request: both
+            // 0 leaves a connection that never sends one with no bound at
+            // all. At least one must stay on.
             if (handshakeTimeoutMillis == 0 && idleTimeoutMillis == 0) {
                 throw invalid(":handshake-timeout", handshakeTimeoutMillis,
                               ":handshake-timeout and :idle-timeout must not both be 0 "
