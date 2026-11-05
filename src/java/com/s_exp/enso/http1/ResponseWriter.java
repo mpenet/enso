@@ -314,9 +314,10 @@ final class ResponseWriter {
 
     /**
      * The 503 answering a handler that outlived :handler-timeout, built
-     * whole so another thread can write it in one piece.
+     * whole so another thread can write it in one piece; without its body
+     * for a HEAD request.
      */
-    static byte[] handlerTimeoutResponse() throws IOException {
+    static byte[] handlerTimeoutResponse(boolean headRequest) throws IOException {
         byte[] body = HttpStatus.reason(503).getBytes(StandardCharsets.ISO_8859_1);
         java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream(256);
         bytes.write(STATUS_LINES[503]);
@@ -327,7 +328,9 @@ final class ResponseWriter {
         bytes.write(CONNECTION_CLOSE);
         bytes.write(HttpDates.dateLine());
         bytes.write(CRLF);
-        bytes.write(body);
+        if (!headRequest) {
+            bytes.write(body);
+        }
         return bytes.toByteArray();
     }
 
@@ -710,13 +713,14 @@ final class ResponseWriter {
     /**
      * A whole error response with Connection: close, written now after
      * what is pending. {@code extraHeaders}: preformatted field lines
-     * (each ending CRLF), or null.
+     * (each ending CRLF), or null. {@code headRequest}: the body is left
+     * out (RFC 9110 §9.3.2), its Content-Length kept.
      */
-    void writeError(int status, String message, byte[] extraHeaders) {
+    void writeError(int status, String message, byte[] extraHeaders, boolean headRequest) {
         try {
             flushHbuf();
             byte[] body = message.getBytes(StandardCharsets.UTF_8);
-            bodyBytesWritten = body.length;
+            bodyBytesWritten = headRequest ? 0 : body.length;
             hAppend(statusLine(status));
             if (extraHeaders != null) {
                 hAppend(extraHeaders);
@@ -728,7 +732,9 @@ final class ResponseWriter {
             hAppend(CONNECTION_CLOSE);
             hAppend(HttpDates.dateLine());
             hCrlf();
-            hAppend(body);
+            if (!headRequest) {
+                hAppend(body);
+            }
             flushHbuf();
         } catch (IOException ignored) {
             // best effort

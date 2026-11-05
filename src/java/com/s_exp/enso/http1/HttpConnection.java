@@ -371,7 +371,7 @@ public final class HttpConnection implements Runnable, Drainable {
                 awaitTimeoutResponse();
                 linger = true;
                 c.status = 503;
-                c.responseBytes = HttpStatus.reason(503).length();
+                c.responseBytes = reader.headRequest() ? 0 : HttpStatus.reason(503).length();
                 c.complete();
                 return false;
             }
@@ -567,7 +567,7 @@ public final class HttpConnection implements Runnable, Drainable {
     /** {@code extraHeaders}: preformatted field lines (each ending CRLF), or null. */
     private void writeError(int status, String message, byte[] extraHeaders) {
         linger = true;
-        writer.writeError(status, message, extraHeaders);
+        writer.writeError(status, message, extraHeaders, reader.headRequest());
     }
 
     /** The response with {@code status} is written: reported once. */
@@ -664,7 +664,7 @@ public final class HttpConnection implements Runnable, Drainable {
      */
     private void respondHandlerTimeout() {
         try {
-            byte[] bytes = ResponseWriter.handlerTimeoutResponse();
+            byte[] bytes = ResponseWriter.handlerTimeoutResponse(reader.headRequest());
             // Straight to the transport: hbuf belongs to the connection
             // thread.
             handlerWriteLock.lock();

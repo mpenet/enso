@@ -1467,6 +1467,23 @@
           (let [ms (ms-until-received sock "first" 3000)]
             (is (and ms (< ms 1000)) (str label ": " ms " ms"))))))))
 
+(deftest head-error-responses-have-no-body
+  ;; RFC 9110 §9.3.2: a response to HEAD carries no content, the error
+  ;; responses the server writes itself included.
+  (doseq [[label handler opts req]
+          [["handler threw" (fn [_] (throw (ex-info "boom" {}))) {}
+            "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n"]
+           ["bad request" (fn [_] {:status 200 :body "ok"}) {}
+            "HEAD / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n"]
+           ["handler timeout" (fn [_] (Thread/sleep 2000) {:status 200 :body "ok"}) {:handler-timeout 200}
+            "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n"]]]
+    (with-server handler opts
+      (fn []
+        (let [resp (send-and-read! req 1500)
+              sep (clojure.string/index-of resp "\r\n\r\n")]
+          (is (>= (status-of resp) 400) label)
+          (is (= (+ sep 4) (count resp)) (str label ": " (pr-str resp))))))))
+
 (deftest unknown-header-names-lowercased
   (let [captured (atom nil)]
     (with-server (fn [req] (reset! captured (:headers req)) {:status 200 :body ""}) {}

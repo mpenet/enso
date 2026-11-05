@@ -150,6 +150,9 @@ final class RequestReader {
     private long bodyWaitedNanos;
     // Set while a body may only consume what is already buffered.
     private boolean bufferedOnly;
+    // The request line being answered said HEAD: error responses then
+    // carry no body. False until a request line is parsed.
+    private boolean headRequest;
     // Wall-clock end of the post-response drain of an unread body, 0 when
     // none is running.
     private long drainDeadlineNanos;
@@ -221,6 +224,7 @@ final class RequestReader {
      */
     void startIdle() {
         phase = PHASE_IDLE;
+        headRequest = false;
         if (!keepGrownBuffer && buf.length > initialBufferBytes && limit == 0) {
             buf = new byte[initialBufferBytes];
             releasedGrownBuffer = true;
@@ -502,8 +506,14 @@ final class RequestReader {
 
     // ---- Request parsing ----------------------------------------------------
 
+    /** Whether the request line being answered said HEAD. */
+    boolean headRequest() {
+        return headRequest;
+    }
+
     Request parseRequest() throws IOException {
         headBytes = 0;
+        headRequest = false;
         int lineEnd = scanRequestLine();
         while (lineEnd == pos) {
             // Empty lines before the request line (RFC 9112 §2.2) are
@@ -525,6 +535,7 @@ final class RequestReader {
             throw new HttpError(400, "Bad Request");
         }
         String method = method(pos, sp1);
+        headRequest = method.equals("HEAD");
         int q = scanTarget(sp1 + 1, sp2);
         // HTTP-version = "HTTP/" DIGIT "." DIGIT. Anything else (including a
         // target with a stray SP pushing junk here) is a syntax error → 400;
