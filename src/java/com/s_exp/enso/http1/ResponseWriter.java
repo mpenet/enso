@@ -16,6 +16,7 @@ import java.util.Arrays;
 import com.s_exp.enso.EnsoServer;
 import com.s_exp.enso.api.ChunkedWriter;
 import com.s_exp.enso.api.Response;
+import com.s_exp.enso.core.Causes;
 import com.s_exp.enso.core.ChunkedWriters;
 import com.s_exp.enso.core.Exchange;
 import com.s_exp.enso.core.HttpDates;
@@ -502,20 +503,23 @@ final class ResponseWriter {
                         default -> {
                         }
                     }
-                } catch (RuntimeException e) {
-                    // Written after the handler's response was claimed: nothing
-                    // interrupts it, so only the client can make it expected.
-                    (Exchange.clientCaused(e) ? HttpConnection.EXPECTED_BODY_FAILURES : HttpConnection.BODY_FAILURES)
-                        .log("response body failed, closing connection", e);
-                    if (closeDelimited) {
-                        abort();
-                    }
-                    return false;
                 } catch (IOException e) {
                     if (closeDelimited) {
                         abort();
                     }
                     throw e;
+                } catch (Throwable t) {
+                    // Anything but I/O, checked exceptions and Errors too, is
+                    // the body's fault unless the client caused it or it comes
+                    // from the interrupt of a stopping server.
+                    boolean expected = Exchange.clientCaused(t)
+                        || Causes.find(t, InterruptedException.class) != null;
+                    (expected ? HttpConnection.EXPECTED_BODY_FAILURES : HttpConnection.BODY_FAILURES)
+                        .log("response body failed, closing connection", t);
+                    if (closeDelimited) {
+                        abort();
+                    }
+                    return false;
                 }
             }
 

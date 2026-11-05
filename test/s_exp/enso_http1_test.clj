@@ -925,6 +925,29 @@
         (is (not (clojure.string/includes? resp "0\r\n\r\n")) "no terminal chunk")
         (is (= 1 (status-line-count resp)) "connection closed after the failure")))))
 
+(deftest streaming-body-checked-exception-or-error-is-a-server-fault
+  ;; Only the client causes I/O errors: anything else a streamed body
+  ;; throws, a checked exception or an Error, is logged at WARNING like a
+  ;; RuntimeException, and the connection ends without the last chunk.
+  (doseq [t [(Exception. "checked boom") (AssertionError. "assert boom")]]
+    (Thread/sleep 1100)
+    (let [resp (atom nil)
+          records (support/capture-logs
+                   "com.s_exp.enso"
+                   #(with-server
+                      (fn [_] {:status 200
+                               :body (fn [w]
+                                       (enso/write! w "partial")
+                                       (enso/flush! w)
+                                       (throw t))})
+                      {}
+                      (fn [] (reset! resp (send-and-read! two-keep-alive-reqs)))))]
+      (is (not (clojure.string/includes? @resp "0\r\n\r\n")) "no terminal chunk")
+      (is (= 1 (status-line-count @resp)) "connection closed after the failure")
+      (is (some #{"response body failed, closing connection"}
+                (support/records-at records java.util.logging.Level/WARNING))
+          (str (class t))))))
+
 (deftest streaming-body-illegal-argument-after-commit-sends-no-second-response
   (with-server
     (fn [_] {:status 200
