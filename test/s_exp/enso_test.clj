@@ -1782,6 +1782,29 @@
     (.write ^java.io.OutputStream out (.getBytes "bc" StandardCharsets/UTF_8))
     (.close ^java.io.OutputStream out)))
 
+(defrecord ClosingBody [closed]
+  ring.core.protocols/StreamableResponseBody
+  (write-body-to-stream [_ _ out]
+    (.close ^java.io.OutputStream out))
+  java.io.Closeable
+  (close [_] (deliver closed true)))
+
+(deftest skipped-closeable-streamable-body-is-closed
+  ;; A response that carries no body (HEAD, 204, 304) never writes it, so a
+  ;; Closeable StreamableResponseBody is closed instead, as an InputStream
+  ;; body would be.
+  (doseq [[label status method] [["HEAD" 200 "HEAD"] ["204" 204 "GET"] ["304" 304 "GET"]]]
+    (let [closed (promise)]
+      (with-server (fn [_] {:status status :body (->ClosingBody closed)}) nil
+        (fn []
+          (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+            (let [out (.getOutputStream sock)]
+              (.write out (.getBytes (str method " / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                                     StandardCharsets/ISO_8859_1))
+              (.flush out)
+              (.readAllBytes (.getInputStream sock))))
+          (is (true? (deref closed 2000 false)) label))))))
+
 (deftest streamable-body-gets-a-plain-output-stream
   (let [seen (atom nil)]
     (with-server (fn [_] {:status 200 :body (->ProbeBody seen)}) nil

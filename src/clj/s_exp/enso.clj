@@ -91,12 +91,19 @@
     ;; implementation.
     (and streamable-body-var
          (satisfies? (current streamable-body-var) body))
-    (reify StreamingBody
+    ;; Closeable so a body never written (HEAD, 204, 304, a discarded
+    ;; response) still releases what it holds, when it is Closeable.
+    (reify
+      StreamingBody
       (write [_ writer]
         (let [out (ChunkedOutputStream. writer)]
           ((current write-body-to-stream-var) body response out)
           (when async
-            (.awaitClose out)))))
+            (.awaitClose out))))
+      java.io.Closeable
+      (close [_]
+        (when (instance? java.io.Closeable body)
+          (.close ^java.io.Closeable body))))
 
     :else body))
 

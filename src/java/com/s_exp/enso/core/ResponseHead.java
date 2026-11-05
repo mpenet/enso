@@ -149,6 +149,14 @@ public final class ResponseHead {
             } catch (IOException ignored) {
             }
         }
+        // A streaming body is never written without a body to send: one
+        // that holds something to release is closed instead.
+        if (!bodyAllowed && streaming instanceof java.io.Closeable c) {
+            try {
+                c.close();
+            } catch (IOException ignored) {
+            }
+        }
         closeFileChannel();
         clearRefs();
     }
