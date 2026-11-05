@@ -1484,6 +1484,18 @@
           (is (>= (status-of resp) 400) label)
           (is (= (+ sep 4) (count resp)) (str label ": " (pr-str resp))))))))
 
+(deftest file-body-must-be-a-regular-file
+  ;; A File body naming a directory or nothing is the handler's error,
+  ;; answered 500 for GET and HEAD alike, never a 200 cut short.
+  (let [dir (.toFile (java.nio.file.Files/createTempDirectory "enso-file-body" (make-array java.nio.file.attribute.FileAttribute 0)))
+        missing (java.io.File. dir "missing.txt")]
+    (doseq [[label f] [["directory" dir] ["missing" missing]]
+            method ["GET" "HEAD"]]
+      (with-server (fn [_] {:status 200 :body f}) {}
+        (fn []
+          (is (= 500 (status-of (send-and-read! (str method " / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))))
+              (str label " " method)))))))
+
 (deftest unknown-header-names-lowercased
   (let [captured (atom nil)]
     (with-server (fn [req] (reset! captured (:headers req)) {:status 200 :body ""}) {}

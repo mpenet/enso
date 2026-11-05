@@ -13,7 +13,9 @@ import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -257,14 +259,18 @@ public final class ResponseHead {
             case BODY_ASCII:
                 return text.length();
             case BODY_FILE:
-                if (!bodyAllowed) {
-                    return file.length();
-                }
-                // One open + size() serves both Content-Length and the
-                // transfer, so the two can't disagree.
+                // One stat gives the type and Content-Length; the transfer
+                // is held to that length, so a file that shrank since only
+                // aborts the body (connection closed or stream reset).
                 try {
-                    fileChannel = FileChannel.open(file.toPath(), StandardOpenOption.READ);
-                    return fileChannel.size();
+                    BasicFileAttributes attrs = Files.readAttributes(file.toPath(), BasicFileAttributes.class);
+                    if (!attrs.isRegularFile()) {
+                        throw new IllegalArgumentException("response body file is not a regular file: " + file);
+                    }
+                    if (bodyAllowed) {
+                        fileChannel = FileChannel.open(file.toPath(), StandardOpenOption.READ);
+                    }
+                    return attrs.size();
                 } catch (IOException e) {
                     throw new UncheckedIOException("unreadable response body file", e);
                 }
