@@ -815,7 +815,7 @@ public final class HttpConnection implements Runnable, Drainable {
         // subprotocol it didn't offer, so that's a handler error.
         String protocol = response.webSocketProtocol;
         String offered = request.header("sec-websocket-protocol");
-        if (protocol != null && (offered == null || !HttpFields.containsToken(offered, protocol))) {
+        if (protocol != null && (offered == null || !HttpFields.containsExactToken(offered, protocol))) {
             INVALID_RESPONSES.log("WebSocket subprotocol not offered by the client: " + protocol);
             writeError(request, 500, HttpStatus.reason(500));
             return;

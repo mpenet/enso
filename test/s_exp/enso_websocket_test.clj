@@ -888,6 +888,18 @@
     (is (= "chat" (.webSocketProtocol r)))
     (is (some? (.webSocketListener r)))))
 
+(deftest ws-subprotocol-must-match-an-offer-exactly
+  ;; RFC 6455 §4.1: subprotocol tokens compare case-sensitively, so a
+  ;; client offering "chat" fails a connection that selects "Chat". The
+  ;; handler picking a spelling that wasn't offered is its error: 500.
+  (doseq [[picked expected] [["chat" "101"] ["Chat" "500"]]]
+    (with-ws-server
+      (fn [_] {:ring.websocket/listener {} :ring.websocket/protocol picked})
+      (fn []
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (let [resp (ws-handshake-response sock {"Sec-WebSocket-Protocol" "chat, superchat"})]
+            (is (clojure.string/starts-with? resp (str "HTTP/1.1 " expected)) (str picked ": " resp))))))))
+
 (deftest ws-send-large-frame-length-encoding
   ;; Frames of 64 KiB and more use the 8-byte extended length.
   (let [size 70000

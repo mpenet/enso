@@ -174,6 +174,18 @@ public final class HttpFields {
      * {@code token}, ignoring case and optional whitespace (RFC 9110 §5.6.1).
      */
     public static boolean containsToken(String header, String token) {
+        return containsToken(header, token, true);
+    }
+
+    /**
+     * {@link #containsToken} comparing case: for tokens defined as
+     * case-sensitive, such as WebSocket subprotocols (RFC 6455 §4.1).
+     */
+    public static boolean containsExactToken(String header, String token) {
+        return containsToken(header, token, false);
+    }
+
+    private static boolean containsToken(String header, String token, boolean ignoreCase) {
         int i = 0;
         int len = header.length();
         while (i < len) {
@@ -189,7 +201,7 @@ public final class HttpFields {
                 end--;
             }
             if (end - start == token.length()
-                && header.regionMatches(true, start, token, 0, token.length())) {
+                && header.regionMatches(ignoreCase, start, token, 0, token.length())) {
                 return true;
             }
         }
