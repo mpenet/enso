@@ -2971,6 +2971,57 @@
     (is (some #{"unhandled handler exception"} fine) (pr-str fine))
     (is (some #{"HTTP/2 response body failed"} fine) (pr-str fine))))
 
+(deftest h2-own-io-failures-are-server-faults
+  ;; An I/O error of the handler's or body's own work is a server fault
+  ;; (WARNING); a body whose writes fail because the client reset the
+  ;; stream is not.
+  (Thread/sleep 1100)
+  (let [records (support/capture-logs
+                 "com.s_exp.enso"
+                 #(with-server-instance [_ (fn [req]
+                                             (case (:uri req)
+                                               "/db" (throw (ex-info "db down" {} (java.net.ConnectException. "refused")))
+                                               "/upstream" {:status 200
+                                                            :body (fn [^com.s_exp.enso.api.ChunkedWriter w]
+                                                                    (.write w "x")
+                                                                    (.flush w)
+                                                                    (throw (java.io.IOException. "upstream reset")))}))
+                                         {}]
+                    (with-conn [conn]
+                      (send-request! conn 1 (request-headers "GET" "/db") true)
+                      (send-request! conn 3 (request-headers "GET" "/upstream") true)
+                      (ping-round-trip! conn)
+                      (Thread/sleep 300)
+                      (ping-round-trip! conn))))
+        warnings (support/records-at records java.util.logging.Level/WARNING)]
+    (is (some #{"unhandled handler exception"} warnings) (pr-str warnings))
+    (is (some #{"HTTP/2 response body failed"} warnings) (pr-str warnings)))
+  (Thread/sleep 1100)
+  (let [writing (CountDownLatch. 1)
+        stopped (CountDownLatch. 1)
+        records (support/capture-logs
+                 "com.s_exp.enso"
+                 #(with-server-instance [_ (fn [_]
+                                             {:status 200
+                                              :body (fn [^com.s_exp.enso.api.ChunkedWriter w]
+                                                      (try
+                                                        (loop []
+                                                          (.write w "x")
+                                                          (.flush w)
+                                                          (.countDown writing)
+                                                          (Thread/sleep 5)
+                                                          (recur))
+                                                        (finally (.countDown stopped))))})
+                                         {}]
+                    (with-conn [conn]
+                      (send-request! conn 1 (request-headers "GET" "/") true)
+                      (is (.await writing 5 TimeUnit/SECONDS))
+                      (write-frame! conn frame-rst 0 1 (u32-bytes 0x8))
+                      (is (.await stopped 5 TimeUnit/SECONDS))
+                      (ping-round-trip! conn))))]
+    (is (empty? (support/records-at records java.util.logging.Level/WARNING))
+        (pr-str (support/records-at records java.util.logging.Level/WARNING)))))
+
 (deftest h2-framer-wait-sets-no-socket-timeout
   ;; A timed read per wait between frames would park through the JDK's one
   ;; delay-scheduler thread; the quiet-second release runs on the server's

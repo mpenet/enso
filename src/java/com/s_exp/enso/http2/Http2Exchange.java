@@ -312,11 +312,10 @@ final class Http2Exchange implements Hpack.FieldSink {
             }
         } catch (Throwable t) {
             // Socket died, the stream was reset mid-write, or the body
-            // failed. Never answer a peer's RST_STREAM with another one
-            // (§5.4.2): resetStream only sends one if the stream is open.
-            if (!(t instanceof IOException)) {
-                (s.expectedFailure(t) ? EXPECTED_BODY_FAILURES : BODY_FAILURES).log("HTTP/2 response body failed", t);
-            }
+            // failed, its own I/O included. Never answer a peer's
+            // RST_STREAM with another one (§5.4.2): resetStream only sends
+            // one if the stream is open.
+            (s.expectedFailure(t) ? EXPECTED_BODY_FAILURES : BODY_FAILURES).log("HTTP/2 response body failed", t);
             conn.resetStream(s, Http2.ERROR_INTERNAL_ERROR, true);
         } finally {
             if (!handedOver) {

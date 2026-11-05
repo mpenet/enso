@@ -277,7 +277,10 @@ final class Http3Exchange extends Http3Stream implements Runnable, SignalStack.N
         if (!streamed) return;
         // The connection may have gone since the claim: then nothing sends
         // this body and the producer must fail fast.
-        if (conn.isGone()) b.cancel();
+        if (conn.isGone()) {
+            clientGone();
+            b.cancel();
+        }
         produce(b, file, length, in, streaming);
     }
 

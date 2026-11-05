@@ -1237,6 +1237,11 @@ final class RequestReader {
             } catch (EOFException e) {
                 failure = RequestBodyException.malformed("request body ended early");
                 throw failure;
+            } catch (IOException e) {
+                // The socket failed under the read (a reset): the client is
+                // gone, whatever the handler makes of it.
+                connection.clientGone();
+                throw e;
             }
         }
 

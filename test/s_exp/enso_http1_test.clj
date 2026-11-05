@@ -1574,6 +1574,55 @@
       (is (some #(re-find expect %) msgs) (str label ": " (pr-str msgs)))
       (is (not-any? #(re-find #"[\r\n]|Injected" %) msgs) label))))
 
+(defn- warnings [records]
+  (support/records-at records java.util.logging.Level/WARNING))
+
+(deftest io-failures-are-the-servers-unless-the-client-went-away
+  ;; An I/O error from the handler's or body's own work (a database, an
+  ;; upstream) is a server fault, logged at WARNING; only the exchange's
+  ;; own I/O with a client that went away is expected.
+  (testing "a handler's own I/O failure"
+    (Thread/sleep 1100)
+    (let [records (support/capture-logs
+                   "com.s_exp.enso"
+                   #(with-server (fn [_] (throw (ex-info "db down" {} (java.net.ConnectException. "refused")))) {}
+                      (fn [] (is (= 500 (status-of (send-and-read! close-req)))))))]
+      (is (some #{"unhandled handler exception"} (warnings records)) (pr-str (warnings records)))))
+  (testing "a streamed body's own I/O failure"
+    (Thread/sleep 1100)
+    (let [records (support/capture-logs
+                   "com.s_exp.enso"
+                   #(with-server (fn [_] {:status 200
+                                          :body (fn [w]
+                                                  (enso/write! w "partial")
+                                                  (enso/flush! w)
+                                                  (throw (java.io.IOException. "upstream reset")))})
+                      {}
+                      (fn [] (send-and-read! close-req))))]
+      (is (some #{"response body failed, closing connection"} (warnings records)) (pr-str (warnings records)))))
+  (testing "a client that went away mid-stream"
+    (Thread/sleep 1100)
+    (let [done (promise)
+          records (support/capture-logs
+                   "com.s_exp.enso"
+                   #(with-server (fn [_] {:status 200
+                                          :body (fn [w]
+                                                  (try
+                                                    (loop []
+                                                      (enso/write! w (apply str (repeat 1024 "x")))
+                                                      (enso/flush! w)
+                                                      (Thread/sleep 5)
+                                                      (recur))
+                                                    (finally (deliver done true))))})
+                      {}
+                      (fn []
+                        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+                          (write! sock close-req)
+                          (.read (.getInputStream sock)))
+                        (deref done 3000 nil)
+                        (Thread/sleep 100))))]
+      (is (empty? (warnings records)) (pr-str (warnings records))))))
+
 (deftest unknown-header-names-lowercased
   (let [captured (atom nil)]
     (with-server (fn [req] (reset! captured (:headers req)) {:status 200 :body ""}) {}

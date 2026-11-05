@@ -886,14 +886,15 @@
         (.setLevel logger level)))))
 
 (deftest unhandled-handler-exceptions-log-by-cause
-  (testing "I/O-caused failures (client went away mid-body) are FINE"
+  (testing "an I/O error of the handler's own work, its client still there, is a server fault"
+    (Thread/sleep 1100)
     (let [records (capture-logs "com.s_exp.enso.api.RingErrorHandler"
                                 #(with-server
-                                   (fn [_] (throw (RuntimeException. (java.io.EOFException. "client gone"))))
+                                   (fn [_] (throw (RuntimeException. (java.io.EOFException. "upstream closed"))))
                                    nil
                                    (fn [] (get! "/"))))]
       (is (seq records))
-      (is (every? #(= java.util.logging.Level/FINE (.getLevel ^java.util.logging.LogRecord %)) records))))
+      (is (every? #(= java.util.logging.Level/WARNING (.getLevel ^java.util.logging.LogRecord %)) records))))
   (testing "handler bugs are WARNING, rate-limited"
     ;; The limiter is per call site and JVM-wide: let the one-second window
     ;; opened by earlier tests' failures pass first (a wait on the clock the

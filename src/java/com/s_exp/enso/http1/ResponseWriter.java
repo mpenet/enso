@@ -17,7 +17,6 @@ import java.util.Arrays;
 import com.s_exp.enso.EnsoServer;
 import com.s_exp.enso.api.ChunkedWriter;
 import com.s_exp.enso.api.Response;
-import com.s_exp.enso.core.Causes;
 import com.s_exp.enso.core.ChunkedWriters;
 import com.s_exp.enso.core.Exchange;
 import com.s_exp.enso.core.HttpDates;
@@ -104,6 +103,8 @@ final class ResponseWriter {
 
     // The socket's stream (through the write watchdog when enabled).
     private OutputStream transport;
+    // The connection's exchange, told when the transport fails.
+    private Exchange exchange;
     // What everything writes through: small writes gather in hbuf, so a
     // response head and its body share one write (see Output).
     private final OutputStream out = new Output();
@@ -131,10 +132,61 @@ final class ResponseWriter {
         this.watchdog = watchdog;
     }
 
-    /** Starts writing to {@code transport}; {@code connectionThread} owns hbuf. */
-    void start(OutputStream transport, Thread connectionThread) {
-        this.transport = transport;
+    /**
+     * Starts writing to {@code transport}; {@code connectionThread} owns
+     * hbuf. A failed write to the transport tells {@code exchange} its
+     * client went away.
+     */
+    void start(OutputStream transport, Thread connectionThread, Exchange exchange) {
+        this.transport = new ClientOutput(transport, exchange);
         this.connectionThread = connectionThread;
+        this.exchange = exchange;
+    }
+
+    /** The connection's own output: a write or flush that fails means the client is gone. */
+    private static final class ClientOutput extends OutputStream {
+        private final OutputStream out;
+        private final Exchange exchange;
+
+        ClientOutput(OutputStream out, Exchange exchange) {
+            this.out = out;
+            this.exchange = exchange;
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            try {
+                out.write(b);
+            } catch (IOException e) {
+                exchange.clientGone();
+                throw e;
+            }
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            try {
+                out.write(b, off, len);
+            } catch (IOException e) {
+                exchange.clientGone();
+                throw e;
+            }
+        }
+
+        @Override
+        public void flush() throws IOException {
+            try {
+                out.flush();
+            } catch (IOException e) {
+                exchange.clientGone();
+                throw e;
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            out.close();
+        }
     }
 
     /** What everything on this connection writes through (see {@link Output}). */
@@ -510,21 +562,18 @@ final class ResponseWriter {
                         default -> {
                         }
                     }
-                } catch (IOException e) {
-                    if (closeDelimited) {
-                        abort();
-                    }
-                    throw e;
                 } catch (Throwable t) {
-                    // Anything but I/O, checked exceptions and Errors too, is
-                    // the body's fault unless the client caused it or it comes
-                    // from the interrupt of a stopping server.
-                    boolean expected = Exchange.clientCaused(t)
-                        || Causes.find(t, InterruptedException.class) != null;
+                    // The body's fault, its own I/O failures included, unless
+                    // the client went away or it comes from the interrupt of a
+                    // stopping server.
+                    boolean expected = exchange.expectedFailure(t) || Exchange.interrupted(t);
                     (expected ? HttpConnection.EXPECTED_BODY_FAILURES : HttpConnection.BODY_FAILURES)
                         .log("response body failed, closing connection", t);
                     if (closeDelimited) {
                         abort();
+                    }
+                    if (t instanceof IOException e) {
+                        throw e;
                     }
                     return false;
                 }
@@ -640,6 +689,10 @@ final class ResponseWriter {
             if (wd != null) wd.enter();
             try {
                 n = fc.transferTo(position, Math.min(length - position, WatchedOutputStream.SLICE_BYTES), sc);
+            } catch (IOException e) {
+                // Straight to the socket: a failure is the client's going.
+                exchange.clientGone();
+                throw e;
             } finally {
                 if (wd != null) wd.exit();
             }

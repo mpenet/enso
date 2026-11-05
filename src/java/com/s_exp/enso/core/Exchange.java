@@ -98,6 +98,9 @@ public abstract class Exchange extends Timer.Task {
     // interrupts its handler. Written before the interrupt, so the
     // interrupted thread sees it (JLS 17.4.4).
     private boolean gaveUp;
+    // The client went away: the exchange's own I/O with it failed, or the
+    // peer reset or tore down the stream. Any thread.
+    private volatile boolean clientGone;
 
     /** The server's service (handler, events, config). */
     protected abstract Service service();
@@ -130,6 +133,7 @@ public abstract class Exchange extends Timer.Task {
         responseBytes = 0;
         outcome = RESPONSE;
         gaveUp = false;
+        clientGone = false;
     }
 
     /** Who owns the response: {@link #OPEN}, {@link #HANDLER}, {@link #TIMED_OUT}, {@link #CANCELLED}. */
@@ -150,7 +154,16 @@ public abstract class Exchange extends Timer.Task {
     public final void cancel() {
         claim(CANCELLED);
         gaveUp = true;
+        clientGone = true;
         interruptHandler();
+    }
+
+    /**
+     * The exchange's own I/O with the client failed (a socket read or
+     * write): what fails because of it is expected. Any thread.
+     */
+    public final void clientGone() {
+        clientGone = true;
     }
 
     /** Interrupts the handler thread, unless that is the calling thread. */
@@ -244,22 +257,23 @@ public abstract class Exchange extends Timer.Task {
     /**
      * Whether failure {@code t} of this exchange's handler (or of its
      * streamed body) is expected rather than a server-side fault: the
-     * client caused it ({@link #clientCaused}), or the server gave up on
-     * the exchange ({@code :handler-timeout}, stream reset, connection
-     * gone) and {@code t} comes from the interrupt it delivered. Expected
-     * failures log at FINE, others at WARNING.
+     * client went away ({@link #clientGone}, a stream reset) and {@code t}
+     * is an I/O failure, or the server gave up on the exchange
+     * ({@code :handler-timeout}, stream reset, connection gone) and
+     * {@code t} comes from the interrupt it delivered. An I/O error of the
+     * handler's own work (a database, an upstream) is a server-side fault.
+     * Expected failures log at FINE, others at WARNING.
      */
     public final boolean expectedFailure(Throwable t) {
-        return clientCaused(t) || (gaveUp && Causes.find(t, InterruptedException.class) != null);
+        return (clientGone && Causes.find(t, IOException.class) != null)
+            || (gaveUp && interrupted(t));
     }
 
-    /**
-     * Whether failure {@code t} comes from the client: an I/O error in its
-     * cause chain (the peer went away, reset the stream, sent a broken
-     * body), including interrupted I/O.
-     */
-    public static boolean clientCaused(Throwable t) {
-        return Causes.find(t, IOException.class) != null;
+    /** Whether {@code t} comes from an interrupt: of a wait, or of interruptible I/O. */
+    public static boolean interrupted(Throwable t) {
+        return Causes.find(t, InterruptedException.class) != null
+            || Causes.find(t, java.io.InterruptedIOException.class) != null
+            || Causes.find(t, java.nio.channels.ClosedByInterruptException.class) != null;
     }
 
     /** The status of a client error in {@code t}'s cause chain (body failure, {@link HttpError}), else 0. */

@@ -405,11 +405,13 @@ Errors go through `java.util.logging`, under `com.s_exp.enso.*`
 `com.s_exp.enso.api.RingErrorHandler`, `com.s_exp.enso.core.Timer`).
 
 Failures a client can cause (malformed requests, resets, timeouts, peers
-that vanish, handler exceptions caused by I/O errors) log at FINE. So does
-the InterruptedException of a handler or streamed body the server
+that vanish, and an I/O error of a handler or streamed body once the
+request's own I/O with its client failed or the client reset it) log at
+FINE. So does the interrupt of a handler or streamed body the server
 interrupted because it gave up on the request (stream reset, connection
-gone, `:handler-timeout`). Server
-faults (handler exceptions, invalid responses, internal errors) log at
-WARNING, rate-limited per call site to one record per second with a count
+gone, `:handler-timeout`). Server faults (handler exceptions, I/O errors
+of the handler's own work such as a database or an upstream while its
+client is still there, invalid responses, internal errors, the server
+refusing connections at `:max-connections`) log at WARNING, rate-limited per call site to one record per second with a count
 of suppressed records. Install an SLF4J bridge in your application to
 route them elsewhere.

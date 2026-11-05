@@ -188,7 +188,7 @@ public final class HttpConnection implements Runnable, Drainable {
             if (watchdog != null) {
                 t = new WatchedOutputStream(t, watchdog);
             }
-            writer.start(t, connectionThread);
+            writer.start(t, connectionThread, call);
             while (server.isRunning() && handleOne()) {
                 servedRequests++;
             }
@@ -465,6 +465,11 @@ public final class HttpConnection implements Runnable, Drainable {
         if (server.isRunning() && Thread.interrupted()) {
             STRAY_INTERRUPTS.log(what + " returned with its thread's interrupt flag set; cleared");
         }
+    }
+
+    /** A socket read for the request failed: the client is gone. */
+    void clientGone() {
+        call.clientGone();
     }
 
     /** Whether the client planned to send more requests on this connection. */

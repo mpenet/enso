@@ -124,10 +124,12 @@ value: `write!` or `flush!` throws an `IOException`.
 - On HTTP/1.1 that happens once a write reaches the dead socket, either from `flush!` or from `write!` when the buffer fills. It is usually the second flush after the client left, because the kernel may still accept the first. A fn that waits between writes only notices at its next flush, so send a comment line (`": keep-alive\n\n"`) periodically to find out sooner.
 - On HTTP/2 and HTTP/3 it happens once the stream is reset or the connection lost. A reset also interrupts the body's thread, so a blocking call between writes (`Thread/sleep`, a queue take) throws `InterruptedException` right away.
 
-Return from the fn to end the body. Letting the `IOException` escape is
-also fine: it is treated as the client going away. So is an
-`InterruptedException` from the interrupt a reset delivers, logged at FINE.
-Other exceptions are logged as server faults, at WARNING.
+Return from the fn to end the body. Letting the `IOException` of a write
+to a client that left escape is also fine: it is treated as the client
+going away. So is an `InterruptedException` from the interrupt a reset
+delivers, logged at FINE. Other exceptions, an `IOException` of the fn's
+own work (an upstream it reads) included, are logged as server faults, at
+WARNING.
 
 ## Async handlers
 
