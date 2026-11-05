@@ -1288,9 +1288,9 @@ final class RequestReader {
     private final class ChunkedBody extends RequestBody {
 
         private long chunkRemaining;
-        // Chunk data plus extension bytes, held to :max-request-body-bytes:
-        // extensions are payload the handler never sees, so they can't be
-        // a way around the cap.
+        // Chunk data plus chunk-line padding and extension bytes, held to
+        // :max-request-body-bytes: those are payload the handler never sees,
+        // so they can't be a way around the cap.
         private long charged;
         private boolean finished;
         private boolean started;
@@ -1312,7 +1312,7 @@ final class RequestReader {
                     return -1;
                 }
                 long cap = config.maxRequestBodyBytes;
-                if (cap > 0 && charged + chunkRemaining > cap) {
+                if (cap > 0 && chunkRemaining > cap - charged) {
                     throw new HttpError(413, "Content Too Large");
                 }
             }
@@ -1373,21 +1373,20 @@ final class RequestReader {
                         throw new HttpError(400, "Bad Request");
                     }
                 }
-                charged += lineEnd - semi;
-                long cap = config.maxRequestBodyBytes;
-                if (cap > 0 && charged > cap) {
-                    throw new HttpError(413, "Content Too Large");
-                }
             }
             long size = 0;
             int start = pos;
             if (start == end) {
                 throw new HttpError(400, "Bad Request");
             }
+            int significant = 0;
             for (int i = start; i < end; i++) {
                 int digit = hexDigit(buf[i]);
                 if (digit < 0) {
                     throw new HttpError(400, "Bad Request");
+                }
+                if (size != 0 || digit != 0) {
+                    significant++;
                 }
                 // Reject before the shift whatever would not fit a positive
                 // long after it (a 16th digit of 8 or more, any 17th digit)
@@ -1396,6 +1395,13 @@ final class RequestReader {
                     throw new HttpError(400, "Bad Request");
                 }
                 size = (size << 4) | digit;
+            }
+            // Line bytes past the size's significant digits (leading zeros,
+            // BWS, extensions) carry nothing the handler sees: charge them.
+            charged += (lineEnd - start) - Math.max(significant, 1);
+            long cap = config.maxRequestBodyBytes;
+            if (cap > 0 && charged > cap) {
+                throw new HttpError(413, "Content Too Large");
             }
             pos = lineEnd + 2;
             return size;

@@ -1607,6 +1607,27 @@
       (is (= 200 (status-of (send-and-read! (chunked-post (str (apply str (repeat 5 (str "1;e=" (apply str (repeat 100 "x")) "\r\na\r\n")))
                                                                "0\r\n\r\n")))))))))
 
+(deftest chunk-size-near-long-max-is-413-after-bytes-charged
+  ;; Once some bytes are charged, a chunk size close to Long.MAX_VALUE must
+  ;; still be held to the cap instead of wrapping the sum negative.
+  (with-server echo-body {:max-request-body-bytes 1000}
+    (fn []
+      (doseq [prefix ["1\r\nA\r\n7fffffffffffffff\r\n" "7fffffffffffffff;a\r\n"]]
+        (is (= 413 (status-of (send-and-read! (chunked-post (str prefix (apply str (repeat 2000 "x"))))
+                                              3000)))
+            prefix)))))
+
+(deftest chunk-size-padding-counts-against-the-cap
+  ;; Leading zeros and whitespace on a chunk-size line are bytes the
+  ;; handler never sees, like extensions.
+  (with-server echo-body {:max-request-body-bytes 1000}
+    (fn []
+      (is (= 413 (status-of (send-and-read! (chunked-post (str (apply str (repeat 10 (str (apply str (repeat 200 "0")) "1\r\na\r\n")))
+                                                               "0\r\n\r\n"))))))
+      (is (= 413 (status-of (send-and-read! (chunked-post (str (apply str (repeat 10 (str "1" (apply str (repeat 200 " ")) ";e\r\na\r\n")))
+                                                               "0\r\n\r\n"))))))
+      (is (= 200 (status-of (send-and-read! (chunked-post "0003\r\nabc\r\n0\r\n\r\n"))))))))
+
 (deftest chunk-extension-bws-before-semicolon-accepted
   ;; RFC 9112 §7.1.1: chunk-ext = *( BWS ";" BWS chunk-ext-name ...).
   (with-server echo-body {}
