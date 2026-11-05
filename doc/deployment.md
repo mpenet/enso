@@ -87,8 +87,10 @@ Floods and resource exhaustion:
   certificate rotation needs no restart. `:ssl-context` and
   `:ssl-context-provider` stay available for a prebuilt context.
 - Replace certificate files atomically (write elsewhere, then rename), so
-  the reload check never sees a mismatched pair. A bad or half-written file
-  is kept out and logged at WARNING; the current certificate keeps serving.
+  the reload check never sees a mismatched pair. A bad or half-written file,
+  or a key that doesn't match the certificate, is kept out and logged at
+  WARNING; the current certificate keeps serving until the pair matches.
+  At startup a mismatched pair is an error.
 - `:ssl-cert-reload-interval` sets how often the files are checked (10 s by
   default, 0 to turn it off). A handshake reads only the current
   certificate, so reloading costs nothing per connection.

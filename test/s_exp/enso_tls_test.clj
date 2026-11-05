@@ -1472,6 +1472,37 @@
               "a warning was logged")))
       (finally (enso/stop srv)))))
 
+(deftest file-source-refuses-a-key-that-does-not-match-the-certificate
+  (let [dir (tls-temp-dir)
+        [cert-a key-a] (self-signed! dir "pair-a" :rsa)
+        [cert-b key-b] (self-signed! dir "pair-b" :rsa)
+        [_ key-ec] (self-signed! dir "pair-ec" :ec)]
+    (testing "at start"
+      (doseq [[cert key] [[cert-a key-b] [cert-a key-ec]]]
+        (is (thrown-with-msg? Exception #"does not match"
+                              (enso/stop (enso/run-server (fn [_] {:status 200 :body "ok"})
+                                                          {:host "127.0.0.1" :port 0
+                                                           :ssl-cert-path cert :ssl-key-path key})))
+            key)))
+    (testing "on reload: the current pair keeps serving"
+      (let [cert (in-dir dir "cert.pem")
+            key (in-dir dir "key.pem")
+            _ (write-pair! dir cert key "reload-a")
+            srv (enso/run-server (fn [_] {:status 200 :body "ok"})
+                                 {:host "127.0.0.1" :port 0
+                                  :ssl-cert-path cert :ssl-key-path key :ssl-cert-reload-interval 50})]
+        (try
+          (let [records (support/capture-logs
+                         "com.s_exp.enso.core"
+                         (fn []
+                           (Files/copy (Path/of cert-b (make-array String 0)) (Path/of cert (make-array String 0))
+                                       (into-array CopyOption [StandardCopyOption/REPLACE_EXISTING]))
+                           (Thread/sleep 400)))]
+            (is (re-find #"CN=reload-a" (str (presented-cn (enso/port srv)))))
+            (is (some #(re-find #"does not match" %)
+                      (support/records-at records java.util.logging.Level/WARNING))))
+          (finally (enso/stop srv)))))))
+
 ;; ---- Private-key formats ------------------------------------------------------
 
 (deftest file-source-serves-every-private-key-format

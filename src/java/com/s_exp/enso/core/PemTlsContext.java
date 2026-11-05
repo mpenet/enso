@@ -12,6 +12,7 @@ import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
 import java.security.KeyStore;
 import java.security.PrivateKey;
+import java.security.Signature;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
@@ -44,6 +45,8 @@ public final class PemTlsContext implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger(PemTlsContext.class.getName());
     private static final LogLimiter RELOAD_FAILURES = new LogLimiter(LOG, Level.WARNING);
     private static final String ALIAS = "enso";
+    // Signed with the private key and verified with the certificate.
+    private static final byte[] MATCH_PROBE = {'e', 'n', 's', 'o'};
 
     private final Config config;
     private final SSLContext context;
@@ -170,7 +173,39 @@ public final class PemTlsContext implements AutoCloseable {
     private static ReloadableKeyManager.Identity loadIdentity(Config config) throws IOException {
         X509Certificate[] chain = readCertChain(config.sslCertPath);
         PrivateKey key = readPrivateKey(config.sslKeyPath);
+        if (!matches(key, chain[0])) {
+            throw new IOException("the private key in " + config.sslKeyPath
+                + " does not match the certificate in " + config.sslCertPath);
+        }
         return new ReloadableKeyManager.Identity(ALIAS, key, chain);
+    }
+
+    /**
+     * Whether {@code key} is the private half of the leaf's public key: a
+     * probe it signs must verify with the certificate. Every handshake
+     * would fail on a mismatched pair (a cert and key file rotated apart).
+     */
+    private static boolean matches(PrivateKey key, X509Certificate leaf) throws IOException {
+        if (!key.getAlgorithm().equals(leaf.getPublicKey().getAlgorithm())) {
+            return false;
+        }
+        String algorithm = switch (key.getAlgorithm()) {
+            case "RSA" -> "SHA256withRSA";
+            case "EC" -> "SHA256withECDSA";
+            default -> throw new IOException("unsupported private key algorithm " + key.getAlgorithm());
+        };
+        try {
+            Signature signer = Signature.getInstance(algorithm);
+            signer.initSign(key);
+            signer.update(MATCH_PROBE);
+            byte[] signature = signer.sign();
+            Signature verifier = Signature.getInstance(algorithm);
+            verifier.initVerify(leaf.getPublicKey());
+            verifier.update(MATCH_PROBE);
+            return verifier.verify(signature);
+        } catch (GeneralSecurityException e) {
+            return false;
+        }
     }
 
     /** The certificate chain, leaf first, as the file orders it. */
