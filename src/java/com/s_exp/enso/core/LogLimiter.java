@@ -15,8 +15,9 @@ import java.util.logging.Logger;
  * <p>Policy for the server: failures a client can cause on purpose
  * (malformed requests, resets, timeouts, peers that vanish) log at
  * {@link Level#FINE}; WARNING is reserved for server-side faults (handler
- * bugs, internal errors) and goes through a limiter so even those can't
- * be turned into a log flood.
+ * bugs, internal errors) and for the server reaching its own capacity
+ * (connections refused at :max-connections), and goes through a limiter
+ * so even those can't be turned into a log flood.
  */
 public final class LogLimiter {
 

@@ -563,32 +563,38 @@
 (def ^:private ip-a (InetAddress/getByName "10.0.0.1"))
 (def ^:private ip-b (InetAddress/getByName "10.0.0.2"))
 
+(defn- admit [^ConnectionLimiter l addr]
+  (condp = (.tryAcquire l addr)
+    ConnectionLimiter/ADMITTED :admitted
+    ConnectionLimiter/SERVER_FULL :server-full
+    ConnectionLimiter/ADDRESS_FULL :address-full))
+
 (deftest limiter-caps-total-connections
   (let [l (ConnectionLimiter. 2 0)]
-    (is (.tryAcquire l ip-a))
-    (is (.tryAcquire l ip-b))
-    (is (not (.tryAcquire l ip-a)))
+    (is (= :admitted (admit l ip-a)))
+    (is (= :admitted (admit l ip-b)))
+    (is (= :server-full (admit l ip-a)))
     (is (= 2 (.active l)))
     (.release l ip-a)
-    (is (.tryAcquire l ip-b))))
+    (is (= :admitted (admit l ip-b)))))
 
 (deftest limiter-caps-connections-per-address
   (let [l (ConnectionLimiter. 0 2)]
-    (is (.tryAcquire l ip-a))
-    (is (.tryAcquire l ip-a))
-    (is (not (.tryAcquire l ip-a)) "third from the same address")
-    (is (.tryAcquire l ip-b) "other addresses unaffected")
+    (is (= :admitted (admit l ip-a)))
+    (is (= :admitted (admit l ip-a)))
+    (is (= :address-full (admit l ip-a)) "third from the same address")
+    (is (= :admitted (admit l ip-b)) "other addresses unaffected")
     (.release l ip-a)
-    (is (.tryAcquire l ip-a))
+    (is (= :admitted (admit l ip-a)))
     (testing "a refused per-address attempt doesn't hold a global slot"
       (let [l (ConnectionLimiter. 2 1)]
-        (is (.tryAcquire l ip-a))
-        (is (not (.tryAcquire l ip-a)))
-        (is (.tryAcquire l ip-b))))))
+        (is (= :admitted (admit l ip-a)))
+        (is (= :address-full (admit l ip-a)))
+        (is (= :admitted (admit l ip-b)))))))
 
 (deftest limiter-unlimited-and-allocation-free
   (let [l (ConnectionLimiter. 0 0)]
-    (dotimes [_ 1000] (is (.tryAcquire l ip-a)))
+    (dotimes [_ 1000] (is (= :admitted (admit l ip-a))))
     (is (= 1000 (.active l))))
   (let [l (ConnectionLimiter. 10 0)]
     (is (> 1.0 (bytes-per-op 100000 (fn [] (.tryAcquire l ip-a) (.release l ip-a)))))))

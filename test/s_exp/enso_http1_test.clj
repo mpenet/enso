@@ -1538,6 +1538,26 @@
         (is (= 400 (status-of (send-and-read! (str "GET " target " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))))
             target)))))
 
+(deftest connection-refusals-log-by-cause
+  ;; The server full (:max-connections) is the operator's to see: WARNING,
+  ;; rate-limited. One address over :max-connections-per-ip is that
+  ;; client's doing: FINE.
+  (doseq [[label opts level] [["server-wide" {:max-connections 1} java.util.logging.Level/WARNING]
+                              ["per address" {:max-connections-per-ip 1} java.util.logging.Level/FINE]]]
+    (Thread/sleep 1100)
+    (let [records (support/capture-logs
+                   "com.s_exp.enso"
+                   #(with-server echo-body opts
+                      (fn []
+                        (with-open [held (Socket. "127.0.0.1" (int (:port *server*)))]
+                          (Thread/sleep 100)
+                          (with-open [refused (Socket. "127.0.0.1" (int (:port *server*)))]
+                            (ms-until-closed refused 2000))))))
+          refusals (filter #(re-find #"refused" (str (.getMessage ^java.util.logging.LogRecord %))) records)]
+      (is (seq refusals) label)
+      (is (every? #(= level (.getLevel ^java.util.logging.LogRecord %)) refusals)
+          (str label ": " (pr-str (map #(str (.getLevel ^java.util.logging.LogRecord %)) refusals)))))))
+
 (deftest unknown-header-names-lowercased
   (let [captured (atom nil)]
     (with-server (fn [req] (reset! captured (:headers req)) {:status 200 :body ""}) {}

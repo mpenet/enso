@@ -21,6 +21,13 @@ import java.util.function.BiFunction;
  */
 public final class ConnectionLimiter {
 
+    /** {@link #tryAcquire}: admitted. */
+    public static final int ADMITTED = 0;
+    /** {@link #tryAcquire}: refused, the server is at its connection limit. */
+    public static final int SERVER_FULL = 1;
+    /** {@link #tryAcquire}: refused, this address is at its own limit. */
+    public static final int ADDRESS_FULL = 2;
+
     private static final BiFunction<InetAddress, Integer, Integer> INCREMENT =
         (address, count) -> count == null ? 1 : count + 1;
     private static final BiFunction<InetAddress, Integer, Integer> DECREMENT =
@@ -37,12 +44,16 @@ public final class ConnectionLimiter {
         this.perAddress = maxPerAddress > 0 ? new ConcurrentHashMap<>() : null;
     }
 
-    /** Admits a connection from {@code address}, or returns false (close it). */
-    public boolean tryAcquire(InetAddress address) {
+    /**
+     * Admits a connection from {@code address} ({@link #ADMITTED}), or says
+     * which limit refuses it ({@link #SERVER_FULL}, {@link #ADDRESS_FULL}):
+     * close it then.
+     */
+    public int tryAcquire(InetAddress address) {
         int total = active.incrementAndGet();
         if (maxConnections > 0 && total > maxConnections) {
             active.decrementAndGet();
-            return false;
+            return SERVER_FULL;
         }
         if (perAddress != null) {
             Integer count;
@@ -55,10 +66,10 @@ public final class ConnectionLimiter {
             if (count > maxPerAddress) {
                 perAddress.compute(address, DECREMENT);
                 active.decrementAndGet();
-                return false;
+                return ADDRESS_FULL;
             }
         }
-        return true;
+        return ADMITTED;
     }
 
     /** Releases a slot taken by a successful {@link #tryAcquire}. */

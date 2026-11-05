@@ -88,7 +88,10 @@ import java.util.logging.Logger;
 public final class Http3Listener implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(Http3Listener.class.getName());
-    private static final LogLimiter REFUSED = new LogLimiter(LOG, Level.FINE);
+    // The server full is the operator's to see; one address over its own
+    // limit is that client's doing.
+    private static final LogLimiter SERVER_FULL = new LogLimiter(LOG, Level.WARNING);
+    private static final LogLimiter ADDRESS_FULL = new LogLimiter(LOG, Level.FINE);
     private static final LogLimiter RELOAD_FAILURES = new LogLimiter(LOG, Level.WARNING);
     static final String PROTOCOL = "h3";
     private static final int MAX_LOOPS = 64;
@@ -533,22 +536,28 @@ public final class Http3Listener implements AutoCloseable {
         int handshaking = halfOpen.incrementAndGet();
         if (config.http3MaxHalfOpen > 0 && handshaking > config.http3MaxHalfOpen) {
             halfOpen.decrementAndGet();
-            refused("handshake-limit", "h3 connection refused: too many handshaking connections");
+            refused("handshake-limit", SERVER_FULL, "h3 connection refused: :http3-max-half-open reached");
             return Admission.REFUSED;
         }
         InetAddress remote = peer.getAddress();
-        if (!limiter.tryAcquire(remote)) {
+        int admitted = limiter.tryAcquire(remote);
+        if (admitted != ConnectionLimiter.ADMITTED) {
             halfOpen.decrementAndGet();
-            refused("connection-limit", "h3 connection refused: connection limit reached");
+            if (admitted == ConnectionLimiter.SERVER_FULL) {
+                refused("connection-limit", SERVER_FULL, "h3 connection refused: :max-connections reached");
+            } else {
+                refused("connection-limit", ADDRESS_FULL,
+                        "h3 connection refused: :max-connections-per-ip reached for its address");
+            }
             return Admission.REFUSED;
         }
         return new Admission(Admission.ACCEPT, odcid, remote);
     }
 
-    private void refused(String kind, String message) {
+    private void refused(String kind, LogLimiter log, String message) {
         stats.refused.increment();
         protocolError(kind);
-        REFUSED.log(message);
+        log.log(message);
     }
 
     void protocolError(String kind) {

@@ -60,6 +60,10 @@ public final class EnsoServer implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger(EnsoServer.class.getName());
     private static final LogLimiter ACCEPT_FAILURES = new LogLimiter(LOG, Level.WARNING);
     private static final LogLimiter CONNECTION_FAILURES = new LogLimiter(LOG, Level.FINE);
+    // The server full is the operator's to see; one address over its own
+    // limit is that client's doing.
+    private static final LogLimiter SERVER_FULL = new LogLimiter(LOG, Level.WARNING);
+    private static final LogLimiter ADDRESS_FULL = new LogLimiter(LOG, Level.FINE);
     private static final LogLimiter CERT_RELOAD_FAILURES = new LogLimiter(LOG, Level.WARNING);
     private static final long ACCEPT_FAILURE_BACKOFF_MILLIS = 50;
     // Longest part of :shutdown-timeout kept for force-closing what didn't
@@ -277,10 +281,15 @@ public final class EnsoServer implements AutoCloseable {
     /** Admits {@code sc} through the limiter and dispatches it; closes it when refused. */
     private void admit(SocketChannel sc) {
         InetAddress remote = sc.socket().getInetAddress();
-        if (remote == null || !limiter.tryAcquire(remote)) {
+        int admitted = remote == null ? ConnectionLimiter.ADDRESS_FULL : limiter.tryAcquire(remote);
+        if (admitted != ConnectionLimiter.ADMITTED) {
             closeQuietly(sc);
             service.protocolError("tcp", "connection-limit");
-            CONNECTION_FAILURES.log("connection refused: connection limit reached");
+            if (admitted == ConnectionLimiter.SERVER_FULL) {
+                SERVER_FULL.log("connection refused: :max-connections reached");
+            } else {
+                ADDRESS_FULL.log("connection refused: :max-connections-per-ip reached for its address");
+            }
             return;
         }
         try {
