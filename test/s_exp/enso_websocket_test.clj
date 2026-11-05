@@ -1551,19 +1551,45 @@
 (deftest ws-waiting-for-the-budget-does-not-count-against-the-message-deadline
   ;; The server holding a message back is not the client being slow: while
   ;; a reader waits for the budget (here for the progress lane, held by a
-  ;; connection whose listener takes long), its :read-timeout stops.
+  ;; connection whose listener takes long), its :read-timeout stops, for up
+  ;; to one more :read-timeout.
   (let [budget (doto (MemoryBudget. 100000) (.charge 100000))
         size 200000
         input (frames [0x2 true (byte-array size)] [0x8 true (close-payload 1000 "")])
         in-listener (CountDownLatch. 1)
-        slow (future (run-ws-bytes input {:budget budget :read-timeout 300
-                                          :on-message (fn [_ _] (.countDown in-listener) (Thread/sleep 800))}))
+        slow (future (run-ws-bytes input {:budget budget :read-timeout 500
+                                          :on-message (fn [_ _] (.countDown in-listener) (Thread/sleep 700))}))
         _ (.await in-listener 2 TimeUnit/SECONDS)
         delivered (promise)
-        r (run-ws-bytes input {:budget budget :read-timeout 300
+        r (run-ws-bytes input {:budget budget :read-timeout 500
                                :on-message (fn [_ ^ByteBuffer m] (deliver delivered (.remaining m)))})]
     (is (= size (deref delivered 0 :none)))
     (is (= [1000] (server-close-codes r)) "no 1008")
+    (is (not= :timed-out (deref slow 5000 :timed-out)))
+    (is (= 100000 (.used budget)) "what both messages held was given back")))
+
+(deftest ws-waiting-for-the-budget-is-bounded-by-the-message-deadline
+  ;; Waiting for the budget stops the message clock for at most one more
+  ;; :read-timeout: a reader held back longer (the lane held by a listener
+  ;; that takes long, or by peers that stopped mid-message) fails its
+  ;; message with 1008 and gives back what it held, instead of waiting on.
+  (let [budget (doto (MemoryBudget. 100000) (.charge 100000))
+        size 200000
+        input (frames [0x2 true (byte-array size)] [0x8 true (close-payload 1000 "")])
+        in-listener (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        slow (future (run-ws-bytes input {:budget budget :read-timeout 300
+                                          :on-message (fn [_ _] (.countDown in-listener) (.await release))}))
+        _ (.await in-listener 2 TimeUnit/SECONDS)
+        t0 (System/nanoTime)
+        waiting (future (run-ws-bytes input {:budget budget :read-timeout 300}))
+        r (deref waiting 3000 :stalled)
+        elapsed-ms (/ (- (System/nanoTime) t0) 1e6)]
+    (.countDown release)
+    (is (not= :stalled r) "the waiting reader gave up")
+    (when (map? r)
+      (is (= [1008] (server-close-codes r)))
+      (is (< elapsed-ms 1500) (str elapsed-ms " ms")))
     (is (not= :timed-out (deref slow 5000 :timed-out)))
     (is (= 100000 (.used budget)) "what both messages held was given back")))
 

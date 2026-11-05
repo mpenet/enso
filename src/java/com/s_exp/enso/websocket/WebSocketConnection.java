@@ -337,6 +337,9 @@ public final class WebSocketConnection {
     // started by its first read that had to wait for the socket.
     private boolean deadlineStarted;
     private long deadlineNanos;
+    // Time this message spent waiting for the memory budget, which stops
+    // its deadline for at most one more :read-timeout in all.
+    private long budgetWaitNanos;
     // SO_TIMEOUT last set on the socket, -1 before the first read.
     private int soTimeout = -1;
     // run() returned: the close timer must stay retired.
@@ -699,6 +702,7 @@ public final class WebSocketConnection {
             rlim = 0;
             // Discarding is no message: no message deadline applies.
             deadlineStarted = false;
+            budgetWaitNanos = 0;
             while (fill(rbuf, 0, rbuf.length, idleTimeoutMillis) >= 0) {
                 // discard
             }
@@ -853,7 +857,9 @@ public final class WebSocketConnection {
      * The reader holding the budget's progress lane grows past the limit
      * until its message is delivered; the others wait for the lane or for
      * room. The server holding the client back is not the client being
-     * slow: the message deadline moves by the time waited.
+     * slow: the message deadline moves by the time waited, up to one more
+     * :read-timeout per message. Past that the message times out, so peers
+     * stopped mid-message can't keep each other's budget held.
      */
     private void awaitBudget() throws IOException {
         if (outputHeld) {
@@ -873,6 +879,20 @@ public final class WebSocketConnection {
             budgetWaiter = w;
         }
         long start = System.nanoTime();
+        // What the deadline may still move by, and how long this wait may
+        // last: until the deadline moved that far.
+        long extension = 0;
+        long maxWait = Long.MAX_VALUE;
+        if (messageTimeoutMillis > 0) {
+            // Mid-message, as a socket read that waits would, this wait
+            // starts the deadline if nothing did yet.
+            if (!deadlineStarted) {
+                deadlineStarted = true;
+                deadlineNanos = start + messageTimeoutMillis * 1_000_000L;
+            }
+            extension = Math.max(0, messageTimeoutMillis * 1_000_000L - budgetWaitNanos);
+            maxWait = extension + Math.max(0, deadlineNanos - start);
+        }
         boolean waited = false;
         try {
             while (budget.exhausted()) {
@@ -883,11 +903,19 @@ public final class WebSocketConnection {
                 if (socketClosed || Thread.currentThread().isInterrupted()) {
                     throw new EOFException("connection closed");
                 }
-                // Woken below the low-water mark or with the lane, never
-                // by a clock: the client isn't the one waited for.
+                // Woken below the low-water mark or with the lane, or once
+                // this message has waited all it may.
                 if (budget.await(w)) {
                     waited = true;
-                    LockSupport.park(this);
+                    if (maxWait == Long.MAX_VALUE) {
+                        LockSupport.park(this);
+                    } else {
+                        long left = maxWait - (System.nanoTime() - start);
+                        if (left <= 0) {
+                            throw new SocketTimeoutException("message timeout");
+                        }
+                        LockSupport.parkNanos(this, left);
+                    }
                 }
             }
         } finally {
@@ -896,8 +924,15 @@ public final class WebSocketConnection {
             if (!holdsLane) {
                 budget.leaveLane(w);
             }
-            if (waited && deadlineStarted) {
-                deadlineNanos += System.nanoTime() - start;
+            if (waited) {
+                long paused = System.nanoTime() - start;
+                if (messageTimeoutMillis > 0) {
+                    paused = Math.min(paused, extension);
+                }
+                budgetWaitNanos += paused;
+                if (deadlineStarted) {
+                    deadlineNanos += paused;
+                }
             }
         }
     }
@@ -921,6 +956,7 @@ public final class WebSocketConnection {
     private Frame readFrame() throws IOException {
         if (!inMessage) {
             deadlineStarted = false;
+            budgetWaitNanos = 0;
         }
         if (rpos == rlim) {
             rpos = 0;

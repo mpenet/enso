@@ -49,7 +49,7 @@ Each timeout means the same thing on every protocol.
 |---|---|---|
 | `:handshake-timeout` | TLS handshake; HTTP/2 preface and first SETTINGS; QUIC handshake | wall clock from accept |
 | `:header-timeout` | a complete request head | wall clock from its first byte |
-| `:read-timeout` | request body; a WebSocket message | longest wait without progress; for a WebSocket message, wall clock from first to last frame, less time the server held it back |
+| `:read-timeout` | request body; a WebSocket message | longest wait without progress; for a WebSocket message, wall clock from first to last frame, less time the server held it back (at most one more `:read-timeout`) |
 | `:min-data-rate-bytes` | request body | bytes per second of waiting, after `:min-data-rate-grace` |
 | `:write-timeout` | any response or frame write | longest wait without progress |
 | `:idle-timeout` | time with no request in progress | since the last activity |
@@ -69,7 +69,7 @@ Where each applies:
 
 - `:handshake-timeout` (10000): time allowed for the TLS handshake, plus the HTTP/2 preface and first SETTINGS, or the QUIC handshake. The connection is closed when it runs out. It and `:idle-timeout` must not both be 0. That would leave a half-open connection with no bound at all.
 - `:header-timeout` (10000): time allowed to receive a complete request head, counted from its first byte. Protects against slowloris. Answered with 408.
-- `:read-timeout` (30000): longest time without progress while reading a request body. The read fails (408 unless the handler catches it) and the connection is not reused. Time the server holds the client back doesn't count, see [Memory budget](#memory-budget). Also bounds head reads when `:header-timeout` is 0. On a WebSocket it is a deadline: a message must arrive whole within this time of its first frame, or the connection is closed with 1008 "message timeout". Time the server doesn't read the message for the budget doesn't count.
+- `:read-timeout` (30000): longest time without progress while reading a request body. The read fails (408 unless the handler catches it) and the connection is not reused. Time the server holds the client back doesn't count, see [Memory budget](#memory-budget). Also bounds head reads when `:header-timeout` is 0. On a WebSocket it is a deadline: a message must arrive whole within this time of its first frame, or the connection is closed with 1008 "message timeout". Time the server doesn't read the message for the budget doesn't count, up to one more `:read-timeout`.
 - `:min-data-rate-bytes` (240): least request body bytes per second while a handler waits for them, once `:min-data-rate-grace` of waiting has passed. 0 turns it off. Time the server holds the client back doesn't count. See [Minimum data rate](#minimum-data-rate).
 - `:min-data-rate-grace` (5000): waiting time allowed before `:min-data-rate-bytes` applies.
 - `:write-timeout` (30000): longest time without write progress, meaning the peer stopped reading. The connection is force-closed (TLS without close_notify). Progress is counted per 256 KiB slice. On HTTP/2 it also bounds a peer that keeps its flow-control window shut: a stream that can't send for this long is reset with CANCEL, and a connection window shut this long ends the connection with GOAWAY(ENHANCE_YOUR_CALM).
@@ -160,7 +160,7 @@ the client can send again:
 
 - HTTP/2: while the client has no connection credit left, because the server withholds the WINDOW_UPDATE until handlers read;
 - HTTP/3: while the server doesn't read the request stream;
-- WebSocket: while the server doesn't read a message, waiting for room or for its turn to read past the limit;
+- WebSocket: while the server doesn't read a message, waiting for room or for its turn to read past the limit, for up to one more `:read-timeout` per message. A message held back longer fails with 1008, so connections stopped mid-message can't hold the budget for each other indefinitely;
 - HTTP/1.1 is never held back by the budget, so its clocks always run.
 
 This can't keep a request alive on the client's terms. The clocks only
