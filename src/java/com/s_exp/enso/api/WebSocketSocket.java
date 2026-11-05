@@ -74,8 +74,9 @@ public interface WebSocketSocket {
     }
 
     /**
-     * Sends a ping now, or queued right behind a write in progress: never
-     * waits for a stalled writer. Sent from a listener while more of the
+     * Sends a ping now, or queued right behind a write in progress or
+     * sends already queued: never waits for a stalled writer, nor writes
+     * other sends itself. Sent from a listener while more of the
      * client's frames are already read, it waits in the buffer like
      * {@link #sendText}.
      *

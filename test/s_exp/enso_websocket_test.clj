@@ -958,6 +958,40 @@
         (.close feed)
         (deref done 2000 nil)))))
 
+(deftest ws-ping-does-not-write-the-send-queue
+  ;; A ping finding asynchronous sends queued goes behind them, written by
+  ;; the writer thread: the caller never writes the queue (up to
+  ;; :ws-max-queued-bytes) itself, so a ping can't hold it for that long.
+  (let [writers (atom #{})
+        caller (promise)
+        done (promise)
+        feed (java.io.PipedOutputStream.)
+        in (java.io.PipedInputStream. feed)
+        out (proxy [java.io.OutputStream] []
+              (write ([_] (swap! writers conj (Thread/currentThread)))
+                     ([_ _ _] (swap! writers conj (Thread/currentThread))))
+              (flush []))
+        listener (reify WebSocketListener
+                   (onOpen [_ s]
+                     (deliver caller (Thread/currentThread))
+                     (.sendBinaryAsync ^WebSocketSocket s (ByteBuffer/allocate 65536)
+                                       (reify WebSocketSocket$SendCallback
+                                         (onSuccess [_] (deliver done true))
+                                         (onFailure [_ t] (deliver done t))))
+                     (.sendPing ^WebSocketSocket s (ByteBuffer/allocate 0)))
+                   (onMessage [_ _ _])
+                   (onError [_ _ _])
+                   (onClose [_ _ _ _]))
+        conn (WebSocketConnection. (Socket.) in out listener (ws-config {}) nil test-timer
+                                   (MemoryBudget. Long/MAX_VALUE) nil)
+        running (future (.run conn))]
+    (try
+      (is (true? (deref done 2000 :pending)))
+      (is (not (contains? @writers @caller)) "nothing written on the listener's thread")
+      (finally
+        (.close feed)
+        (deref running 2000 nil)))))
+
 (deftest ws-send-large-frame-length-encoding
   ;; Frames of 64 KiB and more use the 8-byte extended length.
   (let [size 70000

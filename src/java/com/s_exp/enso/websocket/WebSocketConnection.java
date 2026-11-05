@@ -1771,10 +1771,11 @@ public final class WebSocketConnection {
     }
 
     /**
-     * PING / PONG: written at once when no write is in progress (held like
-     * a data frame, see {@link #flushOrHold}), otherwise queued behind it,
-     * so neither the read loop's automatic pong nor a keep-alive ping ever
-     * waits for a stalled writer. A pong finding one queued takes over its
+     * PING / PONG: written at once when no write is in progress and none
+     * is queued (held like a data frame, see {@link #flushOrHold}),
+     * otherwise queued behind them, so neither the read loop's automatic
+     * pong nor a keep-alive ping ever waits for a stalled writer or writes
+     * the queue itself. A pong finding one queued takes over its
      * place (RFC 6455 §5.5.3): a ping flood leaves one, and costs nothing.
      */
     private void sendControl(int opcode, ByteBuffer data) throws IOException {
@@ -1783,32 +1784,30 @@ public final class WebSocketConnection {
             throw new IllegalArgumentException(
                 "control frame payload exceeds " + MAX_CONTROL_PAYLOAD + " bytes");
         }
-        if (writeLock.tryLock()) {
-            Outgoing written = null;
+        // Sends already queued are the writer thread's to write: the
+        // caller writes only its own frame, or queues it behind them.
+        if (queueHead == null && writeLock.tryLock()) {
             try {
-                if (!open) {
-                    throw closed();
-                }
-                written = writeQueued(false);
-                if (!open) {
-                    throw closed();
-                }
-                try {
-                    if (len > 0) {
-                        data.get(data.position(), controlOut, 0, len);
+                if (queueHead == null) {
+                    if (!open) {
+                        throw closed();
                     }
-                    writeHeader(FIN | opcode, len);
-                    out.write(controlOut, 0, len);
-                    flushOrHold();
-                } catch (Throwable e) {
-                    writeFailed(e);
-                    throw e;
+                    try {
+                        if (len > 0) {
+                            data.get(data.position(), controlOut, 0, len);
+                        }
+                        writeHeader(FIN | opcode, len);
+                        out.write(controlOut, 0, len);
+                        flushOrHold();
+                    } catch (Throwable e) {
+                        writeFailed(e);
+                        throw e;
+                    }
+                    return;
                 }
             } finally {
                 writeLock.unlock();
-                complete(written);
             }
-            return;
         }
         if (opcode == OP_PONG && replacePendingPong(data, len)) {
             return;
