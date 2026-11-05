@@ -85,7 +85,9 @@ chunked on a keep-alive HTTP/1.1 connection, delimited by the connection
 closing on HTTP/1.0 or after `Connection: close`, and as DATA frames on
 HTTP/2 and HTTP/3. If the handler set a `Content-Length`, exactly that
 many bytes are sent; a body that comes up short aborts the response
-(connection closed or stream reset).
+(connection closed or stream reset). An InputStream is sent as it is
+read: when a read has to wait (a pipe fed by another thread), the head
+and what was read so far go out first.
 
 ## Streaming
 

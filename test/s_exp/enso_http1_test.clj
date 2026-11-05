@@ -1425,6 +1425,48 @@
       (is (some #(re-find #"interrupt" %) (support/records-at records java.util.logging.Level/WARNING))
           label))))
 
+(defn- ms-until-received
+  "Milliseconds until what `sock` received contains `marker`, or nil if it
+  doesn't within `timeout-ms`."
+  [^Socket sock ^String marker timeout-ms]
+  (let [t0 (System/nanoTime)
+        in (.getInputStream sock)
+        buf (byte-array 4096)
+        acc (StringBuilder.)]
+    (.setSoTimeout sock (int timeout-ms))
+    (loop []
+      (let [n (try (.read in buf) (catch java.net.SocketTimeoutException _ -1))]
+        (when (pos? n)
+          (.append acc (String. buf 0 (int n) StandardCharsets/ISO_8859_1))
+          (if (clojure.string/includes? (str acc) marker)
+            (/ (- (System/nanoTime) t0) 1e6)
+            (recur)))))))
+
+(deftest slow-input-stream-body-goes-out-as-it-is-read
+  ;; An InputStream body whose next read waits (a pipe fed by another
+  ;; thread) doesn't hold back the head and what was already read: they
+  ;; go out once the read waits, however the body is framed.
+  (doseq [[label proto headers] [["chunked" "HTTP/1.1" {}]
+                                 ["content-length" "HTTP/1.1" {"content-length" "11"}]
+                                 ["close-delimited" "HTTP/1.0" {}]]]
+    (with-server
+      (fn [_]
+        (let [out (java.io.PipedOutputStream.)
+              in (java.io.PipedInputStream. out)]
+          (future
+            (.write out (.getBytes "first"))
+            (.flush out)
+            (Thread/sleep 1500)
+            (.write out (.getBytes " later"))
+            (.close out))
+          {:status 200 :headers headers :body in}))
+      {}
+      (fn []
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (write! sock (str "GET / " proto "\r\nHost: x\r\nConnection: close\r\n\r\n"))
+          (let [ms (ms-until-received sock "first" 3000)]
+            (is (and ms (< ms 1000)) (str label ": " ms " ms"))))))))
+
 (deftest unknown-header-names-lowercased
   (let [captured (atom nil)]
     (with-server (fn [req] (reset! captured (:headers req)) {:status 200 :body ""}) {}

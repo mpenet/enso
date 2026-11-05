@@ -2,6 +2,7 @@
 // ABOUTME: bodies (inline, chunked, fixed-length, file), error responses and pipelined coalescing.
 package com.s_exp.enso.http1;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -479,7 +480,7 @@ final class ResponseWriter {
                                     keepAlive = false;
                                 }
                             } else {
-                                bodyBytesWritten = h.stream().transferTo(out);
+                                bodyBytesWritten = boundedTransfer(h.stream(), out, Long.MAX_VALUE);
                             }
                         }
                         case ResponseHead.BODY_STREAMING -> {
@@ -598,7 +599,7 @@ final class ResponseWriter {
         long remaining = limit;
         while (remaining > 0) {
             int max = (int) Math.min(remaining, scratch.length);
-            int n = is.read(scratch, 0, max);
+            int n = readStream(is, scratch, 0, max);
             if (n < 0) {
                 break;
             }
@@ -664,6 +665,26 @@ final class ResponseWriter {
         return scratch;
     }
 
+    /**
+     * Reads a stream body. The output pending meanwhile (the head, what was
+     * read so far) is held as across a pipelined handler: a read that
+     * returns within a timer tick takes it back and the coalescing goes
+     * on, one that waits (a stream fed as it goes) has it written out.
+     */
+    private int readStream(InputStream in, byte[] b, int off, int len) throws IOException {
+        if (hlen == 0 || in.getClass() == ByteArrayInputStream.class || in.available() > 0) {
+            // Nothing to hold, or a read that doesn't wait: an in-memory
+            // stream, or bytes already there.
+            return in.read(b, off, len);
+        }
+        holdOutput();
+        try {
+            return in.read(b, off, len);
+        } finally {
+            reclaimOutput();
+        }
+    }
+
     private void writeChunked(InputStream body) throws IOException {
         // Data is read behind room for the size line and framed in place,
         // so each chunk is one contiguous write: [size CRLF][data][CRLF].
@@ -671,7 +692,7 @@ final class ResponseWriter {
         int room = ChunkedWriter.SIZE_LINE_ROOM;
         long total = 0;
         while (true) {
-            int n = body.read(chunk, room, chunk.length - room - 2);
+            int n = readStream(body, chunk, room, chunk.length - room - 2);
             if (n < 0) {
                 break;
             }
