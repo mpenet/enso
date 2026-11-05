@@ -28,6 +28,7 @@ import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -90,6 +91,8 @@ public final class EnsoServer implements AutoCloseable {
     private final ReentrantLock lifecycle = new ReentrantLock();
     private boolean started;
     private boolean closed;
+    // Opened once the first close() is done: later callers wait for it.
+    private final CountDownLatch closeDone = new CountDownLatch(1);
     // The TLS context last configured (session cache size), so a provider
     // returning the same context isn't reconfigured per connection.
     private volatile SSLContext configuredContext;
@@ -133,6 +136,7 @@ public final class EnsoServer implements AutoCloseable {
 
     private void startLocked() throws IOException {
         if (started) throw new IllegalStateException("server already started");
+        if (closed) throw new IllegalStateException("server closed");
         started = true;
         try {
             timer = new Timer();
@@ -649,13 +653,40 @@ public final class EnsoServer implements AutoCloseable {
      */
     @Override
     public void close() throws IOException {
+        boolean first;
         lifecycle.lock();
         try {
-            if (closed) return;
+            first = !closed;
             closed = true;
         } finally {
             lifecycle.unlock();
         }
+        if (!first) {
+            awaitClose();
+            return;
+        }
+        try {
+            closeOnce();
+        } finally {
+            closeDone.countDown();
+        }
+    }
+
+    /**
+     * Another caller is closing: returns once it is done, so the port and
+     * every connection are released whichever close() returns. An
+     * interrupt (a handler stopping its own server, force-closed by that
+     * close) ends the wait early, with the interrupt status kept.
+     */
+    private void awaitClose() {
+        try {
+            closeDone.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void closeOnce() throws IOException {
         running = false;
         long start = System.nanoTime();
         long budget = config.shutdownTimeoutMillis * 1_000_000L;

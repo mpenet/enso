@@ -540,6 +540,41 @@
       (is (.await stopped 3 TimeUnit/SECONDS) "stop should complete after handler returned")
       (is (some-> (deref result 3000 nil) (str/includes? "done")) "in-flight request should get its response"))))
 
+(deftest concurrent-stop-returns-once-the-server-stopped
+  ;; Two callers stopping the server at once (a component stop racing a
+  ;; shutdown hook): neither returns while the other is still draining,
+  ;; so the port is released when either does.
+  (let [entered (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        srv (enso/run-server (fn [_] (.countDown entered) (.await release 5 TimeUnit/SECONDS) {:status 200 :body "ok"})
+                             {:host "127.0.0.1" :port 0 :shutdown-timeout 5000})
+        client (future (try (with-open [sock (Socket. "127.0.0.1" (int (enso/port srv)))]
+                              (.write (.getOutputStream sock) (.getBytes "GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+                              (.flush (.getOutputStream sock))
+                              (.readAllBytes (.getInputStream sock)))
+                            (catch Exception _)))
+        first-stopped (CountDownLatch. 1)
+        second-stopped (CountDownLatch. 1)]
+    (is (.await entered 2 TimeUnit/SECONDS))
+    (future (enso/stop srv) (.countDown first-stopped))
+    (Thread/sleep 100)
+    (future (enso/stop srv) (.countDown second-stopped))
+    (is (not (.await second-stopped 300 TimeUnit/MILLISECONDS)) "the second stop waits for the first")
+    (.countDown release)
+    (is (.await first-stopped 5 TimeUnit/SECONDS))
+    (is (.await second-stopped 5 TimeUnit/SECONDS))
+    (deref client 2000 nil)))
+
+(deftest closed-server-cannot-start
+  ;; close() before start() leaves nothing running, and the server can't be
+  ;; started afterwards (a later close would find it closed already).
+  (let [srv (com.s_exp.enso.EnsoServer.
+             (reify com.s_exp.enso.api.RingHandler (handle [_ _] nil))
+             (.build (doto (com.s_exp.enso.api.Config/builder) (.host "127.0.0.1") (.port 0))))]
+    (.close srv)
+    (is (thrown? IllegalStateException (.start srv)))
+    (is (not (.isRunning srv)))))
+
 (deftest header-timeout-slowloris
   ;; Drip-feeds 1 byte at a time. Server should time out via 408 before headers complete.
   ;; Concurrent reader avoids losing the 408 to a TCP RST when the server closes mid-write.
