@@ -62,6 +62,7 @@ public final class HttpConnection implements Runnable, Drainable {
     static final LogLimiter INVALID_RESPONSES = new LogLimiter(LOG, Level.WARNING);
     static final LogLimiter BODY_FAILURES = new LogLimiter(LOG, Level.WARNING);
     static final LogLimiter EXPECTED_BODY_FAILURES = new LogLimiter(LOG, Level.FINE);
+    private static final LogLimiter STRAY_INTERRUPTS = new LogLimiter(LOG, Level.WARNING);
 
     private static final byte[] SEC_WEBSOCKET_VERSION_13 =
         "Sec-WebSocket-Version: 13\r\n".getBytes(StandardCharsets.ISO_8859_1);
@@ -161,7 +162,7 @@ public final class HttpConnection implements Runnable, Drainable {
         this.timer = service.timer;
         this.watchdog = config.writeTimeoutMillis > 0 ? new Watchdog() : null;
         this.idleTimeout = config.idleTimeoutMillis > 0 ? new IdleTimeout() : null;
-        this.writer = new ResponseWriter(socket, service, watchdog);
+        this.writer = new ResponseWriter(socket, service, watchdog, server);
         this.reader = new RequestReader(this, writer, socket, config);
     }
 
@@ -375,6 +376,7 @@ public final class HttpConnection implements Runnable, Drainable {
                 return false;
             }
         }
+        clearStrayInterrupt(server, "handler");
         if (c.outcome != Exchange.RESPONSE) {
             // A client error (the body failed) or a handler failure with no
             // error handler response: answered, then the connection ends.
@@ -433,6 +435,18 @@ public final class HttpConnection implements Runnable, Drainable {
             linger = true;
         }
         return reuse;
+    }
+
+    /**
+     * Clears an interrupt flag the handler's code left set on the
+     * connection thread, which would make the next socket write close the
+     * connection, and logs it: the interrupt wasn't the server's. While the
+     * server stops, the interrupt is its own and is kept.
+     */
+    static void clearStrayInterrupt(EnsoServer server, String what) {
+        if (server.isRunning() && Thread.interrupted()) {
+            STRAY_INTERRUPTS.log(what + " returned with its thread's interrupt flag set; cleared");
+        }
     }
 
     /** Whether the client planned to send more requests on this connection. */

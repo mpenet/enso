@@ -95,6 +95,7 @@ final class ResponseWriter {
 
     private final Socket socket;
     private final Service service;
+    private final EnsoServer server;
     private final Timer timer;
     // :write-timeout, null when disabled.
     private final WriteWatchdog watchdog;
@@ -121,9 +122,10 @@ final class ResponseWriter {
     // Body bytes of the response being written, for events and JFR.
     long bodyBytesWritten;
 
-    ResponseWriter(Socket socket, Service service, WriteWatchdog watchdog) {
+    ResponseWriter(Socket socket, Service service, WriteWatchdog watchdog, EnsoServer server) {
         this.socket = socket;
         this.service = service;
+        this.server = server;
         this.timer = service.timer;
         this.watchdog = watchdog;
     }
@@ -494,6 +496,7 @@ final class ResponseWriter {
                             // terminating chunk, which would make the truncated
                             // response look complete.
                             h.streaming().write(writer);
+                            HttpConnection.clearStrayInterrupt(this.server, "response body");
                             ChunkedWriters.finish(writer);
                             bodyBytesWritten = writer.bytesWritten();
                             if (fixed != null && fixed.remaining > 0) {

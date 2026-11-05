@@ -1405,6 +1405,26 @@
             (is (= 200 (status-of resp)) [label framing])
             (is (= "hello world" (response-body resp)) [label framing])))))))
 
+(deftest stray-interrupt-flag-is-cleared-and-logged
+  ;; A handler or streamed body that returns with its thread's interrupt
+  ;; flag set would make the next socket write close the connection: the
+  ;; flag is cleared, the response sent whole, and the fault logged.
+  (doseq [[label handler] [["handler" (fn [_] (.interrupt (Thread/currentThread)) {:status 200 :body "hello"})]
+                           ["streamed body" (fn [_] {:status 200
+                                                     :body (fn [w]
+                                                             (enso/write! w "hello")
+                                                             (.interrupt (Thread/currentThread)))})]]]
+    (Thread/sleep 1100)
+    (let [resp (atom nil)
+          records (support/capture-logs
+                   "com.s_exp.enso"
+                   #(with-server handler {}
+                      (fn [] (reset! resp (send-and-read! close-req)))))]
+      (is (= 200 (status-of @resp)) label)
+      (is (= "hello" (response-body @resp)) label)
+      (is (some #(re-find #"interrupt" %) (support/records-at records java.util.logging.Level/WARNING))
+          label))))
+
 (deftest unknown-header-names-lowercased
   (let [captured (atom nil)]
     (with-server (fn [req] (reset! captured (:headers req)) {:status 200 :body ""}) {}
