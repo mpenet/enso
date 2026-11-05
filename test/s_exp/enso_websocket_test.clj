@@ -900,6 +900,31 @@
           (let [resp (ws-handshake-response sock {"Sec-WebSocket-Protocol" "chat, superchat"})]
             (is (clojure.string/starts-with? resp (str "HTTP/1.1 " expected)) (str picked ": " resp))))))))
 
+(deftest ws-on-error-runs-once
+  ;; The read fails (connection reset) and on-error sends on the dead
+  ;; socket, which fails too: still one on-error, then on-close.
+  (let [errors (atom 0)
+        closes (atom [])
+        in (proxy [InputStream] []
+             (read ([] (throw (java.io.IOException. "reset")))
+                   ([_ _ _] (throw (java.io.IOException. "reset")))))
+        out (proxy [java.io.OutputStream] []
+              (write ([_] (throw (java.io.IOException. "broken pipe")))
+                     ([_ _ _] (throw (java.io.IOException. "broken pipe"))))
+              (flush []))
+        listener (reify WebSocketListener
+                   (onOpen [_ _])
+                   (onMessage [_ _ _])
+                   (onError [_ s _]
+                     (swap! errors inc)
+                     (try (.sendText ^WebSocketSocket s "bye") (catch Exception _)))
+                   (onClose [_ _ code _] (swap! closes conj code)))
+        conn (WebSocketConnection. (Socket.) in out listener (ws-config {}) nil test-timer
+                                   (MemoryBudget. Long/MAX_VALUE) nil)]
+    (.run conn)
+    (is (= 1 @errors))
+    (is (= [1006] @closes))))
+
 (deftest ws-send-large-frame-length-encoding
   ;; Frames of 64 KiB and more use the 8-byte extended length.
   (let [size 70000

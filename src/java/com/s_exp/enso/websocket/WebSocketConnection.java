@@ -310,6 +310,8 @@ public final class WebSocketConnection {
     // The server failed the connection: onClose reports its code, not the
     // peer's answer.
     private boolean failed;
+    // onError ran: it runs at most once, before onClose. Read thread.
+    private boolean errorReported;
     // Bytes of the current frame still unread when a failure was raised
     // with the frame stream intact, -1 when it can't be resumed. Skipped
     // before reading on, so the loop can wait for the peer's CLOSE.
@@ -712,6 +714,10 @@ public final class WebSocketConnection {
     }
 
     private void notifyError(Throwable t) {
+        if (errorReported) {
+            return;
+        }
+        errorReported = true;
         try {
             listener.onError(socketApi, t);
         } catch (Throwable ignored) {
@@ -781,7 +787,7 @@ public final class WebSocketConnection {
         // A write failed while the connection wasn't failing for another
         // reason: reported once, with the write's own exception.
         Throwable wf = writeFailure;
-        if (wf != null && !failed) {
+        if (wf != null && !failed && !errorReported) {
             closeCode = CLOSE_ABNORMAL;
             closeReason = wf.getMessage() == null ? "" : wf.getMessage();
             notifyError(wf);
