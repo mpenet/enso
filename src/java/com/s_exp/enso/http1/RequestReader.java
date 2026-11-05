@@ -76,10 +76,17 @@ final class RequestReader {
     private static final int READ_INTERRUPT_PENDING = 2;
     private static final int READ_INTERRUPTING = 3;
     private static final VarHandle READ_STATE;
+    // Request body states: no read from another thread in flight, one in
+    // flight, claimed by the connection (see RequestBody#claim).
+    private static final int BODY_IDLE = 0;
+    private static final int BODY_READING = 1;
+    private static final int BODY_CLAIMED = 2;
+    private static final VarHandle BODY_STATE;
 
     static {
         try {
             READ_STATE = MethodHandles.lookup().findVarHandle(RequestReader.class, "readState", int.class);
+            BODY_STATE = MethodHandles.lookup().findVarHandle(RequestBody.class, "state", int.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -1106,8 +1113,24 @@ final class RequestReader {
      * after the handler returns, whatever the handler did with the
      * exception, and never calls the error handler for it. Once failed,
      * every read throws the same exception.
+     *
+     * <p>Once its response is done the connection claims the body: it
+     * drains what is left and moves on to the next request, and any later
+     * read throws. Reads must not overlap (a second thread's usually
+     * throws, but that check is not guaranteed). The claim fails while
+     * another thread is mid-read, and the connection then closes instead of
+     * being reused, so no read ever reaches the next request's bytes.
      */
     abstract class RequestBody extends InputStream {
+
+        // The connection thread, which made the body and alone claims it:
+        // its reads can't overlap the claim, so they only read the state,
+        // plainly (seeing another thread's READING is best effort). A read
+        // from another thread moves IDLE -> READING -> IDLE, and the claim
+        // IDLE -> CLAIMED, atomically.
+        private final Thread owner = Thread.currentThread();
+        @SuppressWarnings("unused") // accessed through BODY_STATE
+        private volatile int state;
 
         // Single-byte scratch for read(), allocated by its first call, so a
         // handler reading byte at a time doesn't allocate per call and one
@@ -1132,6 +1155,45 @@ final class RequestReader {
 
         @Override
         public final int read(byte[] b, int off, int len) throws IOException {
+            if (Thread.currentThread() == owner) {
+                int st = (int) BODY_STATE.get(this);
+                if (st != BODY_IDLE) {
+                    throw refused(st);
+                }
+                return readClaimed(b, off, len);
+            }
+            int st = (int) BODY_STATE.compareAndExchange(this, BODY_IDLE, BODY_READING);
+            if (st != BODY_IDLE) {
+                throw refused(st);
+            }
+            try {
+                return readClaimed(b, off, len);
+            } finally {
+                BODY_STATE.compareAndSet(this, BODY_READING, BODY_IDLE);
+            }
+        }
+
+        @Override
+        public final int available() {
+            return state == BODY_CLAIMED ? 0 : availableBody();
+        }
+
+        /**
+         * Takes the body from whoever may still hold it, for the connection
+         * to drain; idempotent, on the connection thread. False while
+         * another thread is mid-read.
+         */
+        final boolean claim() {
+            return (int) BODY_STATE.compareAndExchange(this, BODY_IDLE, BODY_CLAIMED) != BODY_READING;
+        }
+
+        private static IOException refused(int state) {
+            return new IOException(state == BODY_CLAIMED
+                ? "request body read after its response completed"
+                : "request body read by two threads at once");
+        }
+
+        private int readClaimed(byte[] b, int off, int len) throws IOException {
             if (failure != null) {
                 throw failure;
             }
@@ -1168,6 +1230,8 @@ final class RequestReader {
 
         abstract int readBody(byte[] b, int off, int len) throws IOException;
 
+        abstract int availableBody();
+
         abstract boolean isFinished();
 
         /** Unread body bytes when known, else -1. */
@@ -1183,7 +1247,7 @@ final class RequestReader {
             byte[] scratch = writer.chunkScratch();
             long total = 0;
             while (!isFinished()) {
-                int n = read(scratch, 0, scratch.length);
+                int n = readClaimed(scratch, 0, scratch.length);
                 if (n < 0) {
                     break;
                 }
@@ -1270,7 +1334,7 @@ final class RequestReader {
         }
 
         @Override
-        public int available() {
+        int availableBody() {
             return pos < limit ? (int) Math.min(remaining, limit - pos) : 0;
         }
 
@@ -1334,7 +1398,7 @@ final class RequestReader {
         }
 
         @Override
-        public int available() {
+        int availableBody() {
             return pos < limit ? (int) Math.min(chunkRemaining, limit - pos) : 0;
         }
 

@@ -1083,6 +1083,82 @@
     (com.s_exp.enso.core.ChunkedWriters/finish w)
     (is (= "ok" (dechunk (String. (.toByteArray baos) StandardCharsets/ISO_8859_1))))))
 
+(defn- blocking-output
+  "An OutputStream whose writes signal `entered` then wait for `release`."
+  [entered release]
+  (proxy [OutputStream] []
+    (write
+      ([_])
+      ([_ _ _]
+       (.countDown ^java.util.concurrent.CountDownLatch entered)
+       (.await ^java.util.concurrent.CountDownLatch release)))
+    (flush [])))
+
+(deftest chunked-writer-rejects-concurrent-writes
+  ;; One writer at a time: a second thread writing while a write is in
+  ;; flight is refused instead of interleaving bytes.
+  (let [entered (java.util.concurrent.CountDownLatch. 1)
+        release (java.util.concurrent.CountDownLatch. 1)
+        w (ChunkedWriter. ^OutputStream (blocking-output entered release) 512 true)
+        first-write (future (.write w (byte-array 600)))]
+    (is (.await entered 5 java.util.concurrent.TimeUnit/SECONDS))
+    (is (thrown? IllegalStateException (.write w (byte-array 1))))
+    (.countDown release)
+    @first-write
+    (.write w (byte-array 1))
+    (is (= 1 (.buffered w)) "usable again once the write in flight is done")))
+
+(deftest chunked-writer-finish-during-a-write-fails-and-closes-it
+  ;; The body ending while another thread still writes: finish fails (the
+  ;; response is cut, no last chunk), and the writer takes no more writes.
+  (let [entered (java.util.concurrent.CountDownLatch. 1)
+        release (java.util.concurrent.CountDownLatch. 1)
+        w (ChunkedWriter. ^OutputStream (blocking-output entered release) 512 true)
+        late (future (.write w (byte-array 600)))]
+    (is (.await entered 5 java.util.concurrent.TimeUnit/SECONDS))
+    (is (thrown? IllegalStateException (com.s_exp.enso.core.ChunkedWriters/finish w)))
+    (.countDown release)
+    @late
+    (is (thrown? IllegalStateException (.write w (byte-array 1))))))
+
+;; ---- Request body after the response ---------------------------------------
+
+(deftest request-body-read-after-the-response-throws
+  ;; A body kept past its response is no longer readable: it neither reads
+  ;; the connection's next bytes nor passes a drained body off as complete.
+  (let [stashed (promise)]
+    (with-server (fn [req] (deliver stashed (:body req)) {:status 200 :body "ok"}) {}
+      (fn []
+        (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+          (write! sock "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+          (let [resp (read-until-quiet! sock 500)]
+            (is (= 200 (status-of resp))))
+          (is (thrown? java.io.IOException (.read ^java.io.InputStream @stashed))))))))
+
+(deftest request-body-read-concurrently-never-sees-the-next-request
+  ;; A thread still reading the body when the response is done races the
+  ;; connection's drain: the connection is not reused then, so that thread
+  ;; can never read the next request's bytes.
+  (dotimes [_ 5]
+    (let [got (promise)]
+      (with-server
+        (fn [req]
+          (let [body ^java.io.InputStream (:body req)]
+            (future (deliver got (try (String. (.readAllBytes body) StandardCharsets/ISO_8859_1)
+                                      (catch java.io.IOException _ :failed))))
+            (Thread/sleep 100)
+            {:status 202 :body "ok"}))
+        {}
+        (fn []
+          (with-open [sock (Socket. "127.0.0.1" (int (:port *server*)))]
+            (write! sock "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n")
+            (Thread/sleep 300)
+            (write! sock "helloworldGET /SECRET HTTP/1.1\r\nHost: x\r\n\r\n")
+            (let [resp (read-until-quiet! sock 500)
+                  v (deref got 2000 :none)]
+              (is (or (= :failed v) (= "helloworld" v)) (pr-str v))
+              (is (not (clojure.string/includes? resp " 400 ")) "the drain didn't eat the next request"))))))))
+
 ;; ---- WebSocket upgrade ------------------------------------------------------
 
 (defn- ws-request

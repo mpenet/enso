@@ -110,6 +110,12 @@ is an enso extension, not part of the Ring spec.
              (catch InterruptedException _)))})   ; stream reset (h2, h3) or server stop
 ```
 
+Write from one thread at a time. A `write!` or `flush!` after the body
+ended throws `IllegalStateException`. One made while another thread's is
+in flight usually throws too, but that isn't guaranteed. A body that ends
+while a write is still in flight is cut short: the response is aborted
+rather than finished.
+
 The fn finds out that the client left from an exception, not a return
 value: `write!` or `flush!` throws an `IOException`.
 
@@ -144,6 +150,12 @@ the simpler choice. Async support exists for middleware written for it.
 `:error-handler` is `(fn [request throwable])` returning a Ring response.
 It runs when the handler throws or returns nil, on every protocol. If it
 throws or returns nil too, a plain 500 is sent.
+
+Read the request body before the response is done, from one thread at a
+time. On HTTP/1.1 the connection then takes the body back to drain what
+is left, and a later read throws an `IOException`. A read still in flight
+on another thread at that moment closes the connection instead of letting
+it serve another request.
 
 A request body the client got wrong is the client's error. Reading it
 throws an `IOException` (400 for broken or truncated framing, 413 over

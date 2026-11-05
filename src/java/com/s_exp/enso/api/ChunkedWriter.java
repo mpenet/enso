@@ -5,6 +5,8 @@ package com.s_exp.enso.api;
 import com.s_exp.enso.core.ChunkedWriters;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
@@ -18,10 +20,27 @@ import java.util.Objects;
  * forces the accumulated bytes out. Do not touch a writer after the body
  * fn ({@link StreamingBody#write}) returns — the server then ends the body
  * itself (the terminating zero-length chunk on HTTP/1.1).
+ *
+ * <p>One thread writes at a time. Any call once the body has ended throws
+ * {@link IllegalStateException}; a call made while another thread's is in
+ * flight usually does too, but that check is not guaranteed. A body ending
+ * while a write is in flight is cut short (no terminating chunk), never
+ * mixed with what the connection sends next.
  */
 public final class ChunkedWriter {
 
+    // States: no call from another thread in flight, one in flight, ended.
+    private static final int IDLE = 0;
+    private static final int WRITING = 1;
+    private static final int CLOSED = 2;
+    private static final VarHandle STATE;
+
     static {
+        try {
+            STATE = MethodHandles.lookup().findVarHandle(ChunkedWriter.class, "state", int.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
         ChunkedWriters.register(ChunkedWriter::finish);
     }
 
@@ -48,7 +67,14 @@ public final class ChunkedWriter {
     // Chunk-size line scratch for chunks written without copying.
     private byte[] sizeLine;
     private int len;
-    private boolean closed;
+    // The thread that made the writer, which also ends the body: its
+    // writes can't overlap finish, so they only read the state, plainly
+    // (it alone sets CLOSED; seeing another thread's WRITING is best
+    // effort). A write from another thread moves IDLE -> WRITING -> IDLE,
+    // and finish to CLOSED, atomically: no write runs past the end.
+    private final Thread owner = Thread.currentThread();
+    @SuppressWarnings("unused") // accessed through STATE
+    private volatile int state;
     private Charset charset = StandardCharsets.UTF_8;
     private long bytesWritten;
 
@@ -108,7 +134,19 @@ public final class ChunkedWriter {
      * {@code byte[]} allocation on the Clojure adapter side.
      */
     public void write(int b) throws IOException {
-        ensureOpen();
+        if (owned()) {
+            put(b);
+            return;
+        }
+        enter();
+        try {
+            put(b);
+        } finally {
+            exit();
+        }
+    }
+
+    private void put(int b) throws IOException {
         if (len == capacity) {
             flushPending();
         }
@@ -121,8 +159,20 @@ public final class ChunkedWriter {
      * the buffer goes out as its own chunk without being copied.
      */
     public void write(byte[] data, int off, int length) throws IOException {
-        ensureOpen();
         Objects.checkFromIndexSize(off, length, data.length);
+        if (owned()) {
+            put(data, off, length);
+            return;
+        }
+        enter();
+        try {
+            put(data, off, length);
+        } finally {
+            exit();
+        }
+    }
+
+    private void put(byte[] data, int off, int length) throws IOException {
         if (length > capacity - len) {
             flushPending();
             if (length >= capacity) {
@@ -159,7 +209,6 @@ public final class ChunkedWriter {
      * arbitrary text. A rejected string writes nothing.
      */
     public void writeAscii(String s) throws IOException {
-        ensureOpen();
         int n = s.length();
         // Validated up front: once the buffer fills mid-string, part of it
         // is already on its way out and can't be taken back.
@@ -169,6 +218,20 @@ public final class ChunkedWriter {
                     "writeAscii: non-ASCII character at index " + i);
             }
         }
+        if (owned()) {
+            putAscii(s);
+            return;
+        }
+        enter();
+        try {
+            putAscii(s);
+        } finally {
+            exit();
+        }
+    }
+
+    private void putAscii(String s) throws IOException {
+        int n = s.length();
         int i = 0;
         while (i < n) {
             if (len == capacity) {
@@ -190,9 +253,18 @@ public final class ChunkedWriter {
      * visibility of an event.
      */
     public void flush() throws IOException {
-        ensureOpen();
-        flushPending();
-        out.flush();
+        if (owned()) {
+            flushPending();
+            out.flush();
+            return;
+        }
+        enter();
+        try {
+            flushPending();
+            out.flush();
+        } finally {
+            exit();
+        }
     }
 
     /** How many bytes are queued in the pending chunk (not yet written). */
@@ -207,10 +279,13 @@ public final class ChunkedWriter {
 
     // Ends the body; reached by drivers through ChunkedWriters.finish.
     private void finish() throws IOException {
-        if (closed) {
+        int was = (int) STATE.getAndSet(this, CLOSED);
+        if (was == CLOSED) {
             return;
         }
-        closed = true;
+        if (was == WRITING) {
+            throw new IllegalStateException("ChunkedWriter written while its body ended");
+        }
         flushPending();
         if (framed) {
             out.write(CHUNK_END);
@@ -250,9 +325,36 @@ public final class ChunkedWriter {
         }
     }
 
-    private void ensureOpen() {
-        if (closed) {
-            throw new IllegalStateException("ChunkedWriter is closed");
+    /**
+     * Whether the call comes from the owner, which then writes unguarded;
+     * throws if the body ended or another thread's write is seen in flight.
+     */
+    private boolean owned() {
+        if (Thread.currentThread() != owner) {
+            return false;
         }
+        int st = (int) STATE.get(this);
+        if (st != IDLE) {
+            throw refused(st);
+        }
+        return true;
+    }
+
+    /** Starts a call from another thread than the owner. */
+    private void enter() {
+        int st = (int) STATE.compareAndExchange(this, IDLE, WRITING);
+        if (st != IDLE) {
+            throw refused(st);
+        }
+    }
+
+    // A failed exchange means finish ended the body meanwhile: it stays CLOSED.
+    private void exit() {
+        STATE.compareAndSet(this, WRITING, IDLE);
+    }
+
+    private static IllegalStateException refused(int state) {
+        return new IllegalStateException(state == CLOSED
+            ? "ChunkedWriter is closed" : "ChunkedWriter written by two threads at once");
     }
 }

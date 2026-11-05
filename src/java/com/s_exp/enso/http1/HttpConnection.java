@@ -189,7 +189,9 @@ public final class HttpConnection implements Runnable, Drainable {
             writer.flush();
             // Closing with unread input makes the kernel answer it with a
             // reset, which can destroy responses the client hasn't read yet.
-            if (linger || reader.inputPending()) {
+            // Not while a handler's thread still reads the body: it would
+            // race the lingering reads for the input.
+            if ((linger || reader.inputPending()) && claimBody()) {
                 reader.lingeringClose();
             }
         } catch (IOException e) {
@@ -403,6 +405,9 @@ public final class HttpConnection implements Runnable, Drainable {
             // Reported however the write ended: the response was decided.
             complete(status);
         }
+        if (!claimBody()) {
+            return false;
+        }
         if (!bodyAllowsReuse) {
             linger = true;
             return false;
@@ -449,7 +454,13 @@ public final class HttpConnection implements Runnable, Drainable {
      */
     private boolean settleBody(boolean responseReadsBody) throws IOException {
         RequestReader.RequestBody body = reader.body();
-        if (body == null || body.isFinished()) {
+        if (body == null) {
+            return true;
+        }
+        if (!responseReadsBody && !body.claim()) {
+            return false;
+        }
+        if (body.isFinished()) {
             return true;
         }
         if (body.continuePending) {
@@ -491,6 +502,16 @@ public final class HttpConnection implements Runnable, Drainable {
             && !writer.head.closeRequested()
             && bodyAllowsReuse;
         return writer.writeResponse(http11, keepAlive, reader.hasBuffered());
+    }
+
+    /**
+     * Takes the request body back from the handler, whose reads throw from
+     * then on; false while one of its threads is mid-read, and the
+     * connection must then end without reading again.
+     */
+    private boolean claimBody() {
+        RequestReader.RequestBody body = reader.body();
+        return body == null || body.claim();
     }
 
     private boolean drainBody() throws IOException {
