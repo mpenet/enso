@@ -1,5 +1,59 @@
 # Changelog
 
+## 1.0.0-beta138 — 2026-11-06
+
+### Security fixes
+
+HTTP/1.1:
+
+- A chunk size close to `Long.MAX_VALUE` could get a chunked body past `:max-request-body-bytes`: the size is now compared with what is left of the cap. Leading zeros and whitespace on a chunk-size line count against the cap, as extensions did.
+- A request body or `ChunkedWriter` used by another thread after its response was done could read the next request's bytes or write into the next response. Once the response is done the connection takes the body back, and later reads throw an `IOException`; a read still in flight then closes the connection instead of letting it serve another request. A `ChunkedWriter` call after the body ended throws `IllegalStateException`, and a body ending while another thread writes is aborted rather than finished.
+
+WebSocket:
+
+- Waiting for room in the memory budget stopped a message's deadline for as long as it lasted, so connections stopped mid-message could hold the budget indefinitely. The wait now stops the deadline for at most one more `:read-timeout` per message, then fails it with 1008.
+- A frame header was enough to allocate up to 64 KiB (more for a fragment) for the length it claimed, outside the budget. Message buffers now grow only for the bytes received.
+
+All protocols:
+
+- With `:idle-timeout` 0 nothing bounded a connection that never sent a request (cleartext HTTP/1.1, h2c, TLS after the handshake). `:handshake-timeout` now runs from accept until the first request begins, on every transport.
+
+### Fixes
+
+HTTP/1.1:
+
+- A response body produced as it is written (an InputStream such as the request's own `:body`, a fn or `StreamableResponseBody`) that read the request body lost what was already buffered: it was discarded before the body ran.
+- An InputStream body fed as it goes (a pipe) held back everything, the head included, until 32 KiB or the end of the stream. What was read goes out once a read has to wait.
+- Error responses to HEAD (a malformed request, a handler failure, the `:handler-timeout` 503) carried their body.
+- A checked exception or an `Error` from a streamed body was logged at FINE.
+- A handler or streamed body returning with its thread's interrupt flag set made the next socket write close the connection, with nothing logged. The flag is cleared and logged at WARNING.
+- A request-target with a fragment (`#`) is answered 400 (HTTP/2 and HTTP/3 reset the stream).
+
+HTTP/2:
+
+- A 100 (Continue) head could overflow the batch it was packed into after the peer changed HEADER_TABLE_SIZE twice, failing the connection.
+
+WebSocket:
+
+- The selected subprotocol is matched case-sensitively against the client's offer (RFC 6455).
+- `on-error` runs at most once.
+- An `Error` while writing left asynchronous sends unanswered and the connection open after a frame cut short. Any failure while writing now drops the connection and fails the sends.
+- `sendPing` and the automatic pong could write every queued asynchronous send on the caller's thread. With sends queued, a control frame now goes behind them.
+
+All protocols:
+
+- A File body naming a directory gave a 200 cut short, and HEAD on a missing file answered 200. Anything but a regular file is answered 500.
+- A `Closeable` `StreamableResponseBody` is closed when the response has no body to send (HEAD, 204, 304).
+- The PEM file source refuses a private key that doesn't match the certificate: an error at start, and on reload the current pair keeps serving.
+- A second concurrent `stop` returned before the first finished, and `close()` before `start()` left a server that could be started but not stopped. Every `stop` now waits for the server to stop, and `start()` on a closed server throws.
+
+### Features and behaviour changes
+
+- An I/O error of a handler's or streamed body's own work (a database, an upstream) is logged at WARNING. Only a failure of the request's own I/O with a client that went away, or the interrupt of a server that gave up on it, is logged at FINE.
+- Connections refused at `:max-connections` (or HTTP/3's `:http3-max-half-open`) log at WARNING, rate-limited; `:max-connections-per-ip` refusals stay at FINE.
+- Invalid response header errors name the field and the offending character, never the value.
+- A `ChunkedWriter`, and a request body, take one thread at a time; see [handlers.md](doc/handlers.md#streaming).
+
 ## 1.0.0-beta111 — 2026-11-03
 
 ### Fixes
