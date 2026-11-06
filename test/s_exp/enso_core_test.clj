@@ -782,7 +782,7 @@
         b (IllegalStateException. "b")]
     (.initCause a b)
     (.initCause b a)
-    (let [f (future (RingErrorHandler/respond nil nil a (com.s_exp.enso.core.Exchange/clientCaused a)))]
+    (let [f (future (RingErrorHandler/respond nil nil a (com.s_exp.enso.core.Exchange/interrupted a)))]
       (is (nil? (deref f 2000 ::hung)) "no error handler: nil, promptly"))))
 
 ;; ---- Memory budget ---------------------------------------------------------
