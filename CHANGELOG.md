@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0-beta138 — 2026-11-06
+## 1.0.0-beta140 — 2026-11-12
 
 ### Security fixes
 
